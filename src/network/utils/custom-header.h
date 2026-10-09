@@ -148,6 +148,9 @@ public:
 		  uint16_t pg;
 		  uint32_t seq; // the qbb sequence number.
       uint32_t trim_payload_size;
+		  // The sequence of the data packet an acknowledgement answers. On the
+		  // wire only while ackCarriesPacketSeq is set.
+		  uint32_t packet_seq;
 		  IntHeader ih;
 	  } ack;
 	  // PauseHeader
@@ -157,6 +160,11 @@ public:
 		  uint8_t qIndex;
 	  } pfc;
   };
+
+  // Whether acknowledgement headers carry ack.packet_seq. Process-wide, as
+  // IntHeader::mode is, because every writer of the header and this parser
+  // must agree on its size.
+  static bool ackCarriesPacketSeq;
 
   uint8_t GetIpv4EcnBits (void) const;
   uint8_t GetIpv4Dscp (void) const;

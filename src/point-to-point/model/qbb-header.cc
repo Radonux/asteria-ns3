@@ -4,6 +4,7 @@
 #include "ns3/buffer.h"
 #include "ns3/address-utils.h"
 #include "ns3/log.h"
+#include "ns3/custom-header.h"
 
 NS_LOG_COMPONENT_DEFINE("qbbHeader");
 
@@ -13,13 +14,13 @@ namespace ns3 {
 
 	qbbHeader::qbbHeader(uint16_t pg)
 		: sport(0), dport(0), flags(0), m_pg(pg), m_seq(0),
-		  m_trimPayloadSize(0)
+		  m_trimPayloadSize(0), m_packetSeq(0)
 	{
 	}
 
 	qbbHeader::qbbHeader()
 		: sport(0), dport(0), flags(0), m_pg(0), m_seq(0),
-		  m_trimPayloadSize(0)
+		  m_trimPayloadSize(0), m_packetSeq(0)
 	{}
 
 	qbbHeader::~qbbHeader()
@@ -70,6 +71,9 @@ namespace ns3 {
 		else
 			flags &= ~(1 << FLAG_FORGIVENESS_ELIGIBLE);
 	}
+	void qbbHeader::SetPacketSeq(uint32_t seq){
+		m_packetSeq = seq;
+	}
 	void qbbHeader::SetIntHeader(const IntHeader &_ih){
 		ih = _ih;
 	}
@@ -107,6 +111,9 @@ namespace ns3 {
 	bool qbbHeader::IsAllowanceExhausted() const{
 		return (flags >> FLAG_ALLOWANCE_EXHAUSTED) & 1;
 	}
+	uint32_t qbbHeader::GetPacketSeq() const{
+		return m_packetSeq;
+	}
 
 	TypeId
 		qbbHeader::GetTypeId(void)
@@ -132,7 +139,8 @@ namespace ns3 {
 	}
 	uint32_t qbbHeader::GetBaseSize() {
 		qbbHeader tmp;
-		return sizeof(tmp.sport) + sizeof(tmp.dport) + sizeof(tmp.flags) + sizeof(tmp.m_pg) + sizeof(tmp.m_seq) + sizeof(tmp.m_trimPayloadSize);
+		return sizeof(tmp.sport) + sizeof(tmp.dport) + sizeof(tmp.flags) + sizeof(tmp.m_pg) + sizeof(tmp.m_seq) + sizeof(tmp.m_trimPayloadSize) +
+			(CustomHeader::ackCarriesPacketSeq ? sizeof(tmp.m_packetSeq) : 0);
 	}
 	void qbbHeader::Serialize(Buffer::Iterator start)  const
 	{
@@ -143,6 +151,8 @@ namespace ns3 {
 		i.WriteU16(m_pg);
 		i.WriteU32(m_seq);
 		i.WriteU32(m_trimPayloadSize);
+		if (CustomHeader::ackCarriesPacketSeq)
+			i.WriteU32(m_packetSeq);
 
 		// write IntHeader
 		ih.Serialize(i);
@@ -157,6 +167,8 @@ namespace ns3 {
 		m_pg = i.ReadU16();
 		m_seq = i.ReadU32();
 		m_trimPayloadSize = i.ReadU32();
+		if (CustomHeader::ackCarriesPacketSeq)
+			m_packetSeq = i.ReadU32();
 
 		// read IntHeader
 		ih.Deserialize(i);

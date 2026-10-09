@@ -55,6 +55,9 @@ public:
   void SetTrimLastHop(bool lastHop);
   void SetAllowanceExhausted(bool spent);
   void SetForgivenessEligible(bool eligible);
+  // The sequence of the data packet this acknowledgement answers, serialized
+  // only while CustomHeader::ackCarriesPacketSeq is set.
+  void SetPacketSeq(uint32_t seq);
   void SetIntHeader(const IntHeader &_ih);
 
 //Getters
@@ -71,6 +74,7 @@ public:
   uint32_t GetTrimPayloadSize() const;
   bool IsTrimLastHop() const;
   bool IsAllowanceExhausted() const;
+  uint32_t GetPacketSeq() const;
 
   static TypeId GetTypeId (void);
   virtual TypeId GetInstanceTypeId (void) const;
@@ -86,6 +90,7 @@ private:
   uint16_t m_pg;
   uint32_t m_seq; // the qbb sequence number.
   uint32_t m_trimPayloadSize;
+  uint32_t m_packetSeq;
   IntHeader ih;
   
 };

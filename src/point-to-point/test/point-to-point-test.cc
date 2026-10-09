@@ -912,6 +912,72 @@ class LoadBalancingSenderTest : public TestCase
     }
 };
 
+class AckPacketSeqHeaderTest : public TestCase
+{
+  public:
+    AckPacketSeqHeaderTest()
+        : TestCase("An acknowledgement header carries the packet sequence only when asked")
+    {
+    }
+
+    void DoRun() override
+    {
+        const IntHeader::Mode savedIntMode = IntHeader::mode;
+        const bool savedPacketSeq = CustomHeader::ackCarriesPacketSeq;
+        IntHeader::mode = IntHeader::NONE;
+
+        CustomHeader::ackCarriesPacketSeq = false;
+        NS_TEST_EXPECT_MSG_EQ(qbbHeader().GetSerializedSize(),
+                              16,
+                              "without the packet sequence the header keeps its size");
+        NS_TEST_EXPECT_MSG_EQ(CustomHeader::GetAckSerializedSize(),
+                              16,
+                              "the parser agrees on the size without the packet sequence");
+
+        CustomHeader::ackCarriesPacketSeq = true;
+        NS_TEST_EXPECT_MSG_EQ(qbbHeader().GetSerializedSize(),
+                              20,
+                              "the packet sequence adds four bytes");
+        NS_TEST_EXPECT_MSG_EQ(CustomHeader::GetAckSerializedSize(),
+                              20,
+                              "the parser agrees on the size with the packet sequence");
+
+        qbbHeader ack;
+        ack.SetSeq(3000);
+        ack.SetPacketSeq(7000);
+        ack.SetPG(3);
+        ack.SetSport(10001);
+        ack.SetDport(10000);
+        ack.SetCnp();
+        Ptr<Packet> packet = Create<Packet>(0);
+        packet->AddHeader(ack);
+        Ipv4Header ip;
+        ip.SetSource(Ipv4Address("11.0.2.1"));
+        ip.SetDestination(Ipv4Address("11.0.1.1"));
+        ip.SetProtocol(0xFC);
+        ip.SetPayloadSize(packet->GetSize());
+        packet->AddHeader(ip);
+        PppHeader ppp;
+        ppp.SetProtocol(0x0021);
+        packet->AddHeader(ppp);
+        CustomHeader parsed(CustomHeader::L2_Header | CustomHeader::L3_Header |
+                            CustomHeader::L4_Header);
+        packet->PeekHeader(parsed);
+        NS_TEST_EXPECT_MSG_EQ(parsed.ack.seq, 3000, "the cumulative sequence keeps its place");
+        NS_TEST_EXPECT_MSG_EQ(parsed.ack.packet_seq, 7000, "the packet sequence survives the wire");
+        const bool marked = (parsed.ack.flags >> qbbHeader::FLAG_CNP) & 1;
+        NS_TEST_EXPECT_MSG_EQ(marked,
+                              true,
+                              "the flags precede the packet sequence");
+        NS_TEST_EXPECT_MSG_EQ(parsed.GetSerializedSize(),
+                              packet->GetSize(),
+                              "the parser consumes exactly the header written");
+
+        CustomHeader::ackCarriesPacketSeq = savedPacketSeq;
+        IntHeader::mode = savedIntMode;
+    }
+};
+
 /**
  * \brief TestSuite for PointToPoint module
  */
@@ -939,6 +1005,7 @@ PointToPointTestSuite::PointToPointTestSuite()
     AddTestCase(new SpineIdentificationTest, TestCase::Duration::QUICK);
     AddTestCase(new LoadBalancingSwitchTest, TestCase::Duration::QUICK);
     AddTestCase(new LoadBalancingSenderTest, TestCase::Duration::QUICK);
+    AddTestCase(new AckPacketSeqHeaderTest, TestCase::Duration::QUICK);
 }
 
 static PointToPointTestSuite g_pointToPointTestSuite; //!< The testsuite
