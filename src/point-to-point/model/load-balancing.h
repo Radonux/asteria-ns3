@@ -37,6 +37,17 @@ inline uint8_t CarryingSpine(uint16_t identification){
 	return static_cast<uint8_t>(identification & 0xff);
 }
 
+// The part of a data packet's identification that fixes the queues it passes
+// through, so that packets with equal values arrive in the order they were
+// sent. Under SprayUniform it is the requested spine: a source leaf moves
+// every request for a spine whose uplink is down onto the same live spine, so
+// packets with one request still share their queues. Under EntropyHash it is
+// the whole entropy value, which every switch hashes alike.
+inline uint16_t PathOf(LoadBalancingMode mode, uint16_t identification){
+	return mode == LoadBalancingMode::SprayUniform
+		? RequestedSpine(identification) : identification;
+}
+
 } /* namespace ns3 */
 
 #endif /* LOAD_BALANCING_H */

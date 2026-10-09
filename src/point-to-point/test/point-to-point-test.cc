@@ -42,6 +42,8 @@
 #include "ns3/test.h"
 #include "ns3/udp-header.h"
 
+#include <algorithm>
+#include <random>
 #include <set>
 #include <string>
 #include <vector>
@@ -901,6 +903,10 @@ class LoadBalancingSenderTest : public TestCase
         Ptr<RdmaQueuePair> qp = CreateObject<RdmaQueuePair>(
             3, Ipv4Address("11.0.1.1"), Ipv4Address("11.0.2.1"), 10000, 10001);
         qp->m_size = static_cast<uint64_t>(packets) * kMtu;
+        if (mode != LoadBalancingMode::Ecmp)
+        {
+            qp->m_outstanding.SetPacketSize(kMtu);
+        }
         std::vector<uint16_t> identifications;
         for (uint32_t i = 0; i < packets; ++i)
         {
@@ -1023,6 +1029,21 @@ class IsolatedHost
         hw->m_rtTable[peer.Get()].push_back(0);
     }
 
+    // A sender queue pair as AddQueuePair registers it, without the NIC's
+    // scheduler, which no test here drives.
+    Ptr<RdmaQueuePair> AddSender(Ipv4Address self, Ipv4Address peer, uint64_t size)
+    {
+        Ptr<RdmaQueuePair> qp =
+            CreateObject<RdmaQueuePair>(kPriorityGroup, self, peer, kSenderPort, kReceiverPort);
+        qp->m_size = size;
+        if (hw->IsPathPerPacket())
+        {
+            qp->m_outstanding.SetPacketSize(kMtu);
+        }
+        hw->m_qpMap[RdmaHw::GetQpKey(peer.Get(), kSenderPort, kPriorityGroup)] = qp;
+        return qp;
+    }
+
     // A data packet from the sender, parsed as the receiving NIC parses it,
     // handed to this host's transport.
     void ReceiveData(Ipv4Address from,
@@ -1057,6 +1078,39 @@ class IsolatedHost
                             CustomHeader::L4_Header);
         packet->PeekHeader(parsed);
         hw->Receive(packet, parsed);
+    }
+
+    // The acknowledgement of the send of seq along the path that
+    // identification names, with the receiver's cumulative sequence.
+    void ReceiveAck(Ipv4Address from, uint32_t cumulative, uint32_t seq, uint16_t identification)
+    {
+        CustomHeader ack;
+        ack.l3Prot = 0xFC;
+        ack.sip = from.Get();
+        ack.ipid = identification;
+        ack.ack.flags = 0;
+        ack.ack.sport = kReceiverPort;
+        ack.ack.dport = kSenderPort;
+        ack.ack.pg = kPriorityGroup;
+        ack.ack.seq = cumulative;
+        ack.ack.packet_seq = seq;
+        hw->ReceiveAck(Create<Packet>(), ack);
+    }
+
+    // The receiver's repair request for the trimmed send of seq.
+    void ReceiveTrimNack(Ptr<RdmaQueuePair> qp, Ipv4Address from, uint32_t seq, uint16_t identification)
+    {
+        CustomHeader trim;
+        trim.l3Prot = kUecTrimRepairProtocol;
+        trim.sip = from.Get();
+        trim.ipid = identification;
+        trim.ack.flags = 0;
+        trim.ack.sport = kReceiverPort;
+        trim.ack.dport = kSenderPort;
+        trim.ack.pg = kPriorityGroup;
+        trim.ack.seq = seq;
+        trim.ack.trim_payload_size = kMtu;
+        hw->RecoverTrimmedQueue(qp, trim);
     }
 
     Ptr<RdmaHw> hw;
@@ -1163,6 +1217,294 @@ class ReorderGapTest : public TestCase
     }
 };
 
+class OutstandingPacketsModelTest : public TestCase
+{
+  public:
+    OutstandingPacketsModelTest()
+        : TestCase("Send records agree with a plain list under random sends and removals")
+    {
+    }
+
+    void DoRun() override
+    {
+        constexpr uint32_t kSize = 100;
+        constexpr uint16_t kPaths = 4;
+        OutstandingPackets records;
+        records.SetPacketSize(kSize);
+        // The model: outstanding packets in send order, each with its path.
+        std::vector<std::pair<uint64_t, uint16_t>> sent;
+        std::set<uint64_t> lost;
+        uint64_t next = 0;
+        uint64_t first = 0;
+        uint64_t clock = 0;
+        std::mt19937 random(1);
+        auto modelRemove = [&sent](uint64_t packet) {
+            for (auto it = sent.begin(); it != sent.end(); ++it)
+            {
+                if (it->first == packet)
+                {
+                    sent.erase(it);
+                    return;
+                }
+            }
+        };
+        for (uint32_t step = 0; step < 20000; ++step)
+        {
+            const uint32_t action = random() % 10;
+            if (action < 5 || sent.empty())
+            {
+                // A resend of a removed packet or new data, on a random path.
+                uint64_t packet = next;
+                if (!lost.empty() && action == 0)
+                {
+                    packet = *lost.begin();
+                    lost.erase(lost.begin());
+                }
+                else
+                {
+                    next++;
+                }
+                const uint16_t path = random() % kPaths;
+                records.Add(packet * kSize, kSize, path, clock++);
+                sent.emplace_back(packet, path);
+            }
+            else if (action < 9)
+            {
+                // Any outstanding send except, mostly, the oldest, so that a
+                // hole holds the cumulative acknowledgement back and the ring
+                // has to grow.
+                const size_t index = 1 + random() % sent.size();
+                const uint64_t packet = sent[index % sent.size()].first;
+                records.Remove(packet);
+                modelRemove(packet);
+                if (random() % 2)
+                {
+                    lost.insert(packet);
+                }
+            }
+            else
+            {
+                // A cumulative advance below the oldest lost packet and the
+                // next new one.
+                uint64_t limit = lost.empty() ? next : std::min(*lost.begin(), next);
+                if (limit > first)
+                {
+                    first += 1 + random() % (limit - first);
+                }
+                records.RemoveBelow(first * kSize);
+                std::vector<std::pair<uint64_t, uint16_t>> kept;
+                for (const auto& entry : sent)
+                {
+                    if (entry.first >= first)
+                    {
+                        kept.push_back(entry);
+                    }
+                }
+                sent = kept;
+            }
+            NS_TEST_ASSERT_MSG_EQ(records.Bytes(), sent.size() * kSize, "bytes outstanding");
+            NS_TEST_ASSERT_MSG_EQ(records.Oldest(),
+                                  sent.empty() ? OutstandingPackets::kNone : sent.front().first,
+                                  "the oldest send");
+            if (sent.empty())
+            {
+                continue;
+            }
+            const size_t probe = random() % sent.size();
+            const auto [packet, path] = sent[probe];
+            NS_TEST_ASSERT_MSG_EQ(records.Find(packet * kSize, path),
+                                  packet,
+                                  "a send is found by sequence and path");
+            NS_TEST_ASSERT_MSG_EQ(records.Find(packet * kSize, (path + 1) % kPaths),
+                                  OutstandingPackets::kNone,
+                                  "a send is not found along another path");
+            uint64_t olderOnPath = OutstandingPackets::kNone;
+            for (size_t i = 0; i < probe; ++i)
+            {
+                if (sent[i].second == path)
+                {
+                    olderOnPath = sent[i].first;
+                }
+            }
+            NS_TEST_ASSERT_MSG_EQ(records.OlderOnPath(packet),
+                                  olderOnPath,
+                                  "the next older send on the same path");
+        }
+    }
+};
+
+class SelectiveTimeoutTest : public TestCase
+{
+  public:
+    SelectiveTimeoutTest()
+        : TestCase("A timeout repairs only the outstanding sends that waited it out")
+    {
+    }
+
+    void DoRun() override
+    {
+        constexpr uint32_t kMtu = IsolatedHost::kMtu;
+        IsolatedHost sender(LoadBalancingMode::SprayUniform, kTestReceiver, 8);
+        Ptr<RdmaQueuePair> qp = sender.AddSender(kTestSender, kTestReceiver, 10 * kMtu);
+        qp->snd_nxt = 3 * kMtu;
+        qp->m_highest_sent = 3 * kMtu;
+        for (uint16_t spine = 0; spine < 3; ++spine)
+        {
+            qp->m_outstanding.Add(spine * kMtu, kMtu, spine, 0);
+        }
+        qp->AcknowledgePacket(kMtu, 1);
+        sender.hw->ArmRetransmissionTimeout(qp);
+        // A later send re-arms the timer, which must still measure from the
+        // oldest outstanding send.
+        Simulator::Schedule(NanoSeconds(600), [&sender, qp]() {
+            qp->snd_nxt = 4 * kMtu;
+            qp->m_outstanding.Add(3 * kMtu, kMtu, 3, 600);
+            sender.hw->ArmRetransmissionTimeout(qp);
+        });
+        Simulator::Stop(NanoSeconds(1500));
+        Simulator::Run();
+
+        NS_TEST_EXPECT_MSG_EQ(qp->m_timeouts, 1, "the oldest send times out once");
+        NS_TEST_EXPECT_MSG_EQ(qp->m_repair_ranges.size(), 2, "two ranges are repaired");
+        NS_TEST_EXPECT_MSG_EQ(qp->m_repair_ranges.count(0), 1, "the first send is repaired");
+        NS_TEST_EXPECT_MSG_EQ(qp->m_repair_ranges.count(2 * kMtu),
+                              1,
+                              "the third send is repaired");
+        NS_TEST_EXPECT_MSG_EQ(qp->RepairBytesLeft(),
+                              2 * kMtu,
+                              "neither the acknowledged nor the younger send is repaired");
+        NS_TEST_EXPECT_MSG_EQ(qp->m_outstanding.Bytes(), kMtu, "the younger send stays outstanding");
+        NS_TEST_EXPECT_MSG_EQ(qp->snd_nxt, 4 * kMtu, "a selective timeout does not rewind");
+        NS_TEST_EXPECT_MSG_EQ(Simulator::GetDelayLeft(qp->m_retransmissionTimer),
+                              NanoSeconds(100),
+                              "the timer follows the younger send");
+        Simulator::Destroy();
+    }
+};
+
+class OutstandingWindowTest : public TestCase
+{
+  public:
+    OutstandingWindowTest()
+        : TestCase("The window admits new data while a head hole is outstanding")
+    {
+    }
+
+    void DoRun() override
+    {
+        constexpr uint32_t kMtu = IsolatedHost::kMtu;
+        IsolatedHost spray(LoadBalancingMode::SprayUniform, kTestReceiver, 8);
+        Ptr<RdmaQueuePair> qp = Sent(spray);
+        NS_TEST_EXPECT_MSG_EQ(qp->IsWinBound(), true, "three sends fill the window");
+        qp->AcknowledgePacket(kMtu, 1);
+        qp->AcknowledgePacket(2 * kMtu, 2);
+        NS_TEST_EXPECT_MSG_EQ(qp->IsWinBound(),
+                              false,
+                              "acknowledged sends free the window behind a hole");
+        NS_TEST_EXPECT_MSG_EQ(qp->GetOnTheFly(), kMtu, "only the hole is in flight");
+        qp->m_outstanding.Add(3 * kMtu, kMtu, 0, 0);
+        qp->Acknowledge(4 * kMtu);
+        NS_TEST_EXPECT_MSG_EQ(qp->GetOnTheFly(),
+                              0,
+                              "the cumulative acknowledgement releases what it covers");
+        NS_TEST_EXPECT_MSG_EQ(qp->m_outstanding.Oldest(),
+                              OutstandingPackets::kNone,
+                              "no record survives below the cumulative acknowledgement");
+
+        IsolatedHost ecmp(LoadBalancingMode::Ecmp, kTestReceiver);
+        Ptr<RdmaQueuePair> cumulative = Sent(ecmp);
+        NS_TEST_EXPECT_MSG_EQ(cumulative->IsWinBound(),
+                              true,
+                              "ECMP counts the window from the cumulative acknowledgement");
+        Simulator::Destroy();
+    }
+
+  private:
+    static Ptr<RdmaQueuePair> Sent(IsolatedHost& sender)
+    {
+        constexpr uint32_t kMtu = IsolatedHost::kMtu;
+        Ptr<RdmaQueuePair> qp = sender.AddSender(kTestSender, kTestReceiver, 10 * kMtu);
+        qp->SetWin(3 * kMtu);
+        qp->snd_nxt = 3 * kMtu;
+        if (qp->m_outstanding.IsKept())
+        {
+            for (uint16_t spine = 0; spine < 3; ++spine)
+            {
+                qp->m_outstanding.Add(spine * kMtu, kMtu, spine, 0);
+            }
+        }
+        return qp;
+    }
+};
+
+class TrimRepairedOnceTest : public TestCase
+{
+  public:
+    TrimRepairedOnceTest()
+        : TestCase("A trimmed send is repaired once, by a fresh send with a fresh record")
+    {
+    }
+
+    void DoRun() override
+    {
+        constexpr uint32_t kMtu = IsolatedHost::kMtu;
+        constexpr uint16_t kSpine = 3;
+        const uint16_t identification = SpineIdentification(kSpine, kSpine);
+
+        // The trim notification arrives first: the trimmed send's record goes
+        // with it, so the later acknowledgement on its spine finds nothing
+        // older to declare lost.
+        IsolatedHost first(LoadBalancingMode::SprayUniform, kTestReceiver, 8);
+        Ptr<RdmaQueuePair> qp = TwoSends(first, kSpine);
+        first.ReceiveTrimNack(qp, kTestReceiver, 0, identification);
+        first.ReceiveAck(kTestReceiver, 0, kMtu, identification);
+        NS_TEST_EXPECT_MSG_EQ(qp->m_recovery_events, 1, "the trimmed send is repaired once");
+        NS_TEST_EXPECT_MSG_EQ(qp->RepairBytesLeft(), kMtu, "one packet awaits repair");
+        NS_TEST_EXPECT_MSG_EQ(qp->m_outstanding.Bytes(), 0, "neither send is outstanding");
+        CustomHeader repair(CustomHeader::L2_Header | CustomHeader::L3_Header |
+                            CustomHeader::L4_Header);
+        first.hw->GetNxtPacket(qp)->PeekHeader(repair);
+        NS_TEST_EXPECT_MSG_EQ(repair.udp.seq, 0, "the repair resends the trimmed range");
+        const uint16_t path = PathOf(LoadBalancingMode::SprayUniform, repair.ipid);
+        NS_TEST_EXPECT_MSG_EQ(qp->m_outstanding.Find(0, path),
+                              0,
+                              "the repair is recorded along the path it drew");
+        NS_TEST_EXPECT_MSG_EQ(qp->RepairBytesLeft(), 0, "nothing is left to repair");
+
+        // The send is declared lost before its trim notification arrives;
+        // once its repair has left on another spine, the notification for the
+        // first send asks for nothing.
+        IsolatedHost second(LoadBalancingMode::SprayUniform, kTestReceiver, 8);
+        qp = TwoSends(second, kSpine);
+        NS_TEST_EXPECT_MSG_EQ(qp->DeclareLostSentBy(0), 2, "both sends are declared lost");
+        uint64_t start = 0;
+        NS_TEST_EXPECT_MSG_EQ(qp->TakeRepairSegment(kMtu, start), kMtu, "the loss is repaired");
+        qp->m_outstanding.Add(0, kMtu, kSpine + 1, 10);
+        second.ReceiveTrimNack(qp, kTestReceiver, 0, identification);
+        NS_TEST_EXPECT_MSG_EQ(qp->RepairBytesLeft(),
+                              kMtu,
+                              "only the second send awaits repair; the first is not repaired again");
+        NS_TEST_EXPECT_MSG_EQ(qp->m_recovery_events, 2, "the trim adds no recovery");
+        NS_TEST_EXPECT_MSG_EQ(qp->m_trim_notifications, 1, "the trim is still counted");
+        NS_TEST_EXPECT_MSG_EQ(qp->m_outstanding.Find(0, kSpine + 1),
+                              0,
+                              "the repair stays outstanding");
+        Simulator::Destroy();
+    }
+
+  private:
+    static Ptr<RdmaQueuePair> TwoSends(IsolatedHost& sender, uint16_t spine)
+    {
+        constexpr uint32_t kMtu = IsolatedHost::kMtu;
+        Ptr<RdmaQueuePair> qp = sender.AddSender(kTestSender, kTestReceiver, 10 * kMtu);
+        qp->snd_nxt = 2 * kMtu;
+        qp->m_highest_sent = 2 * kMtu;
+        qp->m_outstanding.Add(0, kMtu, spine, 0);
+        qp->m_outstanding.Add(kMtu, kMtu, spine, 0);
+        return qp;
+    }
+};
+
 /**
  * \brief TestSuite for PointToPoint module
  */
@@ -1193,6 +1535,10 @@ PointToPointTestSuite::PointToPointTestSuite()
     AddTestCase(new AckPacketSeqHeaderTest, TestCase::Duration::QUICK);
     AddTestCase(new AckNamesPacketTest, TestCase::Duration::QUICK);
     AddTestCase(new ReorderGapTest, TestCase::Duration::QUICK);
+    AddTestCase(new OutstandingPacketsModelTest, TestCase::Duration::QUICK);
+    AddTestCase(new SelectiveTimeoutTest, TestCase::Duration::QUICK);
+    AddTestCase(new OutstandingWindowTest, TestCase::Duration::QUICK);
+    AddTestCase(new TrimRepairedOnceTest, TestCase::Duration::QUICK);
 }
 
 static PointToPointTestSuite g_pointToPointTestSuite; //!< The testsuite

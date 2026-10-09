@@ -11,6 +11,139 @@
 namespace ns3 {
 
 /**************************
+ * OutstandingPackets
+ *************************/
+OutstandingPackets::OutstandingPackets()
+	: m_packet_size(0), m_first(0), m_oldest(kNone), m_newest(kNone),
+	  m_bytes(0)
+{
+}
+
+void OutstandingPackets::SetPacketSize(uint32_t size){
+	m_packet_size = size;
+}
+
+bool OutstandingPackets::IsKept() const{
+	return m_packet_size != 0;
+}
+
+OutstandingPackets::Record &OutstandingPackets::At(uint64_t packet){
+	return m_ring[packet & (m_ring.size() - 1)];
+}
+
+const OutstandingPackets::Record &OutstandingPackets::At(uint64_t packet) const{
+	return m_ring[packet & (m_ring.size() - 1)];
+}
+
+void OutstandingPackets::Reserve(uint64_t packet){
+	const uint64_t span = packet - m_first + 1;
+	if (span <= m_ring.size())
+		return;
+	uint64_t size = m_ring.empty() ? 1 : m_ring.size();
+	while (size < span)
+		size *= 2;
+	std::vector<Record> ring(size);
+	for (uint64_t p = m_first; p < m_first + m_ring.size(); p++)
+		ring[p & (size - 1)] = At(p);
+	m_ring.swap(ring);
+}
+
+void OutstandingPackets::Add(uint64_t seq, uint32_t size, uint16_t path,
+		uint64_t sentNs){
+	NS_ASSERT_MSG(m_packet_size != 0 && seq % m_packet_size == 0,
+		"a send record is indexed by its packet number");
+	const uint64_t packet = seq / m_packet_size;
+	NS_ASSERT_MSG(packet >= m_first, "a packet below the cumulative "
+		"acknowledgement is never sent");
+	Reserve(packet);
+	Record &record = At(packet);
+	NS_ASSERT_MSG(!record.outstanding,
+		"a packet is resent only after its previous send is removed");
+	auto newestOnPath = m_newest_on_path.find(path);
+	const uint64_t olderOnPath = newestOnPath == m_newest_on_path.end()
+		? kNone : newestOnPath->second;
+	record = {sentNs, size, path, true, m_newest, kNone, olderOnPath, kNone};
+	if (m_newest != kNone)
+		At(m_newest).newer = packet;
+	else
+		m_oldest = packet;
+	m_newest = packet;
+	if (olderOnPath != kNone){
+		At(olderOnPath).newer_on_path = packet;
+		newestOnPath->second = packet;
+	}else{
+		m_newest_on_path.emplace(path, packet);
+	}
+	m_bytes += size;
+}
+
+uint64_t OutstandingPackets::Find(uint64_t seq, uint16_t path) const{
+	if (m_ring.empty())
+		return kNone;
+	const uint64_t packet = seq / m_packet_size;
+	if (packet < m_first || packet - m_first >= m_ring.size())
+		return kNone;
+	const Record &record = At(packet);
+	return record.outstanding && record.path == path ? packet : kNone;
+}
+
+uint64_t OutstandingPackets::Oldest() const{
+	return m_oldest;
+}
+
+uint64_t OutstandingPackets::OlderOnPath(uint64_t packet) const{
+	return At(packet).older_on_path;
+}
+
+uint64_t OutstandingPackets::Seq(uint64_t packet) const{
+	return packet * m_packet_size;
+}
+
+uint32_t OutstandingPackets::Size(uint64_t packet) const{
+	return At(packet).size;
+}
+
+uint64_t OutstandingPackets::SentNs(uint64_t packet) const{
+	return At(packet).sent_ns;
+}
+
+void OutstandingPackets::Remove(uint64_t packet){
+	Record &record = At(packet);
+	if (record.older != kNone)
+		At(record.older).newer = record.newer;
+	else
+		m_oldest = record.newer;
+	if (record.newer != kNone)
+		At(record.newer).older = record.older;
+	else
+		m_newest = record.older;
+	if (record.older_on_path != kNone)
+		At(record.older_on_path).newer_on_path = record.newer_on_path;
+	if (record.newer_on_path != kNone)
+		At(record.newer_on_path).older_on_path = record.older_on_path;
+	else if (record.older_on_path != kNone)
+		m_newest_on_path[record.path] = record.older_on_path;
+	else
+		m_newest_on_path.erase(record.path);
+	record.outstanding = false;
+	m_bytes -= record.size;
+}
+
+void OutstandingPackets::RemoveBelow(uint64_t seq){
+	// Rounded up so that the flow's last packet, the only one shorter than the
+	// packet size, is removed once the acknowledgement covers it.
+	const uint64_t end = (seq + m_packet_size - 1) / m_packet_size;
+	for (; m_first < end; m_first++){
+		if (!m_ring.empty() && At(m_first).outstanding)
+			Remove(m_first);
+	}
+}
+
+uint64_t OutstandingPackets::Bytes() const{
+	return m_bytes;
+}
+
+/**************************
  * RdmaQueuePair
  *************************/
 TypeId RdmaQueuePair::GetTypeId (void)
@@ -230,6 +363,40 @@ void RdmaQueuePair::DropAcknowledgedRepairs(){
 	}
 }
 
+void RdmaQueuePair::AcknowledgePacket(uint64_t seq, uint16_t path){
+	const uint64_t packet = m_outstanding.Find(seq, path);
+	if (packet == OutstandingPackets::kNone)
+		return;
+	m_outstanding.Remove(packet);
+}
+
+bool RdmaQueuePair::ReleasePacket(uint64_t seq, uint16_t path){
+	const uint64_t packet = m_outstanding.Find(seq, path);
+	if (packet == OutstandingPackets::kNone)
+		return false;
+	m_outstanding.Remove(packet);
+	return true;
+}
+
+uint32_t RdmaQueuePair::DeclareLostSentBy(uint64_t sentNs){
+	uint32_t lost = 0;
+	for (uint64_t oldest = m_outstanding.Oldest();
+			oldest != OutstandingPackets::kNone &&
+				m_outstanding.SentNs(oldest) <= sentNs;
+			oldest = m_outstanding.Oldest()){
+		DeclareLost(oldest);
+		lost++;
+	}
+	return lost;
+}
+
+void RdmaQueuePair::DeclareLost(uint64_t packet){
+	const uint64_t seq = m_outstanding.Seq(packet);
+	AddRepairRange(seq, seq + m_outstanding.Size(packet));
+	m_outstanding.Remove(packet);
+	m_recovery_events++;
+}
+
 uint64_t RdmaQueuePair::RepairBytesLeft(){
 	DropAcknowledgedRepairs();
 	uint64_t total = 0;
@@ -256,6 +423,8 @@ uint32_t RdmaQueuePair::GetHash(void){
 void RdmaQueuePair::Acknowledge(uint64_t ack){
 	if (ack > snd_una){
 		snd_una = ack;
+		if (m_outstanding.IsKept())
+			m_outstanding.RemoveBelow(snd_una);
 		// A cumulative ACK can outrun a go-back-N rewind: resent duplicates
 		// make the receiver repeat its frontier ACK, which lands above the
 		// rewound snd_nxt. Unclamped, GetOnTheFly() underflows and the window
@@ -267,6 +436,11 @@ void RdmaQueuePair::Acknowledge(uint64_t ack){
 }
 
 uint64_t RdmaQueuePair::GetOnTheFly(){
+	// With send records the window counts the sends still outstanding, so a
+	// hole at the cumulative acknowledgement does not hold back new data while
+	// the sends above it are acknowledged.
+	if (m_outstanding.IsKept())
+		return m_outstanding.Bytes();
 	return snd_nxt - snd_una;
 }
 

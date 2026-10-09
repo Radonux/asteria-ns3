@@ -287,6 +287,9 @@ void RdmaHw::Setup(QpCompleteCallback cb, QpFailureCallback failure_cb){
 				static_cast<uint32_t>(LoadBalancingMode::SprayUniform) &&
 			m_spineCount == 0,
 		"LoadBalancing 2 names a spine per packet and needs SpineCount");
+	NS_ABORT_MSG_IF(IsPathPerPacket() && !CustomHeader::ackCarriesPacketSeq,
+		"A LoadBalancing mode other than ECMP finds the send an acknowledgement "
+		"answers by the packet sequence the acknowledgement carries");
 	for (uint32_t i = 0; i < m_nic.size(); i++){
 		Ptr<QbbNetDevice> dev = m_nic[i].dev;
 		if (!dev)
@@ -344,6 +347,8 @@ void RdmaHw::AddQueuePair(uint32_t src, uint32_t dest, uint64_t tag, uint64_t si
 	m_nic[nic_idx].qpGrp->AddQp(qp);
 	uint64_t key = GetQpKey(dip.Get(), sport, pg);
 	m_qpMap[key] = qp;
+	if (IsPathPerPacket())
+		qp->m_outstanding.SetPacketSize(m_mtu);
 	// The liveness invariant starts at birth: an unfinished QP always has a
 	// pending timer, even if its first send never gets scheduled.
 	ArmRetransmissionTimeout(qp);
@@ -615,6 +620,9 @@ int RdmaHw::ReceiveAck(Ptr<Packet> p, CustomHeader &ch){
 	if (m_ack_interval == 0)
 		std::cout << "ERROR: shouldn't receive ack\n";
 	else {
+		if (qp->m_outstanding.IsKept())
+			qp->AcknowledgePacket(ch.ack.packet_seq,
+				PathOf(static_cast<LoadBalancingMode>(m_loadBalancing), ch.ipid));
 		const uint64_t acknowledged_before = qp->snd_una;
 		if (!m_backto0){
 			qp->Acknowledge(seq);
@@ -852,9 +860,13 @@ void RdmaHw::RecoverTrimmedQueue(Ptr<RdmaQueuePair> qp,
 		// The notification names the exact trimmed byte range, so repair
 		// only that range instead of rewinding the whole window. The
 		// receiver accepts the out-of-order remainder, so nothing else
-		// needs resending.
-		qp->m_recovery_events++;
-		qp->AddRepairRange(trimStart, trimEnd);
+		// needs resending. With send records, a trimmed send that is no longer
+		// outstanding was already declared lost and is being repaired.
+		if (!qp->m_outstanding.IsKept() || qp->ReleasePacket(trimStart,
+				PathOf(static_cast<LoadBalancingMode>(m_loadBalancing), ch.ipid))){
+			qp->m_recovery_events++;
+			qp->AddRepairRange(trimStart, trimEnd);
+		}
 	}else{
 		RecoverQueue(qp);
 	}
@@ -1162,8 +1174,16 @@ void RdmaHw::ArmRetransmissionTimeout(Ptr<RdmaQueuePair> qp){
 		return;
 	if (!qp->m_retransmissionTimer.IsExpired())
 		Simulator::Cancel(qp->m_retransmissionTimer);
-	qp->m_retransmissionTimer = Simulator::Schedule(
-		NanoSeconds(m_retransmission_timeout_ns),
+	// With send records the timer expires when the oldest outstanding send
+	// has waited out the timeout, however recently anything else was sent.
+	uint64_t delay = m_retransmission_timeout_ns;
+	const uint64_t oldest = qp->m_outstanding.Oldest();
+	if (oldest != OutstandingPackets::kNone){
+		const uint64_t due = qp->m_outstanding.SentNs(oldest) + delay;
+		const uint64_t now = Simulator::Now().GetNanoSeconds();
+		delay = due > now ? due - now : 0;
+	}
+	qp->m_retransmissionTimer = Simulator::Schedule(NanoSeconds(delay),
 		&RdmaHw::HandleRetransmissionTimeout, this, qp);
 }
 
@@ -1176,7 +1196,7 @@ void RdmaHw::HandleRetransmissionTimeout(Ptr<RdmaQueuePair> qp){
 	if (EnforceProgressDeadline(qp)){
 		return;
 	}
-	if (qp->snd_una >= qp->snd_nxt){
+	if (qp->GetOnTheFly() == 0){
 		// Nothing outstanding: the QP is waiting to (re)send — rate limiter,
 		// window, or a busy device. Not a silent-loss retry, so the budget
 		// is untouched; keep the timer alive so the deadline above stays
@@ -1194,7 +1214,13 @@ void RdmaHw::HandleRetransmissionTimeout(Ptr<RdmaQueuePair> qp){
 	qp->m_recovery_retries++;
 	qp->m_timeouts++;
 	ReportTransportEvent("rto_fired", 0);
-	RecoverQueue(qp);
+	if (qp->m_outstanding.IsKept()){
+		const uint32_t lost = qp->DeclareLostSentBy(
+			Simulator::Now().GetNanoSeconds() - m_retransmission_timeout_ns);
+		NS_ASSERT_MSG(lost > 0, "the timer expires with the oldest send");
+	}else{
+		RecoverQueue(qp);
+	}
 	const uint32_t nic_idx = GetNicIdxOfQp(qp);
 	m_nic[nic_idx].dev->TriggerTransmit();
 	ArmRetransmissionTimeout(qp);
@@ -1322,9 +1348,15 @@ Ptr<Packet> RdmaHw::GetNxtPacket(Ptr<RdmaQueuePair> qp){
 	// a congested switch sets them independently of the codepoint.
 	ipHeader.SetTos (0);
 	ipHeader.SetDscp (static_cast<Ipv4Header::DscpType>(kUetDscpTrimmable));
-	ipHeader.SetIdentification (
-		m_loadBalancing == static_cast<uint32_t>(LoadBalancingMode::Ecmp)
-			? qp->m_ipid : DrawPathIdentification());
+	if (IsPathPerPacket()){
+		const uint16_t identification = DrawPathIdentification();
+		ipHeader.SetIdentification(identification);
+		qp->m_outstanding.Add(seq, payload_size,
+			PathOf(static_cast<LoadBalancingMode>(m_loadBalancing), identification),
+			Simulator::Now().GetNanoSeconds());
+	}else{
+		ipHeader.SetIdentification(qp->m_ipid);
+	}
 	p->AddHeader(ipHeader);
 	// add ppp header
 	PppHeader ppp;

@@ -9,9 +9,64 @@
 #include <ns3/custom-header.h>
 #include <ns3/int-header.h>
 #include <map>
+#include <unordered_map>
 #include <vector>
 
 namespace ns3 {
+
+// The data packets a queue pair has sent and has neither seen acknowledged nor
+// declared lost, one record per send. A record is found by its packet number,
+// the sequence divided by the packet size, in a ring that grows to the span
+// from the cumulative acknowledgement to the newest send and is never
+// reallocated once it covers that span. Two doubly linked lists thread the
+// records in send order: one across every path, headed by the oldest send,
+// and one per path, so that a walk from a send towards older sends on its path
+// visits nothing else. Adding, finding and removing a record is O(1), the
+// newest send per path being kept in a hash map; empty until SetPacketSize is
+// called.
+class OutstandingPackets {
+public:
+	static constexpr uint64_t kNone = UINT64_MAX;
+	OutstandingPackets();
+	void SetPacketSize(uint32_t size);
+	bool IsKept() const;
+	// Every sequence is a multiple of the packet size, and a packet is resent
+	// only after its previous send has been removed.
+	void Add(uint64_t seq, uint32_t size, uint16_t path, uint64_t sentNs);
+	// The packet number of the outstanding send of seq along path, or kNone.
+	uint64_t Find(uint64_t seq, uint16_t path) const;
+	uint64_t Oldest() const;
+	uint64_t OlderOnPath(uint64_t packet) const;
+	uint64_t Seq(uint64_t packet) const;
+	uint32_t Size(uint64_t packet) const;
+	uint64_t SentNs(uint64_t packet) const;
+	void Remove(uint64_t packet);
+	// Remove the record of every packet that starts below seq.
+	void RemoveBelow(uint64_t seq);
+	uint64_t Bytes() const;
+
+private:
+	struct Record {
+		uint64_t sent_ns;
+		uint32_t size;
+		uint16_t path;
+		bool outstanding;
+		// Neighbouring outstanding sends as packet numbers, kNone at either
+		// end: across every path, then along this record's path.
+		uint64_t older, newer;
+		uint64_t older_on_path, newer_on_path;
+	};
+	Record &At(uint64_t packet);
+	const Record &At(uint64_t packet) const;
+	void Reserve(uint64_t packet);
+
+	uint32_t m_packet_size;
+	std::vector<Record> m_ring; // a power of two in size
+	uint64_t m_first; // every packet below it has been removed
+	uint64_t m_oldest, m_newest;
+	std::unordered_map<uint16_t, uint64_t> m_newest_on_path;
+	uint64_t m_bytes;
+};
 
 class RdmaQueuePair : public Object {
 public:
@@ -76,6 +131,10 @@ public:
 	// Selective repair: merged byte ranges awaiting retransmission, always
 	// clamped above snd_una. GetNxtPacket serves these before new data.
 	std::map<uint64_t, uint64_t> m_repair_ranges;
+	// Kept only where every data packet draws its own path, because there a
+	// hole below the cumulative acknowledgement says nothing about the sends
+	// above it.
+	OutstandingPackets m_outstanding;
 	EventId m_retransmissionTimer;
 	uint16_t m_pg;
 	uint16_t m_ipid;
@@ -153,6 +212,16 @@ public:
 	uint64_t TakeRepairSegment(uint64_t max_bytes, uint64_t &start);
 	void DropAcknowledgedRepairs();
 	uint64_t RepairBytesLeft();
+	// The acknowledgement of the send of seq along path: its record is
+	// removed. Nothing happens when no outstanding send matches, which is a
+	// duplicate or the answer to an earlier send of a packet resent since.
+	void AcknowledgePacket(uint64_t seq, uint16_t path);
+	// A trimmed send of seq along path. False when no outstanding send matches:
+	// that send was already declared lost and its repair is under way.
+	bool ReleasePacket(uint64_t seq, uint16_t path);
+	// Declare lost every outstanding send made at or before sentNs and queue
+	// its range for repair. Returns how many there were.
+	uint32_t DeclareLostSentBy(uint64_t sentNs);
 
 	uint64_t GetBytesLeft();
 	uint64_t GetInitialSize();
@@ -168,6 +237,9 @@ public:
 	bool IsFinished();
 	bool IsFailed();
 	uint64_t HpGetCurWin(); // window size calculated from hp.m_curRate, used by HPCC
+
+private:
+	void DeclareLost(uint64_t packet);
 };
 
 class RdmaRxQueuePair : public Object { // Rx side queue pair
