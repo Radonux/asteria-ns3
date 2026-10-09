@@ -483,6 +483,9 @@ class UecTrimRecoveryTest : public TestCase
         senderQp->snd_una = 0;
         senderQp->snd_nxt = 2000;
         senderQp->m_highest_sent = 2000;
+        // One silent retransmission timeout already charged, so the trim
+        // below shows it leaves the budget alone and the ACK shows the reset.
+        senderQp->m_recovery_retries = 1;
         senderHw->m_qpMap[senderHw->GetQpKey(
             receiver.Get(), kSourcePort, kPriorityGroup)] = senderQp;
 
@@ -508,7 +511,7 @@ class UecTrimRecoveryTest : public TestCase
                               "an actionable trim must be counted");
         NS_TEST_EXPECT_MSG_EQ(senderQp->m_recovery_retries,
                               1,
-                              "an actionable trim must consume the bounded recovery budget");
+                              "a trim must not charge the silent-timeout budget");
 
         CustomHeader ack;
         ack.l3Prot = 0xFC;
