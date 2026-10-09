@@ -28,6 +28,7 @@
 #include "ns3/point-to-point-helper.h"
 #include "ns3/qbb-helper.h"
 #include "ns3/qbb-header.h"
+#include <algorithm>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
@@ -35,6 +36,7 @@
 #include <cmath>
 #include <limits>
 #include <zstd.h>
+#include <ns3/load-balancing.h>
 #include <ns3/rdma-client-helper.h>
 #include <ns3/rdma-client.h>
 #include <ns3/rdma-driver.h>
@@ -77,11 +79,16 @@ std::string data_loss_scope = "all";
 int32_t data_loss_source_host = -1, data_loss_destination_host = -1;
 int32_t data_loss_receiver_node = -1;
 uint64_t data_loss_rng_stream = 51;
+// Fixed ns-3 stream indices. Data loss takes DATA_LOSS_RNG_STREAM upward, two
+// per link; the hosts' per-packet path draw takes stream 0, so a change of
+// LOAD_BALANCING moves no other draw of a run with the same seed.
+const int64_t path_rng_stream = 0;
 uint64_t retransmission_timeout_ns = 0;
 uint32_t max_retransmission_retries = 0;
 uint64_t no_progress_timeout_ns = 0;
 uint32_t selective_retransmission = 0;
 std::string packet_trim_mode = "disabled";
+std::string load_balancing = "ecmp";
 // UEC 1.0.3 section 4.1.4.1 RECOMMENDS three traffic classes: TC_low for data,
 // TC_med for trimmed packets, TC_high for control. Queue 0 is TC_high here, so
 // the trimmed queue must be a distinct non-zero index.
@@ -521,6 +528,16 @@ uint32_t packet_trim_mode_value() {
   return std::numeric_limits<uint32_t>::max();
 }
 
+uint32_t load_balancing_value() {
+  if (load_balancing == "ecmp")
+    return static_cast<uint32_t>(LoadBalancingMode::Ecmp);
+  if (load_balancing == "ev_hash")
+    return static_cast<uint32_t>(LoadBalancingMode::EntropyHash);
+  if (load_balancing == "spray_uniform")
+    return static_cast<uint32_t>(LoadBalancingMode::SprayUniform);
+  return std::numeric_limits<uint32_t>::max();
+}
+
 void configure_data_loss(Ptr<QbbNetDevice> dev, uint64_t stream_offset) {
   dev->SetAttribute("DataLossStartNs", UintegerValue(data_loss_start_ns));
   dev->SetAttribute("DataLossDurationNs", UintegerValue(data_loss_duration_ns));
@@ -709,6 +726,36 @@ void SetRoutingEntries() {
   }
 }
 
+// Spines are the switches with no host attached, indexed by the rank of their
+// node id, so an index names the same spine in every run of a topology. Each
+// leaf learns its uplink to every spine in that order. Returns the number of
+// spines, or zero when there is none or a leaf lacks a link to one of them.
+uint32_t AssignSpinePorts(NodeContainer &n) {
+  vector<Ptr<Node>> leaves, spines;
+  for (uint32_t i = 0; i < n.GetN(); i++) {
+    Ptr<Node> node = n.Get(i);
+    if (node->GetNodeType() != 1)
+      continue;
+    const bool hosts_attached =
+        std::any_of(nbr2if[node].begin(), nbr2if[node].end(),
+                    [](const auto &link) { return link.first->GetNodeType() == 0; });
+    (hosts_attached ? leaves : spines).push_back(node);
+  }
+  std::sort(spines.begin(), spines.end(),
+            [](Ptr<Node> a, Ptr<Node> b) { return a->GetId() < b->GetId(); });
+  for (Ptr<Node> leaf : leaves) {
+    vector<uint32_t> ports;
+    for (Ptr<Node> spine : spines) {
+      auto link = nbr2if[leaf].find(spine);
+      if (link == nbr2if[leaf].end())
+        return 0;
+      ports.push_back(link->second.idx);
+    }
+    DynamicCast<SwitchNode>(leaf)->SetSpinePorts(ports);
+  }
+  return spines.size();
+}
+
 // take down the link between a and b, and redo the routing
 void TakeDownLink(NodeContainer n, Ptr<Node> a, Ptr<Node> b) {
   if (!nbr2if[a][b].up)
@@ -868,6 +915,8 @@ bool ReadConf(string network_configuration) {
       conf >> no_progress_timeout_ns;
     } else if (key.compare("SELECTIVE_RETRANSMISSION") == 0) {
       conf >> selective_retransmission;
+    } else if (key.compare("LOAD_BALANCING") == 0) {
+      conf >> load_balancing;
 	} else if (key.compare("PACKET_TRIM_MODE") == 0) {
 	  conf >> packet_trim_mode;
 	} else if (key.compare("PACKET_TRIM_QUEUE") == 0) {
@@ -1092,6 +1141,29 @@ bool ReadConf(string network_configuration) {
     std::cerr << "DATA_LOSS_RNG_STREAM exceeds ns-3 stream range\n";
     return false;
   }
+  if (load_balancing_value() == std::numeric_limits<uint32_t>::max()) {
+    std::cerr << "LOAD_BALANCING must be ecmp, ev_hash, or spray_uniform\n";
+    return false;
+  }
+  // Outside ECMP the packets of one flow take different paths and arrive out
+  // of order: the receiver must hold out-of-order data instead of dropping it,
+  // and a congested switch must hand the destination the range it cut.
+  if (load_balancing_value() != static_cast<uint32_t>(LoadBalancingMode::Ecmp) &&
+      (selective_retransmission == 0 ||
+       packet_trim_mode_value() !=
+           static_cast<uint32_t>(PacketTrimMode::ForwardToDestination))) {
+    std::cerr << "LOAD_BALANCING " << load_balancing
+              << " requires SELECTIVE_RETRANSMISSION 1 and PACKET_TRIM_MODE ftd\n";
+    return false;
+  }
+  if (load_balancing_value() != static_cast<uint32_t>(LoadBalancingMode::Ecmp) &&
+      data_loss_duration_ns != 0 &&
+      data_loss_rng_stream == static_cast<uint64_t>(path_rng_stream)) {
+    std::cerr << "DATA_LOSS_RNG_STREAM " << path_rng_stream
+              << " is the path draw's stream under LOAD_BALANCING "
+              << load_balancing << "\n";
+    return false;
+  }
   if (qlen_mon_interval == 0) {
     std::cerr << "QLEN_MON_INTERVAL must be positive\n";
     return false;
@@ -1285,6 +1357,7 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),
       sw->SetAttribute("LastHopTrimCodepoint",
                        BooleanValue(packet_trim_lasthop != 0));
       sw->SetAttribute("PfcEnabled", BooleanValue(enable_pfc != 0));
+      sw->SetAttribute("LoadBalancing", UintegerValue(load_balancing_value()));
       sw->TraceConnectWithoutContext(
           "SwitchDrop", MakeBoundCallback(&get_switch_drop, sw));
         sw->TraceConnectWithoutContext(
@@ -1419,6 +1492,22 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),
     }
   }
 
+  uint32_t spine_count = 0;
+  if (load_balancing_value() ==
+      static_cast<uint32_t>(LoadBalancingMode::SprayUniform)) {
+    spine_count = AssignSpinePorts(n);
+    if (spine_count == 0) {
+      std::cerr << "LOAD_BALANCING spray_uniform needs a leaf-spine fabric in "
+                   "which every leaf links to every spine\n";
+      return false;
+    }
+  }
+  // One variable for every host, so the draw consumes a single fixed stream.
+  Ptr<UniformRandomVariable> path_random;
+  if (load_balancing_value() != static_cast<uint32_t>(LoadBalancingMode::Ecmp))
+    path_random = CreateObjectWithAttributes<UniformRandomVariable>(
+        "Stream", IntegerValue(path_rng_stream));
+
 #if ENABLE_QP
   FILE *fct_output = fopen(fct_output_file.c_str(), "w");
   if (fct_output == nullptr) {
@@ -1472,6 +1561,12 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),
       rdmaHw->SetAttribute("CongestionExemption",
                            BooleanValue(congestion_exempt));
       rdmaHw->SetAttribute("Reengage", BooleanValue(reengage));
+      rdmaHw->SetAttribute("LoadBalancing",
+                           UintegerValue(load_balancing_value()));
+      rdmaHw->SetAttribute("SpineCount", UintegerValue(spine_count));
+      // A PointerValue cannot carry null, which is the ECMP default.
+      if (path_random)
+        rdmaHw->SetAttribute("PathRandomVariable", PointerValue(path_random));
       rdmaHw->m_transportEventCallback =
           MakeCallback(&record_host_transport_event);
       if (recovery_verdict != nullptr)
