@@ -620,6 +620,8 @@ int RdmaHw::ReceiveAck(Ptr<Packet> p, CustomHeader &ch){
 	if (m_ack_interval == 0)
 		std::cout << "ERROR: shouldn't receive ack\n";
 	else {
+		// Before the cumulative advance, which would remove the answered send
+		// without asking what was sent ahead of it on its path.
 		if (qp->m_outstanding.IsKept())
 			qp->AcknowledgePacket(ch.ack.packet_seq,
 				PathOf(static_cast<LoadBalancingMode>(m_loadBalancing), ch.ipid));

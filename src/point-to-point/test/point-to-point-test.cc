@@ -1505,6 +1505,74 @@ class TrimRepairedOnceTest : public TestCase
     }
 };
 
+class PathLossRuleTest : public TestCase
+{
+  public:
+    PathLossRuleTest()
+        : TestCase("An acknowledgement declares the older sends on its path lost, and only those")
+    {
+    }
+
+    void DoRun() override
+    {
+        constexpr uint32_t kMtu = IsolatedHost::kMtu;
+        constexpr uint32_t kSpines = 4;
+        constexpr uint32_t kPackets = 16;
+        IsolatedHost sender(LoadBalancingMode::SprayUniform, kTestReceiver, kSpines);
+        Ptr<RdmaQueuePair> qp = sender.AddSender(kTestSender, kTestReceiver, kPackets * kMtu);
+        std::vector<uint16_t> identifications;
+        for (uint32_t i = 0; i < kPackets; ++i)
+        {
+            CustomHeader parsed(CustomHeader::L2_Header | CustomHeader::L3_Header);
+            sender.hw->GetNxtPacket(qp)->PeekHeader(parsed);
+            identifications.push_back(parsed.ipid);
+        }
+        // The third send along the first packet's spine, so that two older
+        // sends share its spine and later ones may too.
+        const uint8_t spine = RequestedSpine(identifications[0]);
+        std::vector<uint32_t> onSpine;
+        for (uint32_t i = 0; i < kPackets; ++i)
+        {
+            if (RequestedSpine(identifications[i]) == spine)
+            {
+                onSpine.push_back(i);
+            }
+        }
+        NS_TEST_ASSERT_MSG_GT(onSpine.size(), 2, "the draw puts three sends on one spine");
+        const uint32_t acknowledged = onSpine[2];
+
+        // The same packet named along another spine is a different send.
+        sender.ReceiveAck(kTestReceiver,
+                          0,
+                          acknowledged * kMtu,
+                          SpineIdentification((spine + 1) % kSpines, (spine + 1) % kSpines));
+        NS_TEST_EXPECT_MSG_EQ(qp->m_recovery_events, 0, "another spine's answer declares nothing");
+
+        // Moved by the leaf: the requested spine names the queue sequence.
+        sender.ReceiveAck(kTestReceiver,
+                          0,
+                          acknowledged * kMtu,
+                          SpineIdentification(spine, (spine + 1) % kSpines));
+        NS_TEST_EXPECT_MSG_EQ(qp->m_recovery_events, 2, "the two older sends on the spine are lost");
+        NS_TEST_EXPECT_MSG_EQ(qp->RepairBytesLeft(), 2 * kMtu, "exactly two sends are repaired");
+        for (uint32_t i : {onSpine[0], onSpine[1]})
+        {
+            auto range = qp->m_repair_ranges.upper_bound(i * kMtu);
+            const bool repaired = range != qp->m_repair_ranges.begin() &&
+                                  std::prev(range)->second > i * kMtu;
+            NS_TEST_EXPECT_MSG_EQ(repaired, true, "an older send on the spine is repaired");
+        }
+        NS_TEST_EXPECT_MSG_EQ(qp->m_outstanding.Bytes(),
+                              (kPackets - 3) * kMtu,
+                              "every other send stays outstanding");
+
+        // A repeat of the answer finds its send gone and changes nothing.
+        sender.ReceiveAck(kTestReceiver, 0, acknowledged * kMtu, identifications[acknowledged]);
+        NS_TEST_EXPECT_MSG_EQ(qp->m_recovery_events, 2, "a repeated answer declares nothing");
+        Simulator::Destroy();
+    }
+};
+
 /**
  * \brief TestSuite for PointToPoint module
  */
@@ -1539,6 +1607,7 @@ PointToPointTestSuite::PointToPointTestSuite()
     AddTestCase(new SelectiveTimeoutTest, TestCase::Duration::QUICK);
     AddTestCase(new OutstandingWindowTest, TestCase::Duration::QUICK);
     AddTestCase(new TrimRepairedOnceTest, TestCase::Duration::QUICK);
+    AddTestCase(new PathLossRuleTest, TestCase::Duration::QUICK);
 }
 
 static PointToPointTestSuite g_pointToPointTestSuite; //!< The testsuite

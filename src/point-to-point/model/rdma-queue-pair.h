@@ -213,8 +213,9 @@ public:
 	void DropAcknowledgedRepairs();
 	uint64_t RepairBytesLeft();
 	// The acknowledgement of the send of seq along path: its record is
-	// removed. Nothing happens when no outstanding send matches, which is a
-	// duplicate or the answer to an earlier send of a packet resent since.
+	// removed and every older send still outstanding along the same path is
+	// declared lost. Nothing happens when no outstanding send matches, which
+	// is a duplicate or the answer to an earlier send of a packet resent since.
 	void AcknowledgePacket(uint64_t seq, uint16_t path);
 	// A trimmed send of seq along path. False when no outstanding send matches:
 	// that send was already declared lost and its repair is under way.

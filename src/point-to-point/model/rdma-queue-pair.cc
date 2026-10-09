@@ -367,6 +367,15 @@ void RdmaQueuePair::AcknowledgePacket(uint64_t seq, uint16_t path){
 	const uint64_t packet = m_outstanding.Find(seq, path);
 	if (packet == OutstandingPackets::kNone)
 		return;
+	// Sends along one path pass through one sequence of queues and arrive in
+	// the order they left, so an older send on this path that is still
+	// outstanding did not arrive. Under EntropyHash two outstanding sends
+	// rarely share a path, so this seldom finds one and loss falls to the
+	// timeout; only equal values are known to share queues.
+	for (uint64_t older = m_outstanding.OlderOnPath(packet);
+			older != OutstandingPackets::kNone;
+			older = m_outstanding.OlderOnPath(packet))
+		DeclareLost(older);
 	m_outstanding.Remove(packet);
 }
 
