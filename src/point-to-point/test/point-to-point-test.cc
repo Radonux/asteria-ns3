@@ -22,6 +22,7 @@
 #include "ns3/broadcom-egress-queue.h"
 #include "ns3/flow-id-tag.h"
 #include "ns3/ipv4-header.h"
+#include "ns3/load-balancing.h"
 #include "ns3/net-device-queue-interface.h"
 #include "ns3/ppp-header.h"
 #include "ns3/point-to-point-channel.h"
@@ -600,6 +601,51 @@ class UecTrimRecoveryTest : public TestCase
     uint32_t m_repairPayloadBytes = 0;
 };
 
+class SpineIdentificationTest : public TestCase
+{
+  public:
+    SpineIdentificationTest()
+        : TestCase("IPv4 identification carries the requested and the carrying spine")
+    {
+    }
+
+    void DoRun() override
+    {
+        for (uint32_t requested = 0; requested <= UINT8_MAX; ++requested)
+        {
+            for (uint32_t carrying = 0; carrying <= UINT8_MAX; ++carrying)
+            {
+                const uint16_t identification = SpineIdentification(requested, carrying);
+                NS_TEST_ASSERT_MSG_EQ(RequestedSpine(identification),
+                                      requested,
+                                      "the requested spine must survive encoding");
+                NS_TEST_ASSERT_MSG_EQ(CarryingSpine(identification),
+                                      carrying,
+                                      "the carrying spine must survive encoding");
+            }
+        }
+        NS_TEST_EXPECT_MSG_EQ(SpineIdentification(0x12, 0x34),
+                              0x1234,
+                              "the requested spine is the high byte");
+
+        Ptr<Packet> packet = Create<Packet>(0);
+        Ipv4Header ip;
+        ip.SetSource(Ipv4Address("11.0.1.1"));
+        ip.SetDestination(Ipv4Address("11.0.2.1"));
+        ip.SetProtocol(0x11);
+        ip.SetIdentification(SpineIdentification(7, 3));
+        packet->AddHeader(ip);
+        CustomHeader parsed(CustomHeader::L3_Header);
+        packet->PeekHeader(parsed);
+        NS_TEST_EXPECT_MSG_EQ(RequestedSpine(parsed.ipid),
+                              7,
+                              "the wire carries the requested spine");
+        NS_TEST_EXPECT_MSG_EQ(CarryingSpine(parsed.ipid),
+                              3,
+                              "the wire carries the carrying spine");
+    }
+};
+
 /**
  * \brief TestSuite for PointToPoint module
  */
@@ -624,6 +670,7 @@ PointToPointTestSuite::PointToPointTestSuite()
     AddTestCase(new UecTrimSwitchTest(PacketTrimMode::BackToSender, false),
                 TestCase::Duration::QUICK);
     AddTestCase(new UecTrimRecoveryTest, TestCase::Duration::QUICK);
+    AddTestCase(new SpineIdentificationTest, TestCase::Duration::QUICK);
 }
 
 static PointToPointTestSuite g_pointToPointTestSuite; //!< The testsuite

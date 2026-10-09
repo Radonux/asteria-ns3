@@ -43,6 +43,7 @@ build_lib(
     helper/qbb-helper.h
     helper/sim-setting.h
     model/cn-header.h
+    model/load-balancing.h
     model/pause-header.h
     model/pint.h
     model/point-to-point-channel.h
