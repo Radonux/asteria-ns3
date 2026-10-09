@@ -1202,6 +1202,10 @@ void SetConfig() {
     IntHeader::mode = IntHeader::PINT;
   else // others, no extra header
     IntHeader::mode = IntHeader::NONE;
+  // Outside ECMP the sender matches each acknowledgement to the data packet
+  // that triggered it; ECMP keeps the header at its old size.
+  CustomHeader::ackCarriesPacketSeq =
+      load_balancing_value() != static_cast<uint32_t>(LoadBalancingMode::Ecmp);
 
   // Set Pint
   if (cc_mode == 10) {

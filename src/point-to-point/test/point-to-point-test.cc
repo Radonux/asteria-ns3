@@ -979,6 +979,191 @@ class AckPacketSeqHeaderTest : public TestCase
 };
 
 /**
+ * A host transport with one NIC that is never attached, so nothing it emits
+ * leaves the host. Control packets are parsed off the NIC's enqueue trace in
+ * the order they are emitted.
+ */
+class IsolatedHost
+{
+  public:
+    static constexpr uint32_t kMtu = 1000;
+    static constexpr uint16_t kSenderPort = 10000;
+    static constexpr uint16_t kReceiverPort = 10001;
+    static constexpr uint16_t kPriorityGroup = 3;
+    static constexpr uint64_t kTimeoutNs = 1000;
+
+    IsolatedHost(LoadBalancingMode mode, Ipv4Address peer, uint32_t spines = 0)
+    {
+        hw = CreateObject<RdmaHw>();
+        hw->m_mtu = kMtu;
+        hw->m_cc_mode = 0;
+        hw->m_ack_interval = 1;
+        hw->m_chunk = 4000;
+        hw->m_backto0 = false;
+        hw->m_selective_retransmission = true;
+        hw->m_retransmission_timeout_ns = kTimeoutNs;
+        hw->m_max_retransmission_retries = 4;
+        hw->m_no_progress_timeout_ns = 0;
+        hw->m_loadBalancing = static_cast<uint32_t>(mode);
+        hw->m_spineCount = spines;
+        hw->m_pathRandom =
+            CreateObjectWithAttributes<UniformRandomVariable>("Stream", IntegerValue(0));
+        Ptr<QbbNetDevice> device = CreateObject<QbbNetDevice>();
+        device->m_traceEnqueue.ConnectWithoutContext(
+            Callback<void, Ptr<const Packet>, uint32_t>(
+                [this](Ptr<const Packet> packet, uint32_t) {
+                    CustomHeader parsed(CustomHeader::L2_Header | CustomHeader::L3_Header |
+                                        CustomHeader::L4_Header);
+                    packet->PeekHeader(parsed);
+                    emitted.push_back(parsed);
+                }));
+        RdmaInterfaceMgr nic;
+        nic.dev = device;
+        hw->m_nic.push_back(nic);
+        hw->m_rtTable[peer.Get()].push_back(0);
+    }
+
+    // A data packet from the sender, parsed as the receiving NIC parses it,
+    // handed to this host's transport.
+    void ReceiveData(Ipv4Address from,
+                     Ipv4Address to,
+                     uint32_t seq,
+                     uint16_t identification,
+                     bool marked = false)
+    {
+        Ptr<Packet> packet = Create<Packet>(kMtu);
+        SeqTsHeader seqTs;
+        seqTs.SetSeq(seq);
+        seqTs.SetPG(kPriorityGroup);
+        packet->AddHeader(seqTs);
+        UdpHeader udp;
+        udp.SetSourcePort(kSenderPort);
+        udp.SetDestinationPort(kReceiverPort);
+        udp.ForcePayloadSize(CustomHeader::GetUdpHeaderSize() + kMtu);
+        packet->AddHeader(udp);
+        Ipv4Header ip;
+        ip.SetSource(from);
+        ip.SetDestination(to);
+        ip.SetProtocol(0x11);
+        ip.SetDscp(static_cast<Ipv4Header::DscpType>(kUetDscpTrimmable));
+        ip.SetEcn(marked ? Ipv4Header::ECN_CE : Ipv4Header::ECN_NotECT);
+        ip.SetIdentification(identification);
+        ip.SetPayloadSize(packet->GetSize());
+        packet->AddHeader(ip);
+        PppHeader ppp;
+        ppp.SetProtocol(0x0021);
+        packet->AddHeader(ppp);
+        CustomHeader parsed(CustomHeader::L2_Header | CustomHeader::L3_Header |
+                            CustomHeader::L4_Header);
+        packet->PeekHeader(parsed);
+        hw->Receive(packet, parsed);
+    }
+
+    Ptr<RdmaHw> hw;
+    std::vector<CustomHeader> emitted;
+};
+
+const Ipv4Address kTestSender("11.0.1.1");
+const Ipv4Address kTestReceiver("11.0.2.1");
+
+class AckNamesPacketTest : public TestCase
+{
+  public:
+    AckNamesPacketTest()
+        : TestCase("An acknowledgement names the data packet it answers and its path")
+    {
+    }
+
+    void DoRun() override
+    {
+        const bool savedPacketSeq = CustomHeader::ackCarriesPacketSeq;
+        CustomHeader::ackCarriesPacketSeq = true;
+        IsolatedHost receiver(LoadBalancingMode::SprayUniform, kTestSender, 8);
+        // Moved by its leaf from spine 2 to spine 5, then two packets out of
+        // order, the first of them marked.
+        receiver.ReceiveData(kTestSender, kTestReceiver, 0, SpineIdentification(2, 5));
+        receiver.ReceiveData(kTestSender, kTestReceiver, 2000, SpineIdentification(6, 6), true);
+        receiver.ReceiveData(kTestSender, kTestReceiver, 1000, SpineIdentification(1, 1));
+        NS_TEST_ASSERT_MSG_EQ(receiver.emitted.size(), 3, "every data packet is acknowledged");
+        const uint32_t seqs[] = {0, 2000, 1000};
+        const uint32_t cumulative[] = {1000, 1000, 3000};
+        const uint16_t identifications[] = {SpineIdentification(2, 5),
+                                            SpineIdentification(6, 6),
+                                            SpineIdentification(1, 1)};
+        for (uint32_t i = 0; i < 3; ++i)
+        {
+            const CustomHeader& ack = receiver.emitted[i];
+            NS_TEST_EXPECT_MSG_EQ(ack.l3Prot, 0xFC, "each answer is an acknowledgement");
+            NS_TEST_EXPECT_MSG_EQ(ack.ack.packet_seq, seqs[i], "the answer names its packet");
+            NS_TEST_EXPECT_MSG_EQ(ack.ipid,
+                                  identifications[i],
+                                  "the answer returns the packet's requested and carrying spine");
+            NS_TEST_EXPECT_MSG_EQ(ack.ack.seq,
+                                  cumulative[i],
+                                  "the sequence stays the cumulative acknowledgement");
+            const bool marked = (ack.ack.flags >> qbbHeader::FLAG_CNP) & 1;
+            NS_TEST_EXPECT_MSG_EQ(marked,
+                                  (i == 1),
+                                  "the answer echoes its own packet's mark");
+        }
+        CustomHeader::ackCarriesPacketSeq = savedPacketSeq;
+
+        IsolatedHost ecmp(LoadBalancingMode::Ecmp, kTestSender);
+        ecmp.ReceiveData(kTestSender, kTestReceiver, 0, 0x1234);
+        ecmp.ReceiveData(kTestSender, kTestReceiver, 1000, 0x1234);
+        NS_TEST_ASSERT_MSG_EQ(ecmp.emitted.size(), 2, "ECMP acknowledges in-order packets");
+        NS_TEST_EXPECT_MSG_EQ(ecmp.emitted[0].ipid, 0, "ECMP keeps the receive counter");
+        NS_TEST_EXPECT_MSG_EQ(ecmp.emitted[1].ipid, 1, "ECMP keeps the receive counter");
+        Simulator::Destroy();
+    }
+};
+
+class ReorderGapTest : public TestCase
+{
+  public:
+    ReorderGapTest()
+        : TestCase("A reorder gap is acknowledged with per-packet paths and NACKed under ECMP")
+    {
+    }
+
+    void DoRun() override
+    {
+        const bool savedPacketSeq = CustomHeader::ackCarriesPacketSeq;
+        CustomHeader::ackCarriesPacketSeq = true;
+        IsolatedHost spray(LoadBalancingMode::SprayUniform, kTestSender, 8);
+        Deliver(spray);
+        NS_TEST_ASSERT_MSG_EQ(spray.emitted.size(), 4, "every packet is acknowledged");
+        for (const CustomHeader& answer : spray.emitted)
+        {
+            NS_TEST_EXPECT_MSG_EQ(answer.l3Prot, 0xFC, "a gap draws no NACK");
+        }
+        NS_TEST_EXPECT_MSG_EQ(spray.emitted.back().ack.seq,
+                              4000,
+                              "the packets beyond the gap were held, not dropped");
+        CustomHeader::ackCarriesPacketSeq = savedPacketSeq;
+
+        IsolatedHost ecmp(LoadBalancingMode::Ecmp, kTestSender);
+        Deliver(ecmp);
+        NS_TEST_ASSERT_MSG_EQ(ecmp.emitted.size(),
+                              3,
+                              "the limiter silences the second packet beyond one gap");
+        NS_TEST_EXPECT_MSG_EQ(ecmp.emitted[0].l3Prot, 0xFC, "in order is acknowledged");
+        NS_TEST_EXPECT_MSG_EQ(ecmp.emitted[1].l3Prot, 0xFD, "ECMP NACKs a gap");
+        NS_TEST_EXPECT_MSG_EQ(ecmp.emitted[2].ack.seq, 4000, "the filled gap releases the rest");
+        Simulator::Destroy();
+    }
+
+  private:
+    static void Deliver(IsolatedHost& receiver)
+    {
+        receiver.ReceiveData(kTestSender, kTestReceiver, 0, SpineIdentification(0, 0));
+        receiver.ReceiveData(kTestSender, kTestReceiver, 2000, SpineIdentification(2, 2));
+        receiver.ReceiveData(kTestSender, kTestReceiver, 3000, SpineIdentification(3, 3));
+        receiver.ReceiveData(kTestSender, kTestReceiver, 1000, SpineIdentification(1, 1));
+    }
+};
+
+/**
  * \brief TestSuite for PointToPoint module
  */
 class PointToPointTestSuite : public TestSuite
@@ -1006,6 +1191,8 @@ PointToPointTestSuite::PointToPointTestSuite()
     AddTestCase(new LoadBalancingSwitchTest, TestCase::Duration::QUICK);
     AddTestCase(new LoadBalancingSenderTest, TestCase::Duration::QUICK);
     AddTestCase(new AckPacketSeqHeaderTest, TestCase::Duration::QUICK);
+    AddTestCase(new AckNamesPacketTest, TestCase::Duration::QUICK);
+    AddTestCase(new ReorderGapTest, TestCase::Duration::QUICK);
 }
 
 static PointToPointTestSuite g_pointToPointTestSuite; //!< The testsuite

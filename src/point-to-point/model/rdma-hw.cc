@@ -478,7 +478,8 @@ int RdmaHw::ReceiveUdp(Ptr<Packet> p, CustomHeader &ch){
 
 	if (x == 1 || x == 2){ //generate ACK or NACK
 		SendAck(rxQp, ch.dip, ch.sip, ch.udp.dport, ch.udp.sport, ch.udp.pg,
-			ch.udp.ih, x == 2, ecnbits != 0, AllowanceGone(rxQp));
+			ch.udp.ih, ch.udp.seq, ch.ipid, x == 2, ecnbits != 0,
+			AllowanceGone(rxQp));
 	}
 	// After the acknowledgement, so this packet's answer carries the state
 	// this packet produced and anything the report below absorbs is
@@ -505,9 +506,11 @@ int RdmaHw::ReceiveUdp(Ptr<Packet> p, CustomHeader &ch){
 // budget entry is a forgiveness and no repair request follows it.
 void RdmaHw::SendAck(Ptr<RdmaRxQueuePair> q, uint32_t sourceIp,
 		uint32_t destinationIp, uint16_t sport, uint16_t dport, uint16_t pg,
-		const IntHeader &ih, bool nack, bool cnp, bool spent){
+		const IntHeader &ih, uint32_t packetSeq, uint16_t identification,
+		bool nack, bool cnp, bool spent){
 	qbbHeader seqh;
 	seqh.SetSeq(q->ReceiverNextExpectedSeq);
+	seqh.SetPacketSeq(packetSeq);
 	seqh.SetPG(pg);
 	seqh.SetSport(sport);
 	seqh.SetDport(dport);
@@ -532,7 +535,9 @@ void RdmaHw::SendAck(Ptr<RdmaRxQueuePair> q, uint32_t sourceIp,
 	// MUST NOT be marked as trimmable.
 	head.SetDscp(static_cast<Ipv4Header::DscpType>(kUetDscpControl));
 	head.SetPayloadSize(newp->GetSize());
-	head.SetIdentification(q->m_ipid++);
+	// Where each data packet draws its path, the acknowledgement returns the
+	// identification of the packet it answers, which names that path.
+	head.SetIdentification(IsPathPerPacket() ? identification : q->m_ipid++);
 
 	newp->AddHeader(head);
 	AddHeader(newp, 0x800);	// Attach PPP header
@@ -890,7 +895,7 @@ void RdmaHw::ReceiveTrimmedData(const CustomHeader &ch, uint32_t payloadSize,
 	const uint64_t unsettled = q->UnsettledBytes(start, end);
 	if (unsettled == 0){
 		SendAck(q, ch.dip, ch.sip, ch.udp.dport, ch.udp.sport, ch.udp.pg,
-			ch.udp.ih, false, false, AllowanceGone(q));
+			ch.udp.ih, ch.udp.seq, ch.ipid, false, false, AllowanceGone(q));
 		return;
 	}
 	if (unsettled < payloadSize){
@@ -923,7 +928,7 @@ void RdmaHw::ReceiveTrimmedData(const CustomHeader &ch, uint32_t payloadSize,
 		// debt is owed for every trim the sender would otherwise have seen, and
 		// this ACK is what pays it.
 		SendAck(q, ch.dip, ch.sip, ch.udp.dport, ch.udp.sport, ch.udp.pg,
-			ch.udp.ih, false, true, AllowanceGone(q));
+			ch.udp.ih, ch.udp.seq, ch.ipid, false, true, AllowanceGone(q));
 		return;
 	}
 	// The refused range stays a hole, so the report is computed after the
@@ -973,7 +978,7 @@ void RdmaHw::AskRemainderOnArrival(Ptr<RdmaRxQueuePair> q){
 	// pair with, and the group is part of the map key, so every packet that
 	// finds this queue pair carries that same group.
 	SendAck(q, q->sip, q->dip, q->sport, q->dport, q->m_ecn_source.qIndex,
-		IntHeader(), false, false, false);
+		IntHeader(), 0, 0, false, false, false);
 }
 
 // The frontend names a flow by (sender, receiver, sender's port); the receive
@@ -1058,7 +1063,8 @@ int RdmaHw::ReceiverCheckSeq(uint32_t seq, Ptr<RdmaRxQueuePair> q, uint32_t size
 			// behavioral benefit.
 			q->m_milestone_rx += m_ack_interval;
 			return 1; //Generate ACK
-		}else if (q->ReceiverNextExpectedSeq % m_chunk == 0){
+		}else if (IsPathPerPacket() ||
+				q->ReceiverNextExpectedSeq % m_chunk == 0){
 			return 1;
 		}else {
 			return 5;
@@ -1068,6 +1074,11 @@ int RdmaHw::ReceiverCheckSeq(uint32_t seq, Ptr<RdmaRxQueuePair> q, uint32_t size
 			// Accept the out-of-order payload; only its gap needs repair.
 			q->AddOutOfOrderRange(seq, static_cast<uint64_t>(seq) + size);
 		}
+		// Packets that draw their paths one by one arrive out of order without
+		// any loss, so the gap is acknowledged like any arrival and the sender
+		// infers loss per path.
+		if (IsPathPerPacket())
+			return 1;
 		// Generate NACK.
 		if (Simulator::Now() >= q->m_nackTimer || q->m_lastNACK != expected){
 			q->m_nackTimer = Simulator::Now() + MicroSeconds(m_nack_interval);
@@ -1337,6 +1348,10 @@ Ptr<Packet> RdmaHw::GetNxtPacket(Ptr<RdmaQueuePair> qp){
 
 	// return
 	return p;
+}
+
+bool RdmaHw::IsPathPerPacket() const{
+	return m_loadBalancing != static_cast<uint32_t>(LoadBalancingMode::Ecmp);
 }
 
 uint16_t RdmaHw::DrawPathIdentification(){
