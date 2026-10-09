@@ -53,7 +53,6 @@ build_lib(
     model/packet-sink.cc
     model/rdma-client.cc
     model/seq-ts-echo-header.cc
-    model/seq-ts-header.cc
     model/seq-ts-size-header.cc
     model/three-gpp-http-client.cc
     model/three-gpp-http-header.cc
@@ -79,7 +78,6 @@ build_lib(
     model/packet-sink.h
     model/rdma-client.h
     model/seq-ts-echo-header.h
-    model/seq-ts-header.h
     model/seq-ts-size-header.h
     model/three-gpp-http-client.h
     model/three-gpp-http-header.h

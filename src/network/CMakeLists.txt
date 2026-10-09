@@ -71,6 +71,7 @@ set(source_files
     utils/queue.cc
     utils/radiotap-header.cc
     utils/red-queue.cc
+    utils/seq-ts-header.cc
     utils/simple-channel.cc
     utils/simple-net-device.cc
     utils/sll-header.cc
@@ -155,6 +156,7 @@ set(header_files
     utils/queue.h
     utils/radiotap-header.h
     utils/red-queue.h
+    utils/seq-ts-header.h
     utils/sequence-number.h
     utils/simple-channel.h
     utils/simple-net-device.h
