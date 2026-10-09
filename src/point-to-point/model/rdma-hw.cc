@@ -109,6 +109,26 @@ TypeId RdmaHw::GetTypeId (void)
 				BooleanValue(true),
 				MakeBooleanAccessor(&RdmaHw::m_reengage),
 				MakeBooleanChecker())
+		.AddAttribute("LoadBalancing",
+				"What the IPv4 identification of a data packet carries: 0=a "
+				"per-QP counter, 1=a 16-bit entropy value drawn per packet, "
+				"2=a spine index drawn per packet, in both bytes.",
+				UintegerValue(static_cast<uint32_t>(LoadBalancingMode::Ecmp)),
+				MakeUintegerAccessor(&RdmaHw::m_loadBalancing),
+				MakeUintegerChecker<uint32_t>(
+					static_cast<uint32_t>(LoadBalancingMode::Ecmp),
+					static_cast<uint32_t>(LoadBalancingMode::SprayUniform)))
+		.AddAttribute("SpineCount",
+				"Number of spines a data packet may name when LoadBalancing is 2.",
+				UintegerValue(0),
+				MakeUintegerAccessor(&RdmaHw::m_spineCount),
+				MakeUintegerChecker<uint32_t>(0, 256))
+		.AddAttribute("PathRandomVariable",
+				"The variable the identification is drawn from when LoadBalancing "
+				"is not 0. Null by default, so that ECMP allocates no stream.",
+				PointerValue(),
+				MakePointerAccessor(&RdmaHw::m_pathRandom),
+				MakePointerChecker<UniformRandomVariable>())
 		.AddAttribute("EwmaGain",
 				"Control gain parameter which determines the level of rate decrease",
 				DoubleValue(1.0 / 16),
@@ -259,6 +279,14 @@ void RdmaHw::Setup(QpCompleteCallback cb, QpFailureCallback failure_cb){
 			!m_selective_retransmission,
 		"The step stop needs SelectiveRetransmission: a forgiven remainder is "
 		"absorbed as an accepted out-of-order range");
+	NS_ABORT_MSG_IF(m_loadBalancing !=
+				static_cast<uint32_t>(LoadBalancingMode::Ecmp) && !m_pathRandom,
+		"A LoadBalancing mode other than ECMP draws the identification of every "
+		"data packet from PathRandomVariable");
+	NS_ABORT_MSG_IF(m_loadBalancing ==
+				static_cast<uint32_t>(LoadBalancingMode::SprayUniform) &&
+			m_spineCount == 0,
+		"LoadBalancing 2 names a spine per packet and needs SpineCount");
 	for (uint32_t i = 0; i < m_nic.size(); i++){
 		Ptr<QbbNetDevice> dev = m_nic[i].dev;
 		if (!dev)
@@ -1283,7 +1311,9 @@ Ptr<Packet> RdmaHw::GetNxtPacket(Ptr<RdmaQueuePair> qp){
 	// a congested switch sets them independently of the codepoint.
 	ipHeader.SetTos (0);
 	ipHeader.SetDscp (static_cast<Ipv4Header::DscpType>(kUetDscpTrimmable));
-	ipHeader.SetIdentification (qp->m_ipid);
+	ipHeader.SetIdentification (
+		m_loadBalancing == static_cast<uint32_t>(LoadBalancingMode::Ecmp)
+			? qp->m_ipid : DrawPathIdentification());
 	p->AddHeader(ipHeader);
 	// add ppp header
 	PppHeader ppp;
@@ -1307,6 +1337,14 @@ Ptr<Packet> RdmaHw::GetNxtPacket(Ptr<RdmaQueuePair> qp){
 
 	// return
 	return p;
+}
+
+uint16_t RdmaHw::DrawPathIdentification(){
+	if (m_loadBalancing == static_cast<uint32_t>(LoadBalancingMode::SprayUniform)){
+		const uint8_t spine = m_pathRandom->GetInteger(0, m_spineCount - 1);
+		return SpineIdentification(spine, spine);
+	}
+	return m_pathRandom->GetInteger(0, UINT16_MAX);
 }
 
 void RdmaHw::PktSent(Ptr<RdmaQueuePair> qp, Ptr<Packet> pkt, Time interframeGap){

@@ -21,16 +21,20 @@
 #include "ns3/custom-header.h"
 #include "ns3/broadcom-egress-queue.h"
 #include "ns3/flow-id-tag.h"
+#include "ns3/integer.h"
 #include "ns3/ipv4-header.h"
 #include "ns3/load-balancing.h"
 #include "ns3/net-device-queue-interface.h"
 #include "ns3/ppp-header.h"
 #include "ns3/point-to-point-channel.h"
 #include "ns3/point-to-point-net-device.h"
+#include "ns3/pointer.h"
 #include "ns3/qbb-channel.h"
 #include "ns3/qbb-header.h"
 #include "ns3/qbb-net-device.h"
+#include "ns3/random-variable-stream.h"
 #include "ns3/rdma-hw.h"
+#include "ns3/rng-seed-manager.h"
 #include "ns3/switch-node.h"
 #include "ns3/node.h"
 #include "ns3/seq-ts-header.h"
@@ -823,6 +827,91 @@ class LoadBalancingSwitchTest : public TestCase
     }
 };
 
+class LoadBalancingSenderTest : public TestCase
+{
+  public:
+    LoadBalancingSenderTest()
+        : TestCase("A sender writes the path draw into the IPv4 identification")
+    {
+    }
+
+    void DoRun() override
+    {
+        const std::vector<uint16_t> counter = Identifications(LoadBalancingMode::Ecmp, 4);
+        for (uint32_t i = 0; i < counter.size(); ++i)
+        {
+            NS_TEST_ASSERT_MSG_EQ(counter[i], i, "ECMP keeps the per-QP counter");
+        }
+
+        constexpr uint32_t kSpines = 8;
+        constexpr uint32_t kPackets = 8000;
+        std::vector<uint32_t> perSpine(kSpines, 0);
+        for (uint16_t identification :
+             Identifications(LoadBalancingMode::SprayUniform, kPackets, kSpines))
+        {
+            NS_TEST_ASSERT_MSG_EQ(RequestedSpine(identification),
+                                  CarryingSpine(identification),
+                                  "the sender carries the spine it requests");
+            NS_TEST_ASSERT_MSG_LT(RequestedSpine(identification),
+                                  kSpines,
+                                  "the sender names an existing spine");
+            ++perSpine[RequestedSpine(identification)];
+        }
+        // 1000 expected per spine with a standard deviation of 30.
+        for (uint32_t spine = 0; spine < kSpines; ++spine)
+        {
+            NS_TEST_EXPECT_MSG_GT(perSpine[spine], 850, "the spine draw is uniform");
+            NS_TEST_EXPECT_MSG_LT(perSpine[spine], 1150, "the spine draw is uniform");
+        }
+
+        const std::vector<uint16_t> entropy =
+            Identifications(LoadBalancingMode::EntropyHash, 1000);
+        const std::set<uint16_t> distinct(entropy.begin(), entropy.end());
+        // 1000 draws from 65536 values repeat about 8 times.
+        NS_TEST_EXPECT_MSG_GT(distinct.size(), 950, "the entropy draw spans 16 bits");
+        NS_TEST_EXPECT_MSG_GT(*distinct.rbegin(), UINT8_MAX, "the entropy draw uses the high byte");
+
+        // A fixed stream must not take an automatic one, or turning a mode on
+        // would move every later automatic draw of the run.
+        const uint64_t before = RngSeedManager::GetNextStreamIndex();
+        PathVariable();
+        NS_TEST_EXPECT_MSG_EQ(RngSeedManager::GetNextStreamIndex(),
+                              before + 1,
+                              "the path variable allocates no automatic stream");
+        const bool repeated = Identifications(LoadBalancingMode::EntropyHash, 1000) == entropy;
+        NS_TEST_EXPECT_MSG_EQ(repeated, true, "the fixed stream repeats its draws");
+    }
+
+  private:
+    static Ptr<UniformRandomVariable> PathVariable()
+    {
+        return CreateObjectWithAttributes<UniformRandomVariable>("Stream", IntegerValue(0));
+    }
+
+    static std::vector<uint16_t> Identifications(LoadBalancingMode mode,
+                                                 uint32_t packets,
+                                                 uint32_t spines = 0)
+    {
+        constexpr uint32_t kMtu = 1000;
+        Ptr<RdmaHw> hw = CreateObject<RdmaHw>();
+        hw->SetAttribute("Mtu", UintegerValue(kMtu));
+        hw->SetAttribute("LoadBalancing", UintegerValue(static_cast<uint32_t>(mode)));
+        hw->SetAttribute("SpineCount", UintegerValue(spines));
+        hw->SetAttribute("PathRandomVariable", PointerValue(PathVariable()));
+        Ptr<RdmaQueuePair> qp = CreateObject<RdmaQueuePair>(
+            3, Ipv4Address("11.0.1.1"), Ipv4Address("11.0.2.1"), 10000, 10001);
+        qp->m_size = static_cast<uint64_t>(packets) * kMtu;
+        std::vector<uint16_t> identifications;
+        for (uint32_t i = 0; i < packets; ++i)
+        {
+            CustomHeader parsed(CustomHeader::L2_Header | CustomHeader::L3_Header);
+            hw->GetNxtPacket(qp)->PeekHeader(parsed);
+            identifications.push_back(parsed.ipid);
+        }
+        return identifications;
+    }
+};
+
 /**
  * \brief TestSuite for PointToPoint module
  */
@@ -849,6 +938,7 @@ PointToPointTestSuite::PointToPointTestSuite()
     AddTestCase(new UecTrimRecoveryTest, TestCase::Duration::QUICK);
     AddTestCase(new SpineIdentificationTest, TestCase::Duration::QUICK);
     AddTestCase(new LoadBalancingSwitchTest, TestCase::Duration::QUICK);
+    AddTestCase(new LoadBalancingSenderTest, TestCase::Duration::QUICK);
 }
 
 static PointToPointTestSuite g_pointToPointTestSuite; //!< The testsuite

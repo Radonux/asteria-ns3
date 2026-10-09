@@ -5,7 +5,9 @@
 #include <ns3/rdma-queue-pair.h>
 #include <ns3/node.h>
 #include <ns3/custom-header.h>
+#include <ns3/random-variable-stream.h>
 #include "qbb-net-device.h"
+#include "load-balancing.h"
 #include <unordered_map>
 #include "pint.h"
 
@@ -61,6 +63,12 @@ public:
 	// Whether a spent report ends an exemption. False is the reference arm in
 	// which the budget alone bounds the loss.
 	bool m_reengage;
+	// LoadBalancingMode. Outside ECMP the IPv4 identification of every data
+	// packet is drawn from m_pathRandom; SprayUniform draws a spine index below
+	// m_spineCount.
+	uint32_t m_loadBalancing;
+	uint32_t m_spineCount;
+	Ptr<UniformRandomVariable> m_pathRandom;
 	bool m_var_win, m_fast_react;
 	bool m_rateBound;
 	uint32_t m_total_pause_times; 
@@ -214,6 +222,7 @@ public:
 	void RedistributeQp();
 
 	Ptr<Packet> GetNxtPacket(Ptr<RdmaQueuePair> qp); // get next packet to send, inc snd_nxt
+	uint16_t DrawPathIdentification();
 	void PktSent(Ptr<RdmaQueuePair> qp, Ptr<Packet> pkt, Time interframeGap);
 	void UpdateNextAvail(Ptr<RdmaQueuePair> qp, Time interframeGap, uint32_t pkt_size);
 	void ChangeRate(Ptr<RdmaQueuePair> qp, DataRate new_rate);
