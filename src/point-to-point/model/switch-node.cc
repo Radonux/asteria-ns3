@@ -71,6 +71,15 @@ TypeId SwitchNode::GetTypeId (void)
 			BooleanValue(true),
 			MakeBooleanAccessor(&SwitchNode::m_pfcEnabled),
 			MakeBooleanChecker())
+	.AddAttribute("LoadBalancing",
+			"How a data packet's uplink is chosen: 0=ECMP over the four-tuple, "
+			"1=ECMP over the four-tuple and the IPv4 identification, 2=the spine "
+			"named in the high byte of the IPv4 identification.",
+			UintegerValue(static_cast<uint32_t>(LoadBalancingMode::Ecmp)),
+			MakeUintegerAccessor(&SwitchNode::m_loadBalancing),
+			MakeUintegerChecker<uint32_t>(
+				static_cast<uint32_t>(LoadBalancingMode::Ecmp),
+				static_cast<uint32_t>(LoadBalancingMode::SprayUniform)))
 	.AddAttribute("MaxRtt",
 			"Max Rtt of the network",
 			UintegerValue(9000),
@@ -94,6 +103,7 @@ SwitchNode::SwitchNode(){
 	m_minTrimSize = 24;
 	m_lastHopTrimCodepoint = true;
 	m_pfcEnabled = true;
+	m_loadBalancing = static_cast<uint32_t>(LoadBalancingMode::Ecmp);
 	m_mmu = CreateObject<SwitchMmu>();
 	for (uint32_t i = 0; i < pCnt; i++)
 		for (uint32_t j = 0; j < pCnt; j++)
@@ -117,11 +127,17 @@ int SwitchNode::GetOutDev(Ptr<const Packet> p, CustomHeader &ch){
 
 	// entry found
 	auto &nexthops = entry->second;
+	const LoadBalancingMode mode = static_cast<LoadBalancingMode>(m_loadBalancing);
+	// Only the sender's data packets carry a spine; the next hops of a
+	// destination behind another leaf are exactly this leaf's live uplinks.
+	if (mode == LoadBalancingMode::SprayUniform && ch.l3Prot == 0x11 &&
+			IsSpineUplink(nexthops[0]))
+		return RouteToRequestedSpine(ch);
 
 	// pick one next hop based on hash
 	union {
-		uint8_t u8[4+4+2+2];
-		uint32_t u32[3];
+		uint8_t u8[4+4+2+2+4];
+		uint32_t u32[4];
 	} buf;
 	buf.u32[0] = ch.sip;
 	buf.u32[1] = ch.dip;
@@ -133,9 +149,54 @@ int SwitchNode::GetOutDev(Ptr<const Packet> p, CustomHeader &ch){
 			 ch.l3Prot == kUecTrimRepairProtocol ||
 			 ch.l3Prot == kUecTrimNotificationProtocol)
 		buf.u32[2] = ch.ack.sport | ((uint32_t)ch.ack.dport << 16);
+	size_t keyBytes = 12;
+	if (mode == LoadBalancingMode::EntropyHash && ch.l3Prot == 0x11){
+		buf.u32[3] = ch.ipid;
+		keyBytes = 16;
+	}
 
-	uint32_t idx = EcmpHash(buf.u8, 12, m_ecmpSeed) % nexthops.size();
+	uint32_t idx = EcmpHash(buf.u8, keyBytes, m_ecmpSeed) % nexthops.size();
 	return nexthops[idx];
+}
+
+// Sends the packet up the uplink of the spine it requests and records in the
+// identification which spine carries it. The record is the only edit, so a
+// packet that passes this leaf twice, as a trimmed packet does, keeps its
+// spine.
+uint32_t SwitchNode::RouteToRequestedSpine(CustomHeader &ch) const{
+	const uint8_t requested = RequestedSpine(ch.ipid);
+	const uint8_t carrying = LiveSpineFor(requested);
+	ch.ipid = SpineIdentification(requested, carrying);
+	return m_spinePort[carrying];
+}
+
+// The requested spine while its uplink is up. Otherwise the request is folded
+// onto the live spines in index order, so the choice is a function of the
+// request alone and the requests for different dead spines spread over
+// different live ones.
+uint8_t SwitchNode::LiveSpineFor(uint8_t requested) const{
+	auto isLive = [this](uint32_t spine){
+		return m_devices[m_spinePort[spine]]->IsLinkUp();
+	};
+	if (requested < m_spinePort.size() && isLive(requested))
+		return requested;
+	uint32_t liveCount = 0;
+	for (uint32_t spine = 0; spine < m_spinePort.size(); spine++)
+		liveCount += isLive(spine);
+	NS_ASSERT_MSG(liveCount > 0, "a leaf with a route to another leaf has a live uplink");
+	uint32_t rank = requested % liveCount;
+	for (uint32_t spine = 0; spine < m_spinePort.size(); spine++){
+		if (!isLive(spine))
+			continue;
+		if (rank == 0)
+			return spine;
+		rank--;
+	}
+	return requested;
+}
+
+bool SwitchNode::IsSpineUplink(uint32_t port) const{
+	return std::find(m_spinePort.begin(), m_spinePort.end(), port) != m_spinePort.end();
 }
 
 // UEC 1.0.3 section 4.1: "Switches that are configured to perform trimming will
@@ -325,10 +386,21 @@ void SwitchNode::CheckAndSendResume(uint32_t inDev, uint32_t qIndex){
 }
 
 bool SwitchNode::SendToDev(Ptr<Packet>p, CustomHeader &ch){
+	const uint16_t arrivedIdentification = ch.ipid;
 	int idx = GetOutDev(p, ch);
 	if (idx < 0){
 		m_traceDrop(p, static_cast<uint32_t>(SwitchDropReason::Route));
 		return false; // Drop
+	}
+	// GetOutDev recorded a move to another spine; the wire must carry it too.
+	if (ch.ipid != arrivedIdentification){
+		PppHeader ppp;
+		Ipv4Header ip;
+		p->RemoveHeader(ppp);
+		p->RemoveHeader(ip);
+		ip.SetIdentification(ch.ipid);
+		p->AddHeader(ip);
+		p->AddHeader(ppp);
 	}
 	NS_ASSERT_MSG(m_devices[idx]->IsLinkUp(), "The routing table look up should return link that is up");
 
@@ -417,6 +489,10 @@ uint32_t SwitchNode::EcmpHash(const uint8_t* key, size_t len, uint32_t seed) {
 
 void SwitchNode::SetEcmpSeed(uint32_t seed){
 	m_ecmpSeed = seed;
+}
+
+void SwitchNode::SetSpinePorts(const std::vector<uint32_t> &ports){
+	m_spinePort = ports;
 }
 
 void SwitchNode::AddTableEntry(Ipv4Address &dstAddr, uint32_t intf_idx){

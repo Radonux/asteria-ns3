@@ -6,6 +6,7 @@
 #include "qbb-net-device.h"
 #include "switch-mmu.h"
 #include "pint.h"
+#include "load-balancing.h"
 
 namespace ns3 {
 
@@ -65,9 +66,14 @@ protected:
 	uint32_t m_minTrimSize;       // MIN_TRIM_SIZE, in IP payload bytes
 	bool m_lastHopTrimCodepoint;  // emit DSCP_TRIMMED_LAST_HOP on TOR downlinks
 	bool m_pfcEnabled;            // generate PFC on ingress pressure
+	uint32_t m_loadBalancing;     // LoadBalancingMode
+	std::vector<uint32_t> m_spinePort; // spine index -> device index of the uplink to it
 
 private:
 	int GetOutDev(Ptr<const Packet>, CustomHeader &ch);
+	uint32_t RouteToRequestedSpine(CustomHeader &ch) const;
+	uint8_t LiveSpineFor(uint8_t requested) const;
+	bool IsSpineUplink(uint32_t port) const;
 	bool SendToDev(Ptr<Packet>p, CustomHeader &ch);
 	bool TrimAndForward(Ptr<Packet> p, CustomHeader &ch, int outDev,
 		PacketTrimTrigger trigger);
@@ -88,6 +94,7 @@ public:
 	static TypeId GetTypeId (void);
 	SwitchNode();
 	void SetEcmpSeed(uint32_t seed);
+	void SetSpinePorts(const std::vector<uint32_t> &ports);
 	void AddTableEntry(Ipv4Address &dstAddr, uint32_t intf_idx);
 	void ClearTable();
 	bool SwitchReceiveFromDevice(Ptr<NetDevice> device, Ptr<Packet> packet, CustomHeader &ch);

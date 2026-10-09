@@ -5,6 +5,21 @@
 
 namespace ns3 {
 
+// How a data packet's uplink is chosen. The mode is global to a run: the
+// sender decides what it writes into the IPv4 identification field, and every
+// switch decides what it reads from it.
+enum class LoadBalancingMode : uint32_t {
+	// The four-tuple hash. The identification is a per-QP counter that no
+	// switch reads, so every packet of a flow takes one path.
+	Ecmp = 0,
+	// The four-tuple hash extended by the identification, which the sender
+	// fills with a fresh 16-bit entropy value per packet.
+	EntropyHash,
+	// The identification names a spine per packet, drawn uniformly by the
+	// sender, and the source leaf sends the packet up that spine's uplink.
+	SprayUniform,
+};
+
 // The IPv4 identification of a data packet that names its spine: the high
 // byte is the spine the sender requested and the low byte the spine that
 // carried the packet. The sender writes the two equal and only a source leaf

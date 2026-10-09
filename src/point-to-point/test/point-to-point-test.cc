@@ -38,7 +38,9 @@
 #include "ns3/test.h"
 #include "ns3/udp-header.h"
 
+#include <set>
 #include <string>
+#include <vector>
 
 using namespace ns3;
 
@@ -647,6 +649,181 @@ class SpineIdentificationTest : public TestCase
 };
 
 /**
+ * A leaf with one host port and four spine uplinks, its routing entry for the
+ * remote host listing the uplinks out of spine order.
+ */
+class LoadBalancingSwitchTest : public TestCase
+{
+  public:
+    LoadBalancingSwitchTest()
+        : TestCase("A leaf routes data by the requested spine or by the entropy value")
+    {
+    }
+
+    void DoRun() override
+    {
+        RouteBySpine();
+        RouteByEntropy(LoadBalancingMode::Ecmp);
+        RouteByEntropy(LoadBalancingMode::EntropyHash);
+        Simulator::Destroy();
+    }
+
+  private:
+    static constexpr uint32_t kSpines = 4;
+    Ipv4Address m_sender{"11.0.1.1"};
+    Ipv4Address m_localHost{"11.0.1.2"};
+    Ipv4Address m_remoteHost{"11.0.2.1"};
+
+    struct Egress
+    {
+        uint32_t port;
+        uint16_t identification;
+    };
+
+    Ptr<SwitchNode> m_leaf;
+    uint32_t m_hostPort = 0;
+    std::vector<uint32_t> m_spinePorts;
+    std::vector<Egress> m_egress;
+
+    void BuildLeaf(LoadBalancingMode mode)
+    {
+        m_leaf = CreateObject<SwitchNode>();
+        m_leaf->SetAttribute("LoadBalancing", UintegerValue(static_cast<uint32_t>(mode)));
+        m_leaf->SetAttribute("PfcEnabled", BooleanValue(false));
+        m_hostPort = AttachPort(CreateObject<Node>());
+        m_spinePorts.clear();
+        for (uint32_t spine = 0; spine < kSpines; ++spine)
+        {
+            m_spinePorts.push_back(AttachPort(CreateObject<SwitchNode>()));
+        }
+        m_leaf->SetSpinePorts(m_spinePorts);
+        for (uint32_t spine : {2, 0, 3, 1})
+        {
+            m_leaf->AddTableEntry(m_remoteHost, m_spinePorts[spine]);
+        }
+        m_leaf->AddTableEntry(m_localHost, m_hostPort);
+        m_egress.clear();
+    }
+
+    uint32_t AttachPort(Ptr<Node> peerNode)
+    {
+        Ptr<QbbNetDevice> port = CreateObject<QbbNetDevice>();
+        port->SetQueue(CreateObject<BEgressQueue>());
+        m_leaf->AddDevice(port);
+        Ptr<QbbNetDevice> peer = CreateObject<QbbNetDevice>();
+        peerNode->AddDevice(peer);
+        Ptr<QbbChannel> channel = CreateObject<QbbChannel>();
+        port->Attach(channel);
+        peer->Attach(channel);
+        const uint32_t index = port->GetIfIndex();
+        port->m_traceEnqueue.ConnectWithoutContext(
+            Callback<void, Ptr<const Packet>, uint32_t>(
+                [this, index](Ptr<const Packet> packet, uint32_t) {
+                    CustomHeader parsed(CustomHeader::L2_Header | CustomHeader::L3_Header);
+                    packet->PeekHeader(parsed);
+                    m_egress.push_back({index, parsed.ipid});
+                }));
+        return index;
+    }
+
+    Egress Send(Ipv4Address destination, uint16_t sourcePort, uint16_t identification)
+    {
+        Ptr<Packet> packet = Create<Packet>(1000);
+        SeqTsHeader seqTs;
+        // Priority group 0 bypasses buffer admission, which is not under test.
+        seqTs.SetPG(0);
+        packet->AddHeader(seqTs);
+        UdpHeader udp;
+        udp.SetSourcePort(sourcePort);
+        udp.SetDestinationPort(10001);
+        packet->AddHeader(udp);
+        Ipv4Header ip;
+        ip.SetSource(m_sender);
+        ip.SetDestination(destination);
+        ip.SetProtocol(0x11);
+        ip.SetIdentification(identification);
+        ip.SetPayloadSize(packet->GetSize());
+        packet->AddHeader(ip);
+        PppHeader ppp;
+        ppp.SetProtocol(0x0021);
+        packet->AddHeader(ppp);
+        packet->AddPacketTag(FlowIdTag(m_hostPort));
+        CustomHeader parsed(CustomHeader::L2_Header | CustomHeader::L3_Header |
+                            CustomHeader::L4_Header);
+        parsed.getInt = 1;
+        packet->PeekHeader(parsed);
+        const size_t sent = m_egress.size();
+        m_leaf->SwitchReceiveFromDevice(nullptr, packet, parsed);
+        NS_TEST_EXPECT_MSG_EQ(m_egress.size(), sent + 1, "the leaf forwards every packet once");
+        return m_egress.size() > sent ? m_egress.back() : Egress{UINT32_MAX, 0};
+    }
+
+    void RouteBySpine()
+    {
+        BuildLeaf(LoadBalancingMode::SprayUniform);
+        for (uint32_t spine = 0; spine < kSpines; ++spine)
+        {
+            const Egress egress = Send(m_remoteHost, 10000, SpineIdentification(spine, spine));
+            NS_TEST_EXPECT_MSG_EQ(egress.port,
+                                  m_spinePorts[spine],
+                                  "a request leaves on the requested spine's uplink");
+            NS_TEST_EXPECT_MSG_EQ(egress.identification,
+                                  SpineIdentification(spine, spine),
+                                  "an honoured request is not rewritten");
+        }
+
+        const Egress local = Send(m_localHost, 10000, SpineIdentification(3, 3));
+        NS_TEST_EXPECT_MSG_EQ(local.port, m_hostPort, "a local destination ignores the request");
+
+        // With spine 1 down the live spines are 0, 2 and 3; request 1 folds
+        // onto the second of them.
+        DynamicCast<QbbNetDevice>(m_leaf->GetDevice(m_spinePorts[1]))->TakeDown();
+        const Egress moved = Send(m_remoteHost, 10000, SpineIdentification(1, 1));
+        NS_TEST_EXPECT_MSG_EQ(moved.port,
+                              m_spinePorts[2],
+                              "a request for a dead uplink is moved to a live one");
+        NS_TEST_EXPECT_MSG_EQ(RequestedSpine(moved.identification),
+                              1,
+                              "the request survives the move");
+        NS_TEST_EXPECT_MSG_EQ(CarryingSpine(moved.identification),
+                              2,
+                              "the leaf records the spine that carries the packet");
+        const Egress again = Send(m_remoteHost, 10000, moved.identification);
+        NS_TEST_EXPECT_MSG_EQ(again.port,
+                              m_spinePorts[2],
+                              "a packet that passes the leaf again keeps its spine");
+        const Egress live = Send(m_remoteHost, 10000, SpineIdentification(3, 3));
+        NS_TEST_EXPECT_MSG_EQ(live.port,
+                              m_spinePorts[3],
+                              "requests for live uplinks are unaffected by a dead one");
+    }
+
+    void RouteByEntropy(LoadBalancingMode mode)
+    {
+        BuildLeaf(mode);
+        std::set<uint32_t> ports;
+        for (uint32_t identification = 0; identification <= UINT8_MAX; ++identification)
+        {
+            ports.insert(Send(m_remoteHost, 10000, identification).port);
+        }
+        if (mode == LoadBalancingMode::Ecmp)
+        {
+            NS_TEST_EXPECT_MSG_EQ(ports.size(), 1, "ECMP keeps a flow on one path");
+        }
+        else
+        {
+            NS_TEST_EXPECT_MSG_EQ(ports.size(),
+                                  kSpines,
+                                  "the entropy value spreads one flow over every uplink");
+            const uint32_t port = Send(m_remoteHost, 10000, 0x1234).port;
+            NS_TEST_EXPECT_MSG_EQ(Send(m_remoteHost, 10000, 0x1234).port,
+                                  port,
+                                  "an entropy value always takes the same path");
+        }
+    }
+};
+
+/**
  * \brief TestSuite for PointToPoint module
  */
 class PointToPointTestSuite : public TestSuite
@@ -671,6 +848,7 @@ PointToPointTestSuite::PointToPointTestSuite()
                 TestCase::Duration::QUICK);
     AddTestCase(new UecTrimRecoveryTest, TestCase::Duration::QUICK);
     AddTestCase(new SpineIdentificationTest, TestCase::Duration::QUICK);
+    AddTestCase(new LoadBalancingSwitchTest, TestCase::Duration::QUICK);
 }
 
 static PointToPointTestSuite g_pointToPointTestSuite; //!< The testsuite
