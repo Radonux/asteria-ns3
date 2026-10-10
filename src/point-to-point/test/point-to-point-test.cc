@@ -667,6 +667,17 @@ class SpineIdentificationTest : public TestCase
         NS_TEST_EXPECT_MSG_EQ(CarryingSpine(parsed.ipid),
                               3,
                               "the wire carries the carrying spine");
+        for (LoadBalancingMode mode :
+             {LoadBalancingMode::SprayUniform, LoadBalancingMode::SprayPolicy})
+        {
+            NS_TEST_EXPECT_MSG_EQ(
+                PathOf(mode, SpineIdentification(7, 3)),
+                7,
+                "where the identification names a spine, the path is the request");
+        }
+        NS_TEST_EXPECT_MSG_EQ(PathOf(LoadBalancingMode::EntropyHash, 0x0703),
+                              0x0703,
+                              "an entropy value is its own path");
     }
 };
 
@@ -685,8 +696,12 @@ class LoadBalancingSwitchTest : public TestCase
 
     void DoRun() override
     {
-        RouteBySpine();
-        ReturnOverCarryingSpine();
+        for (LoadBalancingMode mode :
+             {LoadBalancingMode::SprayUniform, LoadBalancingMode::SprayPolicy})
+        {
+            RouteBySpine(mode);
+            ReturnOverCarryingSpine(mode);
+        }
         RouteByEntropy(LoadBalancingMode::Ecmp);
         RouteByEntropy(LoadBalancingMode::EntropyHash);
         ProbeAsData();
@@ -813,9 +828,9 @@ class LoadBalancingSwitchTest : public TestCase
         return m_egress.size() > sent ? m_egress.back() : Egress{UINT32_MAX, 0};
     }
 
-    void RouteBySpine()
+    void RouteBySpine(LoadBalancingMode mode)
     {
-        BuildLeaf(LoadBalancingMode::SprayUniform);
+        BuildLeaf(mode);
         for (uint32_t spine = 0; spine < kSpines; ++spine)
         {
             const Egress egress = Send(m_remoteHost, 10000, SpineIdentification(spine, spine));
@@ -902,9 +917,9 @@ class LoadBalancingSwitchTest : public TestCase
     // spine ports are indexed as every leaf's are, so the control packet a host
     // behind it sends in answer leaves on the port of the spine that carried
     // the data.
-    void ReturnOverCarryingSpine()
+    void ReturnOverCarryingSpine(LoadBalancingMode mode)
     {
-        BuildLeaf(LoadBalancingMode::SprayUniform);
+        BuildLeaf(mode);
         m_leaf->SetAttribute("AckHighPrio", UintegerValue(1));
         for (uint8_t protocol : kAnswers)
         {

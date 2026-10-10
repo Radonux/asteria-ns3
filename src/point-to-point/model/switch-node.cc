@@ -73,13 +73,13 @@ TypeId SwitchNode::GetTypeId (void)
 			MakeBooleanChecker())
 	.AddAttribute("LoadBalancing",
 			"How a data packet's uplink is chosen: 0=ECMP over the four-tuple, "
-			"1=ECMP over the four-tuple and the IPv4 identification, 2=the spine "
-			"named in the high byte of the IPv4 identification.",
+			"1=ECMP over the four-tuple and the IPv4 identification, 2 and 3=the "
+			"spine named in the high byte of the IPv4 identification.",
 			UintegerValue(static_cast<uint32_t>(LoadBalancingMode::Ecmp)),
 			MakeUintegerAccessor(&SwitchNode::m_loadBalancing),
 			MakeUintegerChecker<uint32_t>(
 				static_cast<uint32_t>(LoadBalancingMode::Ecmp),
-				static_cast<uint32_t>(LoadBalancingMode::SprayUniform)))
+				static_cast<uint32_t>(LoadBalancingMode::SprayPolicy)))
 	.AddAttribute("MaxRtt",
 			"Max Rtt of the network",
 			UintegerValue(9000),
@@ -132,7 +132,7 @@ int SwitchNode::GetOutDev(Ptr<const Packet> p, CustomHeader &ch){
 	// A destination behind another leaf is reached through spine uplinks alone.
 	// An answer goes up the spine that carried the data packet it answers, so
 	// that the answer to data that got through returns over a working spine.
-	if (mode == LoadBalancingMode::SprayUniform && namesPath &&
+	if (NamesSpine(mode) && namesPath &&
 			IsSpineUplink(nexthops[0])){
 		if (ch.l3Prot == 0x11)
 			return RouteToRequestedSpine(ch, nexthops);
@@ -552,9 +552,10 @@ void SwitchNode::ClearTable(){
 
 // This function can only be called in switch mode
 bool SwitchNode::SwitchReceiveFromDevice(Ptr<NetDevice> device, Ptr<Packet> packet, CustomHeader &ch){
-	// Control packets are lost with the data, as on a dead line card. Under
-	// spray_uniform an answer returns over the spine its data took (GetOutDev),
-	// so the answer to data that got through does not reach a black hole.
+	// Control packets are lost with the data, as on a dead line card. Where the
+	// identification names a spine, an answer returns over the spine its data
+	// took (GetOutDev), so the answer to data that got through does not reach a
+	// black hole.
 	if (!m_blackholed.empty()){
 		const uint32_t port = device->GetIfIndex();
 		if (port < m_blackholed.size() && m_blackholed[port]){

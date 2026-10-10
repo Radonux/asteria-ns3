@@ -18,7 +18,17 @@ enum class LoadBalancingMode : uint32_t {
 	// The identification names a spine per packet, drawn uniformly by the
 	// sender, and the source leaf sends the packet up that spine's uplink.
 	SprayUniform,
+	// As SprayUniform on the wire and at every switch, but the sender draws
+	// each spine from scores built out of the grades every acknowledgement
+	// from the receiver carries.
+	SprayPolicy,
 };
+
+// Whether a data packet's identification names the spine it is sent up.
+inline bool NamesSpine(LoadBalancingMode mode){
+	return mode == LoadBalancingMode::SprayUniform ||
+		mode == LoadBalancingMode::SprayPolicy;
+}
 
 // The IPv4 identification of a data packet that names its spine: the high
 // byte is the spine the sender requested and the low byte the spine that
@@ -39,13 +49,12 @@ inline uint8_t CarryingSpine(uint16_t identification){
 
 // The part of a data packet's identification that fixes the queues it passes
 // through, so that packets with equal values arrive in the order they were
-// sent. Under SprayUniform it is the requested spine: a source leaf moves
-// every request for a spine whose uplink is down onto the same live spine, so
-// packets with one request still share their queues. Under EntropyHash it is
-// the whole entropy value, which every switch hashes alike.
+// sent. Where the identification names a spine it is the requested spine: a
+// source leaf moves every request for a spine whose uplink is down onto the
+// same live spine, so packets with one request still share their queues. Under
+// EntropyHash it is the whole entropy value, which every switch hashes alike.
 inline uint16_t PathOf(LoadBalancingMode mode, uint16_t identification){
-	return mode == LoadBalancingMode::SprayUniform
-		? RequestedSpine(identification) : identification;
+	return NamesSpine(mode) ? RequestedSpine(identification) : identification;
 }
 
 } /* namespace ns3 */
