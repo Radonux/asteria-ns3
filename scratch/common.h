@@ -145,6 +145,8 @@ double spray_mark_cusum_slack = 0.125;
 double spray_mark_cusum_threshold = 0.5;
 double spray_mark_thresholds[3] = {0.25, 0.5, 0.75};
 uint32_t spray_hold_down_intervals = 4;
+double spray_absence_fraction_of_median = 0.125;
+uint32_t spray_absence_minimum_median = 16;
 uint32_t spray_one_way_delay = 0;
 double spray_delay_cusum_slack_base_rtts = 0.125;
 double spray_delay_cusum_threshold_base_rtts = 0.5;
@@ -163,7 +165,8 @@ const std::set<std::string> spray_policy_keys = {
     "SPRAY_ONE_WAY_DELAY", "SPRAY_DELAY_CUSUM_SLACK_BASE_RTTS",
     "SPRAY_DELAY_CUSUM_THRESHOLD_BASE_RTTS", "SPRAY_DELAY_THRESHOLDS_BASE_RTTS",
     "SPRAY_GAMMA", "SPRAY_EPSILON", "SPRAY_CANDIDATES", "SPRAY_CANDIDATE_DRAW",
-    "SPRAY_EDGE_WINDOW_PENALTY", "SPINE_REPORT_OUTPUT_FILE"};
+    "SPRAY_EDGE_WINDOW_PENALTY", "SPINE_REPORT_OUTPUT_FILE",
+    "SPRAY_ABSENCE_FRACTION_OF_MEDIAN", "SPRAY_ABSENCE_MINIMUM_MEDIAN"};
 const std::set<std::string> spray_one_way_delay_keys = {
     "SPRAY_DELAY_CUSUM_SLACK_BASE_RTTS",
     "SPRAY_DELAY_CUSUM_THRESHOLD_BASE_RTTS",
@@ -1074,6 +1077,13 @@ bool valid_spray_policy() {
               << cc_mode << " replaces\n";
     return false;
   }
+  if (!(spray_absence_fraction_of_median >= 0 &&
+        spray_absence_fraction_of_median < 1) ||
+      spray_absence_minimum_median == 0) {
+    std::cerr << "SPRAY_ABSENCE_FRACTION_OF_MEDIAN must be in [0, 1) and "
+                 "SPRAY_ABSENCE_MINIMUM_MEDIAN positive\n";
+    return false;
+  }
   if (!(spray_gamma > 0 && spray_gamma <= 1)) {
     std::cerr << "SPRAY_GAMMA must be in (0, 1]\n";
     return false;
@@ -1264,6 +1274,10 @@ bool ReadConf(string network_configuration) {
       conf >> spray_delay_thresholds_base_rtts[0] >>
           spray_delay_thresholds_base_rtts[1] >>
           spray_delay_thresholds_base_rtts[2];
+    } else if (key.compare("SPRAY_ABSENCE_FRACTION_OF_MEDIAN") == 0) {
+      conf >> spray_absence_fraction_of_median;
+    } else if (key.compare("SPRAY_ABSENCE_MINIMUM_MEDIAN") == 0) {
+      conf >> spray_absence_minimum_median;
     } else if (key.compare("SPRAY_GAMMA") == 0) {
       conf >> spray_gamma;
     } else if (key.compare("SPRAY_EPSILON") == 0) {
@@ -2081,6 +2095,10 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),
                            DoubleValue(spray_delay_thresholds_base_rtts[1]));
       rdmaHw->SetAttribute("SprayDelayThreshold3BaseRtts",
                            DoubleValue(spray_delay_thresholds_base_rtts[2]));
+      rdmaHw->SetAttribute("SprayAbsenceFractionOfMedian",
+                           DoubleValue(spray_absence_fraction_of_median));
+      rdmaHw->SetAttribute("SprayAbsenceMinimumMedian",
+                           UintegerValue(spray_absence_minimum_median));
       rdmaHw->SetAttribute("SprayGamma", DoubleValue(spray_gamma));
       rdmaHw->SetAttribute("SprayEpsilon", DoubleValue(spray_epsilon));
       rdmaHw->SetAttribute("SprayCandidates", UintegerValue(spray_candidates));

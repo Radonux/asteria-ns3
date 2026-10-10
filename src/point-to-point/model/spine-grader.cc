@@ -89,6 +89,10 @@ uint32_t SpineGrader::LastIntervalLastHopTrims() const{
 }
 
 void SpineGrader::Close(uint64_t nowNs){
+	std::array<double, SpineReport::kMaxSpines> arrivals{};
+	for (uint32_t k = 0; k < m_spines.size(); k++)
+		arrivals[k] = m_spines[k].counting.arrivals;
+	const double medianArrivals = Median(arrivals);
 	bool everySpineBelowTop = true;
 	for (uint32_t k = 0; k < m_spines.size(); k++){
 		Spine &spine = m_spines[k];
@@ -103,7 +107,12 @@ void SpineGrader::Close(uint64_t nowNs){
 						spine.leastDelayNs,
 					m_parameters.delayNs);
 		}
-		if (counted.trimmed > 0 || counted.moved > 0)
+		// A spine the report in force graded 0 is sent next to nothing, so
+		// its arrivals are no evidence of absence.
+		counted.absent = medianArrivals >= m_parameters.absenceMinimumMedian &&
+			m_report.Grade(k) > 0 &&
+			counted.arrivals < m_parameters.absenceFractionOfMedian * medianArrivals;
+		if (counted.trimmed > 0 || counted.moved > 0 || counted.absent)
 			spine.heldUntilNs = m_intervalEndNs +
 				m_parameters.holdDownIntervals * m_parameters.intervalNs;
 		const uint8_t earned = Earned(spine);
@@ -129,6 +138,16 @@ uint8_t SpineGrader::Earned(const Spine &spine) const{
 	if (byMarks < SpineReport::kTopGrade || !m_parameters.oneWayDelay)
 		return byMarks;
 	return Quantize(spine.delayNs.Value(), m_parameters.delayThresholdsNs);
+}
+
+double SpineGrader::Median(
+		std::array<double, SpineReport::kMaxSpines> values) const{
+	const uint32_t spines = m_spines.size();
+	const auto middle = values.begin() + spines / 2;
+	std::nth_element(values.begin(), middle, values.begin() + spines);
+	if (spines % 2 == 1)
+		return *middle;
+	return (*middle + *std::max_element(values.begin(), middle)) / 2;
 }
 
 } // namespace ns3

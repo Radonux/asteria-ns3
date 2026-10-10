@@ -3,6 +3,7 @@
 
 #include "spine-report.h"
 #include <stdint.h>
+#include <array>
 #include <vector>
 
 namespace ns3 {
@@ -45,7 +46,8 @@ private:
 // threshold grades the spine by marks alone, and otherwise the delay, where it
 // is measured, grades it. A trimmed or moved packet holds the spine at grade 0
 // for a fixed number of intervals from the end of the interval it was counted
-// in, whatever the averages say. The edge bit is set when the receiver's own
+// in, whatever the averages say, and so does an interval in which the spine's
+// arrivals fall below a fraction of the median spine's. The edge bit is set when the receiver's own
 // downlink trimmed a packet in the interval, or when no spine's averages earn
 // it the top grade.
 class SpineGrader {
@@ -63,6 +65,10 @@ public:
 		// The delays above a spine's least from which it grades 2, 1 and 0.
 		double delayThresholdsNs[3];
 		uint32_t holdDownIntervals;
+		// A spine is held down for arriving less than this fraction of the
+		// median spine's arrivals, once that median is at least the minimum.
+		double absenceFractionOfMedian;
+		uint32_t absenceMinimumMedian;
 	};
 	// What one spine showed over the last interval that ended, and what it
 	// was graded on that.
@@ -74,6 +80,7 @@ public:
 		uint64_t delaySumNs = 0;
 		double markFraction = 0;
 		double delayNs = 0;
+		bool absent = false;
 		bool held = false;
 	};
 
@@ -104,6 +111,8 @@ private:
 	void Close(uint64_t nowNs);
 	// The grade a spine's averages earn it.
 	uint8_t Earned(const Spine &spine) const;
+	// The median of the first spines values.
+	double Median(std::array<double, SpineReport::kMaxSpines> values) const;
 
 	Parameters m_parameters;
 	std::vector<Spine> m_spines;

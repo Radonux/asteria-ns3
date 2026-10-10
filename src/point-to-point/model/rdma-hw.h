@@ -100,6 +100,8 @@ public:
 	double m_sprayMarkCusumThreshold;
 	double m_sprayMarkThreshold1, m_sprayMarkThreshold2, m_sprayMarkThreshold3;
 	uint32_t m_sprayHoldDownIntervals;
+	double m_sprayAbsenceFractionOfMedian;
+	uint32_t m_sprayAbsenceMinimumMedian;
 	bool m_sprayOneWayDelay;
 	double m_sprayDelayCusumSlackBaseRtts;
 	double m_sprayDelayCusumThresholdBaseRtts;

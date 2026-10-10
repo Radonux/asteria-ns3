@@ -285,6 +285,21 @@ TypeId RdmaHw::GetTypeId (void)
 				UintegerValue(4),
 				MakeUintegerAccessor(&RdmaHw::m_sprayHoldDownIntervals),
 				MakeUintegerChecker<uint32_t>())
+		.AddAttribute("SprayAbsenceFractionOfMedian",
+				"Under LoadBalancing 3, a spine whose arrivals in an interval are "
+				"below this fraction of the median spine's is held down as a "
+				"trimmed one is, once the median is at least "
+				"SprayAbsenceMinimumMedian and the report in force grades the "
+				"spine above 0. Zero never holds one. Default 1/8.",
+				DoubleValue(0.125),
+				MakeDoubleAccessor(&RdmaHw::m_sprayAbsenceFractionOfMedian),
+				MakeDoubleChecker<double>(0, 1))
+		.AddAttribute("SprayAbsenceMinimumMedian",
+				"Under LoadBalancing 3, the median arrivals per spine in an "
+				"interval from which a spine's absence is judged. Default 16.",
+				UintegerValue(16),
+				MakeUintegerAccessor(&RdmaHw::m_sprayAbsenceMinimumMedian),
+				MakeUintegerChecker<uint32_t>(1))
 		.AddAttribute("SprayOneWayDelay",
 				"Under LoadBalancing 3, grade a spine with no marks by the one-way "
 				"delay of its packets, which needs IntHeader::mode TS: eight bytes "
@@ -915,6 +930,8 @@ SpineGrader &RdmaHw::Grader(){
 	parameters.delayThresholdsNs[1] = m_sprayDelayThreshold2BaseRtts * rtt;
 	parameters.delayThresholdsNs[2] = m_sprayDelayThreshold3BaseRtts * rtt;
 	parameters.holdDownIntervals = m_sprayHoldDownIntervals;
+	parameters.absenceFractionOfMedian = m_sprayAbsenceFractionOfMedian;
+	parameters.absenceMinimumMedian = m_sprayAbsenceMinimumMedian;
 	m_spineGrader = std::make_unique<SpineGrader>(parameters);
 	return *m_spineGrader;
 }
