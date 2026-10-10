@@ -553,9 +553,10 @@ void SwitchNode::ClearTable(){
 
 // This function can only be called in switch mode
 bool SwitchNode::SwitchReceiveFromDevice(Ptr<NetDevice> device, Ptr<Packet> packet, CustomHeader &ch){
-	// Control packets pass: they follow the four-tuple hash, which no sender can
-	// steer, so losing them would fail flows whatever path their data takes.
-	if (!m_blackholed.empty() && ch.l3Prot == 0x11){
+	// Control packets are lost with the data, as on a dead line card. Under
+	// spray_uniform an answer returns over the spine its data took (GetOutDev),
+	// so the answer to data that got through does not reach a black hole.
+	if (!m_blackholed.empty()){
 		const uint32_t port = device->GetIfIndex();
 		if (port < m_blackholed.size() && m_blackholed[port]){
 			m_traceDrop(packet, static_cast<uint32_t>(SwitchDropReason::Blackhole));

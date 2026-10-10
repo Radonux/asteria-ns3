@@ -1160,7 +1160,7 @@ class BlackholeTest : public TestCase
 {
   public:
     BlackholeTest()
-        : TestCase("A black-holed port drops the data arriving on it without notice")
+        : TestCase("A black-holed port drops the packets arriving on it without notice")
     {
     }
 
@@ -1208,11 +1208,16 @@ class BlackholeTest : public TestCase
         }
         NS_TEST_EXPECT_MSG_EQ(trims, 0, "a black hole sends nobody a trimmed packet");
         ArriveAtSwitch(spine, fromA, hostA, hostB, 0, 0xFC);
-        NS_TEST_EXPECT_MSG_EQ(sentToB, 2, "an acknowledgement from A still crosses the spine");
+        NS_TEST_EXPECT_MSG_EQ(sentToB, 1, "an acknowledgement from A is lost with the data");
+        NS_TEST_ASSERT_MSG_EQ(drops.size(), 3, "the acknowledgement is dropped");
+        NS_TEST_EXPECT_MSG_EQ(drops.back(),
+                              static_cast<uint32_t>(SwitchDropReason::Blackhole),
+                              "the acknowledgement's drop is the port's");
         NS_TEST_EXPECT_MSG_EQ(fromA->IsLinkUp(), true, "the link stays up");
 
         ArriveAtSwitch(spine, fromB, hostB, hostA, 0);
-        NS_TEST_EXPECT_MSG_EQ(sentToA, 2, "the spine still forwards toward A");
+        ArriveAtSwitch(spine, fromB, hostB, hostA, 0, 0xFC);
+        NS_TEST_EXPECT_MSG_EQ(sentToA, 3, "the spine still forwards toward A");
         Simulator::Destroy();
     }
 };
