@@ -684,6 +684,9 @@ class LoadBalancingSwitchTest : public TestCase
     Ipv4Address m_sender{"11.0.1.1"};
     Ipv4Address m_localHost{"11.0.1.2"};
     Ipv4Address m_remoteHost{"11.0.2.1"};
+    // Behind a leaf that spine 2 has lost its link to, so the routing reaches
+    // it through the other three spines only.
+    Ipv4Address m_cutOffHost{"11.0.3.1"};
 
     struct Egress
     {
@@ -711,6 +714,10 @@ class LoadBalancingSwitchTest : public TestCase
         for (uint32_t spine : {2, 0, 3, 1})
         {
             m_leaf->AddTableEntry(m_remoteHost, m_spinePorts[spine]);
+        }
+        for (uint32_t spine : {3, 0, 1})
+        {
+            m_leaf->AddTableEntry(m_cutOffHost, m_spinePorts[spine]);
         }
         m_leaf->AddTableEntry(m_localHost, m_hostPort);
         m_egress.clear();
@@ -785,6 +792,22 @@ class LoadBalancingSwitchTest : public TestCase
 
         const Egress local = Send(m_localHost, 10000, SpineIdentification(3, 3));
         NS_TEST_EXPECT_MSG_EQ(local.port, m_hostPort, "a local destination ignores the request");
+
+        const Egress unrouted = Send(m_cutOffHost, 10000, SpineIdentification(2, 2));
+        NS_TEST_EXPECT_MSG_NE(unrouted.port,
+                              m_spinePorts[2],
+                              "a request for a spine with no route onward is moved, its "
+                              "uplink up or not");
+        NS_TEST_EXPECT_MSG_EQ(RequestedSpine(unrouted.identification), 2, "the request survives");
+        NS_TEST_EXPECT_MSG_EQ(unrouted.port,
+                              m_spinePorts[CarryingSpine(unrouted.identification)],
+                              "the leaf records the spine that carries the packet");
+        for (uint32_t spine : {0, 1, 3})
+        {
+            NS_TEST_EXPECT_MSG_EQ(Send(m_cutOffHost, 10000, SpineIdentification(spine, spine)).port,
+                                  m_spinePorts[spine],
+                                  "requests for routed spines are honoured");
+        }
 
         // With spine 1 down the live spines are 0, 2 and 3; request 1 folds
         // onto the second of them.

@@ -75,8 +75,9 @@ protected:
 
 private:
 	int GetOutDev(Ptr<const Packet>, CustomHeader &ch);
-	uint32_t RouteToRequestedSpine(CustomHeader &ch) const;
-	uint8_t LiveSpineFor(uint8_t requested) const;
+	uint32_t RouteToRequestedSpine(CustomHeader &ch, const std::vector<int> &nexthops) const;
+	bool RoutesThrough(uint32_t spine, const std::vector<int> &nexthops) const;
+	uint8_t LiveSpineFor(uint8_t requested, const std::vector<int> &nexthops) const;
 	bool IsSpineUplink(uint32_t port) const;
 	bool SendToDev(Ptr<Packet>p, CustomHeader &ch);
 	bool TrimAndForward(Ptr<Packet> p, CustomHeader &ch, int outDev,

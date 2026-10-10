@@ -128,11 +128,11 @@ int SwitchNode::GetOutDev(Ptr<const Packet> p, CustomHeader &ch){
 	// entry found
 	auto &nexthops = entry->second;
 	const LoadBalancingMode mode = static_cast<LoadBalancingMode>(m_loadBalancing);
-	// Only the sender's data packets carry a spine; the next hops of a
-	// destination behind another leaf are exactly this leaf's live uplinks.
+	// Only the sender's data packets carry a spine, and a destination behind
+	// another leaf is reached through spine uplinks alone.
 	if (mode == LoadBalancingMode::SprayUniform && ch.l3Prot == 0x11 &&
 			IsSpineUplink(nexthops[0]))
-		return RouteToRequestedSpine(ch);
+		return RouteToRequestedSpine(ch, nexthops);
 
 	// pick one next hop based on hash
 	union {
@@ -163,20 +163,31 @@ int SwitchNode::GetOutDev(Ptr<const Packet> p, CustomHeader &ch){
 // identification which spine carries it. The record is the only edit, so a
 // packet that passes this leaf twice, as a trimmed packet does, keeps its
 // spine.
-uint32_t SwitchNode::RouteToRequestedSpine(CustomHeader &ch) const{
+uint32_t SwitchNode::RouteToRequestedSpine(CustomHeader &ch,
+		const std::vector<int> &nexthops) const{
 	const uint8_t requested = RequestedSpine(ch.ipid);
-	const uint8_t carrying = LiveSpineFor(requested);
+	const uint8_t carrying = LiveSpineFor(requested, nexthops);
 	ch.ipid = SpineIdentification(requested, carrying);
 	return m_spinePort[carrying];
 }
 
-// The requested spine while its uplink is up. Otherwise the request is folded
-// onto the live spines in index order, so the choice is a function of the
-// request alone and the requests for different dead spines spread over
-// different live ones.
-uint8_t SwitchNode::LiveSpineFor(uint8_t requested) const{
-	auto isLive = [this](uint32_t spine){
-		return m_devices[m_spinePort[spine]]->IsLinkUp();
+// A spine is live toward a destination while its uplink is up and the routing
+// still reaches the destination through it. The second fails alone when the
+// spine has lost its link to the destination's leaf, and taking that spine
+// anyway would send the packet down another leaf and back up the same spine.
+bool SwitchNode::RoutesThrough(uint32_t spine, const std::vector<int> &nexthops) const{
+	const int port = m_spinePort[spine];
+	return m_devices[port]->IsLinkUp() &&
+		std::find(nexthops.begin(), nexthops.end(), port) != nexthops.end();
+}
+
+// The requested spine while it is live toward the destination. Otherwise the
+// request is folded onto the live spines in index order, so the choice is a
+// function of the request alone and the requests for different dead spines
+// spread over different live ones.
+uint8_t SwitchNode::LiveSpineFor(uint8_t requested, const std::vector<int> &nexthops) const{
+	auto isLive = [this, &nexthops](uint32_t spine){
+		return RoutesThrough(spine, nexthops);
 	};
 	if (requested < m_spinePort.size() && isLive(requested))
 		return requested;
