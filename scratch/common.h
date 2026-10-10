@@ -450,6 +450,9 @@ void get_switch_drop(Ptr<SwitchNode> sw,
     // trimming switch and at every downstream TC_med queue.
     event = "switch_trimmed_queue_drop";
     break;
+  case SwitchDropReason::Blackhole:
+    event = "switch_blackhole_drop";
+    break;
   }
   accumulate_transport_event(event, (udp || trimmed) ? "data" : "control",
                              packet->GetSize());

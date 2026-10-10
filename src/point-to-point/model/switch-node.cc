@@ -495,6 +495,12 @@ void SwitchNode::SetSpinePorts(const std::vector<uint32_t> &ports){
 	m_spinePort = ports;
 }
 
+void SwitchNode::SetBlackhole(uint32_t port){
+	if (m_blackholed.size() <= port)
+		m_blackholed.resize(port + 1, false);
+	m_blackholed[port] = true;
+}
+
 void SwitchNode::AddTableEntry(Ipv4Address &dstAddr, uint32_t intf_idx){
 	uint32_t dip = dstAddr.Get();
 	m_rtTable[dip].push_back(intf_idx);
@@ -506,6 +512,15 @@ void SwitchNode::ClearTable(){
 
 // This function can only be called in switch mode
 bool SwitchNode::SwitchReceiveFromDevice(Ptr<NetDevice> device, Ptr<Packet> packet, CustomHeader &ch){
+	// Control packets pass: they follow the four-tuple hash, which no sender can
+	// steer, so losing them would fail flows whatever path their data takes.
+	if (!m_blackholed.empty() && ch.l3Prot == 0x11){
+		const uint32_t port = device->GetIfIndex();
+		if (port < m_blackholed.size() && m_blackholed[port]){
+			m_traceDrop(packet, static_cast<uint32_t>(SwitchDropReason::Blackhole));
+			return true;
+		}
+	}
 	SendToDev(packet, ch);
 	return true;
 }

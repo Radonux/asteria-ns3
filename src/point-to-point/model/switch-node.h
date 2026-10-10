@@ -20,6 +20,9 @@ enum class SwitchDropReason : uint32_t {
 	// for the queue associated with DSCP_TRIMMED"; on failure "the normal
 	// procedure for queue overflow should be followed", i.e. it is dropped.
 	TrimmedQueue = 4,
+	// A port that has stopped forwarding data while its link stays up drops
+	// the data that arrives on it and tells nobody.
+	Blackhole = 5,
 };
 
 enum class PacketTrimMode : uint32_t {
@@ -68,6 +71,7 @@ protected:
 	bool m_pfcEnabled;            // generate PFC on ingress pressure
 	uint32_t m_loadBalancing;     // LoadBalancingMode
 	std::vector<uint32_t> m_spinePort; // spine index -> device index of the uplink to it
+	std::vector<bool> m_blackholed; // device index -> drops the data arriving on it
 
 private:
 	int GetOutDev(Ptr<const Packet>, CustomHeader &ch);
@@ -98,6 +102,7 @@ public:
 	SwitchNode();
 	void SetEcmpSeed(uint32_t seed);
 	void SetSpinePorts(const std::vector<uint32_t> &ports);
+	void SetBlackhole(uint32_t port);
 	void AddTableEntry(Ipv4Address &dstAddr, uint32_t intf_idx);
 	void ClearTable();
 	bool SwitchReceiveFromDevice(Ptr<NetDevice> device, Ptr<Packet> packet, CustomHeader &ch);

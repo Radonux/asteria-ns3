@@ -1008,6 +1008,116 @@ class LinkErrorTest : public TestCase
     }
 };
 
+/**
+ * A spine with two leaf ports, one of which has stopped forwarding.
+ */
+class BlackholeTest : public TestCase
+{
+  public:
+    BlackholeTest()
+        : TestCase("A black-holed port drops the data arriving on it without notice")
+    {
+    }
+
+    void DoRun() override
+    {
+        Ptr<SwitchNode> spine = CreateObject<SwitchNode>();
+        spine->SetAttribute("PfcEnabled", BooleanValue(false));
+        spine->SetAttribute("PacketTrimMode",
+                            UintegerValue(static_cast<uint32_t>(PacketTrimMode::ForwardToDestination)));
+        Ptr<QbbNetDevice> fromA = Attach(spine);
+        Ptr<QbbNetDevice> fromB = Attach(spine);
+        Ipv4Address hostA("11.0.1.1");
+        Ipv4Address hostB("11.0.2.1");
+        spine->AddTableEntry(hostA, fromA->GetIfIndex());
+        spine->AddTableEntry(hostB, fromB->GetIfIndex());
+        std::vector<uint32_t> drops;
+        uint32_t trims = 0;
+        spine->m_traceDrop.ConnectWithoutContext(Callback<void, Ptr<const Packet>, uint32_t>(
+            [&drops](Ptr<const Packet>, uint32_t reason) { drops.push_back(reason); }));
+        spine->m_traceTrim.ConnectWithoutContext(Callback<void, Ptr<const Packet>, uint32_t>(
+            [&trims](Ptr<const Packet>, uint32_t) { ++trims; }));
+        uint32_t sentToB = 0;
+        uint32_t sentToA = 0;
+        fromB->m_traceEnqueue.ConnectWithoutContext(Callback<void, Ptr<const Packet>, uint32_t>(
+            [&sentToB](Ptr<const Packet>, uint32_t) { ++sentToB; }));
+        fromA->m_traceEnqueue.ConnectWithoutContext(Callback<void, Ptr<const Packet>, uint32_t>(
+            [&sentToA](Ptr<const Packet>, uint32_t) { ++sentToA; }));
+
+        Deliver(spine, fromA, hostA, hostB);
+        Deliver(spine, fromB, hostB, hostA);
+        NS_TEST_EXPECT_MSG_EQ(sentToB, 1, "a working spine forwards from A to B");
+        NS_TEST_EXPECT_MSG_EQ(sentToA, 1, "a working spine forwards from B to A");
+
+        spine->SetBlackhole(fromA->GetIfIndex());
+        Deliver(spine, fromA, hostA, hostB);
+        Deliver(spine, fromA, hostA, hostB);
+        NS_TEST_EXPECT_MSG_EQ(sentToB, 1, "no data arriving from A leaves the spine");
+        NS_TEST_ASSERT_MSG_EQ(drops.size(), 2, "every data packet is dropped");
+        for (uint32_t reason : drops)
+        {
+            NS_TEST_EXPECT_MSG_EQ(reason,
+                                  static_cast<uint32_t>(SwitchDropReason::Blackhole),
+                                  "the drop is the port's, not admission's");
+        }
+        NS_TEST_EXPECT_MSG_EQ(trims, 0, "a black hole sends nobody a trimmed packet");
+        Deliver(spine, fromA, hostA, hostB, 0xFC);
+        NS_TEST_EXPECT_MSG_EQ(sentToB, 2, "an acknowledgement from A still crosses the spine");
+        NS_TEST_EXPECT_MSG_EQ(fromA->IsLinkUp(), true, "the link stays up");
+
+        Deliver(spine, fromB, hostB, hostA);
+        NS_TEST_EXPECT_MSG_EQ(sentToA, 2, "the spine still forwards toward A");
+        Simulator::Destroy();
+    }
+
+  private:
+    static Ptr<QbbNetDevice> Attach(Ptr<SwitchNode> sw)
+    {
+        Ptr<QbbNetDevice> port = CreateObject<QbbNetDevice>();
+        port->SetQueue(CreateObject<BEgressQueue>());
+        sw->AddDevice(port);
+        Ptr<QbbNetDevice> peer = CreateObject<QbbNetDevice>();
+        CreateObject<SwitchNode>()->AddDevice(peer);
+        Ptr<QbbChannel> channel = CreateObject<QbbChannel>();
+        port->Attach(channel);
+        peer->Attach(channel);
+        return port;
+    }
+
+    static void Deliver(Ptr<SwitchNode> sw,
+                        Ptr<QbbNetDevice> port,
+                        Ipv4Address from,
+                        Ipv4Address to,
+                        uint8_t protocol = 0x11)
+    {
+        Ptr<Packet> packet = Create<Packet>(1000);
+        SeqTsHeader seqTs;
+        // Priority group 0 bypasses buffer admission, which is not under test.
+        seqTs.SetPG(0);
+        packet->AddHeader(seqTs);
+        UdpHeader udp;
+        udp.SetSourcePort(10000);
+        udp.SetDestinationPort(10001);
+        packet->AddHeader(udp);
+        Ipv4Header ip;
+        ip.SetSource(from);
+        ip.SetDestination(to);
+        ip.SetProtocol(protocol);
+        ip.SetDscp(static_cast<Ipv4Header::DscpType>(kUetDscpTrimmable));
+        ip.SetPayloadSize(packet->GetSize());
+        packet->AddHeader(ip);
+        PppHeader ppp;
+        ppp.SetProtocol(0x0021);
+        packet->AddHeader(ppp);
+        packet->AddPacketTag(FlowIdTag(port->GetIfIndex()));
+        CustomHeader parsed(CustomHeader::L2_Header | CustomHeader::L3_Header |
+                            CustomHeader::L4_Header);
+        parsed.getInt = 1;
+        packet->PeekHeader(parsed);
+        sw->SwitchReceiveFromDevice(port, packet, parsed);
+    }
+};
+
 class LoadBalancingSenderTest : public TestCase
 {
   public:
@@ -2252,6 +2362,7 @@ PointToPointTestSuite::PointToPointTestSuite()
     AddTestCase(new LoadBalancingSwitchTest, TestCase::Duration::QUICK);
     AddTestCase(new PortDownBufferTest, TestCase::Duration::QUICK);
     AddTestCase(new LinkErrorTest, TestCase::Duration::QUICK);
+    AddTestCase(new BlackholeTest, TestCase::Duration::QUICK);
     AddTestCase(new LoadBalancingSenderTest, TestCase::Duration::QUICK);
     AddTestCase(new AckPacketSeqHeaderTest, TestCase::Duration::QUICK);
     AddTestCase(new AckNamesPacketTest, TestCase::Duration::QUICK);
