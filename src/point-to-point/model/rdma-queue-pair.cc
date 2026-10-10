@@ -62,7 +62,9 @@ void OutstandingPackets::Add(uint64_t seq, uint32_t size, uint16_t path,
 	auto newestOnPath = m_newest_on_path.find(path);
 	const uint64_t olderOnPath = newestOnPath == m_newest_on_path.end()
 		? kNone : newestOnPath->second;
-	record = {sentNs, size, path, true, m_newest, kNone, olderOnPath, kNone};
+	const bool resendsLost = m_lost.erase(packet) > 0;
+	record = {sentNs, size, path, true, resendsLost, m_newest, kNone,
+		olderOnPath, kNone};
 	if (m_newest != kNone)
 		At(m_newest).newer = packet;
 	else
@@ -107,6 +109,10 @@ uint64_t OutstandingPackets::SentNs(uint64_t packet) const{
 	return At(packet).sent_ns;
 }
 
+bool OutstandingPackets::ResendsLost(uint64_t packet) const{
+	return At(packet).resends_lost;
+}
+
 void OutstandingPackets::Remove(uint64_t packet){
 	Record &record = At(packet);
 	if (record.older != kNone)
@@ -129,10 +135,16 @@ void OutstandingPackets::Remove(uint64_t packet){
 	m_bytes -= record.size;
 }
 
+void OutstandingPackets::RemoveLost(uint64_t packet){
+	Remove(packet);
+	m_lost.insert(packet);
+}
+
 void OutstandingPackets::RemoveBelow(uint64_t seq){
 	// Rounded up so that the flow's last packet, the only one shorter than the
 	// packet size, is removed once the acknowledgement covers it.
 	const uint64_t end = (seq + m_packet_size - 1) / m_packet_size;
+	m_lost.erase(m_lost.begin(), m_lost.lower_bound(end));
 	for (; m_first < end; m_first++){
 		if (!m_ring.empty() && At(m_first).outstanding)
 			Remove(m_first);
@@ -403,7 +415,7 @@ uint32_t RdmaQueuePair::DeclareLost(uint64_t packet){
 	const uint64_t seq = m_outstanding.Seq(packet);
 	const uint32_t size = m_outstanding.Size(packet);
 	AddRepairRange(seq, seq + size);
-	m_outstanding.Remove(packet);
+	m_outstanding.RemoveLost(packet);
 	m_recovery_events++;
 	return size;
 }

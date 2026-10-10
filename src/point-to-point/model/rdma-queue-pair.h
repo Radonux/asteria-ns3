@@ -9,6 +9,7 @@
 #include <ns3/custom-header.h>
 #include <ns3/int-header.h>
 #include <map>
+#include <set>
 #include <unordered_map>
 #include <vector>
 
@@ -40,7 +41,13 @@ public:
 	uint64_t Seq(uint64_t packet) const;
 	uint32_t Size(uint64_t packet) const;
 	uint64_t SentNs(uint64_t packet) const;
+	// Whether the send resends a packet whose previous send was declared
+	// lost. A send declared lost may still arrive, and the answer to it would
+	// name the resend's record.
+	bool ResendsLost(uint64_t packet) const;
 	void Remove(uint64_t packet);
+	// Remove the record of a send declared lost.
+	void RemoveLost(uint64_t packet);
 	// Remove the record of every packet that starts below seq.
 	void RemoveBelow(uint64_t seq);
 	uint64_t Bytes() const;
@@ -51,6 +58,7 @@ private:
 		uint32_t size;
 		uint16_t path;
 		bool outstanding;
+		bool resends_lost;
 		// Neighbouring outstanding sends as packet numbers, kNone at either
 		// end: across every path, then along this record's path.
 		uint64_t older, newer;
@@ -66,6 +74,9 @@ private:
 	uint64_t m_oldest, m_newest;
 	std::unordered_map<uint16_t, uint64_t> m_newest_on_path;
 	uint64_t m_bytes;
+	// The packets whose last send was declared lost and that have not been
+	// sent since.
+	std::set<uint64_t> m_lost;
 };
 
 class RdmaQueuePair : public Object {

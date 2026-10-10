@@ -43,6 +43,7 @@
 #include "ns3/udp-header.h"
 
 #include <algorithm>
+#include <map>
 #include <random>
 #include <set>
 #include <string>
@@ -1234,6 +1235,8 @@ class OutstandingPacketsModelTest : public TestCase
         // The model: outstanding packets in send order, each with its path.
         std::vector<std::pair<uint64_t, uint16_t>> sent;
         std::set<uint64_t> lost;
+        // Whether the latest send of each packet resent a lost send.
+        std::map<uint64_t, bool> resends;
         uint64_t next = 0;
         uint64_t first = 0;
         uint64_t clock = 0;
@@ -1253,9 +1256,10 @@ class OutstandingPacketsModelTest : public TestCase
             const uint32_t action = random() % 10;
             if (action < 5 || sent.empty())
             {
-                // A resend of a removed packet or new data, on a random path.
+                // A resend of a lost packet or new data, on a random path.
                 uint64_t packet = next;
-                if (!lost.empty() && action == 0)
+                const bool resend = !lost.empty() && action == 0;
+                if (resend)
                 {
                     packet = *lost.begin();
                     lost.erase(lost.begin());
@@ -1267,6 +1271,7 @@ class OutstandingPacketsModelTest : public TestCase
                 const uint16_t path = random() % kPaths;
                 records.Add(packet * kSize, kSize, path, clock++);
                 sent.emplace_back(packet, path);
+                resends[packet] = resend;
             }
             else if (action < 9)
             {
@@ -1275,11 +1280,15 @@ class OutstandingPacketsModelTest : public TestCase
                 // has to grow.
                 const size_t index = 1 + random() % sent.size();
                 const uint64_t packet = sent[index % sent.size()].first;
-                records.Remove(packet);
                 modelRemove(packet);
                 if (random() % 2)
                 {
+                    records.RemoveLost(packet);
                     lost.insert(packet);
+                }
+                else
+                {
+                    records.Remove(packet);
                 }
             }
             else
@@ -1318,6 +1327,9 @@ class OutstandingPacketsModelTest : public TestCase
             NS_TEST_ASSERT_MSG_EQ(records.Find(packet * kSize, (path + 1) % kPaths),
                                   OutstandingPackets::kNone,
                                   "a send is not found along another path");
+            NS_TEST_ASSERT_MSG_EQ(records.ResendsLost(packet),
+                                  resends[packet],
+                                  "a send is known to resend a lost send");
             uint64_t olderOnPath = OutstandingPackets::kNone;
             for (size_t i = 0; i < probe; ++i)
             {
