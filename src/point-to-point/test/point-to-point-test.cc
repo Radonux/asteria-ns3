@@ -887,6 +887,59 @@ class LoadBalancingSwitchTest : public TestCase
 };
 
 /**
+ * A packet arriving at a switch on a port: data of priority group pg, or a
+ * control packet of the given protocol, carried in the same headers.
+ */
+void ArriveAtSwitch(Ptr<SwitchNode> sw,
+                    Ptr<NetDevice> port,
+                    Ipv4Address from,
+                    Ipv4Address to,
+                    uint16_t pg,
+                    uint8_t protocol = 0x11)
+{
+    Ptr<Packet> packet = Create<Packet>(1000);
+    SeqTsHeader seqTs;
+    seqTs.SetPG(pg);
+    packet->AddHeader(seqTs);
+    UdpHeader udp;
+    udp.SetSourcePort(10000);
+    udp.SetDestinationPort(10001);
+    packet->AddHeader(udp);
+    Ipv4Header ip;
+    ip.SetSource(from);
+    ip.SetDestination(to);
+    ip.SetProtocol(protocol);
+    ip.SetDscp(static_cast<Ipv4Header::DscpType>(kUetDscpTrimmable));
+    ip.SetPayloadSize(packet->GetSize());
+    packet->AddHeader(ip);
+    PppHeader ppp;
+    ppp.SetProtocol(0x0021);
+    packet->AddHeader(ppp);
+    packet->AddPacketTag(FlowIdTag(port->GetIfIndex()));
+    CustomHeader parsed(CustomHeader::L2_Header | CustomHeader::L3_Header |
+                        CustomHeader::L4_Header);
+    parsed.getInt = 1;
+    packet->PeekHeader(parsed);
+    sw->SwitchReceiveFromDevice(port, packet, parsed);
+}
+
+/**
+ * A port of sw linked to a device of peerNode; returns the switch's device.
+ */
+Ptr<QbbNetDevice> AttachSwitchPort(Ptr<SwitchNode> sw, Ptr<Node> peerNode)
+{
+    Ptr<QbbNetDevice> port = CreateObject<QbbNetDevice>();
+    port->SetQueue(CreateObject<BEgressQueue>());
+    sw->AddDevice(port);
+    Ptr<QbbNetDevice> peer = CreateObject<QbbNetDevice>();
+    peerNode->AddDevice(peer);
+    Ptr<QbbChannel> channel = CreateObject<QbbChannel>();
+    port->Attach(channel);
+    peer->Attach(channel);
+    return port;
+}
+
+/**
  * A switch with a host port and an uplink that queues data, its buffer
  * configured as common.h configures a best-effort switch.
  */
@@ -904,8 +957,9 @@ class PortDownBufferTest : public TestCase
         constexpr uint32_t kPackets = 5;
         Ptr<SwitchNode> sw = CreateObject<SwitchNode>();
         sw->SetAttribute("PfcEnabled", BooleanValue(false));
-        const uint32_t hostPort = Attach(sw, CreateObject<Node>());
-        const uint32_t uplink = Attach(sw, CreateObject<SwitchNode>());
+        Ptr<QbbNetDevice> hostDevice = AttachSwitchPort(sw, CreateObject<Node>());
+        const uint32_t hostPort = hostDevice->GetIfIndex();
+        const uint32_t uplink = AttachSwitchPort(sw, CreateObject<SwitchNode>())->GetIfIndex();
         for (uint32_t port : {hostPort, uplink})
         {
             sw->m_mmu->ConfigHdrm(port, 0);
@@ -917,33 +971,14 @@ class PortDownBufferTest : public TestCase
         sw->AddTableEntry(remote, uplink);
 
         uint32_t packetBytes = 0;
+        DynamicCast<QbbNetDevice>(sw->GetDevice(uplink))
+            ->m_traceEnqueue.ConnectWithoutContext(Callback<void, Ptr<const Packet>, uint32_t>(
+                [&packetBytes](Ptr<const Packet> packet, uint32_t) {
+                    packetBytes = packet->GetSize();
+                }));
         for (uint32_t i = 0; i < kPackets; ++i)
         {
-            Ptr<Packet> packet = Create<Packet>(1000);
-            SeqTsHeader seqTs;
-            seqTs.SetSeq(i * 1000);
-            seqTs.SetPG(kPriorityGroup);
-            packet->AddHeader(seqTs);
-            UdpHeader udp;
-            udp.SetSourcePort(10000);
-            udp.SetDestinationPort(10001);
-            packet->AddHeader(udp);
-            Ipv4Header ip;
-            ip.SetSource(Ipv4Address("11.0.1.1"));
-            ip.SetDestination(remote);
-            ip.SetProtocol(0x11);
-            ip.SetPayloadSize(packet->GetSize());
-            packet->AddHeader(ip);
-            PppHeader ppp;
-            ppp.SetProtocol(0x0021);
-            packet->AddHeader(ppp);
-            packet->AddPacketTag(FlowIdTag(hostPort));
-            packetBytes = packet->GetSize();
-            CustomHeader parsed(CustomHeader::L2_Header | CustomHeader::L3_Header |
-                                CustomHeader::L4_Header);
-            parsed.getInt = 1;
-            packet->PeekHeader(parsed);
-            sw->SwitchReceiveFromDevice(nullptr, packet, parsed);
+            ArriveAtSwitch(sw, hostDevice, Ipv4Address("11.0.1.1"), remote, kPriorityGroup);
         }
         // The first packet went onto the wire and released its buffer then.
         const uint32_t queued = (kPackets - 1) * packetBytes;
@@ -962,20 +997,6 @@ class PortDownBufferTest : public TestCase
                               0,
                               "the ports that fed it are charged nothing for discarded packets");
         Simulator::Destroy();
-    }
-
-  private:
-    static uint32_t Attach(Ptr<SwitchNode> sw, Ptr<Node> peerNode)
-    {
-        Ptr<QbbNetDevice> port = CreateObject<QbbNetDevice>();
-        port->SetQueue(CreateObject<BEgressQueue>());
-        sw->AddDevice(port);
-        Ptr<QbbNetDevice> peer = CreateObject<QbbNetDevice>();
-        peerNode->AddDevice(peer);
-        Ptr<QbbChannel> channel = CreateObject<QbbChannel>();
-        port->Attach(channel);
-        peer->Attach(channel);
-        return port->GetIfIndex();
     }
 };
 
@@ -1077,8 +1098,8 @@ class BlackholeTest : public TestCase
         spine->SetAttribute("PfcEnabled", BooleanValue(false));
         spine->SetAttribute("PacketTrimMode",
                             UintegerValue(static_cast<uint32_t>(PacketTrimMode::ForwardToDestination)));
-        Ptr<QbbNetDevice> fromA = Attach(spine);
-        Ptr<QbbNetDevice> fromB = Attach(spine);
+        Ptr<QbbNetDevice> fromA = AttachSwitchPort(spine, CreateObject<SwitchNode>());
+        Ptr<QbbNetDevice> fromB = AttachSwitchPort(spine, CreateObject<SwitchNode>());
         Ipv4Address hostA("11.0.1.1");
         Ipv4Address hostB("11.0.2.1");
         spine->AddTableEntry(hostA, fromA->GetIfIndex());
@@ -1096,14 +1117,15 @@ class BlackholeTest : public TestCase
         fromA->m_traceEnqueue.ConnectWithoutContext(Callback<void, Ptr<const Packet>, uint32_t>(
             [&sentToA](Ptr<const Packet>, uint32_t) { ++sentToA; }));
 
-        Deliver(spine, fromA, hostA, hostB);
-        Deliver(spine, fromB, hostB, hostA);
+        // Priority group 0 bypasses buffer admission, which is not under test.
+        ArriveAtSwitch(spine, fromA, hostA, hostB, 0);
+        ArriveAtSwitch(spine, fromB, hostB, hostA, 0);
         NS_TEST_EXPECT_MSG_EQ(sentToB, 1, "a working spine forwards from A to B");
         NS_TEST_EXPECT_MSG_EQ(sentToA, 1, "a working spine forwards from B to A");
 
         spine->SetBlackhole(fromA->GetIfIndex());
-        Deliver(spine, fromA, hostA, hostB);
-        Deliver(spine, fromA, hostA, hostB);
+        ArriveAtSwitch(spine, fromA, hostA, hostB, 0);
+        ArriveAtSwitch(spine, fromA, hostA, hostB, 0);
         NS_TEST_EXPECT_MSG_EQ(sentToB, 1, "no data arriving from A leaves the spine");
         NS_TEST_ASSERT_MSG_EQ(drops.size(), 2, "every data packet is dropped");
         for (uint32_t reason : drops)
@@ -1113,60 +1135,13 @@ class BlackholeTest : public TestCase
                                   "the drop is the port's, not admission's");
         }
         NS_TEST_EXPECT_MSG_EQ(trims, 0, "a black hole sends nobody a trimmed packet");
-        Deliver(spine, fromA, hostA, hostB, 0xFC);
+        ArriveAtSwitch(spine, fromA, hostA, hostB, 0, 0xFC);
         NS_TEST_EXPECT_MSG_EQ(sentToB, 2, "an acknowledgement from A still crosses the spine");
         NS_TEST_EXPECT_MSG_EQ(fromA->IsLinkUp(), true, "the link stays up");
 
-        Deliver(spine, fromB, hostB, hostA);
+        ArriveAtSwitch(spine, fromB, hostB, hostA, 0);
         NS_TEST_EXPECT_MSG_EQ(sentToA, 2, "the spine still forwards toward A");
         Simulator::Destroy();
-    }
-
-  private:
-    static Ptr<QbbNetDevice> Attach(Ptr<SwitchNode> sw)
-    {
-        Ptr<QbbNetDevice> port = CreateObject<QbbNetDevice>();
-        port->SetQueue(CreateObject<BEgressQueue>());
-        sw->AddDevice(port);
-        Ptr<QbbNetDevice> peer = CreateObject<QbbNetDevice>();
-        CreateObject<SwitchNode>()->AddDevice(peer);
-        Ptr<QbbChannel> channel = CreateObject<QbbChannel>();
-        port->Attach(channel);
-        peer->Attach(channel);
-        return port;
-    }
-
-    static void Deliver(Ptr<SwitchNode> sw,
-                        Ptr<QbbNetDevice> port,
-                        Ipv4Address from,
-                        Ipv4Address to,
-                        uint8_t protocol = 0x11)
-    {
-        Ptr<Packet> packet = Create<Packet>(1000);
-        SeqTsHeader seqTs;
-        // Priority group 0 bypasses buffer admission, which is not under test.
-        seqTs.SetPG(0);
-        packet->AddHeader(seqTs);
-        UdpHeader udp;
-        udp.SetSourcePort(10000);
-        udp.SetDestinationPort(10001);
-        packet->AddHeader(udp);
-        Ipv4Header ip;
-        ip.SetSource(from);
-        ip.SetDestination(to);
-        ip.SetProtocol(protocol);
-        ip.SetDscp(static_cast<Ipv4Header::DscpType>(kUetDscpTrimmable));
-        ip.SetPayloadSize(packet->GetSize());
-        packet->AddHeader(ip);
-        PppHeader ppp;
-        ppp.SetProtocol(0x0021);
-        packet->AddHeader(ppp);
-        packet->AddPacketTag(FlowIdTag(port->GetIfIndex()));
-        CustomHeader parsed(CustomHeader::L2_Header | CustomHeader::L3_Header |
-                            CustomHeader::L4_Header);
-        parsed.getInt = 1;
-        packet->PeekHeader(parsed);
-        sw->SwitchReceiveFromDevice(port, packet, parsed);
     }
 };
 
@@ -1196,6 +1171,7 @@ class LinkRateChangeTest : public TestCase
         Ptr<QbbChannel> channel = CreateObject<QbbChannel>();
         port->Attach(channel);
         host->Attach(channel);
+        Ipv4Address sender("11.0.1.1");
         Ipv4Address receiver("11.0.2.1");
         sw->AddTableEntry(receiver, port->GetIfIndex());
         std::vector<int64_t> arrivals;
@@ -1208,12 +1184,13 @@ class LinkRateChangeTest : public TestCase
         uint32_t wireBytes = 0;
         port->m_traceDequeue.ConnectWithoutContext(Callback<void, Ptr<const Packet>, uint32_t>(
             [&wireBytes](Ptr<const Packet> packet, uint32_t) { wireBytes = packet->GetSize(); }));
-        Simulator::Schedule(NanoSeconds(0), [&]() { Forward(sw, receiver); });
+        // Priority group 0 bypasses buffer admission, which is not under test.
+        Simulator::Schedule(NanoSeconds(0), [&]() { ArriveAtSwitch(sw, port, sender, receiver, 0); });
         Simulator::Schedule(NanoSeconds(1000), [&]() {
             port->SetDataRate(DataRate("200Gbps"));
             host->SetDataRate(DataRate("200Gbps"));
         });
-        Simulator::Schedule(NanoSeconds(2000), [&]() { Forward(sw, receiver); });
+        Simulator::Schedule(NanoSeconds(2000), [&]() { ArriveAtSwitch(sw, port, sender, receiver, 0); });
         Simulator::Run();
         NS_TEST_ASSERT_MSG_EQ(arrivals.size(), 2, "both packets arrive");
         NS_TEST_EXPECT_MSG_EQ(
@@ -1225,35 +1202,6 @@ class LinkRateChangeTest : public TestCase
             DataRate("200Gbps").CalculateBytesTxTime(wireBytes).GetNanoSeconds(),
             "the second is serialized at 200 Gb/s");
         Simulator::Destroy();
-    }
-
-  private:
-    static void Forward(Ptr<SwitchNode> sw, Ipv4Address to)
-    {
-        Ptr<Packet> packet = Create<Packet>(1000);
-        SeqTsHeader seqTs;
-        // Priority group 0 bypasses buffer admission, which is not under test.
-        seqTs.SetPG(0);
-        packet->AddHeader(seqTs);
-        UdpHeader udp;
-        udp.SetSourcePort(10000);
-        udp.SetDestinationPort(10001);
-        packet->AddHeader(udp);
-        Ipv4Header ip;
-        ip.SetSource(Ipv4Address("11.0.1.1"));
-        ip.SetDestination(to);
-        ip.SetProtocol(0x11);
-        ip.SetPayloadSize(packet->GetSize());
-        packet->AddHeader(ip);
-        PppHeader ppp;
-        ppp.SetProtocol(0x0021);
-        packet->AddHeader(ppp);
-        packet->AddPacketTag(FlowIdTag(0));
-        CustomHeader parsed(CustomHeader::L2_Header | CustomHeader::L3_Header |
-                            CustomHeader::L4_Header);
-        parsed.getInt = 1;
-        packet->PeekHeader(parsed);
-        sw->SwitchReceiveFromDevice(nullptr, packet, parsed);
     }
 };
 
