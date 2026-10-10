@@ -35,7 +35,10 @@ public:
     // the grant: from it the sender withholds congestion signals. The sender
     // cannot know either fact, because eligibility and the step's phase are
     // the receiver's, so the grant is the receiver's to give.
-    FLAG_FORGIVENESS_ELIGIBLE = 3
+    FLAG_FORGIVENESS_ELIGIBLE = 3,
+    // The acknowledgement answers a path probe, not a data packet: it returns
+    // the probe's identification and mark and acknowledges no send.
+    FLAG_PROBE_ANSWER = 4
   };
   qbbHeader (uint16_t pg);
   qbbHeader ();
@@ -55,6 +58,7 @@ public:
   void SetTrimLastHop(bool lastHop);
   void SetAllowanceExhausted(bool spent);
   void SetForgivenessEligible(bool eligible);
+  void SetProbeAnswer();
   // The sequence of the data packet this acknowledgement answers, serialized
   // only while CustomHeader::ackCarriesPacketSeq is set.
   void SetPacketSeq(uint32_t seq);

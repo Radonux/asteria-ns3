@@ -689,6 +689,7 @@ class LoadBalancingSwitchTest : public TestCase
         ReturnOverCarryingSpine();
         RouteByEntropy(LoadBalancingMode::Ecmp);
         RouteByEntropy(LoadBalancingMode::EntropyHash);
+        ProbeAsData();
         Simulator::Destroy();
     }
 
@@ -708,6 +709,7 @@ class LoadBalancingSwitchTest : public TestCase
     {
         uint32_t port;
         uint16_t identification;
+        uint32_t queue;
     };
 
     Ptr<SwitchNode> m_leaf;
@@ -752,27 +754,29 @@ class LoadBalancingSwitchTest : public TestCase
         const uint32_t index = port->GetIfIndex();
         port->m_traceEnqueue.ConnectWithoutContext(
             Callback<void, Ptr<const Packet>, uint32_t>(
-                [this, index](Ptr<const Packet> packet, uint32_t) {
+                [this, index](Ptr<const Packet> packet, uint32_t queue) {
                     CustomHeader parsed(CustomHeader::L2_Header | CustomHeader::L3_Header);
                     packet->PeekHeader(parsed);
-                    m_egress.push_back({index, parsed.ipid});
+                    m_egress.push_back({index, parsed.ipid, queue});
                 }));
         return index;
     }
 
-    // A data packet, or under a control protocol the control packet a host
-    // behind this leaf sends to answer one, with its ports the other way round.
+    // A data packet, a path probe, which travels as its flow's data does, or
+    // under another protocol the control packet a host behind this leaf sends
+    // to answer one, with its ports the other way round. Priority group 0
+    // bypasses buffer admission, which is not under test.
     Egress Send(Ipv4Address destination,
                 uint16_t sourcePort,
                 uint16_t identification,
-                uint8_t protocol = 0x11)
+                uint8_t protocol = 0x11,
+                uint16_t pg = 0)
     {
         Ptr<Packet> packet = Create<Packet>(protocol == 0x11 ? 1000 : 0);
         if (protocol == 0x11)
         {
             SeqTsHeader seqTs;
-            // Priority group 0 bypasses buffer admission, which is not under test.
-            seqTs.SetPG(0);
+            seqTs.SetPG(pg);
             packet->AddHeader(seqTs);
             UdpHeader udp;
             udp.SetSourcePort(sourcePort);
@@ -781,10 +785,11 @@ class LoadBalancingSwitchTest : public TestCase
         }
         else
         {
+            const bool forward = protocol == kPathProbeProtocol;
             qbbHeader control;
-            control.SetPG(0);
-            control.SetSport(10001);
-            control.SetDport(sourcePort);
+            control.SetPG(pg);
+            control.SetSport(forward ? sourcePort : 10001);
+            control.SetDport(forward ? 10001 : sourcePort);
             packet->AddHeader(control);
         }
         Ipv4Header ip;
@@ -938,6 +943,25 @@ class LoadBalancingSwitchTest : public TestCase
         NS_TEST_EXPECT_MSG_EQ(Send(m_remoteHost, 10000, SpineIdentification(3, 3), 0xFC).port,
                               moved.port,
                               "a moved answer keeps one spine while the live ones stay");
+    }
+
+    // A probe of an entropy value takes the path data with that value takes,
+    // and waits in the queue of its priority group.
+    void ProbeAsData()
+    {
+        BuildLeaf(LoadBalancingMode::EntropyHash);
+        for (uint32_t identification = 0; identification <= UINT8_MAX; ++identification)
+        {
+            NS_TEST_EXPECT_MSG_EQ(
+                Send(m_remoteHost, 10000, identification, kPathProbeProtocol).port,
+                Send(m_remoteHost, 10000, identification).port,
+                "a probe takes its data's path");
+        }
+        m_leaf->m_mmu->ConfigNPort(m_leaf->GetNDevices() - 1);
+        m_leaf->m_mmu->ConfigBufferSize(32 * 1024 * 1024);
+        NS_TEST_EXPECT_MSG_EQ(Send(m_remoteHost, 10000, 5, kPathProbeProtocol, 3).queue,
+                              3,
+                              "a probe waits with its priority group's data");
     }
 
     void RouteByEntropy(LoadBalancingMode mode)
@@ -1699,19 +1723,38 @@ class IsolatedHost
         hw->Receive(packet, parsed);
     }
 
+    // A probe of the path identification names, from the sender's queue pair.
+    void ReceiveProbe(Ipv4Address from, Ipv4Address to, uint16_t identification, bool marked)
+    {
+        CustomHeader probe;
+        probe.l3Prot = kPathProbeProtocol;
+        probe.m_tos = marked ? Ipv4Header::ECN_CE : Ipv4Header::ECN_NotECT;
+        probe.sip = from.Get();
+        probe.dip = to.Get();
+        probe.ipid = identification;
+        probe.ack.flags = 0;
+        probe.ack.sport = kSenderPort;
+        probe.ack.dport = kReceiverPort;
+        probe.ack.pg = kPriorityGroup;
+        hw->Receive(Create<Packet>(), probe);
+    }
+
     // The acknowledgement of the send of seq along the path that
-    // identification names, with the receiver's cumulative sequence.
+    // identification names, with the receiver's cumulative sequence; or with
+    // probeAnswer the answer to a probe of that path.
     void ReceiveAck(Ipv4Address from,
                     uint32_t cumulative,
                     uint32_t seq,
                     uint16_t identification,
-                    bool marked = false)
+                    bool marked = false,
+                    bool probeAnswer = false)
     {
         CustomHeader ack;
         ack.l3Prot = 0xFC;
         ack.sip = from.Get();
         ack.ipid = identification;
-        ack.ack.flags = marked ? 1 << qbbHeader::FLAG_CNP : 0;
+        ack.ack.flags = (marked ? 1 << qbbHeader::FLAG_CNP : 0) |
+                        (probeAnswer ? 1 << qbbHeader::FLAG_PROBE_ANSWER : 0);
         ack.ack.sport = kReceiverPort;
         ack.ack.dport = kSenderPort;
         ack.ack.pg = kPriorityGroup;
@@ -1809,9 +1852,26 @@ class AckNamesPacketTest : public TestCase
 class ScriptedSelector : public PathSelector
 {
   public:
-    explicit ScriptedSelector(std::vector<uint16_t> paths)
-        : m_paths(std::move(paths))
+    explicit ScriptedSelector(std::vector<uint16_t> paths, std::vector<uint16_t> probes = {})
+        : m_paths(std::move(paths)),
+          m_probes(std::move(probes))
     {
+    }
+
+    // The probes it was given, one per send, then none.
+    bool TakeProbe(uint64_t, uint16_t& path) override
+    {
+        if (m_probed == m_probes.size())
+        {
+            return false;
+        }
+        path = m_probes[m_probed++];
+        return true;
+    }
+
+    void OnProbeAnswer(uint16_t path, bool marked, uint64_t) override
+    {
+        told.push_back("probe answer " + std::to_string(path) + (marked ? " marked" : ""));
     }
 
     uint16_t Choose(uint64_t) override
@@ -1845,6 +1905,8 @@ class ScriptedSelector : public PathSelector
   private:
     std::vector<uint16_t> m_paths;
     uint32_t m_chosen = 0;
+    std::vector<uint16_t> m_probes;
+    uint32_t m_probed = 0;
 };
 
 class PathSelectorHooksTest : public TestCase
@@ -1896,6 +1958,78 @@ class PathSelectorHooksTest : public TestCase
         {
             NS_TEST_EXPECT_MSG_EQ(told->told[i], expected[i], "the selector hears it in order");
         }
+        CustomHeader::ackCarriesPacketSeq = savedPacketSeq;
+        Simulator::Destroy();
+    }
+};
+
+class PathProbeTest : public TestCase
+{
+  public:
+    PathProbeTest()
+        : TestCase("A probe due at a send leaves with it and its answer acknowledges no send")
+    {
+    }
+
+    void DoRun() override
+    {
+        constexpr uint32_t kMtu = IsolatedHost::kMtu;
+        const bool savedPacketSeq = CustomHeader::ackCarriesPacketSeq;
+        CustomHeader::ackCarriesPacketSeq = true;
+
+        IsolatedHost sender(LoadBalancingMode::EntropyHash, kTestReceiver);
+        Ptr<RdmaQueuePair> qp = sender.AddSender(kTestSender, kTestReceiver, 10 * kMtu);
+        auto selector =
+            std::make_unique<ScriptedSelector>(std::vector<uint16_t>{7}, std::vector<uint16_t>{21});
+        ScriptedSelector* told = selector.get();
+        qp->m_pathSelector = std::move(selector);
+        sender.hw->GetNxtPacket(qp);
+        sender.hw->GetNxtPacket(qp);
+        NS_TEST_ASSERT_MSG_EQ(sender.emitted.size(), 1, "the one probe due leaves, once");
+        const CustomHeader& probe = sender.emitted[0];
+        NS_TEST_EXPECT_MSG_EQ(probe.l3Prot, kPathProbeProtocol, "it is a probe");
+        NS_TEST_EXPECT_MSG_EQ(probe.ipid, 21, "it takes the probed path");
+        NS_TEST_EXPECT_MSG_EQ(probe.ack.sport, IsolatedHost::kSenderPort, "it names the flow");
+        NS_TEST_EXPECT_MSG_EQ(probe.ack.dport, IsolatedHost::kReceiverPort, "it names the flow");
+        NS_TEST_EXPECT_MSG_EQ(probe.ack.pg,
+                              IsolatedHost::kPriorityGroup,
+                              "it rides the flow's priority group");
+        NS_TEST_EXPECT_MSG_EQ(IsUetTrimmableDscp(probe.GetIpv4Dscp()),
+                              false,
+                              "it is not trimmable");
+
+        IsolatedHost receiver(LoadBalancingMode::EntropyHash, kTestSender);
+        receiver.ReceiveProbe(kTestSender, kTestReceiver, 21, false);
+        NS_TEST_EXPECT_MSG_EQ(receiver.emitted.size(), 0, "a probe for no flow goes unanswered");
+        receiver.ReceiveData(kTestSender, kTestReceiver, 0, 7);
+        receiver.ReceiveProbe(kTestSender, kTestReceiver, 21, true);
+        NS_TEST_ASSERT_MSG_EQ(receiver.emitted.size(), 2, "a probe for a flow is answered");
+        const CustomHeader& answer = receiver.emitted[1];
+        const auto answersProbe = [](const CustomHeader& ack) {
+            return static_cast<bool>((ack.ack.flags >> qbbHeader::FLAG_PROBE_ANSWER) & 1);
+        };
+        const bool marked = (answer.ack.flags >> qbbHeader::FLAG_CNP) & 1;
+        NS_TEST_EXPECT_MSG_EQ(answer.l3Prot, 0xFC, "the answer is an acknowledgement");
+        NS_TEST_EXPECT_MSG_EQ(answersProbe(answer), true, "that says it answers a probe");
+        NS_TEST_EXPECT_MSG_EQ(marked, true, "with the probe's mark");
+        NS_TEST_EXPECT_MSG_EQ(answer.ipid, 21, "and the probe's path");
+        NS_TEST_EXPECT_MSG_EQ(answer.ack.seq, kMtu, "and the cumulative acknowledgement");
+        NS_TEST_EXPECT_MSG_EQ(answersProbe(receiver.emitted[0]),
+                              false,
+                              "a data packet's acknowledgement answers no probe");
+        Ptr<RdmaRxQueuePair> flow = receiver.hw->m_rxQpMap.begin()->second;
+        NS_TEST_EXPECT_MSG_EQ(flow->ReceiverNextExpectedSeq,
+                              kMtu,
+                              "a probe moves no receive state");
+        NS_TEST_EXPECT_MSG_EQ(flow->m_data_arrivals, 1, "a probe is no data arrival");
+
+        const uint64_t outstanding = qp->m_outstanding.Bytes();
+        sender.ReceiveAck(kTestReceiver, 0, 0, 21, true, true);
+        NS_TEST_EXPECT_MSG_EQ(qp->m_outstanding.Bytes(),
+                              outstanding,
+                              "the answer acknowledges no send");
+        NS_TEST_ASSERT_MSG_EQ(told->told.size(), 1, "the selector hears the answer alone");
+        NS_TEST_EXPECT_MSG_EQ(told->told[0], "probe answer 21 marked", "as a probe's answer");
         CustomHeader::ackCarriesPacketSeq = savedPacketSeq;
         Simulator::Destroy();
     }
@@ -3120,6 +3254,7 @@ PointToPointTestSuite::PointToPointTestSuite()
     AddTestCase(new AckPacketSeqHeaderTest, TestCase::Duration::QUICK);
     AddTestCase(new AckNamesPacketTest, TestCase::Duration::QUICK);
     AddTestCase(new PathSelectorHooksTest, TestCase::Duration::QUICK);
+    AddTestCase(new PathProbeTest, TestCase::Duration::QUICK);
     AddTestCase(new RepsSelectorTest, TestCase::Duration::QUICK);
     AddTestCase(new UeSelectorTest, TestCase::Duration::QUICK);
     AddTestCase(new SpineArrivalsTest, TestCase::Duration::QUICK);

@@ -37,6 +37,10 @@ public:
 	// waited for, which no switch trimmed: a trimmed send's record is released
 	// by its repair request.
 	virtual void OnTimeout(uint64_t nowNs);
+	// Asked at every data send: whether a probe of some path is due, and which.
+	virtual bool TakeProbe(uint64_t nowNs, uint16_t &path);
+	// The answer to a probe of path; marked when the probe arrived with CE.
+	virtual void OnProbeAnswer(uint16_t path, bool marked, uint64_t nowNs);
 };
 
 // A spine drawn uniformly per packet, named as both the requested and the

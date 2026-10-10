@@ -642,7 +642,7 @@ int RdmaHw::ReceiveUdp(Ptr<Packet> p, CustomHeader &ch){
 	if (x == 1 || x == 2){ //generate ACK or NACK
 		SendAck(rxQp, ch.dip, ch.sip, ch.udp.dport, ch.udp.sport, ch.udp.pg,
 			ch.udp.ih, ch.udp.seq, ch.ipid, x == 2, ecnbits != 0,
-			AllowanceGone(rxQp));
+			AllowanceGone(rxQp), false);
 	}
 	// After the acknowledgement, so this packet's answer carries the state
 	// this packet produced and anything the report below absorbs is
@@ -686,7 +686,7 @@ void RdmaHw::CountArrival(Ptr<RdmaRxQueuePair> q, uint16_t identification,
 void RdmaHw::SendAck(Ptr<RdmaRxQueuePair> q, uint32_t sourceIp,
 		uint32_t destinationIp, uint16_t sport, uint16_t dport, uint16_t pg,
 		const IntHeader &ih, uint32_t packetSeq, uint16_t identification,
-		bool nack, bool cnp, bool spent){
+		bool nack, bool cnp, bool spent, bool probeAnswer){
 	qbbHeader seqh;
 	seqh.SetSeq(q->ReceiverNextExpectedSeq);
 	seqh.SetPacketSeq(packetSeq);
@@ -696,6 +696,8 @@ void RdmaHw::SendAck(Ptr<RdmaRxQueuePair> q, uint32_t sourceIp,
 	seqh.SetIntHeader(ih);
 	if (cnp)
 		seqh.SetCnp();
+	if (probeAnswer)
+		seqh.SetProbeAnswer();
 	seqh.SetAllowanceExhausted(spent);
 	// The grant is this flag without the report above. A receiver that may not
 	// forgive this flow, or a step that is critical, never sets it, so those
@@ -799,11 +801,16 @@ int RdmaHw::ReceiveAck(Ptr<Packet> p, CustomHeader &ch){
 		if (qp->m_outstanding.IsKept()){
 			const uint16_t path =
 				PathOf(static_cast<LoadBalancingMode>(m_loadBalancing), ch.ipid);
-			qp->m_pathSelector->OnAck(path, cnp, Simulator::Now().GetNanoSeconds());
-			if (m_cc_mode == 11 && DeliverCongestionSignal(qp))
-				HandleAckNscc(qp, ch.ack.packet_seq, path, cnp);
-			else
-				qp->AcknowledgePacket(ch.ack.packet_seq, path);
+			const uint64_t now = Simulator::Now().GetNanoSeconds();
+			if ((ch.ack.flags >> qbbHeader::FLAG_PROBE_ANSWER) & 1){
+				qp->m_pathSelector->OnProbeAnswer(path, cnp, now);
+			}else{
+				qp->m_pathSelector->OnAck(path, cnp, now);
+				if (m_cc_mode == 11 && DeliverCongestionSignal(qp))
+					HandleAckNscc(qp, ch.ack.packet_seq, path, cnp);
+				else
+					qp->AcknowledgePacket(ch.ack.packet_seq, path);
+			}
 		}
 		const uint64_t acknowledged_before = qp->snd_una;
 		if (!m_backto0){
@@ -880,7 +887,25 @@ int RdmaHw::Receive(Ptr<Packet> p, CustomHeader &ch){
 		ReceiveAck(p, ch);
 	}else if (ch.l3Prot == 0xFC){ // ACK
 		ReceiveAck(p, ch);
+	}else if (ch.l3Prot == kPathProbeProtocol){
+		ReceivePathProbe(p, ch);
 	}
+	return 0;
+}
+
+// A reliability probe (OCP MRC 1.0 section 7.4.6) is answered with an
+// acknowledgement that returns its identification and its mark and moves no
+// receive state. A probe for a flow this receiver holds no state for is
+// dropped: the flow has finished.
+int RdmaHw::ReceivePathProbe(Ptr<Packet> p, CustomHeader &ch){
+	(void)p;
+	Ptr<RdmaRxQueuePair> q = GetRxQp(ch.dip, ch.sip, ch.ack.dport, ch.ack.sport,
+		ch.ack.pg, false);
+	if (q == nullptr)
+		return 0;
+	SendAck(q, ch.dip, ch.sip, ch.ack.dport, ch.ack.sport, ch.ack.pg,
+		IntHeader(), 0, ch.ipid, false, ch.GetIpv4EcnBits() != 0,
+		AllowanceGone(q), true);
 	return 0;
 }
 
@@ -1111,7 +1136,7 @@ void RdmaHw::ReceiveTrimmedData(const CustomHeader &ch, uint32_t payloadSize,
 	const uint64_t unsettled = q->UnsettledBytes(start, end);
 	if (unsettled == 0){
 		SendAck(q, ch.dip, ch.sip, ch.udp.dport, ch.udp.sport, ch.udp.pg,
-			ch.udp.ih, ch.udp.seq, ch.ipid, false, false, AllowanceGone(q));
+			ch.udp.ih, ch.udp.seq, ch.ipid, false, false, AllowanceGone(q), false);
 		return;
 	}
 	if (unsettled < payloadSize){
@@ -1144,7 +1169,7 @@ void RdmaHw::ReceiveTrimmedData(const CustomHeader &ch, uint32_t payloadSize,
 		// debt is owed for every trim the sender would otherwise have seen, and
 		// this ACK is what pays it.
 		SendAck(q, ch.dip, ch.sip, ch.udp.dport, ch.udp.sport, ch.udp.pg,
-			ch.udp.ih, ch.udp.seq, ch.ipid, false, true, AllowanceGone(q));
+			ch.udp.ih, ch.udp.seq, ch.ipid, false, true, AllowanceGone(q), false);
 		return;
 	}
 	// The refused range stays a hole, so the report is computed after the
@@ -1194,7 +1219,7 @@ void RdmaHw::AskRemainderOnArrival(Ptr<RdmaRxQueuePair> q){
 	// pair with, and the group is part of the map key, so every packet that
 	// finds this queue pair carries that same group.
 	SendAck(q, q->sip, q->dip, q->sport, q->dport, q->m_ecn_source.qIndex,
-		IntHeader(), 0, 0, false, false, false);
+		IntHeader(), 0, 0, false, false, false, false);
 }
 
 // The frontend names a flow by (sender, receiver, sender's port); the receive
@@ -1559,8 +1584,12 @@ Ptr<Packet> RdmaHw::GetNxtPacket(Ptr<RdmaQueuePair> qp){
 	ipHeader.SetTos (0);
 	ipHeader.SetDscp (static_cast<Ipv4Header::DscpType>(kUetDscpTrimmable));
 	if (IsPathPerPacket()){
-		const uint16_t identification =
-			qp->m_pathSelector->Choose(Simulator::Now().GetNanoSeconds());
+		const uint64_t now = Simulator::Now().GetNanoSeconds();
+		// A probe the selector has due leaves the NIC right after this packet.
+		uint16_t probed;
+		if (qp->m_pathSelector->TakeProbe(now, probed))
+			SendPathProbe(qp, probed);
+		const uint16_t identification = qp->m_pathSelector->Choose(now);
 		ipHeader.SetIdentification(identification);
 		qp->m_outstanding.Add(seq, payload_size,
 			PathOf(static_cast<LoadBalancingMode>(m_loadBalancing), identification),
@@ -1597,6 +1626,32 @@ Ptr<Packet> RdmaHw::GetNxtPacket(Ptr<RdmaQueuePair> qp){
 
 bool RdmaHw::IsPathPerPacket() const{
 	return m_loadBalancing != static_cast<uint32_t>(LoadBalancingMode::Ecmp);
+}
+
+// A probe of path carries no payload and no sequence. It names the queue
+// pair's priority group, which a switch queues it by, so that it waits where
+// the queue pair's data waits and comes back with the mark the path gives that
+// data, and it is not trimmable: a probe that finds a queue full is a probe
+// unanswered.
+void RdmaHw::SendPathProbe(Ptr<RdmaQueuePair> qp, uint16_t path){
+	qbbHeader probe;
+	probe.SetPG(qp->m_pg);
+	probe.SetSport(qp->sport);
+	probe.SetDport(qp->dport);
+	Ptr<Packet> packet = Create<Packet>(
+		std::max(60 - 14 - 20 - static_cast<int>(probe.GetSerializedSize()), 0));
+	packet->AddHeader(probe);
+	Ipv4Header ip;
+	ip.SetSource(qp->sip);
+	ip.SetDestination(qp->dip);
+	ip.SetProtocol(kPathProbeProtocol);
+	ip.SetTtl(64);
+	ip.SetPayloadSize(packet->GetSize());
+	ip.SetIdentification(path);
+	packet->AddHeader(ip);
+	AddHeader(packet, 0x800);
+	m_nic[GetNicIdxOfQp(qp)].dev->RdmaEnqueueHighPrioQ(packet);
+	ReportTransportEvent("path_probe", 0);
 }
 
 void RdmaHw::StartPathSelection(Ptr<RdmaQueuePair> qp, uint64_t bdpBytes){

@@ -28,13 +28,18 @@ namespace ns3 {
 
 constexpr uint8_t kUecTrimRepairProtocol = 0xFA;
 constexpr uint8_t kUecTrimNotificationProtocol = 0xFB;
+// A sender's probe of the path its identification names, which the receiver
+// answers with an acknowledgement.
+constexpr uint8_t kPathProbeProtocol = 0xF9;
 
 // Whether a packet of this IPv4 protocol carries a qbbHeader after its IP
-// header: an ACK, a NACK, or a trim's repair request or notification.
+// header: an ACK, a NACK, a trim's repair request or notification, or a path
+// probe.
 constexpr bool CarriesQbbHeader(uint8_t protocol){
 	return protocol == 0xFC || protocol == 0xFD ||
 		protocol == kUecTrimRepairProtocol ||
-		protocol == kUecTrimNotificationProtocol;
+		protocol == kUecTrimNotificationProtocol ||
+		protocol == kPathProbeProtocol;
 }
 
 // UET diffserv codepoints. UEC 1.0.3 section 3.6.4.7.1 names the codepoints

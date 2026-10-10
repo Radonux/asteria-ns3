@@ -183,6 +183,7 @@ public:
 	int ReceiveCnp(Ptr<Packet> p, CustomHeader &ch);
 	int ReceiveAck(Ptr<Packet> p, CustomHeader &ch); // handle both ACK and NACK
 	int ReceiveTrim(Ptr<Packet> p, CustomHeader &ch);
+	int ReceivePathProbe(Ptr<Packet> p, CustomHeader &ch);
 	int Receive(Ptr<Packet> p, CustomHeader &ch); // callback function that the QbbNetDevice should use when receive packets. Only NIC can call this function. And do not call this upon PFC
 
 	void PCIePause(uint32_t nic_idx, uint32_t qIndex);
@@ -201,11 +202,12 @@ public:
 		uint32_t destinationIp, uint16_t sport, uint16_t dport, uint16_t pg,
 		uint32_t seq, uint32_t payloadSize, bool lastHop, bool spent,
 		bool eligible);
-	// packetSeq and identification describe the data packet answered.
+	// packetSeq and identification describe the data packet answered, or with
+	// probeAnswer the probe.
 	void SendAck(Ptr<RdmaRxQueuePair> q, uint32_t sourceIp,
 		uint32_t destinationIp, uint16_t sport, uint16_t dport, uint16_t pg,
 		const IntHeader &ih, uint32_t packetSeq, uint16_t identification,
-		bool nack, bool cnp, bool spent);
+		bool nack, bool cnp, bool spent, bool probeAnswer);
 	// Read the receiver's two bits off an arriving repair request or
 	// acknowledgement and follow them: eligible with room grants the
 	// exemption and eligible with none returns the sender to its controller,
@@ -246,6 +248,7 @@ public:
 
 	Ptr<Packet> GetNxtPacket(Ptr<RdmaQueuePair> qp); // get next packet to send, inc snd_nxt
 	bool IsPathPerPacket() const;
+	void SendPathProbe(Ptr<RdmaQueuePair> qp, uint16_t path);
 	// Where every data packet draws its own path: keep the queue pair's send
 	// records and give it the selector that draws its paths. bdpBytes is the
 	// queue pair's bandwidth-delay product, as AddQueuePair receives it.

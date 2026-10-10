@@ -71,6 +71,9 @@ namespace ns3 {
 		else
 			flags &= ~(1 << FLAG_FORGIVENESS_ELIGIBLE);
 	}
+	void qbbHeader::SetProbeAnswer(){
+		flags |= 1 << FLAG_PROBE_ANSWER;
+	}
 	void qbbHeader::SetPacketSeq(uint32_t seq){
 		m_packetSeq = seq;
 	}

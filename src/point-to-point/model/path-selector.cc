@@ -17,6 +17,13 @@ void PathSelector::OnLoss(uint16_t, uint64_t){
 void PathSelector::OnTimeout(uint64_t){
 }
 
+bool PathSelector::TakeProbe(uint64_t, uint16_t &){
+	return false;
+}
+
+void PathSelector::OnProbeAnswer(uint16_t, bool, uint64_t){
+}
+
 UniformSpineSelector::UniformSpineSelector(Ptr<UniformRandomVariable> random,
 		uint32_t spines)
 	: m_random(random), m_spines(spines)

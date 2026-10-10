@@ -172,11 +172,12 @@ void SwitchNode::FillFlowKey(const CustomHeader &ch, uint32_t key[3]){
 }
 
 // Whether the identification names the packet's path under a load-balancing
-// mode other than ECMP: a data packet's does, and so does that of an
-// acknowledgement, a NACK or a repair request, which returns the
-// identification of the data packet it answers.
+// mode other than ECMP: a data packet's and a path probe's do, and so does that
+// of an acknowledgement, a NACK or a repair request, which returns the
+// identification of the packet it answers.
 bool SwitchNode::IdentifiesPath(const CustomHeader &ch){
-	return ch.l3Prot == 0x11 || ch.l3Prot == 0xFC || ch.l3Prot == 0xFD ||
+	return ch.l3Prot == 0x11 || ch.l3Prot == kPathProbeProtocol ||
+		ch.l3Prot == 0xFC || ch.l3Prot == 0xFD ||
 		ch.l3Prot == kUecTrimRepairProtocol;
 }
 
