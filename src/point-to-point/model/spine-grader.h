@@ -13,16 +13,19 @@ namespace ns3 {
 // samples' excess over the average, and of their shortfall below it, each net
 // of a slack per sample, are kept, and when either passes a threshold the
 // average restarts at the sample and both sums at zero. A step in the samples
-// moves the average at once instead of at the pace of its gain. Before the
-// first sample the average is zero.
+// moves the average at once instead of at the pace of its gain. A sample drawn
+// from at least intervalSamples packets replaces the average outright, unless
+// intervalSamples is zero. Before the first sample the average is zero.
 class SupervisedEwma {
 public:
 	struct Parameters {
 		double gain;
 		double slack;
 		double threshold;
+		uint32_t intervalSamples;
 	};
-	void Add(double sample, const Parameters &parameters);
+	// sample is the mean of a value over packets packets.
+	void Add(double sample, uint32_t packets, const Parameters &parameters);
 	double Value() const;
 
 private:

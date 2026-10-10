@@ -96,6 +96,7 @@ public:
 	uint64_t m_sprayBaseRttNs;
 	double m_sprayReportIntervalBaseRtts;
 	double m_sprayEstimatorGain;
+	uint32_t m_sprayEstimatorIntervalSamples;
 	double m_sprayMarkCusumSlack;
 	double m_sprayMarkCusumThreshold;
 	double m_sprayMarkThreshold1, m_sprayMarkThreshold2, m_sprayMarkThreshold3;

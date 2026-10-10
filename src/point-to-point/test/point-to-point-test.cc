@@ -3543,13 +3543,13 @@ class SupervisedEwmaTest : public TestCase
 
     void DoRun() override
     {
-        const SupervisedEwma::Parameters parameters{1.0 / 16, 0.125, 0.5};
+        const SupervisedEwma::Parameters parameters{1.0 / 16, 0.125, 0.5, 0};
         SupervisedEwma average;
         NS_TEST_EXPECT_MSG_EQ(average.Value(), 0, "an average starts at zero");
         // Samples within the slack of the average move it by the gain alone.
         for (uint32_t i = 0; i < 100; ++i)
         {
-            average.Add(0.1, parameters);
+            average.Add(0.1, 100, parameters);
         }
         NS_TEST_EXPECT_MSG_EQ_TOL(average.Value(),
                                   0.1 * (1 - std::pow(15.0 / 16, 100)),
@@ -3558,17 +3558,34 @@ class SupervisedEwmaTest : public TestCase
         // A step of 0.5: the excess net of the slack is 0.275 per sample, so
         // the second sample passes the threshold and restarts the average.
         const double before = average.Value();
-        average.Add(0.6, parameters);
+        average.Add(0.6, 100, parameters);
         NS_TEST_EXPECT_MSG_EQ_TOL(average.Value(),
                                   before + (0.6 - before) / 16,
                                   1e-12,
                                   "one sample of a step moves the average by the gain");
-        average.Add(0.6, parameters);
+        average.Add(0.6, 100, parameters);
         NS_TEST_EXPECT_MSG_EQ(average.Value(), 0.6, "the second sample of a step restarts it");
         // And back down.
-        average.Add(0.0, parameters);
-        average.Add(0.0, parameters);
+        average.Add(0.0, 100, parameters);
+        average.Add(0.0, 100, parameters);
         NS_TEST_EXPECT_MSG_EQ(average.Value(), 0.0, "a fall restarts it the same way");
+
+        // With interval samples, a sample of that many packets replaces the
+        // average and one of fewer moves it by the gain.
+        const SupervisedEwma::Parameters sampled{1.0 / 16, 0.125, 0.5, 32};
+        SupervisedEwma replaced;
+        replaced.Add(0.2, 31, sampled);
+        NS_TEST_EXPECT_MSG_EQ_TOL(replaced.Value(),
+                                  0.2 / 16,
+                                  1e-12,
+                                  "a sample of fewer packets moves the average by the gain");
+        replaced.Add(0.2, 32, sampled);
+        NS_TEST_EXPECT_MSG_EQ(replaced.Value(), 0.2, "one of that many replaces it");
+        replaced.Add(0.3, 31, sampled);
+        NS_TEST_EXPECT_MSG_EQ_TOL(replaced.Value(),
+                                  0.2 + 0.1 / 16,
+                                  1e-12,
+                                  "and a later sample of fewer moves it by the gain again");
     }
 };
 
@@ -3591,7 +3608,8 @@ class GraderFixture
         parameters.phaseNs = 0;
         parameters.marks = {hw->m_sprayEstimatorGain,
                             hw->m_sprayMarkCusumSlack,
-                            hw->m_sprayMarkCusumThreshold};
+                            hw->m_sprayMarkCusumThreshold,
+                            hw->m_sprayEstimatorIntervalSamples};
         parameters.markThresholds[0] = hw->m_sprayMarkThreshold1;
         parameters.markThresholds[1] = hw->m_sprayMarkThreshold2;
         parameters.markThresholds[2] = hw->m_sprayMarkThreshold3;
@@ -3599,7 +3617,8 @@ class GraderFixture
         // A base RTT of 10 us.
         parameters.delayNs = {hw->m_sprayEstimatorGain,
                               hw->m_sprayDelayCusumSlackBaseRtts * 10000,
-                              hw->m_sprayDelayCusumThresholdBaseRtts * 10000};
+                              hw->m_sprayDelayCusumThresholdBaseRtts * 10000,
+                              hw->m_sprayEstimatorIntervalSamples};
         parameters.delayThresholdsNs[0] = hw->m_sprayDelayThreshold1BaseRtts * 10000;
         parameters.delayThresholdsNs[1] = hw->m_sprayDelayThreshold2BaseRtts * 10000;
         parameters.delayThresholdsNs[2] = hw->m_sprayDelayThreshold3BaseRtts * 10000;

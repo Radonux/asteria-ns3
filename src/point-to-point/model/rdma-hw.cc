@@ -247,6 +247,13 @@ TypeId RdmaHw::GetTypeId (void)
 				DoubleValue(1.0 / 16),
 				MakeDoubleAccessor(&RdmaHw::m_sprayEstimatorGain),
 				MakeDoubleChecker<double>(0, 1))
+		.AddAttribute("SprayEstimatorIntervalSamples",
+				"Under LoadBalancing 3, the packets from which an interval's mark "
+				"fraction and mean delay replace a spine's averages instead of "
+				"moving them by the gain. Zero, the default, never replaces them.",
+				UintegerValue(0),
+				MakeUintegerAccessor(&RdmaHw::m_sprayEstimatorIntervalSamples),
+				MakeUintegerChecker<uint32_t>())
 		.AddAttribute("SprayMarkCusumSlack",
 				"Under LoadBalancing 3, the CUSUM slack of the marked fraction, "
 				"per report interval. Default 0.125, half the width of a grade.",
@@ -929,14 +936,14 @@ SpineGrader &RdmaHw::Grader(){
 	parameters.phaseNs =
 		static_cast<uint64_t>(PhaseOf(m_node->GetId()) * parameters.intervalNs);
 	parameters.marks = {m_sprayEstimatorGain, m_sprayMarkCusumSlack,
-		m_sprayMarkCusumThreshold};
+		m_sprayMarkCusumThreshold, m_sprayEstimatorIntervalSamples};
 	parameters.markThresholds[0] = m_sprayMarkThreshold1;
 	parameters.markThresholds[1] = m_sprayMarkThreshold2;
 	parameters.markThresholds[2] = m_sprayMarkThreshold3;
 	parameters.oneWayDelay = m_sprayOneWayDelay;
 	parameters.delayNs = {m_sprayEstimatorGain,
 		m_sprayDelayCusumSlackBaseRtts * rtt,
-		m_sprayDelayCusumThresholdBaseRtts * rtt};
+		m_sprayDelayCusumThresholdBaseRtts * rtt, m_sprayEstimatorIntervalSamples};
 	parameters.delayThresholdsNs[0] = m_sprayDelayThreshold1BaseRtts * rtt;
 	parameters.delayThresholdsNs[1] = m_sprayDelayThreshold2BaseRtts * rtt;
 	parameters.delayThresholdsNs[2] = m_sprayDelayThreshold3BaseRtts * rtt;

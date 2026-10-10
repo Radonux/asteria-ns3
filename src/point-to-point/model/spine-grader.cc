@@ -17,7 +17,13 @@ uint8_t Quantize(double value, const double (&thresholds)[3]){
 
 } // namespace
 
-void SupervisedEwma::Add(double sample, const Parameters &parameters){
+void SupervisedEwma::Add(double sample, uint32_t packets,
+		const Parameters &parameters){
+	if (parameters.intervalSamples > 0 && packets >= parameters.intervalSamples){
+		m_value = sample;
+		m_rise = m_fall = 0;
+		return;
+	}
 	m_rise = std::max(0.0, m_rise + sample - m_value - parameters.slack);
 	m_fall = std::max(0.0, m_fall + m_value - sample - parameters.slack);
 	if (m_rise > parameters.threshold || m_fall > parameters.threshold){
@@ -98,12 +104,12 @@ void SpineGrader::Close(uint64_t nowNs){
 		if (counted.arrivals > 0){
 			spine.markFraction.Add(
 				static_cast<double>(counted.marked) / counted.arrivals,
-				m_parameters.marks);
+				counted.arrivals, m_parameters.marks);
 			if (m_parameters.oneWayDelay)
 				spine.delayNs.Add(
 					static_cast<double>(counted.delaySumNs) / counted.arrivals -
 						spine.leastDelayNs,
-					m_parameters.delayNs);
+					counted.arrivals, m_parameters.delayNs);
 		}
 		marks[k] = spine.markFraction.Value();
 		delays[k] = spine.delayNs.Value();

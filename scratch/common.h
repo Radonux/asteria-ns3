@@ -141,6 +141,7 @@ std::set<std::string> path_selector_parameters_given;
 // parameters, each RdmaHw's default; times in base RTTs.
 double spray_report_interval_base_rtts = 2.0;
 double spray_estimator_gain = 1.0 / 16;
+uint32_t spray_estimator_interval_samples = 0;
 double spray_mark_cusum_slack = 0.125;
 double spray_mark_cusum_threshold = 0.5;
 double spray_mark_thresholds[3] = {0.25, 0.5, 0.75};
@@ -168,7 +169,8 @@ const std::set<std::string> spray_policy_keys = {
     "SPRAY_GAMMA", "SPRAY_EPSILON", "SPRAY_CANDIDATES", "SPRAY_CANDIDATE_DRAW",
     "SPRAY_EDGE_WINDOW_PENALTY", "SPINE_REPORT_OUTPUT_FILE",
     "SPRAY_ABSENCE_FRACTION_OF_MEDIAN", "SPRAY_ABSENCE_MINIMUM_MEDIAN",
-    "SPRAY_GRADE_REFERENCE"};
+    "SPRAY_GRADE_REFERENCE",
+    "SPRAY_ESTIMATOR_INTERVAL_SAMPLES"};
 const std::set<std::string> spray_one_way_delay_keys = {
     "SPRAY_DELAY_CUSUM_SLACK_BASE_RTTS",
     "SPRAY_DELAY_CUSUM_THRESHOLD_BASE_RTTS",
@@ -1294,6 +1296,8 @@ bool ReadConf(string network_configuration) {
       conf >> spray_absence_minimum_median;
     } else if (key.compare("SPRAY_GRADE_REFERENCE") == 0) {
       conf >> spray_grade_reference;
+    } else if (key.compare("SPRAY_ESTIMATOR_INTERVAL_SAMPLES") == 0) {
+      conf >> spray_estimator_interval_samples;
     } else if (key.compare("SPRAY_GAMMA") == 0) {
       conf >> spray_gamma;
     } else if (key.compare("SPRAY_EPSILON") == 0) {
@@ -2117,6 +2121,8 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),
                            UintegerValue(spray_absence_minimum_median));
       rdmaHw->SetAttribute("SprayGradeReference",
                            UintegerValue(spray_grade_reference_value()));
+      rdmaHw->SetAttribute("SprayEstimatorIntervalSamples",
+                           UintegerValue(spray_estimator_interval_samples));
       rdmaHw->SetAttribute("SprayGamma", DoubleValue(spray_gamma));
       rdmaHw->SetAttribute("SprayEpsilon", DoubleValue(spray_epsilon));
       rdmaHw->SetAttribute("SprayCandidates", UintegerValue(spray_candidates));
