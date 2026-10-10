@@ -3,6 +3,7 @@
 
 #include <ns3/ptr.h>
 #include <ns3/random-variable-stream.h>
+#include "spine-report.h"
 #include <deque>
 #include <stdint.h>
 #include <utility>
@@ -44,6 +45,9 @@ public:
 	virtual bool TakeProbe(uint64_t nowNs, uint16_t &path);
 	// The answer to a probe of path; marked when the probe arrived with CE.
 	virtual void OnProbeAnswer(uint16_t path, bool marked, uint64_t nowNs);
+	// The receiving host's spine report an acknowledgement or a repair request
+	// carried, before the answer itself is told.
+	virtual void OnReport(const SpineReport &report, uint64_t nowNs);
 };
 
 // A spine drawn uniformly per packet, named as both the requested and the
@@ -56,6 +60,73 @@ public:
 private:
 	Ptr<UniformRandomVariable> m_random;
 	uint32_t m_spines;
+};
+
+// A sender's scores of the spines towards one receiving host, which every
+// queue pair to that host draws its spines from. Each report from the host
+// that is newer than the last one taken decays every score and then adds the
+// spine's grade: s <- (1 - gamma) s + x. A spine is drawn with probability
+// p = (1 - epsilon) s / sum(s) + epsilon / N, and uniformly while every score
+// is zero; drawing candidates more than one at a time sends on the
+// highest-scored of them, the candidates drawn from p or uniformly. While a
+// report's edge bit is set the scores stay as they are, and without reports
+// they decay once per report interval from two intervals after the last.
+//
+// A score is fixed-point, 1/256 of a grade, and a decay removes the rounded-up
+// fraction gamma of it, so that a score left without deposits reaches zero.
+// Every score starts where the top grade holds it.
+class SpineScores {
+public:
+	enum class CandidateDraw : uint32_t {
+		Proportional = 0,
+		Uniform,
+	};
+	struct Parameters {
+		double gamma;
+		double epsilon;
+		uint32_t candidates;
+		CandidateDraw candidateDraw;
+		uint64_t reportIntervalNs;
+	};
+	SpineScores(uint32_t spines, const Parameters &parameters);
+	void OnReport(const SpineReport &report, uint64_t nowNs);
+	uint8_t Choose(UniformRandomVariable &random, uint64_t nowNs);
+	// p for spine, as the scores stand.
+	double Share(uint32_t spine) const;
+	uint32_t Score(uint32_t spine) const;
+
+private:
+	static constexpr uint32_t kGradeScale = 256;
+	void Decay();
+	// Decay the scores for every report interval missed by now.
+	void Age(uint64_t nowNs);
+	void Accumulate();
+	uint8_t DrawFromShares(UniformRandomVariable &random) const;
+
+	Parameters m_parameters;
+	// gamma in 1/65536.
+	uint64_t m_decay;
+	std::vector<uint32_t> m_scores;
+	// The running sum of the scores in spine order; the last is their sum.
+	std::vector<uint64_t> m_accumulated;
+	bool m_reported;
+	uint8_t m_sequence;
+	uint64_t m_reportedNs;
+	uint64_t m_nextDecayNs;
+};
+
+// A spine drawn per packet from the scores towards the queue pair's
+// destination, named as both the requested and the carrying spine
+// (spray_policy).
+class PolicySpineSelector : public PathSelector {
+public:
+	PolicySpineSelector(Ptr<UniformRandomVariable> random, SpineScores &scores);
+	uint16_t Choose(uint64_t nowNs) override;
+	void OnReport(const SpineReport &report, uint64_t nowNs) override;
+
+private:
+	Ptr<UniformRandomVariable> m_random;
+	SpineScores &m_scores;
 };
 
 // Oblivious packet spraying, OPS: a fresh 16-bit entropy value drawn

@@ -3859,6 +3859,468 @@ class SpineGradeTest : public TestCase
     }
 };
 
+/**
+ * A sender's scores of eight spines towards one host with the design's gamma
+ * of 0.25, epsilon of 0.02 and one candidate drawn in proportion, reports due
+ * every 10 us, and the reports it is fed.
+ */
+class ScoresFixture
+{
+  public:
+    static constexpr uint32_t kSpines = 8;
+    static constexpr uint64_t kInterval = 10000;
+
+    static SpineScores::Parameters Defaults()
+    {
+        return SpineScores::Parameters{0.25,
+                                       0.02,
+                                       1,
+                                       SpineScores::CandidateDraw::Proportional,
+                                       kInterval};
+    }
+
+    static SpineReport Report(uint8_t sequence, const std::vector<uint8_t>& grades)
+    {
+        SpineReport report;
+        report.sequence = sequence;
+        for (uint32_t spine = 0; spine < grades.size(); ++spine)
+        {
+            report.SetGrade(spine, grades[spine]);
+        }
+        return report;
+    }
+
+    // Reports 1, 2, ... one interval apart, spine 3 graded as given and the
+    // others 3; the share of spine 3 after each.
+    static std::vector<double> Feed(SpineScores& scores,
+                                    const std::vector<uint8_t>& spine3,
+                                    uint32_t firstSequence = 1)
+    {
+        std::vector<double> shares;
+        for (uint32_t i = 0; i < spine3.size(); ++i)
+        {
+            std::vector<uint8_t> grades(kSpines, 3);
+            grades[3] = spine3[i];
+            const uint32_t sequence = firstSequence + i;
+            scores.OnReport(Report(sequence, grades), sequence * kInterval);
+            shares.push_back(scores.Share(3));
+        }
+        return shares;
+    }
+};
+
+class SpineScoresDrainTest : public TestCase
+{
+  public:
+    SpineScoresDrainTest()
+        : TestCase("Scenario 12a: a spine graded 0 drains geometrically, 1/gamma reports to a "
+                   "time constant, without oscillation")
+    {
+    }
+
+    void DoRun() override
+    {
+        const SpineScores::Parameters defaults = ScoresFixture::Defaults();
+        NS_TEST_ASSERT_MSG_EQ(defaults.gamma, 0.25, "the default gamma is the design's");
+        SpineScores scores(ScoresFixture::kSpines, defaults);
+        const double uniform = 1.0 / ScoresFixture::kSpines;
+        NS_TEST_EXPECT_MSG_EQ_TOL(scores.Share(3), uniform, 1e-12, "scores start uniform");
+        const uint32_t start = scores.Score(3);
+        ScoresFixture::Feed(scores, std::vector<uint8_t>(5, 3));
+        NS_TEST_EXPECT_MSG_EQ(scores.Score(3),
+                              start,
+                              "the top grade holds a score where it starts");
+
+        // Graded 0 from report 6: s_3 falls by 1 - gamma per report.
+        std::vector<double> shares = ScoresFixture::Feed(scores, std::vector<uint8_t>(40, 0), 6);
+        uint32_t timeConstant = 0;
+        double previous = uniform;
+        SpineScores replay(ScoresFixture::kSpines, defaults);
+        // Until the score reaches zero, after which the share stays at the floor.
+        for (uint32_t n = 1; n <= shares.size(); ++n)
+        {
+            if (n <= 20)
+            {
+                NS_TEST_EXPECT_MSG_LT(shares[n - 1], previous, "the share falls with every report");
+            }
+            NS_TEST_EXPECT_MSG_LT_OR_EQ(shares[n - 1], previous, "the share never rises");
+            previous = shares[n - 1];
+        }
+        for (uint32_t n = 1; n <= 12; ++n)
+        {
+            std::vector<uint8_t> grades(ScoresFixture::kSpines, 3);
+            grades[3] = 0;
+            replay.OnReport(ScoresFixture::Report(n, grades), n * ScoresFixture::kInterval);
+            const double expected = start * std::pow(1 - defaults.gamma, n);
+            NS_TEST_EXPECT_MSG_EQ_TOL(replay.Score(3) / expected,
+                                      1.0,
+                                      0.02,
+                                      "the score is (1 - gamma)^n of its start");
+            if (timeConstant == 0 && replay.Score(3) <= start / std::exp(1.0))
+            {
+                timeConstant = n;
+            }
+        }
+        // ln(1 / e) / ln(0.75) is 3.48 reports.
+        NS_TEST_EXPECT_MSG_EQ(timeConstant, 4, "the score reaches 1/e in about 1/gamma reports");
+        NS_TEST_EXPECT_MSG_EQ_TOL(shares.back(),
+                                  defaults.epsilon / ScoresFixture::kSpines,
+                                  1e-9,
+                                  "the share drains to the exploration floor");
+        NS_TEST_EXPECT_MSG_EQ(scores.Score(3), 0, "the score reaches zero");
+
+        // At gamma 0.5 a drain and a recovery are both monotone.
+        SpineScores::Parameters half = defaults;
+        half.gamma = 0.5;
+        SpineScores fast(ScoresFixture::kSpines, half);
+        std::vector<uint8_t> grades(20, 0);
+        grades.insert(grades.end(), 20, 3);
+        shares = ScoresFixture::Feed(fast, grades);
+        for (uint32_t n = 1; n < shares.size(); ++n)
+        {
+            if (n < 20)
+            {
+                NS_TEST_EXPECT_MSG_LT_OR_EQ(shares[n], shares[n - 1], "the drain never turns back");
+            }
+            else
+            {
+                NS_TEST_EXPECT_MSG_GT_OR_EQ(shares[n],
+                                            shares[n - 1],
+                                            "the recovery never turns back");
+                NS_TEST_EXPECT_MSG_LT_OR_EQ(shares[n], uniform + 1e-12, "nor overshoots");
+            }
+        }
+        NS_TEST_EXPECT_MSG_EQ_TOL(shares.back(), uniform, 1e-3, "and returns to uniform");
+    }
+};
+
+class SpineScoresFloorTest : public TestCase
+{
+  public:
+    SpineScoresFloorTest()
+        : TestCase("Scenario 12b: all-zero grades, or no reports, fall back to the uniform floor")
+    {
+    }
+
+    void DoRun() override
+    {
+        SpineScores scores(ScoresFixture::kSpines, ScoresFixture::Defaults());
+        ScoresFixture::Feed(scores, std::vector<uint8_t>(20, 0));
+        NS_TEST_ASSERT_MSG_LT(scores.Share(3), 0.01, "spine 3 starts drained");
+        Ptr<UniformRandomVariable> random =
+            CreateObjectWithAttributes<UniformRandomVariable>("Stream", IntegerValue(0));
+        uint32_t sequence = 21;
+        for (; sequence < 100; ++sequence)
+        {
+            scores.OnReport(ScoresFixture::Report(sequence, std::vector<uint8_t>(8, 0)),
+                            sequence * ScoresFixture::kInterval);
+            double sum = 0;
+            for (uint32_t spine = 0; spine < ScoresFixture::kSpines; ++spine)
+            {
+                const double share = scores.Share(spine);
+                NS_TEST_EXPECT_MSG_EQ(std::isfinite(share), true, "a share is always a number");
+                sum += share;
+            }
+            NS_TEST_EXPECT_MSG_EQ_TOL(sum, 1.0, 1e-9, "the shares always sum to one");
+            NS_TEST_EXPECT_MSG_LT(uint32_t(scores.Choose(*random, sequence * 10000)),
+                                  ScoresFixture::kSpines,
+                                  "a draw always names a spine");
+        }
+        for (uint32_t spine = 0; spine < ScoresFixture::kSpines; ++spine)
+        {
+            NS_TEST_EXPECT_MSG_EQ(scores.Score(spine),
+                                  0,
+                                  "without deposits every score reaches zero");
+            NS_TEST_EXPECT_MSG_EQ(scores.Share(spine), 1.0 / 8, "then every share is uniform");
+        }
+        NS_TEST_EXPECT_MSG_EQ(Spread(scores, *random, sequence * 10000),
+                              true,
+                              "and the draws spread uniformly");
+
+        // Reports that stop: two intervals after the last, each interval
+        // decays the scores once, to zero and the uniform floor.
+        SpineScores stale(ScoresFixture::kSpines, ScoresFixture::Defaults());
+        ScoresFixture::Feed(stale, std::vector<uint8_t>(10, 0));
+        const uint64_t last = 10 * ScoresFixture::kInterval;
+        const uint32_t before = stale.Score(0);
+        stale.Choose(*random, last + 2 * ScoresFixture::kInterval - 1);
+        NS_TEST_EXPECT_MSG_EQ(stale.Score(0), before, "a report one interval late decays nothing");
+        stale.Choose(*random, last + 2 * ScoresFixture::kInterval);
+        NS_TEST_EXPECT_MSG_EQ(stale.Score(0),
+                              before - before / 4,
+                              "then each interval decays once");
+        stale.Choose(*random, last + 200 * ScoresFixture::kInterval);
+        NS_TEST_EXPECT_MSG_EQ(stale.Score(0), 0, "until the scores reach zero");
+        NS_TEST_EXPECT_MSG_EQ(stale.Share(3), 1.0 / 8, "and the shares are uniform");
+        NS_TEST_EXPECT_MSG_EQ(Spread(stale, *random, last + 201 * ScoresFixture::kInterval),
+                              true,
+                              "so are the draws");
+        Simulator::Destroy();
+    }
+
+  private:
+    // 80000 draws at one instant, each spine within five binomial standard
+    // deviations of an eighth.
+    static bool Spread(SpineScores& scores, UniformRandomVariable& random, uint64_t now)
+    {
+        std::vector<uint32_t> counts(ScoresFixture::kSpines, 0);
+        for (uint32_t i = 0; i < 80000; ++i)
+        {
+            ++counts[scores.Choose(random, now)];
+        }
+        return std::all_of(counts.begin(), counts.end(), [](uint32_t count) {
+            return count > 10000 - 5 * 93.5 && count < 10000 + 5 * 93.5;
+        });
+    }
+};
+
+class SpineScoresFlapTest : public TestCase
+{
+  public:
+    SpineScoresFlapTest()
+        : TestCase("Scenario 12c: a grade flapping between 2 and 3 holds the share at an "
+                   "intermediate ratio")
+    {
+    }
+
+    void DoRun() override
+    {
+        SpineScores scores(ScoresFixture::kSpines, ScoresFixture::Defaults());
+        // At gamma 0.25 the flapping score settles between 4.25 / 0.4375 and
+        // 4.5 / 0.4375 grades, against 12 for a healthy spine: shares of 0.81
+        // and 0.86 of a healthy spine's, where the grades are 2/3 and 1 of it.
+        double low = 1, high = 0;
+        for (uint32_t sequence = 1; sequence <= 60; ++sequence)
+        {
+            std::vector<uint8_t> grades(ScoresFixture::kSpines, 3);
+            grades[3] = sequence % 2 == 0 ? 3 : 2;
+            scores.OnReport(ScoresFixture::Report(sequence, grades),
+                            sequence * ScoresFixture::kInterval);
+            const double ratio = scores.Share(3) / scores.Share(0);
+            if (sequence > 40)
+            {
+                low = std::min(low, ratio);
+                high = std::max(high, ratio);
+            }
+        }
+        NS_TEST_EXPECT_MSG_GT(low, 0.78, "the share settles above grade 2's ratio");
+        NS_TEST_EXPECT_MSG_LT(high, 0.89, "and below grade 3's");
+        NS_TEST_EXPECT_MSG_LT(high - low,
+                              (1 - 2.0 / 3) / 4,
+                              "its swing is a fraction of the grades'");
+    }
+};
+
+class SpineScoresDrawTest : public TestCase
+{
+  public:
+    SpineScoresDrawTest()
+        : TestCase("A spine is drawn in proportion to its share, the best of k candidates "
+                   "under k > 1, and a report is taken once and not under the edge bit")
+    {
+    }
+
+    void DoRun() override
+    {
+        Proportional();
+        Candidates();
+        Reports();
+        Selector();
+        Simulator::Destroy();
+    }
+
+  private:
+    static Ptr<UniformRandomVariable> Stream()
+    {
+        return CreateObjectWithAttributes<UniformRandomVariable>("Stream", IntegerValue(0));
+    }
+
+    // Spines 0 to 7 graded 0 to 3 twice over, until the scores settle.
+    static SpineScores Graded(const SpineScores::Parameters& parameters)
+    {
+        SpineScores scores(ScoresFixture::kSpines, parameters);
+        for (uint32_t sequence = 1; sequence < 40; ++sequence)
+        {
+            scores.OnReport(ScoresFixture::Report(sequence, {0, 1, 2, 3, 0, 1, 2, 3}),
+                            sequence * ScoresFixture::kInterval);
+        }
+        return scores;
+    }
+
+    // k = 1 is the inverse of p's distribution at one uniform draw per packet.
+    void Proportional()
+    {
+        SpineScores scores = Graded(ScoresFixture::Defaults());
+        Ptr<UniformRandomVariable> drawn = Stream();
+        Ptr<UniformRandomVariable> replayed = Stream();
+        // The floor's draws spread evenly over the spines and the others in
+        // proportion to the scores, which as one distribution is p.
+        std::vector<double> byScore;
+        double sum = 0;
+        for (uint32_t spine = 0; spine < ScoresFixture::kSpines; ++spine)
+        {
+            sum += scores.Score(spine);
+            byScore.push_back(sum);
+        }
+        std::vector<uint32_t> counts(ScoresFixture::kSpines, 0);
+        const uint32_t kDraws = 100000;
+        uint32_t disagree = 0;
+        for (uint32_t i = 0; i < kDraws; ++i)
+        {
+            const uint8_t spine = scores.Choose(*drawn, 400000);
+            ++counts[spine];
+            const double u = replayed->GetValue();
+            const uint32_t expected =
+                u < 0.02
+                    ? uint32_t(u / 0.02 * 8)
+                    : std::upper_bound(byScore.begin(), byScore.end(), (u - 0.02) / 0.98 * sum) -
+                          byScore.begin();
+            disagree += expected != spine;
+        }
+        NS_TEST_EXPECT_MSG_LT(disagree, 10, "one draw per packet, mapped through p");
+        NS_TEST_EXPECT_MSG_EQ(drawn->GetValue(), replayed->GetValue(), "and no draw more");
+        for (uint32_t spine = 0; spine < ScoresFixture::kSpines; ++spine)
+        {
+            const double p = scores.Share(spine);
+            const double sd = std::sqrt(kDraws * p * (1 - p));
+            NS_TEST_EXPECT_MSG_EQ_TOL(double(counts[spine]),
+                                      kDraws * p,
+                                      5 * sd + 1,
+                                      "each spine is drawn at its share");
+        }
+        NS_TEST_EXPECT_MSG_GT(counts[0], 0, "a spine graded 0 keeps the floor");
+    }
+
+    void Candidates()
+    {
+        // One spine scored zero among eight healthy ones.
+        auto oneDown = [](SpineScores::CandidateDraw draw, uint32_t k) {
+            SpineScores::Parameters parameters = ScoresFixture::Defaults();
+            parameters.candidates = k;
+            parameters.candidateDraw = draw;
+            SpineScores scores(ScoresFixture::kSpines, parameters);
+            ScoresFixture::Feed(scores, std::vector<uint8_t>(60, 0));
+            Ptr<UniformRandomVariable> random = Stream();
+            uint32_t onDown = 0;
+            for (uint32_t i = 0; i < 64000; ++i)
+            {
+                onDown += scores.Choose(*random, 600000) == 3;
+            }
+            return onDown;
+        };
+        // Uniform candidates: k = 1 is uniform spraying, and at k = 2 spine 3
+        // wins only when both candidates are spine 3, one draw in 64.
+        NS_TEST_EXPECT_MSG_EQ_TOL(oneDown(SpineScores::CandidateDraw::Uniform, 1),
+                                  8000,
+                                  5 * 83.7,
+                                  "one uniform candidate is uniform spraying");
+        NS_TEST_EXPECT_MSG_EQ_TOL(oneDown(SpineScores::CandidateDraw::Uniform, 2),
+                                  1000,
+                                  5 * 31.4,
+                                  "a spine scored below the rest wins only as both candidates");
+        // Proportional candidates: spine 3's floor of 0.0025 to the power k.
+        NS_TEST_EXPECT_MSG_EQ_TOL(oneDown(SpineScores::CandidateDraw::Proportional, 1),
+                                  160,
+                                  5 * 12.6,
+                                  "one proportional candidate is the floor");
+        NS_TEST_EXPECT_MSG_LT(oneDown(SpineScores::CandidateDraw::Proportional, 2),
+                              5,
+                              "two proportional candidates square it");
+
+        // Among graded spines, more candidates favour the best.
+        auto bestShare = [](uint32_t k) {
+            SpineScores::Parameters parameters = ScoresFixture::Defaults();
+            parameters.candidates = k;
+            SpineScores scores = Graded(parameters);
+            Ptr<UniformRandomVariable> random = Stream();
+            uint32_t best = 0;
+            for (uint32_t i = 0; i < 40000; ++i)
+            {
+                const uint8_t spine = scores.Choose(*random, 400000);
+                best += spine == 3 || spine == 7;
+            }
+            return best / 40000.0;
+        };
+        const double one = bestShare(1);
+        const double two = bestShare(2);
+        const double three = bestShare(3);
+        NS_TEST_EXPECT_MSG_EQ_TOL(one,
+                                  0.02 * 2 / 8 + 0.98 * 2 * 3 / 12.0,
+                                  0.01,
+                                  "one candidate draws the best spines at their share");
+        NS_TEST_EXPECT_MSG_GT(two, one + 0.1, "two candidates favour them");
+        NS_TEST_EXPECT_MSG_GT(three, two + 0.05, "three more so");
+    }
+
+    void Reports()
+    {
+        SpineScores scores(ScoresFixture::kSpines, ScoresFixture::Defaults());
+        const uint32_t start = scores.Score(0);
+        std::vector<uint8_t> grades(8, 3);
+        grades[0] = 0;
+        scores.OnReport(ScoresFixture::Report(10, grades), 100000);
+        const uint32_t once = scores.Score(0);
+        NS_TEST_EXPECT_MSG_LT(once, start, "a report is taken");
+        scores.OnReport(ScoresFixture::Report(10, grades), 100100);
+        NS_TEST_EXPECT_MSG_EQ(scores.Score(0), once, "the same report is taken once");
+        scores.OnReport(ScoresFixture::Report(9, grades), 100200);
+        NS_TEST_EXPECT_MSG_EQ(scores.Score(0), once, "an older one is not taken");
+        SpineReport edge = ScoresFixture::Report(11, grades);
+        edge.edgeCongested = true;
+        scores.OnReport(edge, 110000);
+        NS_TEST_EXPECT_MSG_EQ(scores.Score(0), once, "a report with the edge bit moves no score");
+        scores.OnReport(ScoresFixture::Report(12, grades), 120000);
+        NS_TEST_EXPECT_MSG_LT(scores.Score(0), once, "the next report without it is taken");
+        // The sequence wraps.
+        for (uint32_t sequence = 13; sequence < 13 + 300; ++sequence)
+        {
+            const uint32_t previous = scores.Score(1);
+            grades[1] = sequence % 2 == 0 ? 3 : 0;
+            scores.OnReport(ScoresFixture::Report(sequence % 256, grades), sequence * 10000);
+            NS_TEST_EXPECT_MSG_NE(scores.Score(1), previous, "each newer report is taken");
+        }
+        // After half the sequence's range without a report, any report is the
+        // latest.
+        const uint32_t before = scores.Score(1);
+        grades[1] = 3;
+        scores.OnReport(ScoresFixture::Report(0, grades), (313 + 128) * 10000);
+        NS_TEST_EXPECT_MSG_NE(scores.Score(1), before, "a report after a long silence is taken");
+    }
+
+    // Two queue pairs to one host draw from one set of scores, which a report
+    // to either moves; a queue pair to another host draws from its own.
+    void Selector()
+    {
+        SpineScores toFirst(ScoresFixture::kSpines, ScoresFixture::Defaults());
+        SpineScores toSecond(ScoresFixture::kSpines, ScoresFixture::Defaults());
+        PolicySpineSelector a(Stream(), toFirst);
+        PolicySpineSelector b(Stream(), toFirst);
+        PolicySpineSelector c(Stream(), toSecond);
+        std::vector<uint8_t> grades(8, 0);
+        grades[6] = 3;
+        for (uint32_t sequence = 1; sequence < 40; ++sequence)
+        {
+            a.OnReport(ScoresFixture::Report(sequence, grades), sequence * 10000);
+        }
+        uint32_t onSix = 0;
+        for (uint32_t i = 0; i < 1000; ++i)
+        {
+            const uint16_t identification = b.Choose(400000);
+            NS_TEST_ASSERT_MSG_EQ(RequestedSpine(identification),
+                                  CarryingSpine(identification),
+                                  "the request names its spine in both bytes");
+            onSix += RequestedSpine(identification) == 6;
+        }
+        NS_TEST_EXPECT_MSG_GT(onSix, 950, "a report to one queue pair steers the other");
+        uint32_t cOnSix = 0;
+        for (uint32_t i = 0; i < 1000; ++i)
+        {
+            cOnSix += RequestedSpine(c.Choose(400000)) == 6;
+        }
+        NS_TEST_EXPECT_MSG_LT(cOnSix, 200, "a queue pair to another host keeps its own scores");
+    }
+};
+
 class PointToPointTestSuite : public TestSuite
 {
   public:
@@ -3916,6 +4378,10 @@ PointToPointTestSuite::PointToPointTestSuite()
     AddTestCase(new SupervisedEwmaTest, TestCase::Duration::QUICK);
     AddTestCase(new SpineAttributionTest, TestCase::Duration::QUICK);
     AddTestCase(new SpineGradeTest, TestCase::Duration::QUICK);
+    AddTestCase(new SpineScoresDrainTest, TestCase::Duration::QUICK);
+    AddTestCase(new SpineScoresFloorTest, TestCase::Duration::QUICK);
+    AddTestCase(new SpineScoresFlapTest, TestCase::Duration::QUICK);
+    AddTestCase(new SpineScoresDrawTest, TestCase::Duration::QUICK);
 }
 
 static PointToPointTestSuite g_pointToPointTestSuite; //!< The testsuite

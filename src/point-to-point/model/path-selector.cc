@@ -1,6 +1,8 @@
 #include "path-selector.h"
 #include "load-balancing.h"
 #include <ns3/assert.h>
+#include <algorithm>
+#include <cmath>
 #include <utility>
 
 namespace ns3 {
@@ -24,6 +26,9 @@ bool PathSelector::TakeProbe(uint64_t, uint16_t &){
 void PathSelector::OnProbeAnswer(uint16_t, bool, uint64_t){
 }
 
+void PathSelector::OnReport(const SpineReport &, uint64_t){
+}
+
 UniformSpineSelector::UniformSpineSelector(Ptr<UniformRandomVariable> random,
 		uint32_t spines)
 	: m_random(random), m_spines(spines)
@@ -33,6 +38,128 @@ UniformSpineSelector::UniformSpineSelector(Ptr<UniformRandomVariable> random,
 uint16_t UniformSpineSelector::Choose(uint64_t){
 	const uint8_t spine = m_random->GetInteger(0, m_spines - 1);
 	return SpineIdentification(spine, spine);
+}
+
+SpineScores::SpineScores(uint32_t spines, const Parameters &parameters)
+	: m_parameters(parameters),
+	  m_decay(std::llround(parameters.gamma * 65536)),
+	  m_accumulated(spines), m_reported(false), m_sequence(0),
+	  m_reportedNs(0), m_nextDecayNs(UINT64_MAX)
+{
+	NS_ASSERT_MSG(spines > 0 && spines <= SpineReport::kMaxSpines,
+		"a report grades at most SpineReport::kMaxSpines spines");
+	NS_ASSERT_MSG(m_decay > 0 && m_decay <= 65536, "gamma is in (0, 1]");
+	NS_ASSERT_MSG(parameters.candidates > 0, "a spine is drawn from candidates");
+	// The largest score a decay takes exactly the top grade from.
+	m_scores.assign(spines,
+		SpineReport::kTopGrade * kGradeScale * uint64_t{65536} / m_decay);
+	Accumulate();
+}
+
+void SpineScores::OnReport(const SpineReport &report, uint64_t nowNs){
+	// Acknowledgements return over different spines and overtake one another,
+	// so a report can arrive after a newer one. The sequence has eight bits,
+	// which tell newer from older for half their range; after that many report
+	// intervals without a report, the one that arrives is the latest.
+	const bool newer = static_cast<int8_t>(report.sequence - m_sequence) > 0;
+	if (m_reported && !newer &&
+			nowNs - m_reportedNs < 128 * m_parameters.reportIntervalNs)
+		return;
+	Age(nowNs);
+	m_reported = true;
+	m_sequence = report.sequence;
+	m_reportedNs = nowNs;
+	// A report is due every interval, and the acknowledgements carrying one
+	// arrive with an interval of jitter.
+	m_nextDecayNs = nowNs + 2 * m_parameters.reportIntervalNs;
+	if (report.edgeCongested)
+		return;
+	Decay();
+	for (uint32_t k = 0; k < m_scores.size(); k++)
+		m_scores[k] += report.Grade(k) * kGradeScale;
+	Accumulate();
+}
+
+uint8_t SpineScores::Choose(UniformRandomVariable &random, uint64_t nowNs){
+	if (nowNs >= m_nextDecayNs)
+		Age(nowNs);
+	auto candidate = [&]() -> uint8_t {
+		return m_parameters.candidateDraw == CandidateDraw::Proportional
+			? DrawFromShares(random)
+			: random.GetInteger(0, m_scores.size() - 1);
+	};
+	uint8_t chosen = candidate();
+	for (uint32_t i = 1; i < m_parameters.candidates; i++){
+		const uint8_t next = candidate();
+		if (m_scores[next] > m_scores[chosen])
+			chosen = next;
+	}
+	return chosen;
+}
+
+double SpineScores::Share(uint32_t spine) const{
+	const double spines = m_scores.size();
+	const uint64_t sum = m_accumulated.back();
+	if (sum == 0)
+		return 1 / spines;
+	return (1 - m_parameters.epsilon) * m_scores[spine] / sum +
+		m_parameters.epsilon / spines;
+}
+
+uint32_t SpineScores::Score(uint32_t spine) const{
+	return m_scores[spine];
+}
+
+void SpineScores::Decay(){
+	for (uint32_t &score : m_scores)
+		score -= (score * m_decay + 65535) >> 16;
+}
+
+void SpineScores::Age(uint64_t nowNs){
+	while (nowNs >= m_nextDecayNs){
+		Decay();
+		Accumulate();
+		m_nextDecayNs = m_accumulated.back() == 0
+			? UINT64_MAX : m_nextDecayNs + m_parameters.reportIntervalNs;
+	}
+}
+
+void SpineScores::Accumulate(){
+	uint64_t sum = 0;
+	for (uint32_t k = 0; k < m_scores.size(); k++){
+		sum += m_scores[k];
+		m_accumulated[k] = sum;
+	}
+}
+
+uint8_t SpineScores::DrawFromShares(UniformRandomVariable &random) const{
+	const uint32_t spines = m_scores.size();
+	const double epsilon = m_parameters.epsilon;
+	const double u = random.GetValue();
+	if (u < epsilon)
+		return std::min(static_cast<uint32_t>(u / epsilon * spines), spines - 1);
+	const double v = (u - epsilon) / (1 - epsilon);
+	const uint64_t sum = m_accumulated.back();
+	if (sum == 0)
+		return std::min(static_cast<uint32_t>(v * spines), spines - 1);
+	const uint64_t target = std::min(static_cast<uint64_t>(v * sum), sum - 1);
+	return std::upper_bound(m_accumulated.begin(), m_accumulated.end(), target) -
+		m_accumulated.begin();
+}
+
+PolicySpineSelector::PolicySpineSelector(Ptr<UniformRandomVariable> random,
+		SpineScores &scores)
+	: m_random(random), m_scores(scores)
+{
+}
+
+uint16_t PolicySpineSelector::Choose(uint64_t nowNs){
+	const uint8_t spine = m_scores.Choose(*m_random, nowNs);
+	return SpineIdentification(spine, spine);
+}
+
+void PolicySpineSelector::OnReport(const SpineReport &report, uint64_t nowNs){
+	m_scores.OnReport(report, nowNs);
 }
 
 ObliviousSelector::ObliviousSelector(Ptr<UniformRandomVariable> random)
