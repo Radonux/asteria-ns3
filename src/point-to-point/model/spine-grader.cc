@@ -96,7 +96,8 @@ uint32_t SpineGrader::LastIntervalLastHopTrims() const{
 
 void SpineGrader::Close(uint64_t nowNs){
 	const uint32_t spines = m_spines.size();
-	std::array<double, SpineReport::kMaxSpines> arrivals{}, marks{}, delays{};
+	std::array<double, SpineReport::kMaxSpines> arrivals{}, marks{}, trims{},
+		delays{};
 	for (uint32_t k = 0; k < spines; k++){
 		Spine &spine = m_spines[k];
 		const SpineInterval &counted = spine.counting;
@@ -104,14 +105,19 @@ void SpineGrader::Close(uint64_t nowNs){
 		if (counted.arrivals > 0){
 			spine.markFraction.Add(
 				static_cast<double>(counted.marked) / counted.arrivals,
-				counted.arrivals, m_parameters.marks);
+				counted.arrivals, m_parameters.fractions);
 			if (m_parameters.oneWayDelay)
 				spine.delayNs.Add(
 					static_cast<double>(counted.delaySumNs) / counted.arrivals -
 						spine.leastDelayNs,
 					counted.arrivals, m_parameters.delayNs);
 		}
+		const uint32_t packets = counted.arrivals + counted.trimmed;
+		if (packets > 0)
+			spine.trimFraction.Add(static_cast<double>(counted.trimmed) / packets,
+				packets, m_parameters.fractions);
 		marks[k] = spine.markFraction.Value();
+		trims[k] = spine.trimFraction.Value();
 		delays[k] = spine.delayNs.Value();
 	}
 	const double medianArrivals = Median(arrivals);
@@ -119,6 +125,7 @@ void SpineGrader::Close(uint64_t nowNs){
 	// median reference, unlike a rank, has no loser on a healthy fabric.
 	const bool median = m_parameters.reference == GradeReference::Median;
 	const double markReference = median ? Median(marks) : 0;
+	const double trimReference = median ? Median(trims) : 0;
 	const double delayReference = median ? Median(delays) : 0;
 	bool everySpineBelowTop = true;
 	for (uint32_t k = 0; k < spines; k++){
@@ -129,13 +136,19 @@ void SpineGrader::Close(uint64_t nowNs){
 		counted.absent = medianArrivals >= m_parameters.absenceMinimumMedian &&
 			m_report.Grade(k) > 0 &&
 			counted.arrivals < m_parameters.absenceFractionOfMedian * medianArrivals;
-		if (counted.trimmed > 0 || counted.moved > 0 || counted.absent)
+		if (counted.moved > 0 || counted.absent)
 			spine.heldUntilNs = m_intervalEndNs +
 				m_parameters.holdDownIntervals * m_parameters.intervalNs;
-		everySpineBelowTop &= Earned(marks[k], delays[k]) < SpineReport::kTopGrade;
-		const uint8_t earned =
-			Earned(marks[k] - markReference, delays[k] - delayReference);
+		// A trimmed packet and a marked one both met a queue past a threshold,
+		// so whichever kind stands out more is the spine's congestion; adding
+		// them would count one queue twice.
+		everySpineBelowTop &= Earned(std::max(marks[k], trims[k]), delays[k]) <
+			SpineReport::kTopGrade;
+		const uint8_t earned = Earned(
+			std::max(marks[k] - markReference, trims[k] - trimReference),
+			delays[k] - delayReference);
 		counted.markFraction = marks[k];
+		counted.trimFraction = trims[k];
 		counted.delayNs = delays[k];
 		counted.held = nowNs < spine.heldUntilNs;
 		m_report.SetGrade(k, counted.held ? 0 : earned);
@@ -150,10 +163,11 @@ void SpineGrader::Close(uint64_t nowNs){
 	m_lastHopTrims = 0;
 }
 
-uint8_t SpineGrader::Earned(double markCost, double delayCostNs) const{
-	const uint8_t byMarks = Quantize(markCost, m_parameters.markThresholds);
-	if (byMarks < SpineReport::kTopGrade || !m_parameters.oneWayDelay)
-		return byMarks;
+uint8_t SpineGrader::Earned(double congestionCost, double delayCostNs) const{
+	const uint8_t byCongestion =
+		Quantize(congestionCost, m_parameters.congestionThresholds);
+	if (byCongestion < SpineReport::kTopGrade || !m_parameters.oneWayDelay)
+		return byCongestion;
 	return Quantize(delayCostNs, m_parameters.delayThresholdsNs);
 }
 

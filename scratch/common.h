@@ -142,9 +142,9 @@ std::set<std::string> path_selector_parameters_given;
 double spray_report_interval_base_rtts = 2.0;
 double spray_estimator_gain = 1.0 / 16;
 uint32_t spray_estimator_interval_samples = 0;
-double spray_mark_cusum_slack = 0.125;
-double spray_mark_cusum_threshold = 0.5;
-double spray_mark_thresholds[3] = {0.25, 0.5, 0.75};
+double spray_fraction_cusum_slack = 0.125;
+double spray_fraction_cusum_threshold = 0.5;
+double spray_congestion_thresholds[3] = {0.25, 0.5, 0.75};
 uint32_t spray_hold_down_intervals = 4;
 double spray_absence_fraction_of_median = 0.125;
 uint32_t spray_absence_minimum_median = 16;
@@ -162,8 +162,8 @@ uint32_t spray_edge_window_penalty = 64;
 // one-way delay reads; a key nothing reads is refused.
 const std::set<std::string> spray_policy_keys = {
     "SPRAY_REPORT_INTERVAL_BASE_RTTS", "SPRAY_ESTIMATOR_GAIN",
-    "SPRAY_MARK_CUSUM_SLACK", "SPRAY_MARK_CUSUM_THRESHOLD",
-    "SPRAY_MARK_THRESHOLDS", "SPRAY_HOLD_DOWN_INTERVALS",
+    "SPRAY_FRACTION_CUSUM_SLACK", "SPRAY_FRACTION_CUSUM_THRESHOLD",
+    "SPRAY_CONGESTION_THRESHOLDS", "SPRAY_HOLD_DOWN_INTERVALS",
     "SPRAY_ONE_WAY_DELAY", "SPRAY_DELAY_CUSUM_SLACK_BASE_RTTS",
     "SPRAY_DELAY_CUSUM_THRESHOLD_BASE_RTTS", "SPRAY_DELAY_THRESHOLDS_BASE_RTTS",
     "SPRAY_GAMMA", "SPRAY_EPSILON", "SPRAY_CANDIDATES", "SPRAY_CANDIDATE_DRAW",
@@ -1003,10 +1003,12 @@ void write_spine_report(uint32_t rank, uint64_t now_ns,
   const std::vector<SpineGrader::SpineInterval> &spines = grader.LastInterval();
   for (uint32_t spine = 0; spine < spines.size(); spine++) {
     const SpineGrader::SpineInterval &closed = spines[spine];
-    fprintf(spine_report_file, "%lu,%u,%u,%u,%u,%u,%u,%u,%.6f,%.1f,%d,%u,%u,%d\n",
+    fprintf(spine_report_file,
+            "%lu,%u,%u,%u,%u,%u,%u,%u,%.6f,%.6f,%.1f,%d,%u,%u,%d\n",
             static_cast<unsigned long>(now_ns), rank, report.sequence, spine,
             closed.arrivals, closed.marked, closed.trimmed, closed.moved,
-            closed.markFraction, closed.delayNs, closed.held ? 1 : 0,
+            closed.markFraction, closed.trimFraction, closed.delayNs,
+            closed.held ? 1 : 0,
             report.Grade(spine), grader.LastIntervalLastHopTrims(),
             report.edgeCongested ? 1 : 0);
   }
@@ -1061,16 +1063,18 @@ bool valid_spray_policy() {
     std::cerr << "SPRAY_ESTIMATOR_GAIN must be in (0, 1]\n";
     return false;
   }
-  if (!(spray_mark_cusum_slack >= 0 && spray_mark_cusum_threshold > 0 &&
+  if (!(spray_fraction_cusum_slack >= 0 &&
+        spray_fraction_cusum_threshold > 0 &&
         spray_delay_cusum_slack_base_rtts >= 0 &&
         spray_delay_cusum_threshold_base_rtts > 0)) {
     std::cerr << "a SPRAY_*_CUSUM_SLACK must be at least zero and a "
                  "SPRAY_*_CUSUM_THRESHOLD positive\n";
     return false;
   }
-  if (!increasing(spray_mark_thresholds) || spray_mark_thresholds[2] > 1) {
-    std::cerr << "SPRAY_MARK_THRESHOLDS must be three increasing fractions "
-                 "in (0, 1]\n";
+  if (!increasing(spray_congestion_thresholds) ||
+      spray_congestion_thresholds[2] > 1) {
+    std::cerr << "SPRAY_CONGESTION_THRESHOLDS must be three increasing "
+                 "fractions in (0, 1]\n";
     return false;
   }
   if (!increasing(spray_delay_thresholds_base_rtts)) {
@@ -1271,13 +1275,13 @@ bool ReadConf(string network_configuration) {
       conf >> spray_report_interval_base_rtts;
     } else if (key.compare("SPRAY_ESTIMATOR_GAIN") == 0) {
       conf >> spray_estimator_gain;
-    } else if (key.compare("SPRAY_MARK_CUSUM_SLACK") == 0) {
-      conf >> spray_mark_cusum_slack;
-    } else if (key.compare("SPRAY_MARK_CUSUM_THRESHOLD") == 0) {
-      conf >> spray_mark_cusum_threshold;
-    } else if (key.compare("SPRAY_MARK_THRESHOLDS") == 0) {
-      conf >> spray_mark_thresholds[0] >> spray_mark_thresholds[1] >>
-          spray_mark_thresholds[2];
+    } else if (key.compare("SPRAY_FRACTION_CUSUM_SLACK") == 0) {
+      conf >> spray_fraction_cusum_slack;
+    } else if (key.compare("SPRAY_FRACTION_CUSUM_THRESHOLD") == 0) {
+      conf >> spray_fraction_cusum_threshold;
+    } else if (key.compare("SPRAY_CONGESTION_THRESHOLDS") == 0) {
+      conf >> spray_congestion_thresholds[0] >>
+          spray_congestion_thresholds[1] >> spray_congestion_thresholds[2];
     } else if (key.compare("SPRAY_HOLD_DOWN_INTERVALS") == 0) {
       conf >> spray_hold_down_intervals;
     } else if (key.compare("SPRAY_ONE_WAY_DELAY") == 0) {
@@ -2091,16 +2095,16 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),
                            DoubleValue(spray_report_interval_base_rtts));
       rdmaHw->SetAttribute("SprayEstimatorGain",
                            DoubleValue(spray_estimator_gain));
-      rdmaHw->SetAttribute("SprayMarkCusumSlack",
-                           DoubleValue(spray_mark_cusum_slack));
-      rdmaHw->SetAttribute("SprayMarkCusumThreshold",
-                           DoubleValue(spray_mark_cusum_threshold));
-      rdmaHw->SetAttribute("SprayMarkThreshold1",
-                           DoubleValue(spray_mark_thresholds[0]));
-      rdmaHw->SetAttribute("SprayMarkThreshold2",
-                           DoubleValue(spray_mark_thresholds[1]));
-      rdmaHw->SetAttribute("SprayMarkThreshold3",
-                           DoubleValue(spray_mark_thresholds[2]));
+      rdmaHw->SetAttribute("SprayFractionCusumSlack",
+                           DoubleValue(spray_fraction_cusum_slack));
+      rdmaHw->SetAttribute("SprayFractionCusumThreshold",
+                           DoubleValue(spray_fraction_cusum_threshold));
+      rdmaHw->SetAttribute("SprayCongestionThreshold1",
+                           DoubleValue(spray_congestion_thresholds[0]));
+      rdmaHw->SetAttribute("SprayCongestionThreshold2",
+                           DoubleValue(spray_congestion_thresholds[1]));
+      rdmaHw->SetAttribute("SprayCongestionThreshold3",
+                           DoubleValue(spray_congestion_thresholds[2]));
       rdmaHw->SetAttribute("SprayHoldDownIntervals",
                            UintegerValue(spray_hold_down_intervals));
       rdmaHw->SetAttribute("SprayOneWayDelay",
@@ -2303,7 +2307,8 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),
     }
     fprintf(spine_report_file,
             "time_ns,rank,sequence,spine,arrivals,marked,trimmed,moved,"
-            "mark_fraction,delay_ns,held,grade,last_hop_trims,edge\n");
+            "mark_fraction,trim_fraction,delay_ns,held,grade,last_hop_trims,"
+            "edge\n");
     for (uint32_t i = 0; i < node_num; i++)
       if (n.Get(i)->GetNodeType() == 0)
         n.Get(i)->GetObject<RdmaDriver>()->m_rdma->TraceConnectWithoutContext(

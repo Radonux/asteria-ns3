@@ -254,41 +254,43 @@ TypeId RdmaHw::GetTypeId (void)
 				UintegerValue(0),
 				MakeUintegerAccessor(&RdmaHw::m_sprayEstimatorIntervalSamples),
 				MakeUintegerChecker<uint32_t>())
-		.AddAttribute("SprayMarkCusumSlack",
-				"Under LoadBalancing 3, the CUSUM slack of the marked fraction, "
-				"per report interval. Default 0.125, half the width of a grade.",
+		.AddAttribute("SprayFractionCusumSlack",
+				"Under LoadBalancing 3, the CUSUM slack of the marked and the "
+				"trimmed fraction, per report interval. Default 0.125, half the "
+				"width of a grade.",
 				DoubleValue(0.125),
-				MakeDoubleAccessor(&RdmaHw::m_sprayMarkCusumSlack),
+				MakeDoubleAccessor(&RdmaHw::m_sprayFractionCusumSlack),
 				MakeDoubleChecker<double>(0))
-		.AddAttribute("SprayMarkCusumThreshold",
-				"Under LoadBalancing 3, the CUSUM sum of the marked fraction at "
-				"which its average restarts at the sample. Default 0.5, the width "
-				"of two grades.",
+		.AddAttribute("SprayFractionCusumThreshold",
+				"Under LoadBalancing 3, the CUSUM sum of the marked or the trimmed "
+				"fraction at which its average restarts at the sample. Default "
+				"0.5, the width of two grades.",
 				DoubleValue(0.5),
-				MakeDoubleAccessor(&RdmaHw::m_sprayMarkCusumThreshold),
+				MakeDoubleAccessor(&RdmaHw::m_sprayFractionCusumThreshold),
 				MakeDoubleChecker<double>(0))
-		.AddAttribute("SprayMarkThreshold1",
-				"Under LoadBalancing 3, the average marked fraction from which a "
-				"spine grades 2. Default 0.25.",
+		.AddAttribute("SprayCongestionThreshold1",
+				"Under LoadBalancing 3, the congestion cost, the larger of the "
+				"marked and the trimmed fraction's, from which a spine grades 2. "
+				"Default 0.25.",
 				DoubleValue(0.25),
-				MakeDoubleAccessor(&RdmaHw::m_sprayMarkThreshold1),
+				MakeDoubleAccessor(&RdmaHw::m_sprayCongestionThreshold1),
 				MakeDoubleChecker<double>(0, 1))
-		.AddAttribute("SprayMarkThreshold2",
-				"Under LoadBalancing 3, the average marked fraction from which a "
-				"spine grades 1. Default 0.5.",
+		.AddAttribute("SprayCongestionThreshold2",
+				"Under LoadBalancing 3, the congestion cost from which a spine "
+				"grades 1. Default 0.5.",
 				DoubleValue(0.5),
-				MakeDoubleAccessor(&RdmaHw::m_sprayMarkThreshold2),
+				MakeDoubleAccessor(&RdmaHw::m_sprayCongestionThreshold2),
 				MakeDoubleChecker<double>(0, 1))
-		.AddAttribute("SprayMarkThreshold3",
-				"Under LoadBalancing 3, the average marked fraction from which a "
-				"spine grades 0. Default 0.75.",
+		.AddAttribute("SprayCongestionThreshold3",
+				"Under LoadBalancing 3, the congestion cost from which a spine "
+				"grades 0. Default 0.75.",
 				DoubleValue(0.75),
-				MakeDoubleAccessor(&RdmaHw::m_sprayMarkThreshold3),
+				MakeDoubleAccessor(&RdmaHw::m_sprayCongestionThreshold3),
 				MakeDoubleChecker<double>(0, 1))
 		.AddAttribute("SprayHoldDownIntervals",
 				"Under LoadBalancing 3, the report intervals a spine grades 0 "
-				"after a packet it carried was trimmed before the last hop, or a "
-				"packet requested on it was moved to another. Default 4.",
+				"after a packet requested on it was moved to another, or its "
+				"arrivals fell short of the median spine's. Default 4.",
 				UintegerValue(4),
 				MakeUintegerAccessor(&RdmaHw::m_sprayHoldDownIntervals),
 				MakeUintegerChecker<uint32_t>())
@@ -935,11 +937,11 @@ SpineGrader &RdmaHw::Grader(){
 	// together.
 	parameters.phaseNs =
 		static_cast<uint64_t>(PhaseOf(m_node->GetId()) * parameters.intervalNs);
-	parameters.marks = {m_sprayEstimatorGain, m_sprayMarkCusumSlack,
-		m_sprayMarkCusumThreshold, m_sprayEstimatorIntervalSamples};
-	parameters.markThresholds[0] = m_sprayMarkThreshold1;
-	parameters.markThresholds[1] = m_sprayMarkThreshold2;
-	parameters.markThresholds[2] = m_sprayMarkThreshold3;
+	parameters.fractions = {m_sprayEstimatorGain, m_sprayFractionCusumSlack,
+		m_sprayFractionCusumThreshold, m_sprayEstimatorIntervalSamples};
+	parameters.congestionThresholds[0] = m_sprayCongestionThreshold1;
+	parameters.congestionThresholds[1] = m_sprayCongestionThreshold2;
+	parameters.congestionThresholds[2] = m_sprayCongestionThreshold3;
 	parameters.oneWayDelay = m_sprayOneWayDelay;
 	parameters.delayNs = {m_sprayEstimatorGain,
 		m_sprayDelayCusumSlackBaseRtts * rtt,

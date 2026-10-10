@@ -97,9 +97,9 @@ public:
 	double m_sprayReportIntervalBaseRtts;
 	double m_sprayEstimatorGain;
 	uint32_t m_sprayEstimatorIntervalSamples;
-	double m_sprayMarkCusumSlack;
-	double m_sprayMarkCusumThreshold;
-	double m_sprayMarkThreshold1, m_sprayMarkThreshold2, m_sprayMarkThreshold3;
+	double m_sprayFractionCusumSlack;
+	double m_sprayFractionCusumThreshold;
+	double m_sprayCongestionThreshold1, m_sprayCongestionThreshold2, m_sprayCongestionThreshold3;
 	uint32_t m_sprayHoldDownIntervals;
 	double m_sprayAbsenceFractionOfMedian;
 	uint32_t m_sprayAbsenceMinimumMedian;

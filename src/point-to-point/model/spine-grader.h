@@ -40,21 +40,24 @@ private:
 // the packets trimmed before the last hop and the packets a source leaf moved
 // off the spine they requested; under one-way delay it also sums each
 // packet's delay. At the first event of a new interval the counts of the one
-// that ended update two supervised averages per spine, the fraction of
-// arrivals marked and the mean one-way delay above the least the spine has
-// shown, and a report is issued.
+// that ended update three supervised averages per spine, the fraction of
+// arrivals marked, the fraction of its packets trimmed before the last hop
+// (of arrivals and such trims together), and the mean one-way delay above the
+// least the spine has shown, and a report is issued.
 //
-// A spine's grade comes from its averages through thresholds, with marks
-// taking precedence over delay: a mark cost at or above the first threshold
-// grades the spine by marks alone, and otherwise the delay cost, where delay
-// is measured, grades it. Under the absolute reference a cost is the average
-// itself; under the median reference it is the average's excess over the
-// median of the spines' averages. A trimmed or moved packet holds the spine at grade 0
-// for a fixed number of intervals from the end of the interval it was counted
-// in, whatever the averages say, and so does an interval in which the spine's
-// arrivals fall below a fraction of the median spine's. The edge bit is set when the receiver's own
-// downlink trimmed a packet in the interval, or when no spine's averages earn
-// it the top grade under the absolute reference.
+// A spine's grade comes from its costs through thresholds, its congestion cost
+// taking precedence over its delay cost: a congestion cost at or above the
+// first threshold grades the spine by it alone, and otherwise the delay cost,
+// where delay is measured, grades it. Under the absolute reference a cost is
+// the average itself; under the median reference it is the average's excess
+// over the median of the spines' averages. The congestion cost is the larger
+// of the marked and the trimmed fraction's costs. A moved packet holds the
+// spine at grade 0 for a fixed number of intervals from the end of the
+// interval it was counted in, whatever the costs say, and so does an interval
+// in which the spine's arrivals fall below a fraction of the median spine's.
+// The edge bit is set when the receiver's own downlink trimmed a packet in the
+// interval, or when no spine's averages earn it the top grade under the
+// absolute reference.
 class SpineGrader {
 public:
 	enum class GradeReference : uint32_t {
@@ -66,9 +69,10 @@ public:
 		uint64_t intervalNs;
 		// Where this receiver's intervals start within the first one.
 		uint64_t phaseNs;
-		SupervisedEwma::Parameters marks;
-		// The mark fractions from which a spine grades 2, 1 and 0.
-		double markThresholds[3];
+		// The marked and the trimmed fraction's averages.
+		SupervisedEwma::Parameters fractions;
+		// The congestion costs from which a spine grades 2, 1 and 0.
+		double congestionThresholds[3];
 		bool oneWayDelay;
 		SupervisedEwma::Parameters delayNs;
 		// The delays above a spine's least from which it grades 2, 1 and 0.
@@ -89,6 +93,7 @@ public:
 		uint32_t moved = 0;
 		uint64_t delaySumNs = 0;
 		double markFraction = 0;
+		double trimFraction = 0;
 		double delayNs = 0;
 		bool absent = false;
 		bool held = false;
@@ -114,13 +119,14 @@ private:
 	struct Spine {
 		SpineInterval counting;
 		SupervisedEwma markFraction;
+		SupervisedEwma trimFraction;
 		SupervisedEwma delayNs;
 		uint64_t leastDelayNs = UINT64_MAX;
 		uint64_t heldUntilNs = 0;
 	};
 	void Close(uint64_t nowNs);
-	// The grade a spine's mark and delay costs earn it.
-	uint8_t Earned(double markCost, double delayCostNs) const;
+	// The grade a spine's congestion and delay costs earn it.
+	uint8_t Earned(double congestionCost, double delayCostNs) const;
 	// The median of the first spines values.
 	double Median(std::array<double, SpineReport::kMaxSpines> values) const;
 

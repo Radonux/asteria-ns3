@@ -3606,13 +3606,13 @@ class GraderFixture
         parameters.spines = kSpines;
         parameters.intervalNs = kInterval;
         parameters.phaseNs = 0;
-        parameters.marks = {hw->m_sprayEstimatorGain,
-                            hw->m_sprayMarkCusumSlack,
-                            hw->m_sprayMarkCusumThreshold,
-                            hw->m_sprayEstimatorIntervalSamples};
-        parameters.markThresholds[0] = hw->m_sprayMarkThreshold1;
-        parameters.markThresholds[1] = hw->m_sprayMarkThreshold2;
-        parameters.markThresholds[2] = hw->m_sprayMarkThreshold3;
+        parameters.fractions = {hw->m_sprayEstimatorGain,
+                                hw->m_sprayFractionCusumSlack,
+                                hw->m_sprayFractionCusumThreshold,
+                                hw->m_sprayEstimatorIntervalSamples};
+        parameters.congestionThresholds[0] = hw->m_sprayCongestionThreshold1;
+        parameters.congestionThresholds[1] = hw->m_sprayCongestionThreshold2;
+        parameters.congestionThresholds[2] = hw->m_sprayCongestionThreshold3;
         parameters.oneWayDelay = oneWayDelay;
         // A base RTT of 10 us.
         parameters.delayNs = {hw->m_sprayEstimatorGain,
@@ -3622,8 +3622,7 @@ class GraderFixture
         parameters.delayThresholdsNs[0] = hw->m_sprayDelayThreshold1BaseRtts * 10000;
         parameters.delayThresholdsNs[1] = hw->m_sprayDelayThreshold2BaseRtts * 10000;
         parameters.delayThresholdsNs[2] = hw->m_sprayDelayThreshold3BaseRtts * 10000;
-        parameters.reference =
-            static_cast<SpineGrader::GradeReference>(hw->m_sprayGradeReference);
+        parameters.reference = static_cast<SpineGrader::GradeReference>(hw->m_sprayGradeReference);
         parameters.holdDownIntervals = hw->m_sprayHoldDownIntervals;
         parameters.absenceFractionOfMedian = hw->m_sprayAbsenceFractionOfMedian;
         parameters.absenceMinimumMedian = hw->m_sprayAbsenceMinimumMedian;
@@ -3725,7 +3724,7 @@ class SpineGradeTest : public TestCase
 {
   public:
     SpineGradeTest()
-        : TestCase("A spine's grade follows absolute thresholds, marks before delay, a trim "
+        : TestCase("A spine's grade follows absolute thresholds, marks before delay, a move "
                    "holds it down for a while, and the edge bit needs every spine")
     {
     }
@@ -3808,8 +3807,9 @@ class SpineGradeTest : public TestCase
         SpineGrader grader(parameters);
         const std::vector<double> clean(GraderFixture::kSpines, 0.0);
         GraderFixture::Interval(grader, 0, clean);
-        // Interval 1: a trim on spine 4 before the last hop, one at the last
-        // hop on spine 6, and a packet requested on spine 5 carried by 7.
+        // Interval 1: a trim on spine 4 before the last hop, which grades it
+        // by its trimmed fraction and holds nothing, one at the last hop on
+        // spine 6, and a packet requested on spine 5 carried by 7.
         grader.Advance(GraderFixture::kInterval);
         grader.OnTrim(4, false);
         grader.OnTrim(6, true);
@@ -3827,11 +3827,12 @@ class SpineGradeTest : public TestCase
             const bool held = interval < 1 + hold;
             for (uint32_t spine = 0; spine < GraderFixture::kSpines; ++spine)
             {
-                const bool heldSpine = held && (spine == 4 || spine == 5);
+                const bool heldSpine = held && spine == 5;
+                const bool trimmed = interval == 1 && spine == 4;
                 NS_TEST_EXPECT_MSG_EQ(uint32_t(grader.Report().Grade(spine)),
-                                      heldSpine ? 0u : 3u,
-                                      "a trim or a move holds its spine at 0 for the hold's "
-                                      "intervals and no other");
+                                      heldSpine || trimmed ? 0u : 3u,
+                                      "a move holds its spine at 0 for the hold's intervals, "
+                                      "and a trim grades its spine for its interval");
                 NS_TEST_EXPECT_MSG_EQ(grader.LastInterval()[spine].held,
                                       heldSpine,
                                       "the interval records the hold");
@@ -3840,26 +3841,26 @@ class SpineGradeTest : public TestCase
                                   (interval == 1),
                                   "a last-hop trim sets the edge bit for its interval");
         }
-        // A trim during the hold extends it from its own interval.
+        // A move during the hold extends it from its own interval.
         SpineGrader again(parameters);
-        again.OnTrim(2, false);
+        again.OnArrival(2, 7, false, 0);
         again.Advance(GraderFixture::kInterval);
         again.Advance(2 * GraderFixture::kInterval - 1);
-        again.OnTrim(2, false);
+        again.OnArrival(2, 7, false, 0);
         for (uint32_t interval = 1; interval < hold + 1; ++interval)
         {
             again.Advance((interval + 1) * GraderFixture::kInterval);
             NS_TEST_EXPECT_MSG_EQ(uint32_t(again.Report().Grade(2)),
                                   0u,
-                                  "a second trim extends the hold");
+                                  "a second move extends the hold");
         }
         again.Advance((hold + 2) * GraderFixture::kInterval);
         NS_TEST_EXPECT_MSG_EQ(uint32_t(again.Report().Grade(2)), 3u, "and the hold ends");
         // An idle stretch counts against the hold like any other interval.
         SpineGrader idle(parameters);
-        idle.OnTrim(1, false);
+        idle.OnArrival(1, 7, false, 0);
         idle.Advance(GraderFixture::kInterval);
-        NS_TEST_EXPECT_MSG_EQ(uint32_t(idle.Report().Grade(1)), 0u, "the trim holds its spine");
+        NS_TEST_EXPECT_MSG_EQ(uint32_t(idle.Report().Grade(1)), 0u, "the move holds its spine");
         idle.Advance((hold + 1) * GraderFixture::kInterval);
         NS_TEST_EXPECT_MSG_EQ(uint32_t(idle.Report().Grade(1)), 3u, "idle intervals run it out");
         NS_TEST_EXPECT_MSG_EQ(uint32_t(idle.Report().sequence), 2u, "one report per closing");
@@ -3883,6 +3884,66 @@ class SpineGradeTest : public TestCase
                               "every spine marked alike sets the edge bit");
         NS_TEST_EXPECT_MSG_EQ(one.Report().edgeCongested, false, "one spine marked does not");
         NS_TEST_EXPECT_MSG_EQ(uint32_t(one.Report().Grade(2)), 2u, "it grades that spine down");
+    }
+};
+
+class SpineTrimCostTest : public TestCase
+{
+  public:
+    SpineTrimCostTest()
+        : TestCase("Trims before the last hop grade a spine through its trimmed fraction, the "
+                   "larger of it and the marked fraction, and hold nothing")
+    {
+    }
+
+    void DoRun() override
+    {
+        // Per spine: arrivals, marked arrivals and trims per interval. Spine 3
+        // trims 20 percent of its packets, spine 4 30 percent, spine 5 marks
+        // and trims 30 percent each, spine 6 trims 60 percent.
+        const uint32_t arrivals[GraderFixture::kSpines] = {100, 100, 100, 100, 70, 70, 40, 100};
+        const uint32_t marked[GraderFixture::kSpines] = {0, 0, 0, 0, 0, 30, 0, 0};
+        const uint32_t trims[GraderFixture::kSpines] = {0, 0, 0, 25, 30, 30, 60, 0};
+        const uint32_t expected[GraderFixture::kSpines] = {3, 3, 3, 3, 2, 2, 1, 3};
+        for (auto reference :
+             {SpineGrader::GradeReference::Absolute, SpineGrader::GradeReference::Median})
+        {
+            SpineGrader::Parameters parameters = GraderFixture::Defaults();
+            parameters.reference = reference;
+            SpineGrader grader(parameters);
+            for (uint32_t interval = 0; interval < 4; ++interval)
+            {
+                grader.Advance(interval * GraderFixture::kInterval);
+                for (uint32_t spine = 0; spine < GraderFixture::kSpines; ++spine)
+                {
+                    for (uint32_t i = 0; i < arrivals[spine]; ++i)
+                    {
+                        grader.OnArrival(spine, spine, i < marked[spine], 0);
+                    }
+                    for (uint32_t i = 0; i < trims[spine]; ++i)
+                    {
+                        grader.OnTrim(spine, false);
+                    }
+                }
+                grader.Advance((interval + 1) * GraderFixture::kInterval);
+                for (uint32_t spine = 0; spine < GraderFixture::kSpines; ++spine)
+                {
+                    NS_TEST_EXPECT_MSG_EQ(grader.LastInterval()[spine].held,
+                                          false,
+                                          "a trim holds no spine");
+                }
+            }
+            for (uint32_t spine = 0; spine < GraderFixture::kSpines; ++spine)
+            {
+                NS_TEST_EXPECT_MSG_EQ(uint32_t(grader.Report().Grade(spine)),
+                                      expected[spine],
+                                      "a spine grades by the larger of its fractions");
+            }
+            NS_TEST_EXPECT_MSG_EQ_TOL(grader.LastInterval()[4].trimFraction,
+                                      0.3,
+                                      1e-9,
+                                      "the trimmed fraction is of arrivals and trims together");
+        }
     }
 };
 
@@ -4607,7 +4668,8 @@ class SprayPolicyTransportTest : public TestCase
                                  marked);
             seq += IsolatedHost::kMtu;
         };
-        // Three intervals, eight packets per spine each, then one packet.
+        // Three intervals, eight packets per spine each and eight more on
+        // spine 5 trimmed, then one packet.
         for (uint32_t i = 0; i < 3; ++i)
         {
             Simulator::Schedule(NanoSeconds(phase + i * interval + 1), [&]() {
@@ -4618,21 +4680,27 @@ class SprayPolicyTransportTest : public TestCase
                         deliver(spine, spine == 2);
                     }
                 }
+                for (uint32_t j = 0; j < 8; ++j)
+                {
+                    Trim(receiver, seq, 5);
+                    seq += IsolatedHost::kMtu;
+                }
             });
         }
-        Simulator::Schedule(NanoSeconds(phase + interval + 2), [&]() {
-            Trim(receiver, seq, 5);
-            seq += IsolatedHost::kMtu;
-        });
         Simulator::Schedule(NanoSeconds(phase + 3 * interval + 1), [&]() { deliver(0, false); });
         Simulator::Run();
-        NS_TEST_ASSERT_MSG_EQ(receiver.emitted.size(), 3 * 64 + 2, "every packet is answered");
+        NS_TEST_ASSERT_MSG_EQ(receiver.emitted.size(), 3 * 72 + 1, "every packet is answered");
         const CustomHeader& last = receiver.emitted.back();
         NS_TEST_EXPECT_MSG_EQ(last.l3Prot, 0xFC, "the last answer is an acknowledgement");
         const SpineReport& report = receiver.hw->Grader().Report();
         NS_TEST_EXPECT_MSG_EQ(uint32_t(report.sequence), 3u, "three intervals closed");
         NS_TEST_EXPECT_MSG_EQ(uint32_t(report.Grade(2)), 0u, "the marked spine is graded down");
-        NS_TEST_EXPECT_MSG_EQ(uint32_t(report.Grade(5)), 0u, "the trimmed spine is held down");
+        NS_TEST_EXPECT_MSG_EQ(uint32_t(report.Grade(5)),
+                              1u,
+                              "the spine trimming half its packets grades by its trimmed fraction");
+        NS_TEST_EXPECT_MSG_EQ(receiver.hw->Grader().LastInterval()[5].held,
+                              false,
+                              "and is not held");
         NS_TEST_EXPECT_MSG_EQ(uint32_t(report.Grade(1)), 3u, "a clean spine keeps the top grade");
         NS_TEST_EXPECT_MSG_EQ(uint32_t(last.ack.spine_report[0]),
                               uint32_t(report.sequence),
@@ -4656,14 +4724,16 @@ class SprayPolicyTransportTest : public TestCase
         NS_TEST_EXPECT_MSG_EQ(uint32_t(first.ack.spine_report[1]),
                               0xffu,
                               "which grades every spine at the top");
-        const CustomHeader& repair = receiver.emitted[2 * 64];
+        const CustomHeader& repair = receiver.emitted[72 + 64];
         NS_TEST_EXPECT_MSG_EQ(repair.l3Prot, kUecTrimRepairProtocol, "the trim is answered");
         NS_TEST_EXPECT_MSG_EQ(uint32_t(repair.ack.spine_report[0]),
                               1u,
                               "the repair request carries the latest report");
         std::copy_n(repair.ack.spine_report + 1, 2, wire.grades);
         NS_TEST_EXPECT_MSG_EQ(uint32_t(wire.Grade(2)), 0u, "with the marked spine graded down");
-        NS_TEST_EXPECT_MSG_EQ(uint32_t(wire.Grade(5)), 3u, "before its own trim is graded");
+        NS_TEST_EXPECT_MSG_EQ(uint32_t(wire.Grade(5)),
+                              3u,
+                              "and the trimmed spine as one interval of trims left it");
         Simulator::Destroy();
     }
 
@@ -4868,6 +4938,7 @@ PointToPointTestSuite::PointToPointTestSuite()
     AddTestCase(new SupervisedEwmaTest, TestCase::Duration::QUICK);
     AddTestCase(new SpineAttributionTest, TestCase::Duration::QUICK);
     AddTestCase(new SpineGradeTest, TestCase::Duration::QUICK);
+    AddTestCase(new SpineTrimCostTest, TestCase::Duration::QUICK);
     AddTestCase(new SpineGradeReferenceTest, TestCase::Duration::QUICK);
     AddTestCase(new SpineAbsenceTest, TestCase::Duration::QUICK);
     AddTestCase(new SpineScoresDrainTest, TestCase::Duration::QUICK);
