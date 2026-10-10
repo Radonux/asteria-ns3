@@ -103,6 +103,7 @@ public:
 	double m_sprayAbsenceFractionOfMedian;
 	uint32_t m_sprayAbsenceMinimumMedian;
 	bool m_sprayOneWayDelay;
+	uint32_t m_sprayGradeReference; // SpineGrader::GradeReference
 	double m_sprayDelayCusumSlackBaseRtts;
 	double m_sprayDelayCusumThresholdBaseRtts;
 	double m_sprayDelayThreshold1BaseRtts, m_sprayDelayThreshold2BaseRtts,

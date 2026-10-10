@@ -41,17 +41,23 @@ private:
 // arrivals marked and the mean one-way delay above the least the spine has
 // shown, and a report is issued.
 //
-// A spine's grade comes from its averages through absolute thresholds, with
-// marks taking precedence over delay: a mark fraction at or above the first
-// threshold grades the spine by marks alone, and otherwise the delay, where it
-// is measured, grades it. A trimmed or moved packet holds the spine at grade 0
+// A spine's grade comes from its averages through thresholds, with marks
+// taking precedence over delay: a mark cost at or above the first threshold
+// grades the spine by marks alone, and otherwise the delay cost, where delay
+// is measured, grades it. Under the absolute reference a cost is the average
+// itself; under the median reference it is the average's excess over the
+// median of the spines' averages. A trimmed or moved packet holds the spine at grade 0
 // for a fixed number of intervals from the end of the interval it was counted
 // in, whatever the averages say, and so does an interval in which the spine's
 // arrivals fall below a fraction of the median spine's. The edge bit is set when the receiver's own
 // downlink trimmed a packet in the interval, or when no spine's averages earn
-// it the top grade.
+// it the top grade under the absolute reference.
 class SpineGrader {
 public:
+	enum class GradeReference : uint32_t {
+		Absolute = 0,
+		Median,
+	};
 	struct Parameters {
 		uint32_t spines;
 		uint64_t intervalNs;
@@ -64,6 +70,7 @@ public:
 		SupervisedEwma::Parameters delayNs;
 		// The delays above a spine's least from which it grades 2, 1 and 0.
 		double delayThresholdsNs[3];
+		GradeReference reference;
 		uint32_t holdDownIntervals;
 		// A spine is held down for arriving less than this fraction of the
 		// median spine's arrivals, once that median is at least the minimum.
@@ -109,8 +116,8 @@ private:
 		uint64_t heldUntilNs = 0;
 	};
 	void Close(uint64_t nowNs);
-	// The grade a spine's averages earn it.
-	uint8_t Earned(const Spine &spine) const;
+	// The grade a spine's mark and delay costs earn it.
+	uint8_t Earned(double markCost, double delayCostNs) const;
 	// The median of the first spines values.
 	double Median(std::array<double, SpineReport::kMaxSpines> values) const;
 

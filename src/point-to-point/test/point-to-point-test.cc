@@ -3603,6 +3603,8 @@ class GraderFixture
         parameters.delayThresholdsNs[0] = hw->m_sprayDelayThreshold1BaseRtts * 10000;
         parameters.delayThresholdsNs[1] = hw->m_sprayDelayThreshold2BaseRtts * 10000;
         parameters.delayThresholdsNs[2] = hw->m_sprayDelayThreshold3BaseRtts * 10000;
+        parameters.reference =
+            static_cast<SpineGrader::GradeReference>(hw->m_sprayGradeReference);
         parameters.holdDownIntervals = hw->m_sprayHoldDownIntervals;
         parameters.absenceFractionOfMedian = hw->m_sprayAbsenceFractionOfMedian;
         parameters.absenceMinimumMedian = hw->m_sprayAbsenceMinimumMedian;
@@ -3862,6 +3864,60 @@ class SpineGradeTest : public TestCase
                               "every spine marked alike sets the edge bit");
         NS_TEST_EXPECT_MSG_EQ(one.Report().edgeCongested, false, "one spine marked does not");
         NS_TEST_EXPECT_MSG_EQ(uint32_t(one.Report().Grade(2)), 2u, "it grades that spine down");
+    }
+};
+
+class SpineGradeReferenceTest : public TestCase
+{
+  public:
+    SpineGradeReferenceTest()
+        : TestCase("Against the median, spines marked alike all earn the top grade and one "
+                   "standing out grades down")
+    {
+    }
+
+    void DoRun() override
+    {
+        // Every spine at 0.3; one at 0.3 and the rest at 0; one at 0.6 and the
+        // rest at 0.3; three at 0.6, which the median of 0 sets apart by more
+        // than the mean of 0.225 would.
+        const std::vector<std::vector<double>> fractions{
+            std::vector<double>(GraderFixture::kSpines, 0.3),
+            {0, 0, 0, 0.3, 0, 0, 0, 0},
+            {0.3, 0.3, 0.3, 0.6, 0.3, 0.3, 0.3, 0.3},
+            {0, 0, 0, 0.6, 0, 0.6, 0.6, 0},
+        };
+        // The grades of spine 3 and of spine 0, absolute then median.
+        const uint32_t expected[4][2][2] = {
+            {{2, 2}, {3, 3}},
+            {{2, 3}, {2, 3}},
+            {{1, 2}, {2, 3}},
+            {{1, 3}, {1, 3}},
+        };
+        for (uint32_t c = 0; c < fractions.size(); ++c)
+        {
+            for (auto reference :
+                 {SpineGrader::GradeReference::Absolute, SpineGrader::GradeReference::Median})
+            {
+                SpineGrader::Parameters parameters = GraderFixture::Defaults();
+                parameters.reference = reference;
+                SpineGrader grader(parameters);
+                for (uint32_t interval = 0; interval < 4; ++interval)
+                {
+                    GraderFixture::Interval(grader, interval, fractions[c]);
+                }
+                const uint32_t r = reference == SpineGrader::GradeReference::Median;
+                NS_TEST_EXPECT_MSG_EQ(uint32_t(grader.Report().Grade(3)),
+                                      expected[c][r][0],
+                                      "spine 3 earns its grade against the reference");
+                NS_TEST_EXPECT_MSG_EQ(uint32_t(grader.Report().Grade(0)),
+                                      expected[c][r][1],
+                                      "and spine 0 its");
+                NS_TEST_EXPECT_MSG_EQ(grader.Report().edgeCongested,
+                                      (c == 0 || c == 2),
+                                      "the edge bit is judged on the averages themselves");
+            }
+        }
     }
 };
 
@@ -4793,6 +4849,7 @@ PointToPointTestSuite::PointToPointTestSuite()
     AddTestCase(new SupervisedEwmaTest, TestCase::Duration::QUICK);
     AddTestCase(new SpineAttributionTest, TestCase::Duration::QUICK);
     AddTestCase(new SpineGradeTest, TestCase::Duration::QUICK);
+    AddTestCase(new SpineGradeReferenceTest, TestCase::Duration::QUICK);
     AddTestCase(new SpineAbsenceTest, TestCase::Duration::QUICK);
     AddTestCase(new SpineScoresDrainTest, TestCase::Duration::QUICK);
     AddTestCase(new SpineScoresFloorTest, TestCase::Duration::QUICK);

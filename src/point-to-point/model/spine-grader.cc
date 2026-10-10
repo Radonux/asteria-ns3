@@ -89,14 +89,12 @@ uint32_t SpineGrader::LastIntervalLastHopTrims() const{
 }
 
 void SpineGrader::Close(uint64_t nowNs){
-	std::array<double, SpineReport::kMaxSpines> arrivals{};
-	for (uint32_t k = 0; k < m_spines.size(); k++)
-		arrivals[k] = m_spines[k].counting.arrivals;
-	const double medianArrivals = Median(arrivals);
-	bool everySpineBelowTop = true;
-	for (uint32_t k = 0; k < m_spines.size(); k++){
+	const uint32_t spines = m_spines.size();
+	std::array<double, SpineReport::kMaxSpines> arrivals{}, marks{}, delays{};
+	for (uint32_t k = 0; k < spines; k++){
 		Spine &spine = m_spines[k];
-		SpineInterval &counted = spine.counting;
+		const SpineInterval &counted = spine.counting;
+		arrivals[k] = counted.arrivals;
 		if (counted.arrivals > 0){
 			spine.markFraction.Add(
 				static_cast<double>(counted.marked) / counted.arrivals,
@@ -107,6 +105,19 @@ void SpineGrader::Close(uint64_t nowNs){
 						spine.leastDelayNs,
 					m_parameters.delayNs);
 		}
+		marks[k] = spine.markFraction.Value();
+		delays[k] = spine.delayNs.Value();
+	}
+	const double medianArrivals = Median(arrivals);
+	// Spines alike all earn the top grade against their median, so the
+	// median reference, unlike a rank, has no loser on a healthy fabric.
+	const bool median = m_parameters.reference == GradeReference::Median;
+	const double markReference = median ? Median(marks) : 0;
+	const double delayReference = median ? Median(delays) : 0;
+	bool everySpineBelowTop = true;
+	for (uint32_t k = 0; k < spines; k++){
+		Spine &spine = m_spines[k];
+		SpineInterval &counted = spine.counting;
 		// A spine the report in force graded 0 is sent next to nothing, so
 		// its arrivals are no evidence of absence.
 		counted.absent = medianArrivals >= m_parameters.absenceMinimumMedian &&
@@ -115,10 +126,11 @@ void SpineGrader::Close(uint64_t nowNs){
 		if (counted.trimmed > 0 || counted.moved > 0 || counted.absent)
 			spine.heldUntilNs = m_intervalEndNs +
 				m_parameters.holdDownIntervals * m_parameters.intervalNs;
-		const uint8_t earned = Earned(spine);
-		everySpineBelowTop &= earned < SpineReport::kTopGrade;
-		counted.markFraction = spine.markFraction.Value();
-		counted.delayNs = spine.delayNs.Value();
+		everySpineBelowTop &= Earned(marks[k], delays[k]) < SpineReport::kTopGrade;
+		const uint8_t earned =
+			Earned(marks[k] - markReference, delays[k] - delayReference);
+		counted.markFraction = marks[k];
+		counted.delayNs = delays[k];
 		counted.held = nowNs < spine.heldUntilNs;
 		m_report.SetGrade(k, counted.held ? 0 : earned);
 		m_lastInterval[k] = counted;
@@ -132,12 +144,11 @@ void SpineGrader::Close(uint64_t nowNs){
 	m_lastHopTrims = 0;
 }
 
-uint8_t SpineGrader::Earned(const Spine &spine) const{
-	const uint8_t byMarks =
-		Quantize(spine.markFraction.Value(), m_parameters.markThresholds);
+uint8_t SpineGrader::Earned(double markCost, double delayCostNs) const{
+	const uint8_t byMarks = Quantize(markCost, m_parameters.markThresholds);
 	if (byMarks < SpineReport::kTopGrade || !m_parameters.oneWayDelay)
 		return byMarks;
-	return Quantize(spine.delayNs.Value(), m_parameters.delayThresholdsNs);
+	return Quantize(delayCostNs, m_parameters.delayThresholdsNs);
 }
 
 double SpineGrader::Median(

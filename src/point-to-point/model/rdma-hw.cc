@@ -340,6 +340,17 @@ TypeId RdmaHw::GetTypeId (void)
 				DoubleValue(0.75),
 				MakeDoubleAccessor(&RdmaHw::m_sprayDelayThreshold3BaseRtts),
 				MakeDoubleChecker<double>(0))
+		.AddAttribute("SprayGradeReference",
+				"Under LoadBalancing 3, what a spine's averages are graded "
+				"against: 0=nothing, the averages themselves; 1=the median of "
+				"the spines' averages, which the averages' excess is graded by. "
+				"Default 0.",
+				UintegerValue(static_cast<uint32_t>(
+					SpineGrader::GradeReference::Absolute)),
+				MakeUintegerAccessor(&RdmaHw::m_sprayGradeReference),
+				MakeUintegerChecker<uint32_t>(
+					static_cast<uint32_t>(SpineGrader::GradeReference::Absolute),
+					static_cast<uint32_t>(SpineGrader::GradeReference::Median)))
 		.AddAttribute("SprayGamma",
 				"Under LoadBalancing 3, the fraction of every spine score a "
 				"report decays. Default 0.25.",
@@ -929,6 +940,8 @@ SpineGrader &RdmaHw::Grader(){
 	parameters.delayThresholdsNs[0] = m_sprayDelayThreshold1BaseRtts * rtt;
 	parameters.delayThresholdsNs[1] = m_sprayDelayThreshold2BaseRtts * rtt;
 	parameters.delayThresholdsNs[2] = m_sprayDelayThreshold3BaseRtts * rtt;
+	parameters.reference =
+		static_cast<SpineGrader::GradeReference>(m_sprayGradeReference);
 	parameters.holdDownIntervals = m_sprayHoldDownIntervals;
 	parameters.absenceFractionOfMedian = m_sprayAbsenceFractionOfMedian;
 	parameters.absenceMinimumMedian = m_sprayAbsenceMinimumMedian;
