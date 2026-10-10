@@ -13,6 +13,9 @@
 #include "ppp-header.h"
 #include "qbb-header.h"
 #include "cn-header.h"
+#include <algorithm>
+#include <cmath>
+#include <utility>
 
 namespace ns3{
 
@@ -26,6 +29,26 @@ uint64_t AnswerRtt(const OutstandingPackets &outstanding, uint64_t packet){
 	if (packet == OutstandingPackets::kNone || outstanding.ResendsLost(packet))
 		return NsccWindow::kNoRtt;
 	return Simulator::Now().GetNanoSeconds() - outstanding.SentNs(packet);
+}
+
+static_assert(sizeof(std::declval<CustomHeader>().ack.spine_report) ==
+		1 + SpineReport::GradeBytes(SpineReport::kMaxSpines),
+	"an acknowledgement header holds the largest spine report");
+
+// The spine report an acknowledgement or a repair request carries.
+SpineReport ReportOf(const CustomHeader &ch){
+	SpineReport report;
+	report.sequence = ch.ack.spine_report[0];
+	std::copy_n(ch.ack.spine_report + 1, CustomHeader::ackReportBytes - 1,
+		report.grades);
+	report.edgeCongested = (ch.ack.flags >> qbbHeader::FLAG_EDGE_CONGESTED) & 1;
+	return report;
+}
+
+// A fraction of the golden ratio per node, which sets the hosts' phases apart
+// for any number of hosts.
+double PhaseOf(uint32_t node){
+	return std::fmod(node * 0.6180339887498949, 1.0);
 }
 
 } // namespace
@@ -126,14 +149,17 @@ TypeId RdmaHw::GetTypeId (void)
 		.AddAttribute("LoadBalancing",
 				"What the IPv4 identification of a data packet carries: 0=a "
 				"per-QP counter, 1=a 16-bit entropy value drawn per packet, "
-				"2=a spine index drawn per packet, in both bytes.",
+				"2=a spine index drawn uniformly per packet, in both bytes, "
+				"3=a spine index drawn per packet from scores built out of the "
+				"receiver's grades, in both bytes.",
 				UintegerValue(static_cast<uint32_t>(LoadBalancingMode::Ecmp)),
 				MakeUintegerAccessor(&RdmaHw::m_loadBalancing),
 				MakeUintegerChecker<uint32_t>(
 					static_cast<uint32_t>(LoadBalancingMode::Ecmp),
-					static_cast<uint32_t>(LoadBalancingMode::SprayUniform)))
+					static_cast<uint32_t>(LoadBalancingMode::SprayPolicy)))
 		.AddAttribute("SpineCount",
-				"Number of spines a data packet may name when LoadBalancing is 2.",
+				"Number of spines a data packet may name when LoadBalancing is 2 "
+				"or 3.",
 				UintegerValue(0),
 				MakeUintegerAccessor(&RdmaHw::m_spineCount),
 				MakeUintegerChecker<uint32_t>(0, 256))
@@ -201,6 +227,145 @@ TypeId RdmaHw::GetTypeId (void)
 				DoubleValue(1.0),
 				MakeDoubleAccessor(&RdmaHw::m_mrcProbeTimeouts),
 				MakeDoubleChecker<double>(0))
+		.AddAttribute("SprayBaseRttNs",
+				"Under LoadBalancing 3, the base RTT the attributes below count "
+				"time in. Zero, the default, is refused at the first use.",
+				UintegerValue(0),
+				MakeUintegerAccessor(&RdmaHw::m_sprayBaseRttNs),
+				MakeUintegerChecker<uint64_t>())
+		.AddAttribute("SprayReportIntervalBaseRtts",
+				"Under LoadBalancing 3, the interval a receiver issues a spine "
+				"report per, in base RTTs. Default 2: one report per round trip, "
+				"which under load is about twice the base RTT.",
+				DoubleValue(2.0),
+				MakeDoubleAccessor(&RdmaHw::m_sprayReportIntervalBaseRtts),
+				MakeDoubleChecker<double>(0))
+		.AddAttribute("SprayEstimatorGain",
+				"Under LoadBalancing 3, the gain of a receiver's per-spine "
+				"averages, per report interval. Default 1/16, DCTCP's gain on the "
+				"fraction of marked packets.",
+				DoubleValue(1.0 / 16),
+				MakeDoubleAccessor(&RdmaHw::m_sprayEstimatorGain),
+				MakeDoubleChecker<double>(0, 1))
+		.AddAttribute("SprayMarkCusumSlack",
+				"Under LoadBalancing 3, the CUSUM slack of the marked fraction, "
+				"per report interval. Default 0.125, half the width of a grade.",
+				DoubleValue(0.125),
+				MakeDoubleAccessor(&RdmaHw::m_sprayMarkCusumSlack),
+				MakeDoubleChecker<double>(0))
+		.AddAttribute("SprayMarkCusumThreshold",
+				"Under LoadBalancing 3, the CUSUM sum of the marked fraction at "
+				"which its average restarts at the sample. Default 0.5, the width "
+				"of two grades.",
+				DoubleValue(0.5),
+				MakeDoubleAccessor(&RdmaHw::m_sprayMarkCusumThreshold),
+				MakeDoubleChecker<double>(0))
+		.AddAttribute("SprayMarkThreshold1",
+				"Under LoadBalancing 3, the average marked fraction from which a "
+				"spine grades 2. Default 0.25.",
+				DoubleValue(0.25),
+				MakeDoubleAccessor(&RdmaHw::m_sprayMarkThreshold1),
+				MakeDoubleChecker<double>(0, 1))
+		.AddAttribute("SprayMarkThreshold2",
+				"Under LoadBalancing 3, the average marked fraction from which a "
+				"spine grades 1. Default 0.5.",
+				DoubleValue(0.5),
+				MakeDoubleAccessor(&RdmaHw::m_sprayMarkThreshold2),
+				MakeDoubleChecker<double>(0, 1))
+		.AddAttribute("SprayMarkThreshold3",
+				"Under LoadBalancing 3, the average marked fraction from which a "
+				"spine grades 0. Default 0.75.",
+				DoubleValue(0.75),
+				MakeDoubleAccessor(&RdmaHw::m_sprayMarkThreshold3),
+				MakeDoubleChecker<double>(0, 1))
+		.AddAttribute("SprayHoldDownIntervals",
+				"Under LoadBalancing 3, the report intervals a spine grades 0 "
+				"after a packet it carried was trimmed before the last hop, or a "
+				"packet requested on it was moved to another. Default 4.",
+				UintegerValue(4),
+				MakeUintegerAccessor(&RdmaHw::m_sprayHoldDownIntervals),
+				MakeUintegerChecker<uint32_t>())
+		.AddAttribute("SprayOneWayDelay",
+				"Under LoadBalancing 3, grade a spine with no marks by the one-way "
+				"delay of its packets, which needs IntHeader::mode TS: eight bytes "
+				"more in every data packet and acknowledgement. Default false.",
+				BooleanValue(false),
+				MakeBooleanAccessor(&RdmaHw::m_sprayOneWayDelay),
+				MakeBooleanChecker())
+		.AddAttribute("SprayDelayCusumSlackBaseRtts",
+				"Under SprayOneWayDelay, the CUSUM slack of a spine's delay above "
+				"its least, in base RTTs. Default 0.125, half the width of a "
+				"grade.",
+				DoubleValue(0.125),
+				MakeDoubleAccessor(&RdmaHw::m_sprayDelayCusumSlackBaseRtts),
+				MakeDoubleChecker<double>(0))
+		.AddAttribute("SprayDelayCusumThresholdBaseRtts",
+				"Under SprayOneWayDelay, the CUSUM sum of a spine's delay at which "
+				"its average restarts at the sample, in base RTTs. Default 0.5, "
+				"the width of two grades.",
+				DoubleValue(0.5),
+				MakeDoubleAccessor(&RdmaHw::m_sprayDelayCusumThresholdBaseRtts),
+				MakeDoubleChecker<double>(0))
+		.AddAttribute("SprayDelayThreshold1BaseRtts",
+				"Under SprayOneWayDelay, the average delay above a spine's least "
+				"from which it grades 2, in base RTTs. Default 0.25.",
+				DoubleValue(0.25),
+				MakeDoubleAccessor(&RdmaHw::m_sprayDelayThreshold1BaseRtts),
+				MakeDoubleChecker<double>(0))
+		.AddAttribute("SprayDelayThreshold2BaseRtts",
+				"Under SprayOneWayDelay, the average delay above a spine's least "
+				"from which it grades 1, in base RTTs. Default 0.5.",
+				DoubleValue(0.5),
+				MakeDoubleAccessor(&RdmaHw::m_sprayDelayThreshold2BaseRtts),
+				MakeDoubleChecker<double>(0))
+		.AddAttribute("SprayDelayThreshold3BaseRtts",
+				"Under SprayOneWayDelay, the average delay above a spine's least "
+				"from which it grades 0, in base RTTs. Default 0.75, NSCC's "
+				"target_qdelay.",
+				DoubleValue(0.75),
+				MakeDoubleAccessor(&RdmaHw::m_sprayDelayThreshold3BaseRtts),
+				MakeDoubleChecker<double>(0))
+		.AddAttribute("SprayGamma",
+				"Under LoadBalancing 3, the fraction of every spine score a "
+				"report decays. Default 0.25.",
+				DoubleValue(0.25),
+				MakeDoubleAccessor(&RdmaHw::m_sprayGamma),
+				MakeDoubleChecker<double>(0, 1))
+		.AddAttribute("SprayEpsilon",
+				"Under LoadBalancing 3, the fraction of draws spread evenly over "
+				"the spines whatever their scores. Default 0.02.",
+				DoubleValue(0.02),
+				MakeDoubleAccessor(&RdmaHw::m_sprayEpsilon),
+				MakeDoubleChecker<double>(0, 1))
+		.AddAttribute("SprayCandidates",
+				"Under LoadBalancing 3, the candidates drawn per packet, of which "
+				"the highest-scored is sent on. Default 1.",
+				UintegerValue(1),
+				MakeUintegerAccessor(&RdmaHw::m_sprayCandidates),
+				MakeUintegerChecker<uint32_t>(1))
+		.AddAttribute("SprayCandidateDraw",
+				"Under LoadBalancing 3, how each candidate is drawn: 0=in "
+				"proportion to the spine shares, 1=uniformly. Default 0.",
+				UintegerValue(static_cast<uint32_t>(
+					SpineScores::CandidateDraw::Proportional)),
+				MakeUintegerAccessor(&RdmaHw::m_sprayCandidateDraw),
+				MakeUintegerChecker<uint32_t>(
+					static_cast<uint32_t>(SpineScores::CandidateDraw::Proportional),
+					static_cast<uint32_t>(SpineScores::CandidateDraw::Uniform)))
+		.AddAttribute("SprayEdgeWindowPenalty",
+				"Under LoadBalancing 3 and CC mode 11, the Rcv_Cwnd_Pend (UEC "
+				"1.0.3 section 3.6.13.2) of an acknowledgement whose report says "
+				"the receiver's downlink is congested, 0 to 127. Default 64, the "
+				"section's example that halves a window over a round trip.",
+				UintegerValue(64),
+				MakeUintegerAccessor(&RdmaHw::m_sprayEdgeWindowPenalty),
+				MakeUintegerChecker<uint32_t>(0, 127))
+		.AddTraceSource("SpineReport",
+				"Under LoadBalancing 3, a receiver issued a spine report: the "
+				"time, then the grader, which holds the report and the interval "
+				"it closed.",
+				MakeTraceSourceAccessor(&RdmaHw::m_traceSpineReport),
+				"ns3::RdmaHw::SpineReportTracedCallback")
 		.AddAttribute("EwmaGain",
 				"Control gain parameter which determines the level of rate decrease",
 				DoubleValue(1.0 / 16),
@@ -443,10 +608,19 @@ void RdmaHw::Setup(QpCompleteCallback cb, QpFailureCallback failure_cb){
 				static_cast<uint32_t>(LoadBalancingMode::Ecmp) && !m_pathRandom,
 		"A LoadBalancing mode other than ECMP draws the identification of every "
 		"data packet from PathRandomVariable");
-	NS_ABORT_MSG_IF(m_loadBalancing ==
-				static_cast<uint32_t>(LoadBalancingMode::SprayUniform) &&
+	NS_ABORT_MSG_IF(NamesSpine(static_cast<LoadBalancingMode>(m_loadBalancing)) &&
 			m_spineCount == 0,
-		"LoadBalancing 2 names a spine per packet and needs SpineCount");
+		"LoadBalancing 2 and 3 name a spine per packet and need SpineCount");
+	NS_ABORT_MSG_IF(IsSprayPolicy() && m_spineCount > SpineReport::kMaxSpines,
+		"a spine report grades at most SpineReport::kMaxSpines spines");
+	NS_ABORT_MSG_IF(CustomHeader::ackReportBytes != (IsSprayPolicy()
+			? 1 + SpineReport::GradeBytes(m_spineCount) : 0),
+		"LoadBalancing 3 and only it carries a report on the spines in every "
+		"acknowledgement, its sequence and the grades of SpineCount spines");
+	NS_ABORT_MSG_IF(m_sprayOneWayDelay &&
+			(!IsSprayPolicy() || IntHeader::mode != IntHeader::TS),
+		"SprayOneWayDelay grades the spines of LoadBalancing 3 by the send "
+		"timestamp of IntHeader::mode TS");
 	NS_ABORT_MSG_IF(m_pathSelectorKind !=
 				static_cast<uint32_t>(PathSelectorKind::Ops) &&
 			m_loadBalancing !=
@@ -648,6 +822,8 @@ int RdmaHw::ReceiveUdp(Ptr<Packet> p, CustomHeader &ch){
 	}
 	rxQp->m_ecn_source.total++;
 	CountArrival(rxQp, ch.ipid, payload_size);
+	if (IsSprayPolicy())
+		GradeArrival(ch, ecnbits != 0);
 	rxQp->m_milestone_rx = m_ack_interval;
 
 	// No logging on the non-ACK paths: behind a trim- or drop-induced gap,
@@ -690,7 +866,7 @@ int RdmaHw::ReceiveUdp(Ptr<Packet> p, CustomHeader &ch){
 void RdmaHw::CountArrival(Ptr<RdmaRxQueuePair> q, uint16_t identification,
 		uint32_t payloadSize){
 	q->m_data_arrivals++;
-	if (m_loadBalancing != static_cast<uint32_t>(LoadBalancingMode::SprayUniform))
+	if (!NamesSpine(static_cast<LoadBalancingMode>(m_loadBalancing)))
 		return;
 	const uint8_t carrying = CarryingSpine(identification);
 	if (carrying >= m_spineArrivals.size())
@@ -701,6 +877,66 @@ void RdmaHw::CountArrival(Ptr<RdmaRxQueuePair> q, uint16_t identification,
 	spine.payloadBytes += payloadSize;
 	spine.folded += folded;
 	q->m_folded_arrivals += folded;
+}
+
+bool RdmaHw::IsSprayPolicy() const{
+	return m_loadBalancing == static_cast<uint32_t>(LoadBalancingMode::SprayPolicy);
+}
+
+uint64_t RdmaHw::SprayReportIntervalNs() const{
+	NS_ABORT_MSG_IF(m_sprayBaseRttNs == 0,
+		"LoadBalancing 3 counts its report interval in SprayBaseRttNs");
+	return static_cast<uint64_t>(m_sprayReportIntervalBaseRtts * m_sprayBaseRttNs);
+}
+
+// Made at the first event, because the base RTT is set only after every host
+// is built.
+SpineGrader &RdmaHw::Grader(){
+	if (m_spineGrader)
+		return *m_spineGrader;
+	const double rtt = m_sprayBaseRttNs;
+	SpineGrader::Parameters parameters;
+	parameters.spines = m_spineCount;
+	parameters.intervalNs = SprayReportIntervalNs();
+	// Receivers whose intervals end together move their senders' shares
+	// together.
+	parameters.phaseNs =
+		static_cast<uint64_t>(PhaseOf(m_node->GetId()) * parameters.intervalNs);
+	parameters.marks = {m_sprayEstimatorGain, m_sprayMarkCusumSlack,
+		m_sprayMarkCusumThreshold};
+	parameters.markThresholds[0] = m_sprayMarkThreshold1;
+	parameters.markThresholds[1] = m_sprayMarkThreshold2;
+	parameters.markThresholds[2] = m_sprayMarkThreshold3;
+	parameters.oneWayDelay = m_sprayOneWayDelay;
+	parameters.delayNs = {m_sprayEstimatorGain,
+		m_sprayDelayCusumSlackBaseRtts * rtt,
+		m_sprayDelayCusumThresholdBaseRtts * rtt};
+	parameters.delayThresholdsNs[0] = m_sprayDelayThreshold1BaseRtts * rtt;
+	parameters.delayThresholdsNs[1] = m_sprayDelayThreshold2BaseRtts * rtt;
+	parameters.delayThresholdsNs[2] = m_sprayDelayThreshold3BaseRtts * rtt;
+	parameters.holdDownIntervals = m_sprayHoldDownIntervals;
+	m_spineGrader = std::make_unique<SpineGrader>(parameters);
+	return *m_spineGrader;
+}
+
+SpineGrader &RdmaHw::GraderNow(){
+	const uint64_t now = Simulator::Now().GetNanoSeconds();
+	SpineGrader &grader = Grader();
+	if (grader.Advance(now))
+		m_traceSpineReport(now, grader);
+	return grader;
+}
+
+void RdmaHw::GradeArrival(const CustomHeader &ch, bool marked){
+	// One clock serves the whole simulation, so the difference is the delay.
+	const uint64_t delay = m_sprayOneWayDelay
+		? (Simulator::Now() - TimeStep(ch.udp.ih.ts)).GetNanoSeconds() : 0;
+	GraderNow().OnArrival(RequestedSpine(ch.ipid), CarryingSpine(ch.ipid), marked,
+		delay);
+}
+
+void RdmaHw::GradeTrim(const CustomHeader &ch, bool lastHop){
+	GraderNow().OnTrim(CarryingSpine(ch.ipid), lastHop);
 }
 
 // The receiver's cumulative acknowledgement, shared by the in-order data path
@@ -726,6 +962,8 @@ void RdmaHw::SendAck(Ptr<RdmaRxQueuePair> q, uint32_t sourceIp,
 	if (probeAnswer)
 		seqh.SetProbeAnswer();
 	seqh.SetAllowanceExhausted(spent);
+	if (IsSprayPolicy())
+		seqh.SetSpineReport(Grader().Report());
 	// The grant is this flag without the report above. A receiver that may not
 	// forgive this flow, or a step that is critical, never sets it, so those
 	// senders obey their controller throughout.
@@ -829,12 +1067,19 @@ int RdmaHw::ReceiveAck(Ptr<Packet> p, CustomHeader &ch){
 			const uint16_t path =
 				PathOf(static_cast<LoadBalancingMode>(m_loadBalancing), ch.ipid);
 			const uint64_t now = Simulator::Now().GetNanoSeconds();
+			if (IsSprayPolicy())
+				qp->m_pathSelector->OnReport(ReportOf(ch), now);
 			if ((ch.ack.flags >> qbbHeader::FLAG_PROBE_ANSWER) & 1){
 				qp->m_pathSelector->OnProbeAnswer(path, cnp, now);
 			}else{
 				qp->m_pathSelector->OnAck(path, cnp, now);
+				// The destination's downlink being congested is the receiver's
+				// flow control of UEC 1.0.3 section 3.6.13.2.
+				const uint32_t rcvCwndPend = IsSprayPolicy() &&
+						((ch.ack.flags >> qbbHeader::FLAG_EDGE_CONGESTED) & 1)
+					? m_sprayEdgeWindowPenalty : 0;
 				if (m_cc_mode == 11 && DeliverCongestionSignal(qp))
-					HandleAckNscc(qp, ch.ack.packet_seq, path, cnp);
+					HandleAckNscc(qp, ch.ack.packet_seq, path, cnp, rcvCwndPend);
 				else
 					qp->AcknowledgePacket(ch.ack.packet_seq, path);
 			}
@@ -959,6 +1204,8 @@ void RdmaHw::SendTrimNack(const CustomHeader &ch, uint32_t sourceIp,
 	// flow; without this flag a clear bit means nothing, because a receiver
 	// with no budget at all also sends one.
 	repair.SetForgivenessEligible(eligible);
+	if (IsSprayPolicy())
+		repair.SetSpineReport(Grader().Report());
 	Ptr<Packet> packet = Create<Packet>(
 		std::max(60 - 14 - 20 - static_cast<int>(repair.GetSerializedSize()), 0));
 	packet->AddHeader(repair);
@@ -1064,10 +1311,13 @@ void RdmaHw::RecoverTrimmedQueue(Ptr<RdmaQueuePair> qp,
 	const uint16_t path =
 		PathOf(static_cast<LoadBalancingMode>(m_loadBalancing), ch.ipid);
 	// A stale trim reports on its path all the same.
-	if (qp->m_outstanding.IsKept())
+	if (qp->m_outstanding.IsKept()){
+		const uint64_t now = Simulator::Now().GetNanoSeconds();
+		if (IsSprayPolicy())
+			qp->m_pathSelector->OnReport(ReportOf(ch), now);
 		qp->m_pathSelector->OnTrim(path, lastHop,
-			(ch.ack.flags >> qbbHeader::FLAG_CNP) & 1,
-			Simulator::Now().GetNanoSeconds());
+			(ch.ack.flags >> qbbHeader::FLAG_CNP) & 1, now);
+	}
 	const uint64_t trimStart = ch.ack.seq;
 	const uint64_t trimEnd = trimStart + ch.ack.trim_payload_size;
 	if (ch.ack.trim_payload_size == 0 || trimEnd <= qp->snd_una){
@@ -1281,6 +1531,8 @@ int RdmaHw::ReceiveTrim(Ptr<Packet> p, CustomHeader &ch){
 		const uint32_t originalPayload = ch.udp.payload_size > udpHeaderBytes
 			? ch.udp.payload_size - udpHeaderBytes : 0;
 		const bool lastHop = ch.GetIpv4Dscp() == kUetDscpTrimmedLastHop;
+		if (IsSprayPolicy())
+			GradeTrim(ch, lastHop);
 		if (m_forgiveness && originalPayload > 0){
 			ReceiveTrimmedData(ch, originalPayload, lastHop);
 			return 0;
@@ -1687,6 +1939,17 @@ void RdmaHw::StartPathSelection(Ptr<RdmaQueuePair> qp, uint64_t bdpBytes,
 	if (m_loadBalancing == static_cast<uint32_t>(LoadBalancingMode::SprayUniform)){
 		qp->m_pathSelector =
 			std::make_unique<UniformSpineSelector>(m_pathRandom, m_spineCount);
+		return;
+	}
+	if (IsSprayPolicy()){
+		const SpineScores::Parameters parameters{m_sprayGamma, m_sprayEpsilon,
+			m_sprayCandidates,
+			static_cast<SpineScores::CandidateDraw>(m_sprayCandidateDraw),
+			SprayReportIntervalNs()};
+		SpineScores &scores = m_spineScores.try_emplace(qp->dip.Get(),
+			m_spineCount, parameters).first->second;
+		qp->m_pathSelector =
+			std::make_unique<PolicySpineSelector>(m_pathRandom, scores);
 		return;
 	}
 	switch (static_cast<PathSelectorKind>(m_pathSelectorKind)){
@@ -2249,7 +2512,7 @@ NsccWindow::Parameters RdmaHw::NsccParameters() const{
 }
 
 void RdmaHw::HandleAckNscc(Ptr<RdmaQueuePair> qp, uint64_t seq, uint16_t path,
-		bool marked){
+		bool marked, uint32_t rcvCwndPend){
 	const uint64_t packet = qp->m_outstanding.Find(seq, path);
 	// A repeated or late answer: its bytes already left the window.
 	if (packet == OutstandingPackets::kNone)
@@ -2259,7 +2522,7 @@ void RdmaHw::HandleAckNscc(Ptr<RdmaQueuePair> qp, uint64_t seq, uint16_t path,
 	const uint64_t rtt = AnswerRtt(qp->m_outstanding, packet);
 	const uint64_t lost = qp->AcknowledgePacket(seq, path);
 	qp->nscc.OnAck(bytes, marked, rtt, qp->GetOnTheFly(),
-		Simulator::Now().GetNanoSeconds(), 0);
+		Simulator::Now().GetNanoSeconds(), rcvCwndPend);
 	if (lost > 0)
 		qp->nscc.OnLoss(lost);
 	ApplyNsccWindow(qp);

@@ -3573,11 +3573,8 @@ class SupervisedEwmaTest : public TestCase
 };
 
 /**
- * A receiver's grader of eight spines over 10 us intervals starting at zero:
- * averages of gain 1/16, CUSUM slack 0.125 and threshold 0.5 on the marked
- * fraction, grade bands from marked fractions of 0.25, 0.5 and 0.75, and with
- * one-way delay from delays of 2.5, 5 and 7.5 us, with CUSUM slack 1.25 us and
- * threshold 5 us; four intervals of hold-down. And the intervals it is fed.
+ * A receiver's grader of eight spines with the RdmaHw defaults, over 10 us
+ * intervals starting at zero, and the intervals it is fed.
  */
 class GraderFixture
 {
@@ -3587,20 +3584,26 @@ class GraderFixture
 
     static SpineGrader::Parameters Defaults(bool oneWayDelay = false)
     {
+        Ptr<RdmaHw> hw = CreateObject<RdmaHw>();
         SpineGrader::Parameters parameters;
         parameters.spines = kSpines;
         parameters.intervalNs = kInterval;
         parameters.phaseNs = 0;
-        parameters.marks = {1.0 / 16, 0.125, 0.5};
-        parameters.markThresholds[0] = 0.25;
-        parameters.markThresholds[1] = 0.5;
-        parameters.markThresholds[2] = 0.75;
+        parameters.marks = {hw->m_sprayEstimatorGain,
+                            hw->m_sprayMarkCusumSlack,
+                            hw->m_sprayMarkCusumThreshold};
+        parameters.markThresholds[0] = hw->m_sprayMarkThreshold1;
+        parameters.markThresholds[1] = hw->m_sprayMarkThreshold2;
+        parameters.markThresholds[2] = hw->m_sprayMarkThreshold3;
         parameters.oneWayDelay = oneWayDelay;
-        parameters.delayNs = {1.0 / 16, 1250, 5000};
-        parameters.delayThresholdsNs[0] = 2500;
-        parameters.delayThresholdsNs[1] = 5000;
-        parameters.delayThresholdsNs[2] = 7500;
-        parameters.holdDownIntervals = 4;
+        // A base RTT of 10 us.
+        parameters.delayNs = {hw->m_sprayEstimatorGain,
+                              hw->m_sprayDelayCusumSlackBaseRtts * 10000,
+                              hw->m_sprayDelayCusumThresholdBaseRtts * 10000};
+        parameters.delayThresholdsNs[0] = hw->m_sprayDelayThreshold1BaseRtts * 10000;
+        parameters.delayThresholdsNs[1] = hw->m_sprayDelayThreshold2BaseRtts * 10000;
+        parameters.delayThresholdsNs[2] = hw->m_sprayDelayThreshold3BaseRtts * 10000;
+        parameters.holdDownIntervals = hw->m_sprayHoldDownIntervals;
         return parameters;
     }
 
@@ -3861,9 +3864,8 @@ class SpineGradeTest : public TestCase
 };
 
 /**
- * A sender's scores of eight spines towards one host with the design's gamma
- * of 0.25, epsilon of 0.02 and one candidate drawn in proportion, reports due
- * every 10 us, and the reports it is fed.
+ * A sender's scores of eight spines towards one host with the RdmaHw
+ * defaults, and the reports it is fed.
  */
 class ScoresFixture
 {
@@ -3873,11 +3875,13 @@ class ScoresFixture
 
     static SpineScores::Parameters Defaults()
     {
-        return SpineScores::Parameters{0.25,
-                                       0.02,
-                                       1,
-                                       SpineScores::CandidateDraw::Proportional,
-                                       kInterval};
+        Ptr<RdmaHw> hw = CreateObject<RdmaHw>();
+        return SpineScores::Parameters{
+            hw->m_sprayGamma,
+            hw->m_sprayEpsilon,
+            hw->m_sprayCandidates,
+            static_cast<SpineScores::CandidateDraw>(hw->m_sprayCandidateDraw),
+            kInterval};
     }
 
     static SpineReport Report(uint8_t sequence, const std::vector<uint8_t>& grades)
@@ -4322,6 +4326,216 @@ class SpineScoresDrawTest : public TestCase
     }
 };
 
+class SprayPolicyTransportTest : public TestCase
+{
+  public:
+    SprayPolicyTransportTest()
+        : TestCase("Under spray_policy every answer carries the receiver's latest report and the "
+                   "sender's scores and window follow it")
+    {
+    }
+
+    void DoRun() override
+    {
+        const bool savedPacketSeq = CustomHeader::ackCarriesPacketSeq;
+        const uint32_t savedReportBytes = CustomHeader::ackReportBytes;
+        CustomHeader::ackCarriesPacketSeq = true;
+        CustomHeader::ackReportBytes = 1 + SpineReport::GradeBytes(8);
+        Receiver();
+        Sender();
+        EdgePenalty();
+        CustomHeader::ackReportBytes = savedReportBytes;
+        CustomHeader::ackCarriesPacketSeq = savedPacketSeq;
+    }
+
+  private:
+    static constexpr uint64_t kBaseRtt = 10000;
+
+    // A receiver with two spines graded apart: spine 2 marked on every packet,
+    // spine 5 trimmed once, the rest clean.
+    void Receiver()
+    {
+        IsolatedHost receiver(LoadBalancingMode::SprayPolicy, kTestSender, 8);
+        Ptr<Node> node = CreateObject<Node>();
+        receiver.hw->SetNode(node);
+        receiver.hw->m_sprayBaseRttNs = kBaseRtt;
+        const uint64_t interval = receiver.hw->m_sprayReportIntervalBaseRtts * kBaseRtt;
+        // The receiver's first interval ends a fraction of the golden ratio per
+        // node id into the second.
+        const uint64_t phase = std::fmod(node->GetId() * 0.6180339887498949, 1.0) * interval;
+        uint32_t seq = 0;
+        auto deliver = [&](uint8_t spine, bool marked) {
+            receiver.ReceiveData(kTestSender,
+                                 kTestReceiver,
+                                 seq,
+                                 SpineIdentification(spine, spine),
+                                 marked);
+            seq += IsolatedHost::kMtu;
+        };
+        // Three intervals, eight packets per spine each, then one packet.
+        for (uint32_t i = 0; i < 3; ++i)
+        {
+            Simulator::Schedule(NanoSeconds(phase + i * interval + 1), [&]() {
+                for (uint8_t spine = 0; spine < 8; ++spine)
+                {
+                    for (uint32_t j = 0; j < 8; ++j)
+                    {
+                        deliver(spine, spine == 2);
+                    }
+                }
+            });
+        }
+        Simulator::Schedule(NanoSeconds(phase + interval + 2), [&]() {
+            Trim(receiver, seq, 5);
+            seq += IsolatedHost::kMtu;
+        });
+        Simulator::Schedule(NanoSeconds(phase + 3 * interval + 1), [&]() { deliver(0, false); });
+        Simulator::Run();
+        NS_TEST_ASSERT_MSG_EQ(receiver.emitted.size(), 3 * 64 + 2, "every packet is answered");
+        const CustomHeader& last = receiver.emitted.back();
+        NS_TEST_EXPECT_MSG_EQ(last.l3Prot, 0xFC, "the last answer is an acknowledgement");
+        const SpineReport& report = receiver.hw->Grader().Report();
+        NS_TEST_EXPECT_MSG_EQ(uint32_t(report.sequence), 3u, "three intervals closed");
+        NS_TEST_EXPECT_MSG_EQ(uint32_t(report.Grade(2)), 0u, "the marked spine is graded down");
+        NS_TEST_EXPECT_MSG_EQ(uint32_t(report.Grade(5)), 0u, "the trimmed spine is held down");
+        NS_TEST_EXPECT_MSG_EQ(uint32_t(report.Grade(1)), 3u, "a clean spine keeps the top grade");
+        NS_TEST_EXPECT_MSG_EQ(uint32_t(last.ack.spine_report[0]),
+                              uint32_t(report.sequence),
+                              "the acknowledgement carries the latest report");
+        SpineReport wire;
+        std::copy_n(last.ack.spine_report + 1, 2, wire.grades);
+        for (uint32_t spine = 0; spine < 8; ++spine)
+        {
+            NS_TEST_EXPECT_MSG_EQ(uint32_t(wire.Grade(spine)),
+                                  uint32_t(report.Grade(spine)),
+                                  "and its grades");
+        }
+        NS_TEST_EXPECT_MSG_EQ(((last.ack.flags >> qbbHeader::FLAG_EDGE_CONGESTED) & 1),
+                              0,
+                              "two spines graded down are not the downlink");
+        // The answers of an interval carry the report of the one before.
+        const CustomHeader& first = receiver.emitted.front();
+        NS_TEST_EXPECT_MSG_EQ(uint32_t(first.ack.spine_report[0]),
+                              0u,
+                              "the first interval's answers carry the starting report");
+        NS_TEST_EXPECT_MSG_EQ(uint32_t(first.ack.spine_report[1]),
+                              0xffu,
+                              "which grades every spine at the top");
+        const CustomHeader& repair = receiver.emitted[2 * 64];
+        NS_TEST_EXPECT_MSG_EQ(repair.l3Prot, kUecTrimRepairProtocol, "the trim is answered");
+        NS_TEST_EXPECT_MSG_EQ(uint32_t(repair.ack.spine_report[0]),
+                              1u,
+                              "the repair request carries the latest report");
+        std::copy_n(repair.ack.spine_report + 1, 2, wire.grades);
+        NS_TEST_EXPECT_MSG_EQ(uint32_t(wire.Grade(2)), 0u, "with the marked spine graded down");
+        NS_TEST_EXPECT_MSG_EQ(uint32_t(wire.Grade(5)), 3u, "before its own trim is graded");
+        Simulator::Destroy();
+    }
+
+    // A data packet trimmed on spine before the last hop, as its destination
+    // parses it.
+    static void Trim(IsolatedHost& receiver, uint32_t seq, uint8_t spine)
+    {
+        CustomHeader trimmed;
+        trimmed.l3Prot = 0x11;
+        trimmed.m_tos = kUetDscpTrimmed << 2;
+        trimmed.sip = kTestSender.Get();
+        trimmed.dip = kTestReceiver.Get();
+        trimmed.ipid = SpineIdentification(spine, spine);
+        trimmed.udp.sport = IsolatedHost::kSenderPort;
+        trimmed.udp.dport = IsolatedHost::kReceiverPort;
+        trimmed.udp.pg = IsolatedHost::kPriorityGroup;
+        trimmed.udp.seq = seq;
+        trimmed.udp.payload_size = CustomHeader::GetUdpHeaderSize() + IsolatedHost::kMtu;
+        receiver.hw->Receive(Create<Packet>(), trimmed);
+    }
+
+    void Sender()
+    {
+        IsolatedHost sender(LoadBalancingMode::SprayPolicy, kTestReceiver, 8);
+        sender.hw->m_sprayBaseRttNs = kBaseRtt;
+        Ptr<RdmaQueuePair> first =
+            sender.AddSender(kTestSender, kTestReceiver, 100 * IsolatedHost::kMtu);
+        for (uint32_t i = 0; i < 4; ++i)
+        {
+            sender.hw->GetNxtPacket(first);
+        }
+        NS_TEST_ASSERT_MSG_EQ(sender.hw->m_spineScores.size(),
+                              1,
+                              "one destination, one set of scores");
+        const SpineScores& scores = sender.hw->m_spineScores.begin()->second;
+        const uint32_t start = scores.Score(4);
+        CustomHeader ack;
+        ack.l3Prot = 0xFC;
+        ack.sip = kTestReceiver.Get();
+        ack.ack.sport = IsolatedHost::kReceiverPort;
+        ack.ack.dport = IsolatedHost::kSenderPort;
+        ack.ack.pg = IsolatedHost::kPriorityGroup;
+        ack.ack.flags = 0;
+        ack.ack.seq = 0;
+        ack.ack.packet_seq = 0;
+        SpineReport report;
+        report.sequence = 1;
+        report.SetGrade(4, 0);
+        ack.ack.spine_report[0] = report.sequence;
+        std::copy_n(report.grades, 2, ack.ack.spine_report + 1);
+        sender.hw->ReceiveAck(Create<Packet>(), ack);
+        NS_TEST_EXPECT_MSG_LT(scores.Score(4),
+                              start,
+                              "an acknowledgement's report moves the scores");
+        NS_TEST_EXPECT_MSG_EQ(scores.Score(3), start, "the top grade keeps a score");
+        const uint32_t after = scores.Score(4);
+        ack.ack.trim_payload_size = IsolatedHost::kMtu;
+        ack.l3Prot = kUecTrimRepairProtocol;
+        ack.ack.spine_report[0] = 2;
+        sender.hw->RecoverTrimmedQueue(first, ack);
+        NS_TEST_EXPECT_MSG_LT(scores.Score(4), after, "so does a repair request's");
+        Simulator::Destroy();
+    }
+
+    // Under NSCC, an acknowledgement whose report has the edge bit set hands
+    // the window SprayEdgeWindowPenalty as the destination's Rcv_Cwnd_Pend.
+    void EdgePenalty()
+    {
+        constexpr uint32_t kMtu = IsolatedHost::kMtu;
+        auto windowAfter = [](bool edge) {
+            IsolatedHost sender(LoadBalancingMode::SprayPolicy, kTestReceiver, 8);
+            sender.hw->m_sprayBaseRttNs = kBaseRtt;
+            sender.hw->m_cc_mode = 11;
+            Ptr<RdmaQueuePair> qp = sender.AddSender(kTestSender, kTestReceiver, 100 * kMtu);
+            qp->nscc.Start(sender.hw->NsccParameters(), kMtu, 50 * kMtu, kBaseRtt, 0);
+            CustomHeader sent(CustomHeader::L2_Header | CustomHeader::L3_Header);
+            sender.hw->GetNxtPacket(qp)->PeekHeader(sent);
+            for (uint32_t i = 0; i < 9; ++i)
+            {
+                sender.hw->GetNxtPacket(qp);
+            }
+            CustomHeader ack;
+            ack.l3Prot = 0xFC;
+            ack.sip = kTestReceiver.Get();
+            ack.ipid = sent.ipid;
+            ack.ack.sport = IsolatedHost::kReceiverPort;
+            ack.ack.dport = IsolatedHost::kSenderPort;
+            ack.ack.pg = IsolatedHost::kPriorityGroup;
+            ack.ack.flags = edge ? 1 << qbbHeader::FLAG_EDGE_CONGESTED : 0;
+            ack.ack.seq = kMtu;
+            ack.ack.packet_seq = 0;
+            ack.ack.spine_report[0] = 1;
+            std::fill_n(ack.ack.spine_report + 1, 2, 0xff);
+            sender.hw->ReceiveAck(Create<Packet>(), ack);
+            const uint64_t window = qp->nscc.Cwnd();
+            Simulator::Destroy();
+            return window;
+        };
+        // Nine packets in flight after the answer, less 64/128 of the one it
+        // answers.
+        NS_TEST_EXPECT_MSG_EQ(windowAfter(true),
+                              9 * kMtu - kMtu / 2,
+                              "the edge bit holds the window down");
+        NS_TEST_EXPECT_MSG_GT(windowAfter(false), 9 * kMtu, "without it the window is left alone");
+    }
+};
+
 class NsccReceiverPenaltyTest : public TestCase
 {
   public:
@@ -4423,6 +4637,7 @@ PointToPointTestSuite::PointToPointTestSuite()
     AddTestCase(new SpineScoresFloorTest, TestCase::Duration::QUICK);
     AddTestCase(new SpineScoresFlapTest, TestCase::Duration::QUICK);
     AddTestCase(new SpineScoresDrawTest, TestCase::Duration::QUICK);
+    AddTestCase(new SprayPolicyTransportTest, TestCase::Duration::QUICK);
     AddTestCase(new NsccReceiverPenaltyTest, TestCase::Duration::QUICK);
 }
 

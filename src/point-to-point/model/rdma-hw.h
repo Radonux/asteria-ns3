@@ -10,6 +10,8 @@
 #include "qbb-net-device.h"
 #include "load-balancing.h"
 #include "nscc-window.h"
+#include "spine-grader.h"
+#include <memory>
 #include <unordered_map>
 #include "pint.h"
 
@@ -75,7 +77,7 @@ public:
 	bool m_reengage;
 	// LoadBalancingMode. Outside ECMP a queue pair's PathSelector draws the
 	// IPv4 identification of each of its data packets from m_pathRandom;
-	// SprayUniform draws a spine index below m_spineCount.
+	// SprayUniform and SprayPolicy draw a spine index below m_spineCount.
 	uint32_t m_loadBalancing;
 	uint32_t m_spineCount;
 	Ptr<UniformRandomVariable> m_pathRandom;
@@ -88,8 +90,47 @@ public:
 	uint32_t m_mrcEvSetSize;
 	double m_mrcSkipBaseRtts;
 	double m_mrcProbeTimeouts;
-	// Indexed by carrying spine; kept under SprayUniform, where the
-	// identification names one.
+	// SprayPolicy. Times are in units of m_sprayBaseRttNs, the fabric's base
+	// RTT; the receiver's parameters are those of SpineGrader and the sender's
+	// those of SpineScores.
+	uint64_t m_sprayBaseRttNs;
+	double m_sprayReportIntervalBaseRtts;
+	double m_sprayEstimatorGain;
+	double m_sprayMarkCusumSlack;
+	double m_sprayMarkCusumThreshold;
+	double m_sprayMarkThreshold1, m_sprayMarkThreshold2, m_sprayMarkThreshold3;
+	uint32_t m_sprayHoldDownIntervals;
+	bool m_sprayOneWayDelay;
+	double m_sprayDelayCusumSlackBaseRtts;
+	double m_sprayDelayCusumThresholdBaseRtts;
+	double m_sprayDelayThreshold1BaseRtts, m_sprayDelayThreshold2BaseRtts,
+		m_sprayDelayThreshold3BaseRtts;
+	double m_sprayGamma;
+	double m_sprayEpsilon;
+	uint32_t m_sprayCandidates;
+	uint32_t m_sprayCandidateDraw; // SpineScores::CandidateDraw
+	// The Rcv_Cwnd_Pend NSCC is handed for an acknowledgement whose report has
+	// the edge bit set.
+	uint32_t m_sprayEdgeWindowPenalty;
+	// The receiver's grader, made at the first event it counts, and the
+	// sender's scores towards each destination host by address, shared by
+	// every queue pair to that host.
+	std::unique_ptr<SpineGrader> m_spineGrader;
+	std::unordered_map<uint32_t, SpineScores> m_spineScores;
+	// The SpineReport trace source: the time and the grader that has just
+	// issued a report.
+	typedef void (*SpineReportTracedCallback)(uint64_t nowNs,
+		const SpineGrader &grader);
+	TracedCallback<uint64_t, const SpineGrader &> m_traceSpineReport;
+	bool IsSprayPolicy() const;
+	uint64_t SprayReportIntervalNs() const;
+	SpineGrader &Grader();
+	// The grader once it has closed the interval that ended by now.
+	SpineGrader &GraderNow();
+	// The data packet or trimmed header of ch counted by the grader.
+	void GradeArrival(const CustomHeader &ch, bool marked);
+	void GradeTrim(const CustomHeader &ch, bool lastHop);
+	// Indexed by carrying spine; kept where the identification names one.
 	std::vector<SpineArrivals> m_spineArrivals;
 	bool m_var_win, m_fast_react;
 	bool m_rateBound;
@@ -348,9 +389,10 @@ public:
 	double m_nscc_adjust_period;
 	NsccWindow::Parameters NsccParameters() const;
 	// The acknowledgement of the send of seq along path, as AcknowledgePacket
-	// takes it, with the window following what it says.
+	// takes it, with the window following what it says and the receiver's
+	// Rcv_Cwnd_Pend.
 	void HandleAckNscc(Ptr<RdmaQueuePair> qp, uint64_t seq, uint16_t path,
-		bool marked);
+		bool marked, uint32_t rcvCwndPend);
 	// The window the NIC enforces follows the controller's, as the rate does
 	// under the rate-based modes.
 	void ApplyNsccWindow(Ptr<RdmaQueuePair> qp);
