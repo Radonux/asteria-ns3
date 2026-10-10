@@ -40,6 +40,7 @@
 #include "ns3/switch-node.h"
 #include "ns3/node.h"
 #include "ns3/nscc-window.h"
+#include "ns3/path-selector.h"
 #include "ns3/seq-ts-header.h"
 #include "ns3/simulator.h"
 #include "ns3/string.h"
@@ -48,6 +49,7 @@
 
 #include <algorithm>
 #include <map>
+#include <memory>
 #include <random>
 #include <set>
 #include <string>
@@ -1522,7 +1524,7 @@ class LoadBalancingSenderTest : public TestCase
         qp->m_size = static_cast<uint64_t>(packets) * kMtu;
         if (mode != LoadBalancingMode::Ecmp)
         {
-            qp->m_outstanding.SetPacketSize(kMtu);
+            hw->StartPathSelection(qp);
         }
         std::vector<uint16_t> identifications;
         for (uint32_t i = 0; i < packets; ++i)
@@ -1655,7 +1657,7 @@ class IsolatedHost
         qp->m_size = size;
         if (hw->IsPathPerPacket())
         {
-            qp->m_outstanding.SetPacketSize(kMtu);
+            hw->StartPathSelection(qp);
         }
         hw->m_qpMap[RdmaHw::GetQpKey(peer.Get(), kSenderPort, kPriorityGroup)] = qp;
         return qp;
@@ -1718,14 +1720,21 @@ class IsolatedHost
         hw->ReceiveAck(Create<Packet>(), ack);
     }
 
-    // The receiver's repair request for the trimmed send of seq.
-    void ReceiveTrimNack(Ptr<RdmaQueuePair> qp, Ipv4Address from, uint32_t seq, uint16_t identification)
+    // The receiver's repair request for the trimmed send of seq, trimmed at the
+    // last hop or before it, marked when the trimmed packet carried CE.
+    void ReceiveTrimNack(Ptr<RdmaQueuePair> qp,
+                         Ipv4Address from,
+                         uint32_t seq,
+                         uint16_t identification,
+                         bool lastHop = false,
+                         bool marked = false)
     {
         CustomHeader trim;
         trim.l3Prot = kUecTrimRepairProtocol;
         trim.sip = from.Get();
         trim.ipid = identification;
-        trim.ack.flags = 0;
+        trim.ack.flags = (lastHop ? 1 << qbbHeader::FLAG_TRIM_LASTHOP : 0) |
+                         (marked ? 1 << qbbHeader::FLAG_CNP : 0);
         trim.ack.sport = kReceiverPort;
         trim.ack.dport = kSenderPort;
         trim.ack.pg = kPriorityGroup;
@@ -1789,6 +1798,105 @@ class AckNamesPacketTest : public TestCase
         NS_TEST_ASSERT_MSG_EQ(ecmp.emitted.size(), 2, "ECMP acknowledges in-order packets");
         NS_TEST_EXPECT_MSG_EQ(ecmp.emitted[0].ipid, 0, "ECMP keeps the receive counter");
         NS_TEST_EXPECT_MSG_EQ(ecmp.emitted[1].ipid, 1, "ECMP keeps the receive counter");
+        Simulator::Destroy();
+    }
+};
+
+/**
+ * A selector that hands out the paths it was given in turn and writes down,
+ * in order, what the transport tells it.
+ */
+class ScriptedSelector : public PathSelector
+{
+  public:
+    explicit ScriptedSelector(std::vector<uint16_t> paths)
+        : m_paths(std::move(paths))
+    {
+    }
+
+    uint16_t Choose(uint64_t) override
+    {
+        return m_paths[m_chosen++ % m_paths.size()];
+    }
+
+    void OnAck(uint16_t path, bool marked, uint64_t) override
+    {
+        told.push_back("ack " + std::to_string(path) + (marked ? " marked" : ""));
+    }
+
+    void OnTrim(uint16_t path, bool lastHop, bool marked, uint64_t) override
+    {
+        told.push_back("trim " + std::to_string(path) + (lastHop ? " last hop" : "") +
+                       (marked ? " marked" : ""));
+    }
+
+    void OnLoss(uint16_t path, uint64_t) override
+    {
+        told.push_back("loss " + std::to_string(path));
+    }
+
+    void OnTimeout(uint64_t nowNs) override
+    {
+        told.push_back("timeout at " + std::to_string(nowNs));
+    }
+
+    std::vector<std::string> told;
+
+  private:
+    std::vector<uint16_t> m_paths;
+    uint32_t m_chosen = 0;
+};
+
+class PathSelectorHooksTest : public TestCase
+{
+  public:
+    PathSelectorHooksTest()
+        : TestCase("A queue pair's selector names every send's path and hears every answer")
+    {
+    }
+
+    void DoRun() override
+    {
+        constexpr uint32_t kMtu = IsolatedHost::kMtu;
+        const bool savedPacketSeq = CustomHeader::ackCarriesPacketSeq;
+        CustomHeader::ackCarriesPacketSeq = true;
+        IsolatedHost sender(LoadBalancingMode::EntropyHash, kTestReceiver);
+        Ptr<RdmaQueuePair> qp = sender.AddSender(kTestSender, kTestReceiver, 10 * kMtu);
+        auto selector = std::make_unique<ScriptedSelector>(std::vector<uint16_t>{7, 7, 9, 11, 13});
+        ScriptedSelector* told = selector.get();
+        qp->m_pathSelector = std::move(selector);
+        for (uint16_t path : {7, 7, 9, 11, 13})
+        {
+            CustomHeader parsed(CustomHeader::L2_Header | CustomHeader::L3_Header);
+            sender.hw->GetNxtPacket(qp)->PeekHeader(parsed);
+            NS_TEST_EXPECT_MSG_EQ(parsed.ipid, path, "a data packet takes the path chosen for it");
+        }
+
+        // The second send on path 7 is acknowledged, marked, which declares
+        // the first lost; the send on path 13 is acknowledged unmarked.
+        sender.ReceiveAck(kTestReceiver, 0, kMtu, 7, true);
+        sender.ReceiveAck(kTestReceiver, 0, 4 * kMtu, 13);
+        sender.ReceiveTrimNack(qp, kTestReceiver, 2 * kMtu, 9, true, true);
+        sender.ReceiveTrimNack(qp, kTestReceiver, 2 * kMtu, 9);
+        // The send on path 11 waits out the timeout.
+        Simulator::Stop(NanoSeconds(IsolatedHost::kTimeoutNs + 1));
+        Simulator::Run();
+
+        const std::vector<std::string> expected{"ack 7 marked",
+                                                "loss 7",
+                                                "ack 13",
+                                                "trim 9 last hop marked",
+                                                "trim 9",
+                                                "loss 11",
+                                                "timeout at 1000"};
+        NS_TEST_EXPECT_MSG_EQ(told->told.size(),
+                              expected.size(),
+                              "the selector hears each event once");
+        for (uint32_t i = 0; i < std::min(expected.size(), told->told.size()); ++i)
+        {
+            NS_TEST_EXPECT_MSG_EQ(told->told[i], expected[i], "the selector hears it in order");
+        }
+        CustomHeader::ackCarriesPacketSeq = savedPacketSeq;
         Simulator::Destroy();
     }
 };
@@ -2802,6 +2910,7 @@ PointToPointTestSuite::PointToPointTestSuite()
     AddTestCase(new LoadBalancingSenderTest, TestCase::Duration::QUICK);
     AddTestCase(new AckPacketSeqHeaderTest, TestCase::Duration::QUICK);
     AddTestCase(new AckNamesPacketTest, TestCase::Duration::QUICK);
+    AddTestCase(new PathSelectorHooksTest, TestCase::Duration::QUICK);
     AddTestCase(new SpineArrivalsTest, TestCase::Duration::QUICK);
     AddTestCase(new ReorderGapTest, TestCase::Duration::QUICK);
     AddTestCase(new OutstandingPacketsModelTest, TestCase::Duration::QUICK);

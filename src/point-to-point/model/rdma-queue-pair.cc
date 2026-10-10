@@ -109,6 +109,10 @@ uint64_t OutstandingPackets::SentNs(uint64_t packet) const{
 	return At(packet).sent_ns;
 }
 
+uint16_t OutstandingPackets::Path(uint64_t packet) const{
+	return At(packet).path;
+}
+
 bool OutstandingPackets::ResendsLost(uint64_t packet) const{
 	return At(packet).resends_lost;
 }
@@ -420,6 +424,8 @@ uint64_t RdmaQueuePair::DeclareLostSentBy(uint64_t sentNs){
 uint32_t RdmaQueuePair::DeclareLost(uint64_t packet){
 	const uint64_t seq = m_outstanding.Seq(packet);
 	const uint32_t size = m_outstanding.Size(packet);
+	m_pathSelector->OnLoss(m_outstanding.Path(packet),
+		Simulator::Now().GetNanoSeconds());
 	AddRepairRange(seq, seq + size);
 	m_outstanding.RemoveLost(packet);
 	m_recovery_events++;

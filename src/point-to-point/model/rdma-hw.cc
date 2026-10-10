@@ -454,7 +454,7 @@ void RdmaHw::AddQueuePair(uint32_t src, uint32_t dest, uint64_t tag, uint64_t si
 	uint64_t key = GetQpKey(dip.Get(), sport, pg);
 	m_qpMap[key] = qp;
 	if (IsPathPerPacket())
-		qp->m_outstanding.SetPacketSize(m_mtu);
+		StartPathSelection(qp);
 	// The liveness invariant starts at birth: an unfinished QP always has a
 	// pending timer, even if its first send never gets scheduled.
 	ArmRetransmissionTimeout(qp);
@@ -759,6 +759,7 @@ int RdmaHw::ReceiveAck(Ptr<Packet> p, CustomHeader &ch){
 		if (qp->m_outstanding.IsKept()){
 			const uint16_t path =
 				PathOf(static_cast<LoadBalancingMode>(m_loadBalancing), ch.ipid);
+			qp->m_pathSelector->OnAck(path, cnp, Simulator::Now().GetNanoSeconds());
 			if (m_cc_mode == 11 && DeliverCongestionSignal(qp))
 				HandleAckNscc(qp, ch.ack.packet_seq, path, cnp);
 			else
@@ -967,6 +968,14 @@ void RdmaHw::RecoverTrimmedQueue(Ptr<RdmaQueuePair> qp,
 	// entry, and before the rate cut below, so this trim's own congestion
 	// signal reaches the controller.
 	FollowAllowanceReport(qp, ch);
+	const bool lastHop = (ch.ack.flags >> qbbHeader::FLAG_TRIM_LASTHOP) & 1;
+	const uint16_t path =
+		PathOf(static_cast<LoadBalancingMode>(m_loadBalancing), ch.ipid);
+	// A stale trim reports on its path all the same.
+	if (qp->m_outstanding.IsKept())
+		qp->m_pathSelector->OnTrim(path, lastHop,
+			(ch.ack.flags >> qbbHeader::FLAG_CNP) & 1,
+			Simulator::Now().GetNanoSeconds());
 	const uint64_t trimStart = ch.ack.seq;
 	const uint64_t trimEnd = trimStart + ch.ack.trim_payload_size;
 	if (ch.ack.trim_payload_size == 0 || trimEnd <= qp->snd_una){
@@ -985,7 +994,6 @@ void RdmaHw::RecoverTrimmedQueue(Ptr<RdmaQueuePair> qp,
 	// sustained blockade — e.g. while a shared-buffer switch fair-shares
 	// its pool against an incast burst — turning engineered congestion
 	// into spurious transport failure.
-	const bool lastHop = (ch.ack.flags >> qbbHeader::FLAG_TRIM_LASTHOP) & 1;
 	qp->m_trim_notifications++;
 	if (qp->m_first_trim_ns == 0)
 		qp->m_first_trim_ns = Simulator::Now().GetNanoSeconds();
@@ -1001,8 +1009,6 @@ void RdmaHw::RecoverTrimmedQueue(Ptr<RdmaQueuePair> qp,
 	if (m_cc_mode == 1 && DeliverCongestionSignal(qp)) {
 		cnp_received_mlx(qp);
 	}
-	const uint16_t path =
-		PathOf(static_cast<LoadBalancingMode>(m_loadBalancing), ch.ipid);
 	// Timed before the release below removes the trimmed send's record.
 	const uint64_t trimmedRtt = m_cc_mode == 11
 		? AnswerRtt(qp->m_outstanding, qp->m_outstanding.Find(trimStart, path))
@@ -1373,9 +1379,11 @@ void RdmaHw::HandleRetransmissionTimeout(Ptr<RdmaQueuePair> qp){
 	qp->m_timeouts++;
 	ReportTransportEvent("rto_fired", 0);
 	if (qp->m_outstanding.IsKept()){
-		const uint64_t lost = qp->DeclareLostSentBy(
-			Simulator::Now().GetNanoSeconds() - m_retransmission_timeout_ns);
+		const uint64_t now = Simulator::Now().GetNanoSeconds();
+		const uint64_t lost =
+			qp->DeclareLostSentBy(now - m_retransmission_timeout_ns);
 		NS_ASSERT_MSG(lost > 0, "the timer expires with the oldest send");
+		qp->m_pathSelector->OnTimeout(now);
 		if (m_cc_mode == 11 && DeliverCongestionSignal(qp)){
 			qp->nscc.OnLoss(lost);
 			ApplyNsccWindow(qp);
@@ -1511,7 +1519,8 @@ Ptr<Packet> RdmaHw::GetNxtPacket(Ptr<RdmaQueuePair> qp){
 	ipHeader.SetTos (0);
 	ipHeader.SetDscp (static_cast<Ipv4Header::DscpType>(kUetDscpTrimmable));
 	if (IsPathPerPacket()){
-		const uint16_t identification = DrawPathIdentification();
+		const uint16_t identification =
+			qp->m_pathSelector->Choose(Simulator::Now().GetNanoSeconds());
 		ipHeader.SetIdentification(identification);
 		qp->m_outstanding.Add(seq, payload_size,
 			PathOf(static_cast<LoadBalancingMode>(m_loadBalancing), identification),
@@ -1550,12 +1559,13 @@ bool RdmaHw::IsPathPerPacket() const{
 	return m_loadBalancing != static_cast<uint32_t>(LoadBalancingMode::Ecmp);
 }
 
-uint16_t RdmaHw::DrawPathIdentification(){
-	if (m_loadBalancing == static_cast<uint32_t>(LoadBalancingMode::SprayUniform)){
-		const uint8_t spine = m_pathRandom->GetInteger(0, m_spineCount - 1);
-		return SpineIdentification(spine, spine);
-	}
-	return m_pathRandom->GetInteger(0, UINT16_MAX);
+void RdmaHw::StartPathSelection(Ptr<RdmaQueuePair> qp){
+	qp->m_outstanding.SetPacketSize(m_mtu);
+	if (m_loadBalancing == static_cast<uint32_t>(LoadBalancingMode::SprayUniform))
+		qp->m_pathSelector =
+			std::make_unique<UniformSpineSelector>(m_pathRandom, m_spineCount);
+	else
+		qp->m_pathSelector = std::make_unique<ObliviousSelector>(m_pathRandom);
 }
 
 void RdmaHw::PktSent(Ptr<RdmaQueuePair> qp, Ptr<Packet> pkt, Time interframeGap){

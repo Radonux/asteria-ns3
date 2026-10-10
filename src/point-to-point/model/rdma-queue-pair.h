@@ -9,7 +9,9 @@
 #include <ns3/custom-header.h>
 #include <ns3/int-header.h>
 #include "nscc-window.h"
+#include "path-selector.h"
 #include <map>
+#include <memory>
 #include <set>
 #include <unordered_map>
 #include <vector>
@@ -42,6 +44,7 @@ public:
 	uint64_t Seq(uint64_t packet) const;
 	uint32_t Size(uint64_t packet) const;
 	uint64_t SentNs(uint64_t packet) const;
+	uint16_t Path(uint64_t packet) const;
 	// Whether the send resends a packet whose previous send was declared
 	// lost. A send declared lost may still arrive, and the answer to it would
 	// name the resend's record.
@@ -155,6 +158,8 @@ public:
 	// hole below the cumulative acknowledgement says nothing about the sends
 	// above it.
 	OutstandingPackets m_outstanding;
+	// What draws those paths, set together with the send records.
+	std::unique_ptr<PathSelector> m_pathSelector;
 	EventId m_retransmissionTimer;
 	uint16_t m_pg;
 	uint16_t m_ipid;

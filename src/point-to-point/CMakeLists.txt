@@ -23,6 +23,7 @@ build_lib(
     helper/qbb-helper.cc
     model/cn-header.cc
     model/nscc-window.cc
+    model/path-selector.cc
     model/pause-header.cc
     model/pint.cc
     model/point-to-point-channel.cc
@@ -46,6 +47,7 @@ build_lib(
     model/cn-header.h
     model/load-balancing.h
     model/nscc-window.h
+    model/path-selector.h
     model/pause-header.h
     model/pint.h
     model/point-to-point-channel.h

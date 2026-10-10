@@ -73,9 +73,9 @@ public:
 	// Whether a spent report ends an exemption. False is the reference arm in
 	// which the budget alone bounds the loss.
 	bool m_reengage;
-	// LoadBalancingMode. Outside ECMP the IPv4 identification of every data
-	// packet is drawn from m_pathRandom; SprayUniform draws a spine index below
-	// m_spineCount.
+	// LoadBalancingMode. Outside ECMP a queue pair's PathSelector draws the
+	// IPv4 identification of each of its data packets from m_pathRandom;
+	// SprayUniform draws a spine index below m_spineCount.
 	uint32_t m_loadBalancing;
 	uint32_t m_spineCount;
 	Ptr<UniformRandomVariable> m_pathRandom;
@@ -240,7 +240,9 @@ public:
 
 	Ptr<Packet> GetNxtPacket(Ptr<RdmaQueuePair> qp); // get next packet to send, inc snd_nxt
 	bool IsPathPerPacket() const;
-	uint16_t DrawPathIdentification();
+	// Where every data packet draws its own path: keep the queue pair's send
+	// records and give it the selector that draws its paths.
+	void StartPathSelection(Ptr<RdmaQueuePair> qp);
 	void PktSent(Ptr<RdmaQueuePair> qp, Ptr<Packet> pkt, Time interframeGap);
 	void UpdateNextAvail(Ptr<RdmaQueuePair> qp, Time interframeGap, uint32_t pkt_size);
 	void ChangeRate(Ptr<RdmaQueuePair> qp, DataRate new_rate);
