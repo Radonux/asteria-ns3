@@ -7,6 +7,7 @@
 #include "ns3/header.h"
 #include "ns3/buffer.h"
 #include "ns3/int-header.h"
+#include "spine-report.h"
 
 namespace ns3 {
 
@@ -38,7 +39,10 @@ public:
     FLAG_FORGIVENESS_ELIGIBLE = 3,
     // The acknowledgement answers a path probe, not a data packet: it returns
     // the probe's identification and mark and acknowledges no send.
-    FLAG_PROBE_ANSWER = 4
+    FLAG_PROBE_ANSWER = 4,
+    // The spine report this header carries says the receiver's own downlink
+    // is congested.
+    FLAG_EDGE_CONGESTED = 5
   };
   qbbHeader (uint16_t pg);
   qbbHeader ();
@@ -62,6 +66,9 @@ public:
   // The sequence of the data packet this acknowledgement answers, serialized
   // only while CustomHeader::ackCarriesPacketSeq is set.
   void SetPacketSeq(uint32_t seq);
+  // The receiving host's latest spine report, serialized only while
+  // CustomHeader::ackReportBytes is not zero; its edge bit is a flag.
+  void SetSpineReport(const SpineReport &report);
   void SetIntHeader(const IntHeader &_ih);
 
 //Getters
@@ -79,6 +86,7 @@ public:
   bool IsTrimLastHop() const;
   bool IsAllowanceExhausted() const;
   uint32_t GetPacketSeq() const;
+  const SpineReport &GetSpineReport() const;
 
   static TypeId GetTypeId (void);
   virtual TypeId GetInstanceTypeId (void) const;
@@ -95,6 +103,7 @@ private:
   uint32_t m_seq; // the qbb sequence number.
   uint32_t m_trimPayloadSize;
   uint32_t m_packetSeq;
+  SpineReport m_spineReport;
   IntHeader ih;
   
 };

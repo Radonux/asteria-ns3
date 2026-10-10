@@ -61,6 +61,7 @@ build_lib(
     model/rdma-driver.h
     model/rdma-hw.h
     model/rdma-queue-pair.h
+    model/spine-report.h
     model/switch-mmu.h
     model/switch-node.h
     model/trace-format.h

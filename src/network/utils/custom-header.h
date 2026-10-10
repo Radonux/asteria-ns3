@@ -164,6 +164,10 @@ public:
 		  // The sequence of the data packet an acknowledgement answers. On the
 		  // wire only while ackCarriesPacketSeq is set.
 		  uint32_t packet_seq;
+		  // The receiving host's latest report on the spines: its sequence,
+		  // then two bits per spine. On the wire, ackReportBytes of it, only
+		  // while that is not zero.
+		  uint8_t spine_report[9];
 		  IntHeader ih;
 	  } ack;
 	  // PauseHeader
@@ -178,6 +182,9 @@ public:
   // IntHeader::mode is, because every writer of the header and this parser
   // must agree on its size.
   static bool ackCarriesPacketSeq;
+  // How many bytes of ack.spine_report acknowledgement headers carry, zero
+  // for none. Process-wide for the same reason.
+  static uint32_t ackReportBytes;
 
   uint8_t GetIpv4EcnBits (void) const;
   uint8_t GetIpv4Dscp (void) const;

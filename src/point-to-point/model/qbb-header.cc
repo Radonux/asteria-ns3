@@ -77,6 +77,13 @@ namespace ns3 {
 	void qbbHeader::SetPacketSeq(uint32_t seq){
 		m_packetSeq = seq;
 	}
+	void qbbHeader::SetSpineReport(const SpineReport &report){
+		m_spineReport = report;
+		if (report.edgeCongested)
+			flags |= 1 << FLAG_EDGE_CONGESTED;
+		else
+			flags &= ~(1 << FLAG_EDGE_CONGESTED);
+	}
 	void qbbHeader::SetIntHeader(const IntHeader &_ih){
 		ih = _ih;
 	}
@@ -117,6 +124,9 @@ namespace ns3 {
 	uint32_t qbbHeader::GetPacketSeq() const{
 		return m_packetSeq;
 	}
+	const SpineReport &qbbHeader::GetSpineReport() const{
+		return m_spineReport;
+	}
 
 	TypeId
 		qbbHeader::GetTypeId(void)
@@ -143,7 +153,8 @@ namespace ns3 {
 	uint32_t qbbHeader::GetBaseSize() {
 		qbbHeader tmp;
 		return sizeof(tmp.sport) + sizeof(tmp.dport) + sizeof(tmp.flags) + sizeof(tmp.m_pg) + sizeof(tmp.m_seq) + sizeof(tmp.m_trimPayloadSize) +
-			(CustomHeader::ackCarriesPacketSeq ? sizeof(tmp.m_packetSeq) : 0);
+			(CustomHeader::ackCarriesPacketSeq ? sizeof(tmp.m_packetSeq) : 0) +
+			CustomHeader::ackReportBytes;
 	}
 	void qbbHeader::Serialize(Buffer::Iterator start)  const
 	{
@@ -156,6 +167,10 @@ namespace ns3 {
 		i.WriteU32(m_trimPayloadSize);
 		if (CustomHeader::ackCarriesPacketSeq)
 			i.WriteU32(m_packetSeq);
+		if (CustomHeader::ackReportBytes > 0){
+			i.WriteU8(m_spineReport.sequence);
+			i.Write(m_spineReport.grades, CustomHeader::ackReportBytes - 1);
+		}
 
 		// write IntHeader
 		ih.Serialize(i);
@@ -172,6 +187,11 @@ namespace ns3 {
 		m_trimPayloadSize = i.ReadU32();
 		if (CustomHeader::ackCarriesPacketSeq)
 			m_packetSeq = i.ReadU32();
+		if (CustomHeader::ackReportBytes > 0){
+			m_spineReport.sequence = i.ReadU8();
+			i.Read(m_spineReport.grades, CustomHeader::ackReportBytes - 1);
+			m_spineReport.edgeCongested = (flags >> FLAG_EDGE_CONGESTED) & 1;
+		}
 
 		// read IntHeader
 		ih.Deserialize(i);

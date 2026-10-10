@@ -3438,6 +3438,98 @@ class NsccRttTest : public TestCase
 /**
  * \brief TestSuite for PointToPoint module
  */
+class SpineReportHeaderTest : public TestCase
+{
+  public:
+    SpineReportHeaderTest()
+        : TestCase("An acknowledgement carries a spine report only under spray_policy, in the "
+                   "padding of its frame")
+    {
+    }
+
+    void DoRun() override
+    {
+        const IntHeader::Mode savedIntMode = IntHeader::mode;
+        const bool savedPacketSeq = CustomHeader::ackCarriesPacketSeq;
+        const uint32_t savedReportBytes = CustomHeader::ackReportBytes;
+        IntHeader::mode = IntHeader::NONE;
+        CustomHeader::ackCarriesPacketSeq = true;
+        CustomHeader::ackReportBytes = 0;
+        NS_TEST_EXPECT_MSG_EQ(qbbHeader().GetSerializedSize(),
+                              20,
+                              "without a report the header keeps its size");
+
+        // Eight spines: a sequence byte and two bytes of grades.
+        CustomHeader::ackReportBytes = 1 + SpineReport::GradeBytes(8);
+        NS_TEST_EXPECT_MSG_EQ(qbbHeader().GetSerializedSize(), 23, "the report adds three bytes");
+        NS_TEST_EXPECT_MSG_EQ(CustomHeader::GetAckSerializedSize(),
+                              23,
+                              "the parser agrees on the size with the report");
+        NS_TEST_EXPECT_MSG_LT_OR_EQ(qbbHeader().GetSerializedSize(),
+                                    60 - 14 - 20,
+                                    "the report fits the padding of a minimum frame");
+        NS_TEST_EXPECT_MSG_EQ(SpineReport::GradeBytes(32), 8, "32 spines take eight bytes");
+
+        SpineReport report;
+        report.sequence = 77;
+        report.edgeCongested = true;
+        report.SetGrade(2, 0);
+        report.SetGrade(5, 1);
+        report.SetGrade(6, 2);
+        qbbHeader ack;
+        ack.SetSeq(3000);
+        ack.SetPacketSeq(7000);
+        ack.SetCnp();
+        ack.SetSpineReport(report);
+        Ptr<Packet> packet = Create<Packet>(0);
+        packet->AddHeader(ack);
+        qbbHeader copy;
+        packet->PeekHeader(copy);
+        Ipv4Header ip;
+        ip.SetSource(Ipv4Address("11.0.2.1"));
+        ip.SetDestination(Ipv4Address("11.0.1.1"));
+        ip.SetProtocol(0xFC);
+        ip.SetPayloadSize(packet->GetSize());
+        packet->AddHeader(ip);
+        PppHeader ppp;
+        ppp.SetProtocol(0x0021);
+        packet->AddHeader(ppp);
+        CustomHeader parsed(CustomHeader::L2_Header | CustomHeader::L3_Header |
+                            CustomHeader::L4_Header);
+        packet->PeekHeader(parsed);
+        NS_TEST_EXPECT_MSG_EQ(parsed.ack.packet_seq, 7000, "the packet sequence keeps its place");
+        NS_TEST_EXPECT_MSG_EQ(parsed.ack.spine_report[0], 77, "the report's sequence is parsed");
+        NS_TEST_EXPECT_MSG_EQ(((parsed.ack.flags >> qbbHeader::FLAG_EDGE_CONGESTED) & 1),
+                              1,
+                              "the edge bit rides the flags");
+        NS_TEST_EXPECT_MSG_EQ(((parsed.ack.flags >> qbbHeader::FLAG_CNP) & 1),
+                              1,
+                              "the edge bit leaves the mark alone");
+        NS_TEST_EXPECT_MSG_EQ(parsed.GetSerializedSize(),
+                              packet->GetSize(),
+                              "the parser consumes exactly the header written");
+        SpineReport wire;
+        std::copy_n(parsed.ack.spine_report + 1, CustomHeader::ackReportBytes - 1, wire.grades);
+        const SpineReport& read = copy.GetSpineReport();
+        NS_TEST_EXPECT_MSG_EQ(read.sequence, 77, "the header reads its own report back");
+        NS_TEST_EXPECT_MSG_EQ(read.edgeCongested, true, "the header reads its own edge bit back");
+        const uint8_t expected[8] = {3, 3, 0, 3, 3, 1, 2, 3};
+        for (uint32_t spine = 0; spine < 8; ++spine)
+        {
+            NS_TEST_EXPECT_MSG_EQ(uint32_t(wire.Grade(spine)),
+                                  uint32_t(expected[spine]),
+                                  "each spine's grade survives the wire");
+            NS_TEST_EXPECT_MSG_EQ(uint32_t(read.Grade(spine)),
+                                  uint32_t(expected[spine]),
+                                  "each spine's grade survives the header");
+        }
+
+        CustomHeader::ackReportBytes = savedReportBytes;
+        CustomHeader::ackCarriesPacketSeq = savedPacketSeq;
+        IntHeader::mode = savedIntMode;
+    }
+};
+
 class PointToPointTestSuite : public TestSuite
 {
   public:
@@ -3491,6 +3583,7 @@ PointToPointTestSuite::PointToPointTestSuite()
     AddTestCase(new NsccCutTest, TestCase::Duration::QUICK);
     AddTestCase(new NsccBoundsTest, TestCase::Duration::QUICK);
     AddTestCase(new NsccRttTest, TestCase::Duration::QUICK);
+    AddTestCase(new SpineReportHeaderTest, TestCase::Duration::QUICK);
 }
 
 static PointToPointTestSuite g_pointToPointTestSuite; //!< The testsuite
