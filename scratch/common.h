@@ -119,6 +119,9 @@ uint32_t reps_buffer_size = 8;
 uint64_t reps_freezing_timeout_ns = 10000000;
 uint32_t ue_ev_set_size = 256;
 double ue_saturation_fraction = 0.5;
+uint32_t mrc_ev_set_size = 128;
+double mrc_skip_base_rtts = 1.0;
+double mrc_probe_timeouts = 1.0;
 // The selectors each parameter belongs to. A parameter given under another
 // selector would be read by nothing, so it is refused.
 const std::map<std::string, std::set<std::string>> path_selector_parameter_owners = {
@@ -126,6 +129,9 @@ const std::map<std::string, std::set<std::string>> path_selector_parameter_owner
     {"REPS_FREEZING_TIMEOUT_NS", {"reps"}},
     {"UE_EV_SET_SIZE", {"ue_oblivious", "ue_aware"}},
     {"UE_SATURATION_FRACTION", {"ue_aware"}},
+    {"MRC_EV_SET_SIZE", {"mrc"}},
+    {"MRC_SKIP_BASE_RTTS", {"mrc"}},
+    {"MRC_PROBE_TIMEOUTS", {"mrc"}},
 };
 std::set<std::string> path_selector_parameters_given;
 // UEC 1.0.3 section 4.1.4.1 RECOMMENDS three traffic classes: TC_low for data,
@@ -591,6 +597,8 @@ uint32_t path_selector_value() {
     return static_cast<uint32_t>(PathSelectorKind::UeOblivious);
   if (path_selector == "ue_aware")
     return static_cast<uint32_t>(PathSelectorKind::UeAware);
+  if (path_selector == "mrc")
+    return static_cast<uint32_t>(PathSelectorKind::Mrc);
   return std::numeric_limits<uint32_t>::max();
 }
 
@@ -1093,6 +1101,12 @@ bool ReadConf(string network_configuration) {
       conf >> ue_ev_set_size;
     } else if (key.compare("UE_SATURATION_FRACTION") == 0) {
       conf >> ue_saturation_fraction;
+    } else if (key.compare("MRC_EV_SET_SIZE") == 0) {
+      conf >> mrc_ev_set_size;
+    } else if (key.compare("MRC_SKIP_BASE_RTTS") == 0) {
+      conf >> mrc_skip_base_rtts;
+    } else if (key.compare("MRC_PROBE_TIMEOUTS") == 0) {
+      conf >> mrc_probe_timeouts;
 	} else if (key.compare("PACKET_TRIM_MODE") == 0) {
 	  conf >> packet_trim_mode;
 	} else if (key.compare("PACKET_TRIM_QUEUE") == 0) {
@@ -1357,7 +1371,7 @@ bool ReadConf(string network_configuration) {
     return false;
   }
   if (path_selector_value() == std::numeric_limits<uint32_t>::max()) {
-    std::cerr << "PATH_SELECTOR must be ops, reps, ue_oblivious or ue_aware\n";
+    std::cerr << "PATH_SELECTOR must be ops, reps, ue_oblivious, ue_aware or mrc\n";
     return false;
   }
   if (path_selector != "ops" &&
@@ -1846,6 +1860,9 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),
       rdmaHw->SetAttribute("UeEvSetSize", UintegerValue(ue_ev_set_size));
       rdmaHw->SetAttribute("UeSaturationFraction",
                            DoubleValue(ue_saturation_fraction));
+      rdmaHw->SetAttribute("MrcEvSetSize", UintegerValue(mrc_ev_set_size));
+      rdmaHw->SetAttribute("MrcSkipBaseRtts", DoubleValue(mrc_skip_base_rtts));
+      rdmaHw->SetAttribute("MrcProbeTimeouts", DoubleValue(mrc_probe_timeouts));
       // A PointerValue cannot carry null, which is the ECMP default.
       if (path_random)
         rdmaHw->SetAttribute("PathRandomVariable", PointerValue(path_random));
