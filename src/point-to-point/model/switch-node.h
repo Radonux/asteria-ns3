@@ -77,7 +77,8 @@ private:
 	int GetOutDev(Ptr<const Packet>, CustomHeader &ch);
 	uint32_t RouteToRequestedSpine(CustomHeader &ch, const std::vector<int> &nexthops) const;
 	bool RoutesThrough(uint32_t spine, const std::vector<int> &nexthops) const;
-	uint8_t LiveSpineFor(uint8_t requested, const std::vector<int> &nexthops) const;
+	uint8_t LiveSpineFor(const CustomHeader &ch, uint8_t requested,
+		const std::vector<int> &nexthops) const;
 	bool IsSpineUplink(uint32_t port) const;
 	bool SendToDev(Ptr<Packet>p, CustomHeader &ch);
 	bool TrimAndForward(Ptr<Packet> p, CustomHeader &ch, int outDev,
@@ -89,6 +90,7 @@ private:
 	bool PacketTrimEnabledFor(const CustomHeader &ch) const;
 	uint32_t QueueIndexFor(const CustomHeader &ch) const;
 	static uint32_t EcmpHash(const uint8_t* key, size_t len, uint32_t seed);
+	static void FillFlowKey(const CustomHeader &ch, uint32_t key[3]);
 	void CheckAndSendPfc(uint32_t inDev, uint32_t qIndex);
 	void CheckAndSendResume(uint32_t inDev, uint32_t qIndex);
 	// Return a queued packet's bytes to the buffer it was admitted against.

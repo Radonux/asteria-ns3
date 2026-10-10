@@ -139,16 +139,7 @@ int SwitchNode::GetOutDev(Ptr<const Packet> p, CustomHeader &ch){
 		uint8_t u8[4+4+2+2+4];
 		uint32_t u32[4];
 	} buf;
-	buf.u32[0] = ch.sip;
-	buf.u32[1] = ch.dip;
-	if (ch.l3Prot == 0x6)
-		buf.u32[2] = ch.tcp.sport | ((uint32_t)ch.tcp.dport << 16);
-	else if (ch.l3Prot == 0x11)
-		buf.u32[2] = ch.udp.sport | ((uint32_t)ch.udp.dport << 16);
-	else if (ch.l3Prot == 0xFC || ch.l3Prot == 0xFD ||
-			 ch.l3Prot == kUecTrimRepairProtocol ||
-			 ch.l3Prot == kUecTrimNotificationProtocol)
-		buf.u32[2] = ch.ack.sport | ((uint32_t)ch.ack.dport << 16);
+	FillFlowKey(ch, buf.u32);
 	size_t keyBytes = 12;
 	if (mode == LoadBalancingMode::EntropyHash && ch.l3Prot == 0x11){
 		buf.u32[3] = ch.ipid;
@@ -159,6 +150,22 @@ int SwitchNode::GetOutDev(Ptr<const Packet> p, CustomHeader &ch){
 	return nexthops[idx];
 }
 
+// The addresses and ports a flow keeps for its life, which ECMP hashes.
+void SwitchNode::FillFlowKey(const CustomHeader &ch, uint32_t key[3]){
+	key[0] = ch.sip;
+	key[1] = ch.dip;
+	if (ch.l3Prot == 0x6)
+		key[2] = ch.tcp.sport | ((uint32_t)ch.tcp.dport << 16);
+	else if (ch.l3Prot == 0x11)
+		key[2] = ch.udp.sport | ((uint32_t)ch.udp.dport << 16);
+	else if (ch.l3Prot == 0xFC || ch.l3Prot == 0xFD ||
+			 ch.l3Prot == kUecTrimRepairProtocol ||
+			 ch.l3Prot == kUecTrimNotificationProtocol)
+		key[2] = ch.ack.sport | ((uint32_t)ch.ack.dport << 16);
+	else
+		key[2] = 0;
+}
+
 // Sends the packet up the uplink of the spine it requests and records in the
 // identification which spine carries it. The record is the only edit, so a
 // packet that passes this leaf twice, as a trimmed packet does, keeps its
@@ -166,7 +173,7 @@ int SwitchNode::GetOutDev(Ptr<const Packet> p, CustomHeader &ch){
 uint32_t SwitchNode::RouteToRequestedSpine(CustomHeader &ch,
 		const std::vector<int> &nexthops) const{
 	const uint8_t requested = RequestedSpine(ch.ipid);
-	const uint8_t carrying = LiveSpineFor(requested, nexthops);
+	const uint8_t carrying = LiveSpineFor(ch, requested, nexthops);
 	ch.ipid = SpineIdentification(requested, carrying);
 	return m_spinePort[carrying];
 }
@@ -181,29 +188,32 @@ bool SwitchNode::RoutesThrough(uint32_t spine, const std::vector<int> &nexthops)
 		std::find(nexthops.begin(), nexthops.end(), port) != nexthops.end();
 }
 
-// The requested spine while it is live toward the destination. Otherwise the
-// request is folded onto the live spines in index order, so the choice is a
-// function of the request alone and the requests for different dead spines
-// spread over different live ones.
-uint8_t SwitchNode::LiveSpineFor(uint8_t requested, const std::vector<int> &nexthops) const{
-	auto isLive = [this, &nexthops](uint32_t spine){
-		return RoutesThrough(spine, nexthops);
-	};
-	if (requested < m_spinePort.size() && isLive(requested))
+// The requested spine while it is live toward the destination. Otherwise one
+// of the live spines, picked by hashing the flow with the request under this
+// leaf's seed, so that across flows a dead spine's requests spread evenly over
+// the live spines rather than all landing on one neighbour.
+//
+// For one flow and one request the pick stays the same for as long as the
+// live spines toward the destination do. The sender's loss rule depends on
+// it: the rule keys a queue pair's sends by requested spine (PathOf) and takes
+// sends with one key to pass through the same queues in order, so that the
+// acknowledgement of one proves an older one lost.
+uint8_t SwitchNode::LiveSpineFor(const CustomHeader &ch, uint8_t requested,
+		const std::vector<int> &nexthops) const{
+	if (requested < m_spinePort.size() && RoutesThrough(requested, nexthops))
 		return requested;
+	uint8_t live[UINT8_MAX + 1];
 	uint32_t liveCount = 0;
-	for (uint32_t spine = 0; spine < m_spinePort.size(); spine++)
-		liveCount += isLive(spine);
-	NS_ASSERT_MSG(liveCount > 0, "a leaf with a route to another leaf has a live uplink");
-	uint32_t rank = requested % liveCount;
 	for (uint32_t spine = 0; spine < m_spinePort.size(); spine++){
-		if (!isLive(spine))
-			continue;
-		if (rank == 0)
-			return spine;
-		rank--;
+		if (RoutesThrough(spine, nexthops))
+			live[liveCount++] = spine;
 	}
-	return requested;
+	NS_ASSERT_MSG(liveCount > 0, "a leaf with a route to another leaf has a live uplink");
+	uint32_t key[4];
+	FillFlowKey(ch, key);
+	key[3] = requested;
+	return live[EcmpHash(reinterpret_cast<const uint8_t*>(key), sizeof(key), m_ecmpSeed) %
+		liveCount];
 }
 
 bool SwitchNode::IsSpineUplink(uint32_t port) const{

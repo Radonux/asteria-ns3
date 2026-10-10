@@ -809,27 +809,56 @@ class LoadBalancingSwitchTest : public TestCase
                                   "requests for routed spines are honoured");
         }
 
-        // With spine 1 down the live spines are 0, 2 and 3; request 1 folds
-        // onto the second of them.
         DynamicCast<QbbNetDevice>(m_leaf->GetDevice(m_spinePorts[1]))->TakeDown();
         const Egress moved = Send(m_remoteHost, 10000, SpineIdentification(1, 1));
-        NS_TEST_EXPECT_MSG_EQ(moved.port,
-                              m_spinePorts[2],
+        NS_TEST_EXPECT_MSG_NE(moved.port,
+                              m_spinePorts[1],
                               "a request for a dead uplink is moved to a live one");
         NS_TEST_EXPECT_MSG_EQ(RequestedSpine(moved.identification),
                               1,
                               "the request survives the move");
-        NS_TEST_EXPECT_MSG_EQ(CarryingSpine(moved.identification),
-                              2,
+        NS_TEST_EXPECT_MSG_EQ(moved.port,
+                              m_spinePorts[CarryingSpine(moved.identification)],
                               "the leaf records the spine that carries the packet");
         const Egress again = Send(m_remoteHost, 10000, moved.identification);
         NS_TEST_EXPECT_MSG_EQ(again.port,
-                              m_spinePorts[2],
+                              moved.port,
                               "a packet that passes the leaf again keeps its spine");
         const Egress live = Send(m_remoteHost, 10000, SpineIdentification(3, 3));
         NS_TEST_EXPECT_MSG_EQ(live.port,
                               m_spinePorts[3],
                               "requests for live uplinks are unaffected by a dead one");
+        FoldByFlow();
+    }
+
+    // With spine 1 dead, the spine a flow's request for it lands on: the
+    // same on every send while the live spines stay the same, and across
+    // flows each live spine equally often.
+    void FoldByFlow()
+    {
+        constexpr uint32_t kFlows = 6000;
+        std::map<uint32_t, uint32_t> perPort;
+        for (uint32_t flow = 0; flow < kFlows; ++flow)
+        {
+            const uint16_t sourcePort = 10000 + flow;
+            const uint32_t port = Send(m_remoteHost, sourcePort, SpineIdentification(1, 1)).port;
+            ++perPort[port];
+            for (uint32_t repeat = 0; repeat < 3; ++repeat)
+            {
+                NS_TEST_ASSERT_MSG_EQ(Send(m_remoteHost, sourcePort, SpineIdentification(1, 1)).port,
+                                      port,
+                                      "a flow's request keeps one spine while the live ones stay");
+            }
+        }
+        NS_TEST_ASSERT_MSG_EQ(perPort.size(), kSpines - 1, "every live spine takes a share");
+        NS_TEST_EXPECT_MSG_EQ(perPort.count(m_spinePorts[1]), 0, "the dead spine takes none");
+        // 2000 expected per live spine, with a binomial standard deviation of
+        // 36.5; four of them either way.
+        for (const auto& [port, flows] : perPort)
+        {
+            NS_TEST_EXPECT_MSG_GT(flows, 1854, "the dead spine's share spreads evenly");
+            NS_TEST_EXPECT_MSG_LT(flows, 2146, "the dead spine's share spreads evenly");
+        }
     }
 
     void RouteByEntropy(LoadBalancingMode mode)
