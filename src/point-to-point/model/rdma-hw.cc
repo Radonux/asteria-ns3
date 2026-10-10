@@ -143,6 +143,26 @@ TypeId RdmaHw::GetTypeId (void)
 				PointerValue(),
 				MakePointerAccessor(&RdmaHw::m_pathRandom),
 				MakePointerChecker<UniformRandomVariable>())
+		.AddAttribute("PathSelector",
+				"Under LoadBalancing 1, what chooses each data packet's entropy "
+				"value: 0=OPS, a fresh value drawn per packet; 1=REPS.",
+				UintegerValue(static_cast<uint32_t>(PathSelectorKind::Ops)),
+				MakeUintegerAccessor(&RdmaHw::m_pathSelectorKind),
+				MakeUintegerChecker<uint32_t>(
+					static_cast<uint32_t>(PathSelectorKind::Ops),
+					static_cast<uint32_t>(PathSelectorKind::Reps)))
+		.AddAttribute("RepsBufferSize",
+				"REPS: the entries of the circular buffer of entropy values to "
+				"reuse. Default 8, REPS section 3.1.",
+				UintegerValue(8),
+				MakeUintegerAccessor(&RdmaHw::m_repsBufferSize),
+				MakeUintegerChecker<uint32_t>(1, UINT8_MAX))
+		.AddAttribute("RepsFreezingTimeoutNs",
+				"REPS: FREEZING_TIMEOUT, how long freezing mode lasts at least. "
+				"Default 10 ms, the REPS artifact's exit_freeze_after.",
+				UintegerValue(10000000),
+				MakeUintegerAccessor(&RdmaHw::m_repsFreezingTimeoutNs),
+				MakeUintegerChecker<uint64_t>())
 		.AddAttribute("EwmaGain",
 				"Control gain parameter which determines the level of rate decrease",
 				DoubleValue(1.0 / 16),
@@ -389,6 +409,11 @@ void RdmaHw::Setup(QpCompleteCallback cb, QpFailureCallback failure_cb){
 				static_cast<uint32_t>(LoadBalancingMode::SprayUniform) &&
 			m_spineCount == 0,
 		"LoadBalancing 2 names a spine per packet and needs SpineCount");
+	NS_ABORT_MSG_IF(m_pathSelectorKind !=
+				static_cast<uint32_t>(PathSelectorKind::Ops) &&
+			m_loadBalancing !=
+				static_cast<uint32_t>(LoadBalancingMode::EntropyHash),
+		"PathSelector chooses entropy values and needs LoadBalancing 1");
 	NS_ABORT_MSG_IF(IsPathPerPacket() && !CustomHeader::ackCarriesPacketSeq,
 		"A LoadBalancing mode other than ECMP finds the send an acknowledgement "
 		"answers by the packet sequence the acknowledgement carries");
@@ -454,7 +479,7 @@ void RdmaHw::AddQueuePair(uint32_t src, uint32_t dest, uint64_t tag, uint64_t si
 	uint64_t key = GetQpKey(dip.Get(), sport, pg);
 	m_qpMap[key] = qp;
 	if (IsPathPerPacket())
-		StartPathSelection(qp);
+		StartPathSelection(qp, win);
 	// The liveness invariant starts at birth: an unfinished QP always has a
 	// pending timer, even if its first send never gets scheduled.
 	ArmRetransmissionTimeout(qp);
@@ -1559,13 +1584,24 @@ bool RdmaHw::IsPathPerPacket() const{
 	return m_loadBalancing != static_cast<uint32_t>(LoadBalancingMode::Ecmp);
 }
 
-void RdmaHw::StartPathSelection(Ptr<RdmaQueuePair> qp){
+void RdmaHw::StartPathSelection(Ptr<RdmaQueuePair> qp, uint64_t bdpBytes){
 	qp->m_outstanding.SetPacketSize(m_mtu);
-	if (m_loadBalancing == static_cast<uint32_t>(LoadBalancingMode::SprayUniform))
+	if (m_loadBalancing == static_cast<uint32_t>(LoadBalancingMode::SprayUniform)){
 		qp->m_pathSelector =
 			std::make_unique<UniformSpineSelector>(m_pathRandom, m_spineCount);
-	else
+		return;
+	}
+	switch (static_cast<PathSelectorKind>(m_pathSelectorKind)){
+	case PathSelectorKind::Ops:
 		qp->m_pathSelector = std::make_unique<ObliviousSelector>(m_pathRandom);
+		break;
+	case PathSelectorKind::Reps:
+		// NUM_PKTS_CWND is the window in packets, as the REPS artifact sizes
+		// its exploration from the bandwidth-delay product.
+		qp->m_pathSelector = std::make_unique<RepsSelector>(m_pathRandom,
+			m_repsBufferSize, m_repsFreezingTimeoutNs, bdpBytes / m_mtu);
+		break;
+	}
 }
 
 void RdmaHw::PktSent(Ptr<RdmaQueuePair> qp, Ptr<Packet> pkt, Time interframeGap){

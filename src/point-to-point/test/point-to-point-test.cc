@@ -1524,7 +1524,7 @@ class LoadBalancingSenderTest : public TestCase
         qp->m_size = static_cast<uint64_t>(packets) * kMtu;
         if (mode != LoadBalancingMode::Ecmp)
         {
-            hw->StartPathSelection(qp);
+            hw->StartPathSelection(qp, 0);
         }
         std::vector<uint16_t> identifications;
         for (uint32_t i = 0; i < packets; ++i)
@@ -1657,7 +1657,7 @@ class IsolatedHost
         qp->m_size = size;
         if (hw->IsPathPerPacket())
         {
-            hw->StartPathSelection(qp);
+            hw->StartPathSelection(qp, 0);
         }
         hw->m_qpMap[RdmaHw::GetQpKey(peer.Get(), kSenderPort, kPriorityGroup)] = qp;
         return qp;
@@ -1898,6 +1898,113 @@ class PathSelectorHooksTest : public TestCase
         }
         CustomHeader::ackCarriesPacketSeq = savedPacketSeq;
         Simulator::Destroy();
+    }
+};
+
+// Two variables on one fixed stream draw the same sequence, so a selector's
+// fresh draws can be read off a second selector that draws nothing else.
+Ptr<UniformRandomVariable> SelectorStream()
+{
+    return CreateObjectWithAttributes<UniformRandomVariable>("Stream", IntegerValue(5));
+}
+
+class RepsSelectorTest : public TestCase
+{
+  public:
+    RepsSelectorTest()
+        : TestCase("REPS reuses each unmarked acknowledgement's value once and freezes on a "
+                   "timeout")
+    {
+    }
+
+    void DoRun() override
+    {
+        constexpr uint32_t kWindow = 20;
+        constexpr uint64_t kFreezingNs = 1000;
+        RepsSelector reps(SelectorStream(), 8, kFreezingNs, kWindow);
+        ObliviousSelector fresh(SelectorStream());
+        // How many of the next sends draw afresh: take what OPS on the same
+        // stream draws next.
+        const auto freshSends = [&reps, &fresh](uint32_t sends, uint64_t nowNs) {
+            uint32_t drawn = 0;
+            for (uint32_t i = 0; i < sends; ++i)
+            {
+                drawn += reps.Choose(nowNs) == fresh.Choose(0);
+            }
+            return drawn;
+        };
+        NS_TEST_EXPECT_MSG_EQ(freshSends(kWindow, 0), kWindow, "the first window explores");
+
+        reps.OnAck(0x1234, false, 0);
+        const uint16_t reused = reps.Choose(0);
+        NS_TEST_EXPECT_MSG_EQ(reused, 0x1234, "an unmarked value is reused");
+        NS_TEST_EXPECT_MSG_EQ(freshSends(50, 0), 50, "and only once");
+        reps.OnAck(0x4321, true, 0);
+        NS_TEST_EXPECT_MSG_EQ(freshSends(1, 0), 1, "a marked value is not reused");
+
+        // Ten values into eight entries: the two oldest are overwritten, and
+        // the rest are reused oldest first.
+        for (uint16_t ev = 1; ev <= 10; ++ev)
+        {
+            reps.OnAck(ev, false, 0);
+        }
+        std::vector<uint16_t> cached;
+        for (uint32_t i = 0; i < 8; ++i)
+        {
+            cached.push_back(reps.Choose(0));
+        }
+        NS_TEST_EXPECT_MSG_EQ((cached == std::vector<uint16_t>{3, 4, 5, 6, 7, 8, 9, 10}),
+                              true,
+                              "cached values are reused oldest first");
+        NS_TEST_EXPECT_MSG_EQ(freshSends(1, 0), 1, "a spent buffer draws afresh");
+
+        // Every cached value used, a timeout freezes: nothing is drawn, and the
+        // eight held values come round in turn.
+        reps.OnTimeout(100);
+        std::vector<uint16_t> frozen;
+        for (uint32_t i = 0; i < 16; ++i)
+        {
+            frozen.push_back(reps.Choose(200));
+        }
+        std::vector<uint16_t> held(frozen.begin(), frozen.begin() + 8);
+        std::sort(held.begin(), held.end());
+        NS_TEST_EXPECT_MSG_EQ((held == std::vector<uint16_t>{3, 4, 5, 6, 7, 8, 9, 10}),
+                              true,
+                              "freezing mode cycles through the held values");
+        NS_TEST_EXPECT_MSG_EQ((std::equal(frozen.begin(), frozen.begin() + 8, frozen.begin() + 8)),
+                              true,
+                              "freezing mode cycles in a fixed order");
+
+        // An unmarked value before the timeout runs out is reused first, and
+        // the cycle goes on.
+        const std::set<uint16_t> stillHeld{4, 5, 6, 7, 8, 9, 10, 77};
+        const auto heldSends = [&reps, &stillHeld](uint32_t sends, uint64_t nowNs) {
+            uint32_t fromHeld = 0;
+            for (uint32_t i = 0; i < sends; ++i)
+            {
+                fromHeld += stillHeld.count(reps.Choose(nowNs));
+            }
+            return fromHeld;
+        };
+        reps.OnAck(77, false, 500);
+        const uint16_t acknowledged = reps.Choose(600);
+        NS_TEST_EXPECT_MSG_EQ(acknowledged, 77, "a fresh acknowledgement's value comes first");
+        NS_TEST_EXPECT_MSG_EQ(heldSends(8, 600), 8, "freezing mode lasts its timeout");
+        reps.OnAck(88, true, 2000);
+        NS_TEST_EXPECT_MSG_EQ(heldSends(1, 2000),
+                              1,
+                              "a marked acknowledgement does not end freezing mode");
+
+        // The first unmarked acknowledgement after the timeout ends it, and a
+        // window of fresh values follows, which a timeout does not interrupt.
+        reps.OnAck(99, false, 2000);
+        reps.OnTimeout(2100);
+        NS_TEST_EXPECT_MSG_EQ(freshSends(kWindow, 2200),
+                              kWindow,
+                              "leaving freezing mode explores a window");
+        const uint16_t afterExploring = reps.Choose(2200);
+        NS_TEST_EXPECT_MSG_EQ(afterExploring, 99, "then the cached value is reused");
+        NS_TEST_EXPECT_MSG_EQ(freshSends(1, 2200), 1, "a timeout while exploring does not freeze");
     }
 };
 
@@ -2911,6 +3018,7 @@ PointToPointTestSuite::PointToPointTestSuite()
     AddTestCase(new AckPacketSeqHeaderTest, TestCase::Duration::QUICK);
     AddTestCase(new AckNamesPacketTest, TestCase::Duration::QUICK);
     AddTestCase(new PathSelectorHooksTest, TestCase::Duration::QUICK);
+    AddTestCase(new RepsSelectorTest, TestCase::Duration::QUICK);
     AddTestCase(new SpineArrivalsTest, TestCase::Duration::QUICK);
     AddTestCase(new ReorderGapTest, TestCase::Duration::QUICK);
     AddTestCase(new OutstandingPacketsModelTest, TestCase::Duration::QUICK);
