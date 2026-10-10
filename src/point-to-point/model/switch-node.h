@@ -99,6 +99,7 @@ private:
 	uint32_t QueueIndexFor(const CustomHeader &ch) const;
 	static uint32_t EcmpHash(const uint8_t* key, size_t len, uint32_t seed);
 	static void FillFlowKey(const CustomHeader &ch, uint32_t key[3]);
+	static bool IdentifiesPath(const CustomHeader &ch);
 	void CheckAndSendPfc(uint32_t inDev, uint32_t qIndex);
 	void CheckAndSendResume(uint32_t inDev, uint32_t qIndex);
 	// Return a queued packet's bytes to the buffer it was admitted against.

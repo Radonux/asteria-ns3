@@ -128,11 +128,16 @@ int SwitchNode::GetOutDev(Ptr<const Packet> p, CustomHeader &ch){
 	// entry found
 	auto &nexthops = entry->second;
 	const LoadBalancingMode mode = static_cast<LoadBalancingMode>(m_loadBalancing);
-	// Only the sender's data packets carry a spine, and a destination behind
-	// another leaf is reached through spine uplinks alone.
-	if (mode == LoadBalancingMode::SprayUniform && ch.l3Prot == 0x11 &&
-			IsSpineUplink(nexthops[0]))
-		return RouteToRequestedSpine(ch, nexthops);
+	const bool namesPath = IdentifiesPath(ch);
+	// A destination behind another leaf is reached through spine uplinks alone.
+	// An answer goes up the spine that carried the data packet it answers, so
+	// that the answer to data that got through returns over a working spine.
+	if (mode == LoadBalancingMode::SprayUniform && namesPath &&
+			IsSpineUplink(nexthops[0])){
+		if (ch.l3Prot == 0x11)
+			return RouteToRequestedSpine(ch, nexthops);
+		return m_spinePort[LiveSpineFor(ch, CarryingSpine(ch.ipid), nexthops)];
+	}
 
 	// pick one next hop based on hash
 	union {
@@ -141,7 +146,9 @@ int SwitchNode::GetOutDev(Ptr<const Packet> p, CustomHeader &ch){
 	} buf;
 	FillFlowKey(ch, buf.u32);
 	size_t keyBytes = 12;
-	if (mode == LoadBalancingMode::EntropyHash && ch.l3Prot == 0x11){
+	// An answer hashes the entropy value it returns, so that one value names
+	// both paths of a round trip.
+	if (mode == LoadBalancingMode::EntropyHash && namesPath){
 		buf.u32[3] = ch.ipid;
 		keyBytes = 16;
 	}
@@ -164,6 +171,15 @@ void SwitchNode::FillFlowKey(const CustomHeader &ch, uint32_t key[3]){
 		key[2] = ch.ack.sport | ((uint32_t)ch.ack.dport << 16);
 	else
 		key[2] = 0;
+}
+
+// Whether the identification names the packet's path under a load-balancing
+// mode other than ECMP: a data packet's does, and so does that of an
+// acknowledgement, a NACK or a repair request, which returns the
+// identification of the data packet it answers.
+bool SwitchNode::IdentifiesPath(const CustomHeader &ch){
+	return ch.l3Prot == 0x11 || ch.l3Prot == 0xFC || ch.l3Prot == 0xFD ||
+		ch.l3Prot == kUecTrimRepairProtocol;
 }
 
 // Sends the packet up the uplink of the spine it requests and records in the

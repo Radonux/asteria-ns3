@@ -668,13 +668,15 @@ class LoadBalancingSwitchTest : public TestCase
 {
   public:
     LoadBalancingSwitchTest()
-        : TestCase("A leaf routes data by the requested spine or by the entropy value")
+        : TestCase("A leaf routes data, and the answers to it, by the requested spine or by "
+                   "the entropy value")
     {
     }
 
     void DoRun() override
     {
         RouteBySpine();
+        ReturnOverCarryingSpine();
         RouteByEntropy(LoadBalancingMode::Ecmp);
         RouteByEntropy(LoadBalancingMode::EntropyHash);
         Simulator::Destroy();
@@ -682,6 +684,9 @@ class LoadBalancingSwitchTest : public TestCase
 
   private:
     static constexpr uint32_t kSpines = 4;
+    // An acknowledgement, a NACK and a repair request, which answer a data
+    // packet and return its identification.
+    static constexpr uint8_t kAnswers[] = {0xFC, 0xFD, kUecTrimRepairProtocol};
     Ipv4Address m_sender{"11.0.1.1"};
     Ipv4Address m_localHost{"11.0.1.2"};
     Ipv4Address m_remoteHost{"11.0.2.1"};
@@ -745,21 +750,37 @@ class LoadBalancingSwitchTest : public TestCase
         return index;
     }
 
-    Egress Send(Ipv4Address destination, uint16_t sourcePort, uint16_t identification)
+    // A data packet, or under a control protocol the control packet a host
+    // behind this leaf sends to answer one, with its ports the other way round.
+    Egress Send(Ipv4Address destination,
+                uint16_t sourcePort,
+                uint16_t identification,
+                uint8_t protocol = 0x11)
     {
-        Ptr<Packet> packet = Create<Packet>(1000);
-        SeqTsHeader seqTs;
-        // Priority group 0 bypasses buffer admission, which is not under test.
-        seqTs.SetPG(0);
-        packet->AddHeader(seqTs);
-        UdpHeader udp;
-        udp.SetSourcePort(sourcePort);
-        udp.SetDestinationPort(10001);
-        packet->AddHeader(udp);
+        Ptr<Packet> packet = Create<Packet>(protocol == 0x11 ? 1000 : 0);
+        if (protocol == 0x11)
+        {
+            SeqTsHeader seqTs;
+            // Priority group 0 bypasses buffer admission, which is not under test.
+            seqTs.SetPG(0);
+            packet->AddHeader(seqTs);
+            UdpHeader udp;
+            udp.SetSourcePort(sourcePort);
+            udp.SetDestinationPort(10001);
+            packet->AddHeader(udp);
+        }
+        else
+        {
+            qbbHeader control;
+            control.SetPG(0);
+            control.SetSport(10001);
+            control.SetDport(sourcePort);
+            packet->AddHeader(control);
+        }
         Ipv4Header ip;
         ip.SetSource(m_sender);
         ip.SetDestination(destination);
-        ip.SetProtocol(0x11);
+        ip.SetProtocol(protocol);
         ip.SetIdentification(identification);
         ip.SetPayloadSize(packet->GetSize());
         packet->AddHeader(ip);
@@ -862,27 +883,77 @@ class LoadBalancingSwitchTest : public TestCase
         }
     }
 
+    // The same leaf stands for the destination leaf of the data it routes: its
+    // spine ports are indexed as every leaf's are, so the control packet a host
+    // behind it sends in answer leaves on the port of the spine that carried
+    // the data.
+    void ReturnOverCarryingSpine()
+    {
+        BuildLeaf(LoadBalancingMode::SprayUniform);
+        m_leaf->SetAttribute("AckHighPrio", UintegerValue(1));
+        for (uint8_t protocol : kAnswers)
+        {
+            for (uint32_t spine = 0; spine < kSpines; ++spine)
+            {
+                const Egress data = Send(m_remoteHost, 10000, SpineIdentification(spine, spine));
+                const Egress answer = Send(m_remoteHost, 10000, data.identification, protocol);
+                NS_TEST_EXPECT_MSG_EQ(answer.port,
+                                      data.port,
+                                      "an answer leaves on the carrying spine's uplink");
+                NS_TEST_EXPECT_MSG_EQ(answer.identification,
+                                      data.identification,
+                                      "an answer's identification is not rewritten");
+            }
+        }
+
+        // Spine 2 cannot reach this host, so its request was carried by another
+        // spine, which the answer takes although spine 2 reaches the remote host.
+        const Egress folded = Send(m_cutOffHost, 10000, SpineIdentification(2, 2));
+        const Egress answer = Send(m_remoteHost, 10000, folded.identification, 0xFC);
+        NS_TEST_EXPECT_MSG_EQ(answer.port,
+                              folded.port,
+                              "an answer follows the carrying spine, not the requested one");
+        NS_TEST_EXPECT_MSG_EQ(answer.identification,
+                              folded.identification,
+                              "a folded data packet's answer keeps both spines");
+
+        DynamicCast<QbbNetDevice>(m_leaf->GetDevice(m_spinePorts[3]))->TakeDown();
+        const Egress moved = Send(m_remoteHost, 10000, SpineIdentification(3, 3), 0xFC);
+        NS_TEST_EXPECT_MSG_NE(moved.port,
+                              m_spinePorts[3],
+                              "an answer whose carrying spine's uplink is down is moved");
+        NS_TEST_EXPECT_MSG_EQ(moved.identification,
+                              SpineIdentification(3, 3),
+                              "a moved answer keeps the identification it echoes");
+        NS_TEST_EXPECT_MSG_EQ(Send(m_remoteHost, 10000, SpineIdentification(3, 3), 0xFC).port,
+                              moved.port,
+                              "a moved answer keeps one spine while the live ones stay");
+    }
+
     void RouteByEntropy(LoadBalancingMode mode)
     {
         BuildLeaf(mode);
-        std::set<uint32_t> ports;
-        for (uint32_t identification = 0; identification <= UINT8_MAX; ++identification)
+        for (uint8_t protocol : {uint8_t{0x11}, kAnswers[0], kAnswers[1], kAnswers[2]})
         {
-            ports.insert(Send(m_remoteHost, 10000, identification).port);
-        }
-        if (mode == LoadBalancingMode::Ecmp)
-        {
-            NS_TEST_EXPECT_MSG_EQ(ports.size(), 1, "ECMP keeps a flow on one path");
-        }
-        else
-        {
-            NS_TEST_EXPECT_MSG_EQ(ports.size(),
-                                  kSpines,
-                                  "the entropy value spreads one flow over every uplink");
-            const uint32_t port = Send(m_remoteHost, 10000, 0x1234).port;
-            NS_TEST_EXPECT_MSG_EQ(Send(m_remoteHost, 10000, 0x1234).port,
-                                  port,
-                                  "an entropy value always takes the same path");
+            std::set<uint32_t> ports;
+            for (uint32_t identification = 0; identification <= UINT8_MAX; ++identification)
+            {
+                ports.insert(Send(m_remoteHost, 10000, identification, protocol).port);
+            }
+            if (mode == LoadBalancingMode::Ecmp)
+            {
+                NS_TEST_EXPECT_MSG_EQ(ports.size(), 1, "ECMP keeps a flow on one path");
+            }
+            else
+            {
+                NS_TEST_EXPECT_MSG_EQ(ports.size(),
+                                      kSpines,
+                                      "the entropy value spreads one flow over every uplink");
+                const uint32_t port = Send(m_remoteHost, 10000, 0x1234, protocol).port;
+                NS_TEST_EXPECT_MSG_EQ(Send(m_remoteHost, 10000, 0x1234, protocol).port,
+                                      port,
+                                      "an entropy value always takes the same path");
+            }
         }
     }
 };
