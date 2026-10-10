@@ -147,12 +147,12 @@ TypeId RdmaHw::GetTypeId (void)
 				"Under LoadBalancing 1, what chooses each data packet's entropy "
 				"value: 0=OPS, a fresh value drawn per packet; 1=REPS; 2=UEC "
 				"oblivious spraying; 3=UEC path-aware spraying with the "
-				"congestion bitmap.",
+				"congestion bitmap; 4=MRC.",
 				UintegerValue(static_cast<uint32_t>(PathSelectorKind::Ops)),
 				MakeUintegerAccessor(&RdmaHw::m_pathSelectorKind),
 				MakeUintegerChecker<uint32_t>(
 					static_cast<uint32_t>(PathSelectorKind::Ops),
-					static_cast<uint32_t>(PathSelectorKind::UeAware)))
+					static_cast<uint32_t>(PathSelectorKind::Mrc)))
 		.AddAttribute("RepsBufferSize",
 				"REPS: the entries of the circular buffer of entropy values to "
 				"reuse. Default 8, REPS section 3.1.",
@@ -178,6 +178,29 @@ TypeId RdmaHw::GetTypeId (void)
 				DoubleValue(0.5),
 				MakeDoubleAccessor(&RdmaHw::m_ueSaturationFraction),
 				MakeDoubleChecker<double>(0, 1))
+		.AddAttribute("MrcEvSetSize",
+				"MRC: the entropy values a queue pair rotates through. Default "
+				"128, within the one to two windows of OCP MRC 1.0 section "
+				"11.2.1 and the 128 to 256 per queue pair MRC is deployed with.",
+				UintegerValue(128),
+				MakeUintegerAccessor(&RdmaHw::m_mrcEvSetSize),
+				MakeUintegerChecker<uint32_t>(1, UINT16_MAX + 1))
+		.AddAttribute("MrcSkipBaseRtts",
+				"MRC: how long a value stays SKIP unless the rotation resets it "
+				"first, in base RTTs. OCP MRC 1.0 leaves it to the "
+				"implementation; default 1, the round trip UEC 1.0.3 section "
+				"3.6.16.4 keeps a marked value out of use for.",
+				DoubleValue(1.0),
+				MakeDoubleAccessor(&RdmaHw::m_mrcSkipBaseRtts),
+				MakeDoubleChecker<double>(0))
+		.AddAttribute("MrcProbeTimeouts",
+				"MRC: the interval between probes of an ASSUMED_BAD value, in "
+				"retransmission timeouts. OCP MRC 1.0 leaves it to the "
+				"implementation; default 1, so that a value is tried again as "
+				"often as the timeout can condemn it.",
+				DoubleValue(1.0),
+				MakeDoubleAccessor(&RdmaHw::m_mrcProbeTimeouts),
+				MakeDoubleChecker<double>(0))
 		.AddAttribute("EwmaGain",
 				"Control gain parameter which determines the level of rate decrease",
 				DoubleValue(1.0 / 16),
@@ -429,6 +452,10 @@ void RdmaHw::Setup(QpCompleteCallback cb, QpFailureCallback failure_cb){
 			m_loadBalancing !=
 				static_cast<uint32_t>(LoadBalancingMode::EntropyHash),
 		"PathSelector chooses entropy values and needs LoadBalancing 1");
+	NS_ABORT_MSG_IF(m_pathSelectorKind ==
+				static_cast<uint32_t>(PathSelectorKind::Mrc) &&
+			m_retransmission_timeout_ns == 0,
+		"MRC probes at multiples of RetransmissionTimeoutNs");
 	NS_ABORT_MSG_IF(IsPathPerPacket() && !CustomHeader::ackCarriesPacketSeq,
 		"A LoadBalancing mode other than ECMP finds the send an acknowledgement "
 		"answers by the packet sequence the acknowledgement carries");
@@ -494,7 +521,7 @@ void RdmaHw::AddQueuePair(uint32_t src, uint32_t dest, uint64_t tag, uint64_t si
 	uint64_t key = GetQpKey(dip.Get(), sport, pg);
 	m_qpMap[key] = qp;
 	if (IsPathPerPacket())
-		StartPathSelection(qp, win);
+		StartPathSelection(qp, win, baseRtt);
 	// The liveness invariant starts at birth: an unfinished QP always has a
 	// pending timer, even if its first send never gets scheduled.
 	ArmRetransmissionTimeout(qp);
@@ -1654,7 +1681,8 @@ void RdmaHw::SendPathProbe(Ptr<RdmaQueuePair> qp, uint16_t path){
 	ReportTransportEvent("path_probe", 0);
 }
 
-void RdmaHw::StartPathSelection(Ptr<RdmaQueuePair> qp, uint64_t bdpBytes){
+void RdmaHw::StartPathSelection(Ptr<RdmaQueuePair> qp, uint64_t bdpBytes,
+		uint64_t baseRttNs){
 	qp->m_outstanding.SetPacketSize(m_mtu);
 	if (m_loadBalancing == static_cast<uint32_t>(LoadBalancingMode::SprayUniform)){
 		qp->m_pathSelector =
@@ -1678,6 +1706,12 @@ void RdmaHw::StartPathSelection(Ptr<RdmaQueuePair> qp, uint64_t bdpBytes){
 	case PathSelectorKind::UeAware:
 		qp->m_pathSelector = std::make_unique<UeAwareSelector>(m_pathRandom,
 			m_ueEvSetSize, m_ueSaturationFraction);
+		break;
+	case PathSelectorKind::Mrc:
+		qp->m_pathSelector = std::make_unique<MrcSelector>(m_pathRandom,
+			m_mrcEvSetSize, static_cast<uint64_t>(m_mrcSkipBaseRtts * baseRttNs),
+			static_cast<uint64_t>(
+				m_mrcProbeTimeouts * m_retransmission_timeout_ns));
 		break;
 	}
 }

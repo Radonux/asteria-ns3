@@ -85,6 +85,9 @@ public:
 	uint64_t m_repsFreezingTimeoutNs;
 	uint32_t m_ueEvSetSize;
 	double m_ueSaturationFraction;
+	uint32_t m_mrcEvSetSize;
+	double m_mrcSkipBaseRtts;
+	double m_mrcProbeTimeouts;
 	// Indexed by carrying spine; kept under SprayUniform, where the
 	// identification names one.
 	std::vector<SpineArrivals> m_spineArrivals;
@@ -250,9 +253,11 @@ public:
 	bool IsPathPerPacket() const;
 	void SendPathProbe(Ptr<RdmaQueuePair> qp, uint16_t path);
 	// Where every data packet draws its own path: keep the queue pair's send
-	// records and give it the selector that draws its paths. bdpBytes is the
-	// queue pair's bandwidth-delay product, as AddQueuePair receives it.
-	void StartPathSelection(Ptr<RdmaQueuePair> qp, uint64_t bdpBytes);
+	// records and give it the selector that draws its paths. bdpBytes and
+	// baseRttNs are the queue pair's bandwidth-delay product and base round
+	// trip, as AddQueuePair receives them.
+	void StartPathSelection(Ptr<RdmaQueuePair> qp, uint64_t bdpBytes,
+		uint64_t baseRttNs);
 	void PktSent(Ptr<RdmaQueuePair> qp, Ptr<Packet> pkt, Time interframeGap);
 	void UpdateNextAvail(Ptr<RdmaQueuePair> qp, Time interframeGap, uint32_t pkt_size);
 	void ChangeRate(Ptr<RdmaQueuePair> qp, DataRate new_rate);

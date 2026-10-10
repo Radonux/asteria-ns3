@@ -193,4 +193,94 @@ void UeAwareSelector::Mark(uint16_t ev){
 	m_markedCount++;
 }
 
+MrcSelector::MrcSelector(Ptr<UniformRandomVariable> random, uint32_t size,
+		uint64_t skipNs, uint64_t probeIntervalNs)
+	: m_rotation(random, size), m_entropies(size, Entropy{State::Good, 0, 0}),
+	  m_skipNs(skipNs), m_probeIntervalNs(probeIntervalNs)
+{
+}
+
+uint16_t MrcSelector::Choose(uint64_t nowNs){
+	bool reset = false;
+	bool assumedBadSeen = false;
+	uint16_t assumedBad = 0;
+	// Two passes reach every value, whatever order the second is shuffled
+	// into, so the value this send resets is reached again.
+	for (uint32_t visited = 0; visited < 2 * m_rotation.Size(); visited++){
+		const uint16_t ev = m_rotation.Next();
+		Entropy &entropy = m_entropies[ev];
+		if (entropy.state == State::Skip && nowNs >= entropy.skipUntilNs)
+			entropy.state = State::Good;
+		if (entropy.state == State::Good)
+			return ev;
+		if (entropy.state == State::Skip && !reset){
+			entropy.state = State::Good;
+			reset = true;
+		}else if (entropy.state == State::AssumedBad && !assumedBadSeen){
+			assumedBad = ev;
+			assumedBadSeen = true;
+		}
+	}
+	// Every value is assumed bad. Sending on one beats not sending; only a
+	// probe's answer brings it back, so its data's answers move nothing.
+	return assumedBad;
+}
+
+void MrcSelector::OnAck(uint16_t path, bool marked, uint64_t nowNs){
+	if (marked)
+		Skip(path, nowNs);
+}
+
+void MrcSelector::OnTrim(uint16_t path, bool lastHop, bool, uint64_t nowNs){
+	if (!lastHop)
+		Skip(path, nowNs);
+}
+
+void MrcSelector::OnLoss(uint16_t path, uint64_t nowNs){
+	Entropy &entropy = At(path);
+	if (entropy.state == State::AssumedBad)
+		return;
+	entropy.state = State::AssumedBad;
+	entropy.probeDueNs = nowNs + m_probeIntervalNs;
+	m_probes.emplace_back(path, entropy.probeDueNs);
+}
+
+bool MrcSelector::TakeProbe(uint64_t nowNs, uint16_t &path){
+	while (!m_probes.empty() && m_probes.front().second <= nowNs){
+		const auto [ev, due] = m_probes.front();
+		m_probes.pop_front();
+		Entropy &entropy = m_entropies[ev];
+		if (entropy.state != State::AssumedBad || entropy.probeDueNs != due)
+			continue;
+		entropy.probeDueNs = nowNs + m_probeIntervalNs;
+		m_probes.emplace_back(ev, entropy.probeDueNs);
+		path = ev;
+		return true;
+	}
+	return false;
+}
+
+void MrcSelector::OnProbeAnswer(uint16_t path, bool marked, uint64_t nowNs){
+	Entropy &entropy = At(path);
+	if (entropy.state != State::AssumedBad)
+		return;
+	entropy.state = State::Good;
+	if (marked)
+		Skip(path, nowNs);
+}
+
+MrcSelector::Entropy &MrcSelector::At(uint16_t ev){
+	NS_ASSERT_MSG(ev < m_entropies.size(), "every send takes a value of the set");
+	return m_entropies[ev];
+}
+
+// A value assumed bad stays out of service until a probe answers.
+void MrcSelector::Skip(uint16_t ev, uint64_t nowNs){
+	Entropy &entropy = At(ev);
+	if (entropy.state == State::AssumedBad)
+		return;
+	entropy.state = State::Skip;
+	entropy.skipUntilNs = nowNs + m_skipNs;
+}
+
 } /* namespace ns3 */

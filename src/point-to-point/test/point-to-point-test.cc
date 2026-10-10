@@ -1548,7 +1548,7 @@ class LoadBalancingSenderTest : public TestCase
         qp->m_size = static_cast<uint64_t>(packets) * kMtu;
         if (mode != LoadBalancingMode::Ecmp)
         {
-            hw->StartPathSelection(qp, 0);
+            hw->StartPathSelection(qp, 0, 0);
         }
         std::vector<uint16_t> identifications;
         for (uint32_t i = 0; i < packets; ++i)
@@ -1681,7 +1681,7 @@ class IsolatedHost
         qp->m_size = size;
         if (hw->IsPathPerPacket())
         {
-            hw->StartPathSelection(qp, 0);
+            hw->StartPathSelection(qp, 0, 0);
         }
         hw->m_qpMap[RdmaHw::GetQpKey(peer.Get(), kSenderPort, kPriorityGroup)] = qp;
         return qp;
@@ -2241,6 +2241,209 @@ class UeSelectorTest : public TestCase
         const uint16_t second = aware.Choose(0);
         NS_TEST_EXPECT_MSG_EQ(first, pass[firstSent], "skipping stops above saturation");
         NS_TEST_EXPECT_MSG_EQ(second, pass[5], "and resumes at saturation");
+    }
+};
+
+class MrcSelectorTest : public TestCase
+{
+  public:
+    MrcSelectorTest()
+        : TestCase("MRC moves each value between GOOD, SKIP and ASSUMED_BAD on its evidence")
+    {
+    }
+
+    void DoRun() override
+    {
+        SkipOnMark();
+        OneResetPerSend();
+        SkipLapses();
+        AssumedBadUntilProbed();
+        DeadPathDrained();
+        AllAssumedBad();
+    }
+
+  private:
+    static constexpr uint32_t kValues = 16;
+    static constexpr uint64_t kSkipNs = 1000;
+    static constexpr uint64_t kProbeNs = 10000;
+
+    // A selector and the order its rotation will take, read off a rotation on
+    // the same stream.
+    struct Fixture
+    {
+        explicit Fixture(uint32_t values = kValues)
+            : mrc(SelectorStream(), values, kSkipNs, kProbeNs)
+        {
+            EntropyRotation order(SelectorStream(), values);
+            for (uint32_t i = 0; i < 4 * values; ++i)
+            {
+                rotation.push_back(order.Next());
+            }
+        }
+
+        // Sends at nowNs, one per position from first to last but those left
+        // out, compared with the rotation's values there: the first that
+        // differs, or nothing.
+        std::string Sends(uint32_t first,
+                          uint32_t last,
+                          const std::set<uint32_t>& leftOut,
+                          uint64_t nowNs)
+        {
+            for (uint32_t position = first; position < last; ++position)
+            {
+                if (leftOut.count(position) > 0)
+                {
+                    continue;
+                }
+                const uint16_t sent = mrc.Choose(nowNs);
+                if (sent != rotation[position])
+                {
+                    return "position " + std::to_string(position) + " sent " +
+                           std::to_string(sent) + ", not " + std::to_string(rotation[position]);
+                }
+            }
+            return "";
+        }
+
+        // The probes due at nowNs, in order; no more than one per value.
+        std::vector<uint16_t> Probes(uint64_t nowNs)
+        {
+            std::vector<uint16_t> due;
+            uint16_t probed;
+            while (due.size() <= rotation.size() && mrc.TakeProbe(nowNs, probed))
+            {
+                due.push_back(probed);
+            }
+            return due;
+        }
+
+        MrcSelector mrc;
+        std::vector<uint16_t> rotation;
+    };
+
+    // A marked acknowledgement and a trim before the last hop each move a value
+    // to SKIP, passed over once; a last-hop trim, marked or not, and an
+    // unmarked acknowledgement move nothing.
+    void SkipOnMark()
+    {
+        Fixture f;
+        f.mrc.OnAck(f.rotation[2], true, 0);
+        f.mrc.OnTrim(f.rotation[5], false, false, 0);
+        f.mrc.OnTrim(f.rotation[8], true, true, 0);
+        f.mrc.OnAck(f.rotation[10], false, 0);
+        const std::string differs = f.Sends(0, 2 * kValues, {2, 5}, 0);
+        NS_TEST_EXPECT_MSG_EQ(differs, "", "a SKIP value is passed over once");
+    }
+
+    // A send resets the first SKIP value it passes over and only that one, so
+    // of two adjacent SKIP values the second is passed over again next pass.
+    void OneResetPerSend()
+    {
+        Fixture f;
+        f.mrc.OnAck(f.rotation[3], true, 0);
+        f.mrc.OnAck(f.rotation[4], true, 0);
+        uint32_t second = kValues;
+        while (f.rotation[second] != f.rotation[4])
+        {
+            ++second;
+        }
+        const std::string differs = f.Sends(0, 3 * kValues, {3, 4, second}, 0);
+        NS_TEST_EXPECT_MSG_EQ(differs, "", "one send resets one SKIP value");
+    }
+
+    void SkipLapses()
+    {
+        Fixture f;
+        f.mrc.OnAck(f.rotation[2], true, 0);
+        const std::string differs = f.Sends(0, kValues, {}, kSkipNs);
+        NS_TEST_EXPECT_MSG_EQ(differs, "", "a SKIP value is GOOD again after its time");
+    }
+
+    // A declared loss takes a value out of service, a probe of it falls due
+    // every interval until one is answered, and an unmarked answer brings it
+    // back; the answer to data sent on it does not.
+    void AssumedBadUntilProbed()
+    {
+        Fixture f;
+        f.mrc.OnLoss(f.rotation[1], 0);
+        f.mrc.OnAck(f.rotation[1], false, 100);
+        std::set<uint32_t> bad;
+        for (uint32_t position = 0; position < 4 * kValues; ++position)
+        {
+            if (f.rotation[position] == f.rotation[1])
+            {
+                bad.insert(position);
+            }
+        }
+        const std::string withoutBad = f.Sends(0, 2 * kValues, bad, 100);
+        NS_TEST_EXPECT_MSG_EQ(withoutBad, "", "an ASSUMED_BAD value is not sent on");
+        const std::vector<uint16_t> condemned{f.rotation[1]};
+        const std::vector<uint16_t> early = f.Probes(kProbeNs - 1);
+        const std::vector<uint16_t> first = f.Probes(kProbeNs);
+        const std::vector<uint16_t> again = f.Probes(kProbeNs);
+        const std::vector<uint16_t> second = f.Probes(2 * kProbeNs);
+        f.mrc.OnProbeAnswer(f.rotation[1], false, 2 * kProbeNs);
+        const std::vector<uint16_t> answered = f.Probes(3 * kProbeNs);
+        NS_TEST_EXPECT_MSG_EQ(early.empty(), true, "no probe is due before its interval");
+        NS_TEST_EXPECT_MSG_EQ((first == condemned), true, "then the value assumed bad is probed");
+        NS_TEST_EXPECT_MSG_EQ(again.empty(), true, "once");
+        NS_TEST_EXPECT_MSG_EQ((second == condemned), true, "and again while unanswered");
+        NS_TEST_EXPECT_MSG_EQ(answered.empty(), true, "an answered value is not probed");
+        const std::string restored = f.Sends(2 * kValues, 4 * kValues, {}, 2 * kProbeNs);
+        NS_TEST_EXPECT_MSG_EQ(restored, "", "an unmarked answer restores GOOD");
+
+        // A marked answer moves the value to SKIP: passed over once.
+        Fixture g;
+        g.mrc.OnLoss(g.rotation[6], 0);
+        g.mrc.OnProbeAnswer(g.rotation[6], true, 0);
+        const std::string skippedOnce = g.Sends(0, 2 * kValues, {6}, 0);
+        NS_TEST_EXPECT_MSG_EQ(skippedOnce, "", "a marked answer moves to SKIP");
+    }
+
+    // Every value of a dead path assumed bad as its sends are lost: none is
+    // sent on again, and each is probed once per interval, in the order they
+    // were condemned.
+    void DeadPathDrained()
+    {
+        Fixture f;
+        const std::vector<uint32_t> dead{0, 3, 7, 8, 12};
+        std::set<uint16_t> deadValues;
+        for (uint32_t i = 0; i < dead.size(); ++i)
+        {
+            f.mrc.OnLoss(f.rotation[dead[i]], i);
+            deadValues.insert(f.rotation[dead[i]]);
+        }
+        uint32_t sentOnDead = 0;
+        for (uint32_t i = 0; i < 4 * kValues; ++i)
+        {
+            sentOnDead += deadValues.count(f.mrc.Choose(100));
+        }
+        NS_TEST_EXPECT_MSG_EQ(sentOnDead, 0, "a dead path is drained");
+        std::vector<uint16_t> condemned;
+        for (uint32_t position : dead)
+        {
+            condemned.push_back(f.rotation[position]);
+        }
+        for (uint64_t round = 1; round <= 2; ++round)
+        {
+            const std::vector<uint16_t> due = f.Probes(round * kProbeNs + dead.size());
+            NS_TEST_EXPECT_MSG_EQ((due == condemned),
+                                  true,
+                                  "each dead value is probed once per interval, in the order "
+                                  "condemned");
+        }
+    }
+
+    // With every value assumed bad, a send still takes one.
+    void AllAssumedBad()
+    {
+        Fixture f(4);
+        for (uint32_t position = 0; position < 4; ++position)
+        {
+            f.mrc.OnLoss(f.rotation[position], 0);
+        }
+        const uint16_t sent = f.mrc.Choose(0);
+        NS_TEST_EXPECT_MSG_EQ(sent, f.rotation[0], "the first value reached is sent");
     }
 };
 
@@ -3257,6 +3460,7 @@ PointToPointTestSuite::PointToPointTestSuite()
     AddTestCase(new PathProbeTest, TestCase::Duration::QUICK);
     AddTestCase(new RepsSelectorTest, TestCase::Duration::QUICK);
     AddTestCase(new UeSelectorTest, TestCase::Duration::QUICK);
+    AddTestCase(new MrcSelectorTest, TestCase::Duration::QUICK);
     AddTestCase(new SpineArrivalsTest, TestCase::Duration::QUICK);
     AddTestCase(new ReorderGapTest, TestCase::Duration::QUICK);
     AddTestCase(new OutstandingPacketsModelTest, TestCase::Duration::QUICK);

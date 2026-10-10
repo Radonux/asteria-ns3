@@ -3,7 +3,9 @@
 
 #include <ns3/ptr.h>
 #include <ns3/random-variable-stream.h>
+#include <deque>
 #include <stdint.h>
+#include <utility>
 #include <vector>
 
 namespace ns3 {
@@ -14,6 +16,7 @@ enum class PathSelectorKind : uint32_t {
 	Reps,
 	UeOblivious,
 	UeAware,
+	Mrc,
 };
 
 // A queue pair's choice of the path each of its data packets takes, and what
@@ -158,6 +161,49 @@ private:
 	std::vector<bool> m_marked;
 	uint32_t m_markedCount;
 	double m_saturationFraction;
+};
+
+// MRC (OCP MRC 1.0 section 9.3.1, with the EV choice of the informative
+// example in section 11.2.2): each value of the queue pair's set is GOOD, SKIP
+// or ASSUMED_BAD. The rotation sends on a GOOD value and passes over the
+// others; the first SKIP value one send passes over it resets to GOOD. A
+// marked acknowledgement or a trim before the last hop moves a value to SKIP,
+// which also lapses to GOOD after a time; a declared loss, by the loss rule or
+// by the timeout, moves it to ASSUMED_BAD, out of service until a periodic
+// probe's answer moves it to GOOD, or to SKIP if the probe came back marked.
+// DENIED is set only by a controller, which the simulator has no counterpart
+// of, so no value is ever DENIED.
+class MrcSelector : public PathSelector {
+public:
+	MrcSelector(Ptr<UniformRandomVariable> random, uint32_t size,
+		uint64_t skipNs, uint64_t probeIntervalNs);
+	uint16_t Choose(uint64_t nowNs) override;
+	void OnAck(uint16_t path, bool marked, uint64_t nowNs) override;
+	// A trim before the last hop is the TRIMMED NACK of section 9.3.1; a
+	// last-hop trim is TRIMMED_LASTHOP, which moves nothing.
+	void OnTrim(uint16_t path, bool lastHop, bool marked, uint64_t nowNs) override;
+	void OnLoss(uint16_t path, uint64_t nowNs) override;
+	bool TakeProbe(uint64_t nowNs, uint16_t &path) override;
+	void OnProbeAnswer(uint16_t path, bool marked, uint64_t nowNs) override;
+
+private:
+	enum class State : uint8_t { Good, Skip, AssumedBad };
+	struct Entropy {
+		State state;
+		uint64_t skipUntilNs;
+		// When an ASSUMED_BAD value's next probe is due.
+		uint64_t probeDueNs;
+	};
+	Entropy &At(uint16_t ev);
+	void Skip(uint16_t ev, uint64_t nowNs);
+
+	EntropyRotation m_rotation;
+	std::vector<Entropy> m_entropies;
+	// Probes as (value, due time), earliest first. An entry whose value has
+	// left ASSUMED_BAD since, or was condemned again, is stale and dropped.
+	std::deque<std::pair<uint16_t, uint64_t>> m_probes;
+	uint64_t m_skipNs;
+	uint64_t m_probeIntervalNs;
 };
 
 } /* namespace ns3 */
