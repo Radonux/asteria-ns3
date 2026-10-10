@@ -1217,7 +1217,7 @@ void RdmaHw::HandleRetransmissionTimeout(Ptr<RdmaQueuePair> qp){
 	qp->m_timeouts++;
 	ReportTransportEvent("rto_fired", 0);
 	if (qp->m_outstanding.IsKept()){
-		const uint32_t lost = qp->DeclareLostSentBy(
+		const uint64_t lost = qp->DeclareLostSentBy(
 			Simulator::Now().GetNanoSeconds() - m_retransmission_timeout_ns);
 		NS_ASSERT_MSG(lost > 0, "the timer expires with the oldest send");
 	}else{

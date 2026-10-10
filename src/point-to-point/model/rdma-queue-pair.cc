@@ -363,20 +363,22 @@ void RdmaQueuePair::DropAcknowledgedRepairs(){
 	}
 }
 
-void RdmaQueuePair::AcknowledgePacket(uint64_t seq, uint16_t path){
+uint64_t RdmaQueuePair::AcknowledgePacket(uint64_t seq, uint16_t path){
 	const uint64_t packet = m_outstanding.Find(seq, path);
 	if (packet == OutstandingPackets::kNone)
-		return;
+		return 0;
 	// Sends along one path pass through one sequence of queues and arrive in
 	// the order they left, so an older send on this path that is still
 	// outstanding did not arrive. Under EntropyHash two outstanding sends
 	// rarely share a path, so this seldom finds one and loss falls to the
 	// timeout; only equal values are known to share queues.
+	uint64_t lost = 0;
 	for (uint64_t older = m_outstanding.OlderOnPath(packet);
 			older != OutstandingPackets::kNone;
 			older = m_outstanding.OlderOnPath(packet))
-		DeclareLost(older);
+		lost += DeclareLost(older);
 	m_outstanding.Remove(packet);
+	return lost;
 }
 
 bool RdmaQueuePair::ReleasePacket(uint64_t seq, uint16_t path){
@@ -387,23 +389,23 @@ bool RdmaQueuePair::ReleasePacket(uint64_t seq, uint16_t path){
 	return true;
 }
 
-uint32_t RdmaQueuePair::DeclareLostSentBy(uint64_t sentNs){
-	uint32_t lost = 0;
+uint64_t RdmaQueuePair::DeclareLostSentBy(uint64_t sentNs){
+	uint64_t lost = 0;
 	for (uint64_t oldest = m_outstanding.Oldest();
 			oldest != OutstandingPackets::kNone &&
 				m_outstanding.SentNs(oldest) <= sentNs;
-			oldest = m_outstanding.Oldest()){
-		DeclareLost(oldest);
-		lost++;
-	}
+			oldest = m_outstanding.Oldest())
+		lost += DeclareLost(oldest);
 	return lost;
 }
 
-void RdmaQueuePair::DeclareLost(uint64_t packet){
+uint32_t RdmaQueuePair::DeclareLost(uint64_t packet){
 	const uint64_t seq = m_outstanding.Seq(packet);
-	AddRepairRange(seq, seq + m_outstanding.Size(packet));
+	const uint32_t size = m_outstanding.Size(packet);
+	AddRepairRange(seq, seq + size);
 	m_outstanding.Remove(packet);
 	m_recovery_events++;
+	return size;
 }
 
 uint64_t RdmaQueuePair::RepairBytesLeft(){

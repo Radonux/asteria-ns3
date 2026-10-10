@@ -1476,7 +1476,7 @@ class TrimRepairedOnceTest : public TestCase
         // first send asks for nothing.
         IsolatedHost second(LoadBalancingMode::SprayUniform, kTestReceiver, 8);
         qp = TwoSends(second, kSpine);
-        NS_TEST_EXPECT_MSG_EQ(qp->DeclareLostSentBy(0), 2, "both sends are declared lost");
+        NS_TEST_EXPECT_MSG_EQ(qp->DeclareLostSentBy(0), 2 * kMtu, "both sends are declared lost");
         uint64_t start = 0;
         NS_TEST_EXPECT_MSG_EQ(qp->TakeRepairSegment(kMtu, start), kMtu, "the loss is repaired");
         qp->m_outstanding.Add(0, kMtu, kSpine + 1, 10);

@@ -216,13 +216,14 @@ public:
 	// removed and every older send still outstanding along the same path is
 	// declared lost. Nothing happens when no outstanding send matches, which
 	// is a duplicate or the answer to an earlier send of a packet resent since.
-	void AcknowledgePacket(uint64_t seq, uint16_t path);
+	// Returns the bytes declared lost.
+	uint64_t AcknowledgePacket(uint64_t seq, uint16_t path);
 	// A trimmed send of seq along path. False when no outstanding send matches:
 	// that send was already declared lost and its repair is under way.
 	bool ReleasePacket(uint64_t seq, uint16_t path);
 	// Declare lost every outstanding send made at or before sentNs and queue
-	// its range for repair. Returns how many there were.
-	uint32_t DeclareLostSentBy(uint64_t sentNs);
+	// its range for repair. Returns the bytes declared lost.
+	uint64_t DeclareLostSentBy(uint64_t sentNs);
 
 	uint64_t GetBytesLeft();
 	uint64_t GetInitialSize();
@@ -240,7 +241,8 @@ public:
 	uint64_t HpGetCurWin(); // window size calculated from hp.m_curRate, used by HPCC
 
 private:
-	void DeclareLost(uint64_t packet);
+	// Returns the bytes declared lost.
+	uint32_t DeclareLost(uint64_t packet);
 };
 
 class RdmaRxQueuePair : public Object { // Rx side queue pair
