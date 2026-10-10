@@ -43,11 +43,13 @@
 #include "ns3/path-selector.h"
 #include "ns3/seq-ts-header.h"
 #include "ns3/simulator.h"
+#include "ns3/spine-grader.h"
 #include "ns3/string.h"
 #include "ns3/test.h"
 #include "ns3/udp-header.h"
 
 #include <algorithm>
+#include <cmath>
 #include <map>
 #include <memory>
 #include <random>
@@ -3530,6 +3532,333 @@ class SpineReportHeaderTest : public TestCase
     }
 };
 
+class SupervisedEwmaTest : public TestCase
+{
+  public:
+    SupervisedEwmaTest()
+        : TestCase("A supervised average follows its gain and restarts at a step")
+    {
+    }
+
+    void DoRun() override
+    {
+        const SupervisedEwma::Parameters parameters{1.0 / 16, 0.125, 0.5};
+        SupervisedEwma average;
+        NS_TEST_EXPECT_MSG_EQ(average.Value(), 0, "an average starts at zero");
+        // Samples within the slack of the average move it by the gain alone.
+        for (uint32_t i = 0; i < 100; ++i)
+        {
+            average.Add(0.1, parameters);
+        }
+        NS_TEST_EXPECT_MSG_EQ_TOL(average.Value(),
+                                  0.1 * (1 - std::pow(15.0 / 16, 100)),
+                                  1e-12,
+                                  "a sample inside the slack moves the average by the gain");
+        // A step of 0.5: the excess net of the slack is 0.275 per sample, so
+        // the second sample passes the threshold and restarts the average.
+        const double before = average.Value();
+        average.Add(0.6, parameters);
+        NS_TEST_EXPECT_MSG_EQ_TOL(average.Value(),
+                                  before + (0.6 - before) / 16,
+                                  1e-12,
+                                  "one sample of a step moves the average by the gain");
+        average.Add(0.6, parameters);
+        NS_TEST_EXPECT_MSG_EQ(average.Value(), 0.6, "the second sample of a step restarts it");
+        // And back down.
+        average.Add(0.0, parameters);
+        average.Add(0.0, parameters);
+        NS_TEST_EXPECT_MSG_EQ(average.Value(), 0.0, "a fall restarts it the same way");
+    }
+};
+
+/**
+ * A receiver's grader of eight spines over 10 us intervals starting at zero:
+ * averages of gain 1/16, CUSUM slack 0.125 and threshold 0.5 on the marked
+ * fraction, grade bands from marked fractions of 0.25, 0.5 and 0.75, and with
+ * one-way delay from delays of 2.5, 5 and 7.5 us, with CUSUM slack 1.25 us and
+ * threshold 5 us; four intervals of hold-down. And the intervals it is fed.
+ */
+class GraderFixture
+{
+  public:
+    static constexpr uint32_t kSpines = 8;
+    static constexpr uint64_t kInterval = 10000;
+
+    static SpineGrader::Parameters Defaults(bool oneWayDelay = false)
+    {
+        SpineGrader::Parameters parameters;
+        parameters.spines = kSpines;
+        parameters.intervalNs = kInterval;
+        parameters.phaseNs = 0;
+        parameters.marks = {1.0 / 16, 0.125, 0.5};
+        parameters.markThresholds[0] = 0.25;
+        parameters.markThresholds[1] = 0.5;
+        parameters.markThresholds[2] = 0.75;
+        parameters.oneWayDelay = oneWayDelay;
+        parameters.delayNs = {1.0 / 16, 1250, 5000};
+        parameters.delayThresholdsNs[0] = 2500;
+        parameters.delayThresholdsNs[1] = 5000;
+        parameters.delayThresholdsNs[2] = 7500;
+        parameters.holdDownIntervals = 4;
+        return parameters;
+    }
+
+    // One interval of arrivals on each spine, marked at the fraction given,
+    // then the report the next interval's first event issues.
+    static void Interval(SpineGrader& grader,
+                         uint32_t interval,
+                         const std::vector<double>& markFractions,
+                         uint32_t arrivals = 100)
+    {
+        grader.Advance(interval * kInterval);
+        for (uint32_t spine = 0; spine < kSpines; ++spine)
+        {
+            const uint32_t marked = std::lround(markFractions[spine] * arrivals);
+            for (uint32_t i = 0; i < arrivals; ++i)
+            {
+                grader.OnArrival(spine, spine, i < marked, 0);
+            }
+        }
+        NS_ASSERT(grader.Advance((interval + 1) * kInterval));
+    }
+};
+
+class SpineAttributionTest : public TestCase
+{
+  public:
+    SpineAttributionTest()
+        : TestCase("A receiver attributes marks to the spine that carried them, and to it alone")
+    {
+    }
+
+    void DoRun() override
+    {
+        constexpr uint32_t kDegraded = 3;
+        constexpr uint32_t kIntervals = 40;
+        SpineGrader grader(GraderFixture::Defaults());
+        // Every spine marks two packets in a hundred at random; from interval
+        // 20 spine 3 marks sixty.
+        std::mt19937 random(7);
+        std::uniform_real_distribution<double> uniform;
+        for (uint32_t interval = 0; interval < kIntervals; ++interval)
+        {
+            grader.Advance(interval * GraderFixture::kInterval);
+            for (uint32_t packet = 0; packet < 800; ++packet)
+            {
+                const uint8_t carrying = packet % GraderFixture::kSpines;
+                const double rate = carrying == kDegraded && interval >= 20 ? 0.6 : 0.02;
+                grader.OnArrival(carrying, carrying, uniform(random) < rate, 0);
+            }
+            grader.Advance((interval + 1) * GraderFixture::kInterval);
+            const std::vector<SpineGrader::SpineInterval>& closed = grader.LastInterval();
+            for (uint32_t spine = 0; spine < GraderFixture::kSpines; ++spine)
+            {
+                NS_TEST_EXPECT_MSG_EQ(closed[spine].arrivals, 100, "every arrival is counted once");
+                const bool degraded = spine == kDegraded && interval >= 21;
+                if (degraded)
+                {
+                    NS_TEST_EXPECT_MSG_GT(closed[spine].markFraction,
+                                          0.5,
+                                          "the degraded spine's average rises within two "
+                                          "intervals");
+                }
+                else if (spine != kDegraded || interval < 20)
+                {
+                    NS_TEST_EXPECT_MSG_LT(closed[spine].markFraction,
+                                          0.06,
+                                          "a healthy spine's average stays at its level");
+                }
+                NS_TEST_EXPECT_MSG_EQ(uint32_t(grader.Report().Grade(spine)),
+                                      degraded ? 1u : 3u,
+                                      "only the degraded spine's grade falls");
+            }
+            NS_TEST_EXPECT_MSG_EQ(grader.Report().edgeCongested,
+                                  false,
+                                  "one degraded spine is not the receiver's downlink");
+            NS_TEST_EXPECT_MSG_EQ(uint32_t(grader.Report().sequence),
+                                  interval + 1,
+                                  "each interval issues one report");
+        }
+
+        // Marks on packets one spine carried for another are the carrier's.
+        SpineGrader moved(GraderFixture::Defaults());
+        for (uint32_t i = 0; i < 100; ++i)
+        {
+            moved.OnArrival(4, 5, true, 0);
+        }
+        moved.Advance(GraderFixture::kInterval);
+        NS_TEST_EXPECT_MSG_EQ(moved.LastInterval()[5].marked, 100, "the carrier counts the marks");
+        NS_TEST_EXPECT_MSG_EQ(moved.LastInterval()[4].arrivals, 0, "the requested spine none");
+        NS_TEST_EXPECT_MSG_EQ(moved.LastInterval()[4].moved, 100, "but counts the moves");
+        Simulator::Destroy();
+    }
+};
+
+class SpineGradeTest : public TestCase
+{
+  public:
+    SpineGradeTest()
+        : TestCase("A spine's grade follows absolute thresholds, marks before delay, a trim "
+                   "holds it down for a while, and the edge bit needs every spine")
+    {
+    }
+
+    void DoRun() override
+    {
+        Thresholds();
+        DelayAfterMarks();
+        HoldDown();
+        Edge();
+        Simulator::Destroy();
+    }
+
+  private:
+    void Thresholds()
+    {
+        SpineGrader grader(GraderFixture::Defaults());
+        const std::vector<double> fractions{0.0, 0.2, 0.3, 0.45, 0.55, 0.7, 0.8, 1.0};
+        for (uint32_t interval = 0; interval < 4; ++interval)
+        {
+            GraderFixture::Interval(grader, interval, fractions);
+        }
+        const uint32_t expected[] = {3, 3, 2, 2, 1, 1, 0, 0};
+        for (uint32_t spine = 0; spine < GraderFixture::kSpines; ++spine)
+        {
+            NS_TEST_EXPECT_MSG_EQ(uint32_t(grader.Report().Grade(spine)),
+                                  expected[spine],
+                                  "a steady mark fraction earns the grade of its band");
+        }
+        NS_TEST_EXPECT_MSG_EQ(grader.Report().edgeCongested,
+                              false,
+                              "spines graded apart are not the downlink");
+    }
+
+    // With one-way delay, a spine without marks grades by its delay above the
+    // least it has shown, and a spine with marks by its marks whatever its
+    // delay. Base RTT 10 us: the delay bands start at 2.5, 5 and 7.5 us.
+    void DelayAfterMarks()
+    {
+        SpineGrader grader(GraderFixture::Defaults(true));
+        const uint64_t kLeast = 3000;
+        const uint64_t extra[GraderFixture::kSpines] = {0, 2000, 3000, 6000, 9000, 9000, 0, 0};
+        const bool marks[GraderFixture::kSpines] =
+            {false, false, false, false, false, true, true, false};
+        for (uint32_t interval = 0; interval < 4; ++interval)
+        {
+            grader.Advance(interval * GraderFixture::kInterval);
+            for (uint32_t spine = 0; spine < GraderFixture::kSpines; ++spine)
+            {
+                // One packet at the least delay, so that the excess is what the
+                // others carry.
+                grader.OnArrival(spine, spine, false, kLeast);
+                for (uint32_t i = 0; i < 99; ++i)
+                {
+                    grader.OnArrival(spine, spine, marks[spine] && i < 40, kLeast + extra[spine]);
+                }
+            }
+            grader.Advance((interval + 1) * GraderFixture::kInterval);
+        }
+        // Spine 5 is marked at 0.4 and delayed into grade 0; spine 6 is
+        // marked at 0.4 without delay.
+        const uint32_t expected[] = {3, 3, 2, 1, 0, 2, 2, 3};
+        for (uint32_t spine = 0; spine < GraderFixture::kSpines; ++spine)
+        {
+            NS_TEST_EXPECT_MSG_EQ(uint32_t(grader.Report().Grade(spine)),
+                                  expected[spine],
+                                  "marks grade a spine first and delay grades the rest");
+        }
+        NS_TEST_EXPECT_MSG_EQ_TOL(grader.LastInterval()[3].delayNs,
+                                  6000 * 0.99,
+                                  1,
+                                  "the delay is the mean excess over the spine's least");
+    }
+
+    void HoldDown()
+    {
+        const SpineGrader::Parameters parameters = GraderFixture::Defaults();
+        const uint32_t hold = parameters.holdDownIntervals;
+        NS_TEST_ASSERT_MSG_GT(hold, 1, "the hold lasts more than one interval");
+        SpineGrader grader(parameters);
+        const std::vector<double> clean(GraderFixture::kSpines, 0.0);
+        GraderFixture::Interval(grader, 0, clean);
+        // Interval 1: a trim on spine 4 before the last hop, one at the last
+        // hop on spine 6, and a packet requested on spine 5 carried by 7.
+        grader.Advance(GraderFixture::kInterval);
+        grader.OnTrim(4, false);
+        grader.OnTrim(6, true);
+        grader.OnArrival(5, 7, false, 0);
+        for (uint32_t interval = 1; interval < 1 + hold + 2; ++interval)
+        {
+            if (interval > 1)
+            {
+                GraderFixture::Interval(grader, interval, clean);
+            }
+            else
+            {
+                grader.Advance(2 * GraderFixture::kInterval);
+            }
+            const bool held = interval < 1 + hold;
+            for (uint32_t spine = 0; spine < GraderFixture::kSpines; ++spine)
+            {
+                const bool heldSpine = held && (spine == 4 || spine == 5);
+                NS_TEST_EXPECT_MSG_EQ(uint32_t(grader.Report().Grade(spine)),
+                                      heldSpine ? 0u : 3u,
+                                      "a trim or a move holds its spine at 0 for the hold's "
+                                      "intervals and no other");
+                NS_TEST_EXPECT_MSG_EQ(grader.LastInterval()[spine].held,
+                                      heldSpine,
+                                      "the interval records the hold");
+            }
+            NS_TEST_EXPECT_MSG_EQ(grader.Report().edgeCongested,
+                                  (interval == 1),
+                                  "a last-hop trim sets the edge bit for its interval");
+        }
+        // A trim during the hold extends it from its own interval.
+        SpineGrader again(parameters);
+        again.OnTrim(2, false);
+        again.Advance(GraderFixture::kInterval);
+        again.Advance(2 * GraderFixture::kInterval - 1);
+        again.OnTrim(2, false);
+        for (uint32_t interval = 1; interval < hold + 1; ++interval)
+        {
+            again.Advance((interval + 1) * GraderFixture::kInterval);
+            NS_TEST_EXPECT_MSG_EQ(uint32_t(again.Report().Grade(2)),
+                                  0u,
+                                  "a second trim extends the hold");
+        }
+        again.Advance((hold + 2) * GraderFixture::kInterval);
+        NS_TEST_EXPECT_MSG_EQ(uint32_t(again.Report().Grade(2)), 3u, "and the hold ends");
+        // An idle stretch counts against the hold like any other interval.
+        SpineGrader idle(parameters);
+        idle.OnTrim(1, false);
+        idle.Advance(GraderFixture::kInterval);
+        NS_TEST_EXPECT_MSG_EQ(uint32_t(idle.Report().Grade(1)), 0u, "the trim holds its spine");
+        idle.Advance((hold + 1) * GraderFixture::kInterval);
+        NS_TEST_EXPECT_MSG_EQ(uint32_t(idle.Report().Grade(1)), 3u, "idle intervals run it out");
+        NS_TEST_EXPECT_MSG_EQ(uint32_t(idle.Report().sequence), 2u, "one report per closing");
+    }
+
+    void Edge()
+    {
+        SpineGrader all(GraderFixture::Defaults());
+        SpineGrader one(GraderFixture::Defaults());
+        std::vector<double> oneMarked(GraderFixture::kSpines, 0.0);
+        oneMarked[2] = 0.4;
+        for (uint32_t interval = 0; interval < 4; ++interval)
+        {
+            GraderFixture::Interval(all,
+                                    interval,
+                                    std::vector<double>(GraderFixture::kSpines, 0.4));
+            GraderFixture::Interval(one, interval, oneMarked);
+        }
+        NS_TEST_EXPECT_MSG_EQ(all.Report().edgeCongested,
+                              true,
+                              "every spine marked alike sets the edge bit");
+        NS_TEST_EXPECT_MSG_EQ(one.Report().edgeCongested, false, "one spine marked does not");
+        NS_TEST_EXPECT_MSG_EQ(uint32_t(one.Report().Grade(2)), 2u, "it grades that spine down");
+    }
+};
+
 class PointToPointTestSuite : public TestSuite
 {
   public:
@@ -3584,6 +3913,9 @@ PointToPointTestSuite::PointToPointTestSuite()
     AddTestCase(new NsccBoundsTest, TestCase::Duration::QUICK);
     AddTestCase(new NsccRttTest, TestCase::Duration::QUICK);
     AddTestCase(new SpineReportHeaderTest, TestCase::Duration::QUICK);
+    AddTestCase(new SupervisedEwmaTest, TestCase::Duration::QUICK);
+    AddTestCase(new SpineAttributionTest, TestCase::Duration::QUICK);
+    AddTestCase(new SpineGradeTest, TestCase::Duration::QUICK);
 }
 
 static PointToPointTestSuite g_pointToPointTestSuite; //!< The testsuite
