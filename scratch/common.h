@@ -33,6 +33,7 @@
 #include <cstring>
 #include <fstream>
 #include <iostream>
+#include <sstream>
 #include <cmath>
 #include <limits>
 #include <zstd.h>
@@ -139,6 +140,20 @@ int nic_total_pause_time =
 uint32_t ack_high_prio = 0;
 uint64_t link_down_time = 0;
 uint32_t link_down_A = 0, link_down_B = 0;
+
+// What befalls the link between two nodes at a time in the run. Down takes the
+// link down and reroutes around it. Blackhole leaves it up while the second
+// node drops the data that arrives from the first. Loss and Rate change the
+// link's error rate or its speed in both directions.
+enum class LinkFailureKind { Down, Blackhole, Loss, Rate };
+struct LinkFailure {
+  uint64_t start_ns;
+  LinkFailureKind kind;
+  uint32_t a, b;
+  double error_rate;
+  DataRate rate;
+};
+vector<LinkFailure> link_failures;
 
 uint32_t enable_trace = 1;
 
@@ -573,14 +588,21 @@ void configure_data_loss(Ptr<QbbNetDevice> dev, uint64_t stream_offset) {
 }
 
 // Loss on the link itself, which every packet arriving at dev is exposed to.
-void configure_link_error(Ptr<QbbNetDevice> dev, double error_rate) {
-  Ptr<RateErrorModel> model = CreateObject<RateErrorModel>();
-  model->SetRandomVariable(CreateObjectWithAttributes<UniformRandomVariable>(
-      "Stream",
-      IntegerValue(device_rng_stream(DeviceRngBlock::LinkError, dev))));
-  model->SetAttribute("ErrorRate", DoubleValue(error_rate));
-  model->SetAttribute("ErrorUnit", StringValue("ERROR_UNIT_PACKET"));
-  dev->SetAttribute("LinkErrorModel", PointerValue(model));
+// A device keeps one model for the run, so a later change of rate continues
+// the same stream of draws.
+void set_link_error_rate(Ptr<QbbNetDevice> dev, double error_rate) {
+  PointerValue current;
+  dev->GetAttribute("LinkErrorModel", current);
+  Ptr<RateErrorModel> model = current.Get<RateErrorModel>();
+  if (!model) {
+    model = CreateObject<RateErrorModel>();
+    model->SetRandomVariable(CreateObjectWithAttributes<UniformRandomVariable>(
+        "Stream",
+        IntegerValue(device_rng_stream(DeviceRngBlock::LinkError, dev))));
+    model->SetAttribute("ErrorUnit", StringValue("ERROR_UNIT_PACKET"));
+    dev->SetAttribute("LinkErrorModel", PointerValue(model));
+  }
+  model->SetRate(error_rate);
 }
 
 void connect_transport_traces(Ptr<QbbNetDevice> dev) {
@@ -822,6 +844,30 @@ void TakeDownLink(NodeContainer n, Ptr<Node> a, Ptr<Node> b) {
   }
 }
 
+void ApplyLinkFailure(NodeContainer n, LinkFailure failure) {
+  Ptr<Node> a = n.Get(failure.a), b = n.Get(failure.b);
+  Ptr<QbbNetDevice> device_at_a =
+      DynamicCast<QbbNetDevice>(a->GetDevice(nbr2if[a][b].idx));
+  Ptr<QbbNetDevice> device_at_b =
+      DynamicCast<QbbNetDevice>(b->GetDevice(nbr2if[b][a].idx));
+  switch (failure.kind) {
+  case LinkFailureKind::Down:
+    TakeDownLink(n, a, b);
+    break;
+  case LinkFailureKind::Blackhole:
+    DynamicCast<SwitchNode>(b)->SetBlackhole(nbr2if[b][a].idx);
+    break;
+  case LinkFailureKind::Loss:
+    set_link_error_rate(device_at_a, failure.error_rate);
+    set_link_error_rate(device_at_b, failure.error_rate);
+    break;
+  case LinkFailureKind::Rate:
+    device_at_a->SetDataRate(failure.rate);
+    device_at_b->SetDataRate(failure.rate);
+    break;
+  }
+}
+
 uint64_t get_nic_rate(NodeContainer &n) {
   for (uint32_t i = 0; i < n.GetN(); i++)
     if (n.Get(i)->GetNodeType() == 0)
@@ -1020,6 +1066,37 @@ bool ReadConf(string network_configuration) {
       conf >> transport_event_summary_output_file;
     } else if (key.compare("LINK_DOWN") == 0) {
       conf >> link_down_time >> link_down_A >> link_down_B;
+    } else if (key.compare("LINK_FAILURE") == 0) {
+      LinkFailure failure = {};
+      std::string kind;
+      conf >> failure.start_ns >> kind >> failure.a >> failure.b;
+      if (kind == "down") {
+        failure.kind = LinkFailureKind::Down;
+      } else if (kind == "blackhole") {
+        failure.kind = LinkFailureKind::Blackhole;
+      } else if (kind == "loss") {
+        failure.kind = LinkFailureKind::Loss;
+        conf >> failure.error_rate;
+        if (!std::isfinite(failure.error_rate) || failure.error_rate <= 0.0 ||
+            failure.error_rate > 1.0) {
+          std::cerr << "LINK_FAILURE loss needs an error rate in (0, 1]\n";
+          return false;
+        }
+      } else if (kind == "rate") {
+        failure.kind = LinkFailureKind::Rate;
+        std::string rate;
+        conf >> rate;
+        // Parsed apart from conf, whose failbit would end the key loop.
+        std::istringstream parse(rate);
+        if (!(parse >> failure.rate) || failure.rate.GetBitRate() == 0) {
+          std::cerr << "LINK_FAILURE rate needs a positive data rate\n";
+          return false;
+        }
+      } else {
+        std::cerr << "LINK_FAILURE kind must be down, blackhole, loss or rate\n";
+        return false;
+      }
+      link_failures.push_back(failure);
     } else if (key.compare("ENABLE_TRACE") == 0) {
       conf >> enable_trace;
     } else if (key.compare("KMAX_MAP") == 0) {
@@ -1460,8 +1537,8 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),
     configure_data_loss(src_dev, static_cast<uint64_t>(i) * 2);
     configure_data_loss(dst_dev, static_cast<uint64_t>(i) * 2 + 1);
     if (error_rate != 0.0) {
-      configure_link_error(src_dev, error_rate);
-      configure_link_error(dst_dev, error_rate);
+      set_link_error_rate(src_dev, error_rate);
+      set_link_error_rate(dst_dev, error_rate);
     }
     connect_transport_traces(src_dev);
     connect_transport_traces(dst_dev);
@@ -1774,6 +1851,21 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),
     Simulator::Schedule(Seconds(2) + MicroSeconds(link_down_time),
                         &TakeDownLink, n, n.Get(link_down_A),
                         n.Get(link_down_B));
+  }
+  for (const LinkFailure &failure : link_failures) {
+    if (failure.a >= node_num || failure.b >= node_num ||
+        nbr2if[n.Get(failure.a)].count(n.Get(failure.b)) == 0) {
+      std::cerr << "LINK_FAILURE names " << failure.a << " " << failure.b
+                << ", which no link joins\n";
+      return false;
+    }
+    if (failure.kind == LinkFailureKind::Blackhole &&
+        n.Get(failure.b)->GetNodeType() != 1) {
+      std::cerr << "LINK_FAILURE blackhole needs a switch as its second node\n";
+      return false;
+    }
+    Simulator::Schedule(NanoSeconds(failure.start_ns), &ApplyLinkFailure, n,
+                        failure);
   }
 
   // schedule buffer monitor

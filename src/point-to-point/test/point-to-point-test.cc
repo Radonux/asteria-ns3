@@ -1170,6 +1170,93 @@ class BlackholeTest : public TestCase
     }
 };
 
+/**
+ * A switch port toward a host whose link is slowed to half its rate while
+ * the run goes on.
+ */
+class LinkRateChangeTest : public TestCase
+{
+  public:
+    LinkRateChangeTest()
+        : TestCase("A link slowed mid-run serializes later packets at its new rate")
+    {
+    }
+
+    void DoRun() override
+    {
+        Ptr<SwitchNode> sw = CreateObject<SwitchNode>();
+        sw->SetAttribute("PfcEnabled", BooleanValue(false));
+        Ptr<QbbNetDevice> port = CreateObject<QbbNetDevice>();
+        port->SetQueue(CreateObject<BEgressQueue>());
+        port->SetDataRate(DataRate("400Gbps"));
+        sw->AddDevice(port);
+        Ptr<QbbNetDevice> host = CreateObject<QbbNetDevice>();
+        host->SetDataRate(DataRate("400Gbps"));
+        CreateObject<Node>()->AddDevice(host);
+        Ptr<QbbChannel> channel = CreateObject<QbbChannel>();
+        port->Attach(channel);
+        host->Attach(channel);
+        Ipv4Address receiver("11.0.2.1");
+        sw->AddTableEntry(receiver, port->GetIfIndex());
+        std::vector<int64_t> arrivals;
+        host->m_rdmaReceiveCb = Callback<int, Ptr<Packet>, CustomHeader&>(
+            [&arrivals](Ptr<Packet>, CustomHeader&) {
+                arrivals.push_back(Simulator::Now().GetNanoSeconds());
+                return 0;
+            });
+
+        uint32_t wireBytes = 0;
+        port->m_traceDequeue.ConnectWithoutContext(Callback<void, Ptr<const Packet>, uint32_t>(
+            [&wireBytes](Ptr<const Packet> packet, uint32_t) { wireBytes = packet->GetSize(); }));
+        Simulator::Schedule(NanoSeconds(0), [&]() { Forward(sw, receiver); });
+        Simulator::Schedule(NanoSeconds(1000), [&]() {
+            port->SetDataRate(DataRate("200Gbps"));
+            host->SetDataRate(DataRate("200Gbps"));
+        });
+        Simulator::Schedule(NanoSeconds(2000), [&]() { Forward(sw, receiver); });
+        Simulator::Run();
+        NS_TEST_ASSERT_MSG_EQ(arrivals.size(), 2, "both packets arrive");
+        NS_TEST_EXPECT_MSG_EQ(
+            arrivals[0],
+            DataRate("400Gbps").CalculateBytesTxTime(wireBytes).GetNanoSeconds(),
+            "the first packet is serialized at 400 Gb/s");
+        NS_TEST_EXPECT_MSG_EQ(
+            arrivals[1] - 2000,
+            DataRate("200Gbps").CalculateBytesTxTime(wireBytes).GetNanoSeconds(),
+            "the second is serialized at 200 Gb/s");
+        Simulator::Destroy();
+    }
+
+  private:
+    static void Forward(Ptr<SwitchNode> sw, Ipv4Address to)
+    {
+        Ptr<Packet> packet = Create<Packet>(1000);
+        SeqTsHeader seqTs;
+        // Priority group 0 bypasses buffer admission, which is not under test.
+        seqTs.SetPG(0);
+        packet->AddHeader(seqTs);
+        UdpHeader udp;
+        udp.SetSourcePort(10000);
+        udp.SetDestinationPort(10001);
+        packet->AddHeader(udp);
+        Ipv4Header ip;
+        ip.SetSource(Ipv4Address("11.0.1.1"));
+        ip.SetDestination(to);
+        ip.SetProtocol(0x11);
+        ip.SetPayloadSize(packet->GetSize());
+        packet->AddHeader(ip);
+        PppHeader ppp;
+        ppp.SetProtocol(0x0021);
+        packet->AddHeader(ppp);
+        packet->AddPacketTag(FlowIdTag(0));
+        CustomHeader parsed(CustomHeader::L2_Header | CustomHeader::L3_Header |
+                            CustomHeader::L4_Header);
+        parsed.getInt = 1;
+        packet->PeekHeader(parsed);
+        sw->SwitchReceiveFromDevice(nullptr, packet, parsed);
+    }
+};
+
 class LoadBalancingSenderTest : public TestCase
 {
   public:
@@ -2415,6 +2502,7 @@ PointToPointTestSuite::PointToPointTestSuite()
     AddTestCase(new PortDownBufferTest, TestCase::Duration::QUICK);
     AddTestCase(new LinkErrorTest, TestCase::Duration::QUICK);
     AddTestCase(new BlackholeTest, TestCase::Duration::QUICK);
+    AddTestCase(new LinkRateChangeTest, TestCase::Duration::QUICK);
     AddTestCase(new LoadBalancingSenderTest, TestCase::Duration::QUICK);
     AddTestCase(new AckPacketSeqHeaderTest, TestCase::Duration::QUICK);
     AddTestCase(new AckNamesPacketTest, TestCase::Duration::QUICK);
