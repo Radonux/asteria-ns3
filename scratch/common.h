@@ -33,6 +33,7 @@
 #include <cstring>
 #include <fstream>
 #include <iostream>
+#include <set>
 #include <sstream>
 #include <cmath>
 #include <limits>
@@ -65,6 +66,11 @@ std::string pfc_output_file = "pfc.txt";
 std::string transport_event_output_file = "transport_events.csv.zst";
 // Aggregated per-(event, plane) totals; what the analyzer consumes.
 std::string transport_event_summary_output_file = "transport_summary.csv";
+// Each switch port's transmissions and marks, and each host's arrivals by
+// carrying spine, written when a link fails and at the end of the run. Empty
+// writes neither.
+std::string port_counter_output_file, spine_arrival_output_file;
+FILE *port_counter_file = nullptr, *spine_arrival_file = nullptr;
 
 double alpha_resume_interval = 55, rp_timer, ewma_gain = 1 / 16;
 double rate_decrease_interval = 4;
@@ -844,6 +850,49 @@ void TakeDownLink(NodeContainer n, Ptr<Node> a, Ptr<Node> b) {
   }
 }
 
+// The node at the far end of a device's link.
+uint32_t neighbour_of(Ptr<NetDevice> dev) {
+  Ptr<Channel> channel = dev->GetChannel();
+  Ptr<NetDevice> peer = channel->GetDevice(0) == dev ? channel->GetDevice(1)
+                                                     : channel->GetDevice(0);
+  return peer->GetNode()->GetId();
+}
+
+// The counters as they stand now, one row per switch port and one per host
+// and spine, under the current time.
+void write_fabric_counters() {
+  const unsigned long now = Simulator::Now().GetNanoSeconds();
+  for (uint32_t i = 0; i < n.GetN(); i++) {
+    Ptr<Node> node = n.Get(i);
+    if (node->GetNodeType() == 1 && port_counter_file != nullptr) {
+      Ptr<SwitchNode> sw = DynamicCast<SwitchNode>(node);
+      for (uint32_t port = 1; port < sw->GetNDevices(); port++) {
+        const SwitchPortCounters &sent = sw->GetPortCounters(port);
+        fprintf(port_counter_file, "%lu,%u,%u,%u,%lu,%lu,%lu,%lu\n", now, i,
+                port, neighbour_of(sw->GetDevice(port)),
+                static_cast<unsigned long>(sent.txPackets),
+                static_cast<unsigned long>(sent.txBytes),
+                static_cast<unsigned long>(sent.dataPackets),
+                static_cast<unsigned long>(sent.ecnMarks));
+      }
+    } else if (node->GetNodeType() == 0 && spine_arrival_file != nullptr) {
+      Ptr<RdmaHw> hw = node->GetObject<RdmaDriver>()->m_rdma;
+      for (uint32_t spine = 0; spine < hw->m_spineCount; spine++) {
+        const SpineArrivals arrived = spine < hw->m_spineArrivals.size()
+                                          ? hw->m_spineArrivals[spine]
+                                          : SpineArrivals{};
+        fprintf(spine_arrival_file, "%lu,%u,%u,%lu,%lu,%lu\n", now, i, spine,
+                static_cast<unsigned long>(arrived.packets),
+                static_cast<unsigned long>(arrived.payloadBytes),
+                static_cast<unsigned long>(arrived.folded));
+      }
+    }
+  }
+  for (FILE *file : {port_counter_file, spine_arrival_file})
+    if (file != nullptr)
+      fflush(file);
+}
+
 void ApplyLinkFailure(NodeContainer n, LinkFailure failure) {
   Ptr<Node> a = n.Get(failure.a), b = n.Get(failure.b);
   Ptr<QbbNetDevice> device_at_a =
@@ -1064,6 +1113,10 @@ bool ReadConf(string network_configuration) {
       conf >> transport_event_segment_byte_limit;
     } else if (key.compare("TRANSPORT_EVENT_SUMMARY_OUTPUT_FILE") == 0) {
       conf >> transport_event_summary_output_file;
+    } else if (key.compare("PORT_COUNTER_OUTPUT_FILE") == 0) {
+      conf >> port_counter_output_file;
+    } else if (key.compare("SPINE_ARRIVAL_OUTPUT_FILE") == 0) {
+      conf >> spine_arrival_output_file;
     } else if (key.compare("LINK_DOWN") == 0) {
       conf >> link_down_time >> link_down_A >> link_down_B;
     } else if (key.compare("LINK_FAILURE") == 0) {
@@ -1297,6 +1350,15 @@ bool ReadConf(string network_configuration) {
   }
   if (qlen_mon_interval == 0) {
     std::cerr << "QLEN_MON_INTERVAL must be positive\n";
+    return false;
+  }
+  // Only a requested spine is named in the identification, so only then can a
+  // receiver tell which spine carried a packet.
+  if (!spine_arrival_output_file.empty() &&
+      load_balancing_value() !=
+          static_cast<uint32_t>(LoadBalancingMode::SprayUniform)) {
+    std::cerr << "SPINE_ARRIVAL_OUTPUT_FILE requires LOAD_BALANCING "
+                 "spray_uniform\n";
     return false;
   }
   return true;
@@ -1852,6 +1914,25 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),
                         &TakeDownLink, n, n.Get(link_down_A),
                         n.Get(link_down_B));
   }
+  if (!port_counter_output_file.empty()) {
+    port_counter_file = fopen(port_counter_output_file.c_str(), "w");
+    if (port_counter_file == nullptr) {
+      std::cerr << "Error: cannot open " << port_counter_output_file << "\n";
+      return false;
+    }
+    fprintf(port_counter_file, "time_ns,switch,port,neighbour,tx_packets,"
+                               "tx_bytes,data_packets,ecn_marks\n");
+  }
+  if (!spine_arrival_output_file.empty()) {
+    spine_arrival_file = fopen(spine_arrival_output_file.c_str(), "w");
+    if (spine_arrival_file == nullptr) {
+      std::cerr << "Error: cannot open " << spine_arrival_output_file << "\n";
+      return false;
+    }
+    fprintf(spine_arrival_file,
+            "time_ns,rank,spine,packets,payload_bytes,folded_packets\n");
+  }
+  std::set<uint64_t> failure_times;
   for (const LinkFailure &failure : link_failures) {
     if (failure.a >= node_num || failure.b >= node_num ||
         nbr2if[n.Get(failure.a)].count(n.Get(failure.b)) == 0) {
@@ -1864,9 +1945,15 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),
       std::cerr << "LINK_FAILURE blackhole needs a switch as its second node\n";
       return false;
     }
+    failure_times.insert(failure.start_ns);
+  }
+  // Scheduled first, so that each set of counters is what stood before the
+  // failures at its time.
+  for (uint64_t start_ns : failure_times)
+    Simulator::Schedule(NanoSeconds(start_ns), &write_fabric_counters);
+  for (const LinkFailure &failure : link_failures)
     Simulator::Schedule(NanoSeconds(failure.start_ns), &ApplyLinkFailure, n,
                         failure);
-  }
 
   // schedule buffer monitor
   FILE *qlen_output = fopen(qlen_mon_file.c_str(), "w");
