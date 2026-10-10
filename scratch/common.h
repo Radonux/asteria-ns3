@@ -46,6 +46,7 @@
 #include <ns3/rdma-driver.h>
 #include <ns3/rdma.h>
 #include <ns3/sim-setting.h>
+#include <ns3/spine-grader.h>
 #include <ns3/switch-node.h>
 #include <time.h>
 #include <unordered_map>
@@ -72,7 +73,9 @@ std::string transport_event_summary_output_file = "transport_summary.csv";
 // carrying spine, written when a link fails and at the end of the run. Empty
 // writes neither.
 std::string port_counter_output_file, spine_arrival_output_file;
+std::string spine_report_output_file;
 FILE *port_counter_file = nullptr, *spine_arrival_file = nullptr;
+FILE *spine_report_file = nullptr;
 
 double alpha_resume_interval = 55, rp_timer, ewma_gain = 1 / 16;
 double rate_decrease_interval = 4;
@@ -134,6 +137,38 @@ const std::map<std::string, std::set<std::string>> path_selector_parameter_owner
     {"MRC_PROBE_TIMEOUTS", {"mrc"}},
 };
 std::set<std::string> path_selector_parameters_given;
+// Under LOAD_BALANCING spray_policy, the receiver's and the sender's
+// parameters, each RdmaHw's default; times in base RTTs.
+double spray_report_interval_base_rtts = 2.0;
+double spray_estimator_gain = 1.0 / 16;
+double spray_mark_cusum_slack = 0.125;
+double spray_mark_cusum_threshold = 0.5;
+double spray_mark_thresholds[3] = {0.25, 0.5, 0.75};
+uint32_t spray_hold_down_intervals = 4;
+uint32_t spray_one_way_delay = 0;
+double spray_delay_cusum_slack_base_rtts = 0.125;
+double spray_delay_cusum_threshold_base_rtts = 0.5;
+double spray_delay_thresholds_base_rtts[3] = {0.25, 0.5, 0.75};
+double spray_gamma = 0.25;
+double spray_epsilon = 0.02;
+uint32_t spray_candidates = 1;
+std::string spray_candidate_draw = "proportional";
+uint32_t spray_edge_window_penalty = 64;
+// The keys that only spray_policy reads, and among them those that only its
+// one-way delay reads; a key nothing reads is refused.
+const std::set<std::string> spray_policy_keys = {
+    "SPRAY_REPORT_INTERVAL_BASE_RTTS", "SPRAY_ESTIMATOR_GAIN",
+    "SPRAY_MARK_CUSUM_SLACK", "SPRAY_MARK_CUSUM_THRESHOLD",
+    "SPRAY_MARK_THRESHOLDS", "SPRAY_HOLD_DOWN_INTERVALS",
+    "SPRAY_ONE_WAY_DELAY", "SPRAY_DELAY_CUSUM_SLACK_BASE_RTTS",
+    "SPRAY_DELAY_CUSUM_THRESHOLD_BASE_RTTS", "SPRAY_DELAY_THRESHOLDS_BASE_RTTS",
+    "SPRAY_GAMMA", "SPRAY_EPSILON", "SPRAY_CANDIDATES", "SPRAY_CANDIDATE_DRAW",
+    "SPRAY_EDGE_WINDOW_PENALTY", "SPINE_REPORT_OUTPUT_FILE"};
+const std::set<std::string> spray_one_way_delay_keys = {
+    "SPRAY_DELAY_CUSUM_SLACK_BASE_RTTS",
+    "SPRAY_DELAY_CUSUM_THRESHOLD_BASE_RTTS",
+    "SPRAY_DELAY_THRESHOLDS_BASE_RTTS"};
+std::set<std::string> spray_policy_keys_given;
 // UEC 1.0.3 section 4.1.4.1 RECOMMENDS three traffic classes: TC_low for data,
 // TC_med for trimmed packets, TC_high for control. Queue 0 is TC_high here, so
 // the trimmed queue must be a distinct non-zero index.
@@ -609,7 +644,21 @@ uint32_t load_balancing_value() {
     return static_cast<uint32_t>(LoadBalancingMode::EntropyHash);
   if (load_balancing == "spray_uniform")
     return static_cast<uint32_t>(LoadBalancingMode::SprayUniform);
+  if (load_balancing == "spray_policy")
+    return static_cast<uint32_t>(LoadBalancingMode::SprayPolicy);
   return std::numeric_limits<uint32_t>::max();
+}
+
+uint32_t spray_candidate_draw_value() {
+  if (spray_candidate_draw == "proportional")
+    return static_cast<uint32_t>(SpineScores::CandidateDraw::Proportional);
+  if (spray_candidate_draw == "uniform")
+    return static_cast<uint32_t>(SpineScores::CandidateDraw::Uniform);
+  return std::numeric_limits<uint32_t>::max();
+}
+
+bool names_spine() {
+  return NamesSpine(static_cast<LoadBalancingMode>(load_balancing_value()));
 }
 
 void configure_data_loss(Ptr<QbbNetDevice> dev, uint64_t stream_offset) {
@@ -926,9 +975,26 @@ void write_fabric_counters() {
       }
     }
   }
-  for (FILE *file : {port_counter_file, spine_arrival_file})
+  for (FILE *file : {port_counter_file, spine_arrival_file, spine_report_file})
     if (file != nullptr)
       fflush(file);
+}
+
+// A spine report as a receiver issued it: one row per spine, with the
+// interval it closed.
+void write_spine_report(uint32_t rank, uint64_t now_ns,
+                        const SpineGrader &grader) {
+  const SpineReport &report = grader.Report();
+  const std::vector<SpineGrader::SpineInterval> &spines = grader.LastInterval();
+  for (uint32_t spine = 0; spine < spines.size(); spine++) {
+    const SpineGrader::SpineInterval &closed = spines[spine];
+    fprintf(spine_report_file, "%lu,%u,%u,%u,%u,%u,%u,%u,%.6f,%.1f,%d,%u,%u,%d\n",
+            static_cast<unsigned long>(now_ns), rank, report.sequence, spine,
+            closed.arrivals, closed.marked, closed.trimmed, closed.moved,
+            closed.markFraction, closed.delayNs, closed.held ? 1 : 0,
+            report.Grade(spine), grader.LastIntervalLastHopTrims(),
+            report.edgeCongested ? 1 : 0);
+  }
 }
 
 void ApplyLinkFailure(NodeContainer n, LinkFailure failure) {
@@ -965,6 +1031,72 @@ uint64_t get_nic_rate(NodeContainer &n) {
   return 0;
 }
 
+// The spray_policy parameters within the ranges their RdmaHw attributes and
+// the grades they set take.
+bool valid_spray_policy() {
+  auto increasing = [](const double (&thresholds)[3]) {
+    return thresholds[0] > 0 && thresholds[0] < thresholds[1] &&
+           thresholds[1] < thresholds[2];
+  };
+  if (!(spray_report_interval_base_rtts > 0)) {
+    std::cerr << "SPRAY_REPORT_INTERVAL_BASE_RTTS must be positive\n";
+    return false;
+  }
+  if (!(spray_estimator_gain > 0 && spray_estimator_gain <= 1)) {
+    std::cerr << "SPRAY_ESTIMATOR_GAIN must be in (0, 1]\n";
+    return false;
+  }
+  if (!(spray_mark_cusum_slack >= 0 && spray_mark_cusum_threshold > 0 &&
+        spray_delay_cusum_slack_base_rtts >= 0 &&
+        spray_delay_cusum_threshold_base_rtts > 0)) {
+    std::cerr << "a SPRAY_*_CUSUM_SLACK must be at least zero and a "
+                 "SPRAY_*_CUSUM_THRESHOLD positive\n";
+    return false;
+  }
+  if (!increasing(spray_mark_thresholds) || spray_mark_thresholds[2] > 1) {
+    std::cerr << "SPRAY_MARK_THRESHOLDS must be three increasing fractions "
+                 "in (0, 1]\n";
+    return false;
+  }
+  if (!increasing(spray_delay_thresholds_base_rtts)) {
+    std::cerr << "SPRAY_DELAY_THRESHOLDS_BASE_RTTS must be three increasing "
+                 "positive numbers\n";
+    return false;
+  }
+  if (spray_one_way_delay > 1) {
+    std::cerr << "SPRAY_ONE_WAY_DELAY must be 0 or 1\n";
+    return false;
+  }
+  // The delay is the timestamp IntHeader::mode TS carries, which HPCC's modes
+  // would replace with their own.
+  if (spray_one_way_delay == 1 && (cc_mode == 3 || cc_mode == 10)) {
+    std::cerr << "SPRAY_ONE_WAY_DELAY 1 needs the timestamp CC_MODE "
+              << cc_mode << " replaces\n";
+    return false;
+  }
+  if (!(spray_gamma > 0 && spray_gamma <= 1)) {
+    std::cerr << "SPRAY_GAMMA must be in (0, 1]\n";
+    return false;
+  }
+  if (!(spray_epsilon >= 0 && spray_epsilon <= 1)) {
+    std::cerr << "SPRAY_EPSILON must be in [0, 1]\n";
+    return false;
+  }
+  if (spray_candidates == 0) {
+    std::cerr << "SPRAY_CANDIDATES must be positive\n";
+    return false;
+  }
+  if (spray_candidate_draw_value() == std::numeric_limits<uint32_t>::max()) {
+    std::cerr << "SPRAY_CANDIDATE_DRAW must be proportional or uniform\n";
+    return false;
+  }
+  if (spray_edge_window_penalty > 127) {
+    std::cerr << "SPRAY_EDGE_WINDOW_PENALTY must be in [0, 127]\n";
+    return false;
+  }
+  return true;
+}
+
 bool ReadConf(string network_configuration) {
   // Read the configuration file
   std::ifstream conf;
@@ -980,6 +1112,8 @@ bool ReadConf(string network_configuration) {
     conf >> key;
     if (path_selector_parameter_owners.count(key) > 0)
       path_selector_parameters_given.insert(key);
+    if (spray_policy_keys.count(key) > 0)
+      spray_policy_keys_given.insert(key);
 
     if (key.compare("ENABLE_QCN") == 0) {
       uint32_t v;
@@ -1107,6 +1241,39 @@ bool ReadConf(string network_configuration) {
       conf >> mrc_skip_base_rtts;
     } else if (key.compare("MRC_PROBE_TIMEOUTS") == 0) {
       conf >> mrc_probe_timeouts;
+    } else if (key.compare("SPRAY_REPORT_INTERVAL_BASE_RTTS") == 0) {
+      conf >> spray_report_interval_base_rtts;
+    } else if (key.compare("SPRAY_ESTIMATOR_GAIN") == 0) {
+      conf >> spray_estimator_gain;
+    } else if (key.compare("SPRAY_MARK_CUSUM_SLACK") == 0) {
+      conf >> spray_mark_cusum_slack;
+    } else if (key.compare("SPRAY_MARK_CUSUM_THRESHOLD") == 0) {
+      conf >> spray_mark_cusum_threshold;
+    } else if (key.compare("SPRAY_MARK_THRESHOLDS") == 0) {
+      conf >> spray_mark_thresholds[0] >> spray_mark_thresholds[1] >>
+          spray_mark_thresholds[2];
+    } else if (key.compare("SPRAY_HOLD_DOWN_INTERVALS") == 0) {
+      conf >> spray_hold_down_intervals;
+    } else if (key.compare("SPRAY_ONE_WAY_DELAY") == 0) {
+      conf >> spray_one_way_delay;
+    } else if (key.compare("SPRAY_DELAY_CUSUM_SLACK_BASE_RTTS") == 0) {
+      conf >> spray_delay_cusum_slack_base_rtts;
+    } else if (key.compare("SPRAY_DELAY_CUSUM_THRESHOLD_BASE_RTTS") == 0) {
+      conf >> spray_delay_cusum_threshold_base_rtts;
+    } else if (key.compare("SPRAY_DELAY_THRESHOLDS_BASE_RTTS") == 0) {
+      conf >> spray_delay_thresholds_base_rtts[0] >>
+          spray_delay_thresholds_base_rtts[1] >>
+          spray_delay_thresholds_base_rtts[2];
+    } else if (key.compare("SPRAY_GAMMA") == 0) {
+      conf >> spray_gamma;
+    } else if (key.compare("SPRAY_EPSILON") == 0) {
+      conf >> spray_epsilon;
+    } else if (key.compare("SPRAY_CANDIDATES") == 0) {
+      conf >> spray_candidates;
+    } else if (key.compare("SPRAY_CANDIDATE_DRAW") == 0) {
+      conf >> spray_candidate_draw;
+    } else if (key.compare("SPRAY_EDGE_WINDOW_PENALTY") == 0) {
+      conf >> spray_edge_window_penalty;
 	} else if (key.compare("PACKET_TRIM_MODE") == 0) {
 	  conf >> packet_trim_mode;
 	} else if (key.compare("PACKET_TRIM_QUEUE") == 0) {
@@ -1173,6 +1340,8 @@ bool ReadConf(string network_configuration) {
       conf >> port_counter_output_file;
     } else if (key.compare("SPINE_ARRIVAL_OUTPUT_FILE") == 0) {
       conf >> spine_arrival_output_file;
+    } else if (key.compare("SPINE_REPORT_OUTPUT_FILE") == 0) {
+      conf >> spine_report_output_file;
     } else if (key.compare("LINK_DOWN") == 0) {
       conf >> link_down_time >> link_down_A >> link_down_B;
     } else if (key.compare("LINK_FAILURE") == 0) {
@@ -1367,9 +1536,22 @@ bool ReadConf(string network_configuration) {
     return false;
   }
   if (load_balancing_value() == std::numeric_limits<uint32_t>::max()) {
-    std::cerr << "LOAD_BALANCING must be ecmp, ev_hash, or spray_uniform\n";
+    std::cerr << "LOAD_BALANCING must be ecmp, ev_hash, spray_uniform or "
+                 "spray_policy\n";
     return false;
   }
+  for (const std::string &key : spray_policy_keys_given) {
+    if (load_balancing != "spray_policy") {
+      std::cerr << key << " is read only under LOAD_BALANCING spray_policy\n";
+      return false;
+    }
+    if (spray_one_way_delay_keys.count(key) > 0 && spray_one_way_delay == 0) {
+      std::cerr << key << " is read only under SPRAY_ONE_WAY_DELAY 1\n";
+      return false;
+    }
+  }
+  if (load_balancing == "spray_policy" && !valid_spray_policy())
+    return false;
   if (path_selector_value() == std::numeric_limits<uint32_t>::max()) {
     std::cerr << "PATH_SELECTOR must be ops, reps, ue_oblivious, ue_aware or mrc\n";
     return false;
@@ -1428,11 +1610,9 @@ bool ReadConf(string network_configuration) {
   }
   // Only a requested spine is named in the identification, so only then can a
   // receiver tell which spine carried a packet.
-  if (!spine_arrival_output_file.empty() &&
-      load_balancing_value() !=
-          static_cast<uint32_t>(LoadBalancingMode::SprayUniform)) {
+  if (!spine_arrival_output_file.empty() && !names_spine()) {
     std::cerr << "SPINE_ARRIVAL_OUTPUT_FILE requires LOAD_BALANCING "
-                 "spray_uniform\n";
+                 "spray_uniform or spray_policy\n";
     return false;
   }
   return true;
@@ -1467,6 +1647,8 @@ void SetConfig() {
     IntHeader::mode = IntHeader::NORMAL;
   else if (cc_mode == 10) // hpcc-pint
     IntHeader::mode = IntHeader::PINT;
+  else if (spray_one_way_delay == 1) // the send time of every data packet
+    IntHeader::mode = IntHeader::TS;
   else // others, no extra header
     IntHeader::mode = IntHeader::NONE;
   // Outside ECMP the sender matches each acknowledgement to the data packet
@@ -1782,14 +1964,22 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),
   }
 
   uint32_t spine_count = 0;
-  if (load_balancing_value() ==
-      static_cast<uint32_t>(LoadBalancingMode::SprayUniform)) {
+  if (names_spine()) {
     spine_count = AssignSpinePorts(n);
     if (spine_count == 0) {
-      std::cerr << "LOAD_BALANCING spray_uniform needs a leaf-spine fabric in "
-                   "which every leaf links to every spine\n";
+      std::cerr << "LOAD_BALANCING " << load_balancing
+                << " needs a leaf-spine fabric in which every leaf links to "
+                   "every spine\n";
       return false;
     }
+  }
+  if (load_balancing == "spray_policy") {
+    if (spine_count > SpineReport::kMaxSpines) {
+      std::cerr << "LOAD_BALANCING spray_policy grades at most "
+                << SpineReport::kMaxSpines << " spines\n";
+      return false;
+    }
+    CustomHeader::ackReportBytes = 1 + SpineReport::GradeBytes(spine_count);
   }
   // One variable for every host, so the draw consumes a single fixed stream.
   Ptr<UniformRandomVariable> path_random;
@@ -1863,6 +2053,41 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),
       rdmaHw->SetAttribute("MrcEvSetSize", UintegerValue(mrc_ev_set_size));
       rdmaHw->SetAttribute("MrcSkipBaseRtts", DoubleValue(mrc_skip_base_rtts));
       rdmaHw->SetAttribute("MrcProbeTimeouts", DoubleValue(mrc_probe_timeouts));
+      rdmaHw->SetAttribute("SprayReportIntervalBaseRtts",
+                           DoubleValue(spray_report_interval_base_rtts));
+      rdmaHw->SetAttribute("SprayEstimatorGain",
+                           DoubleValue(spray_estimator_gain));
+      rdmaHw->SetAttribute("SprayMarkCusumSlack",
+                           DoubleValue(spray_mark_cusum_slack));
+      rdmaHw->SetAttribute("SprayMarkCusumThreshold",
+                           DoubleValue(spray_mark_cusum_threshold));
+      rdmaHw->SetAttribute("SprayMarkThreshold1",
+                           DoubleValue(spray_mark_thresholds[0]));
+      rdmaHw->SetAttribute("SprayMarkThreshold2",
+                           DoubleValue(spray_mark_thresholds[1]));
+      rdmaHw->SetAttribute("SprayMarkThreshold3",
+                           DoubleValue(spray_mark_thresholds[2]));
+      rdmaHw->SetAttribute("SprayHoldDownIntervals",
+                           UintegerValue(spray_hold_down_intervals));
+      rdmaHw->SetAttribute("SprayOneWayDelay",
+                           BooleanValue(spray_one_way_delay == 1));
+      rdmaHw->SetAttribute("SprayDelayCusumSlackBaseRtts",
+                           DoubleValue(spray_delay_cusum_slack_base_rtts));
+      rdmaHw->SetAttribute("SprayDelayCusumThresholdBaseRtts",
+                           DoubleValue(spray_delay_cusum_threshold_base_rtts));
+      rdmaHw->SetAttribute("SprayDelayThreshold1BaseRtts",
+                           DoubleValue(spray_delay_thresholds_base_rtts[0]));
+      rdmaHw->SetAttribute("SprayDelayThreshold2BaseRtts",
+                           DoubleValue(spray_delay_thresholds_base_rtts[1]));
+      rdmaHw->SetAttribute("SprayDelayThreshold3BaseRtts",
+                           DoubleValue(spray_delay_thresholds_base_rtts[2]));
+      rdmaHw->SetAttribute("SprayGamma", DoubleValue(spray_gamma));
+      rdmaHw->SetAttribute("SprayEpsilon", DoubleValue(spray_epsilon));
+      rdmaHw->SetAttribute("SprayCandidates", UintegerValue(spray_candidates));
+      rdmaHw->SetAttribute("SprayCandidateDraw",
+                           UintegerValue(spray_candidate_draw_value()));
+      rdmaHw->SetAttribute("SprayEdgeWindowPenalty",
+                           UintegerValue(spray_edge_window_penalty));
       // A PointerValue cannot carry null, which is the ECMP default.
       if (path_random)
         rdmaHw->SetAttribute("PathRandomVariable", PointerValue(path_random));
@@ -1931,6 +2156,13 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),
     }
   }
   printf("maxRtt=%lu maxBdp=%lu\n", maxRtt, maxBdp);
+  // Known only now that every route is, and read from the first packet on.
+  if (load_balancing == "spray_policy") {
+    for (uint32_t i = 0; i < node_num; i++)
+      if (n.Get(i)->GetNodeType() == 0)
+        n.Get(i)->GetObject<RdmaDriver>()->m_rdma->SetAttribute(
+            "SprayBaseRttNs", UintegerValue(maxRtt));
+  }
 
   //
   // setup switch CC
@@ -2020,6 +2252,20 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),
     }
     fprintf(spine_arrival_file,
             "time_ns,rank,spine,packets,payload_bytes,folded_packets\n");
+  }
+  if (!spine_report_output_file.empty()) {
+    spine_report_file = fopen(spine_report_output_file.c_str(), "w");
+    if (spine_report_file == nullptr) {
+      std::cerr << "Error: cannot open " << spine_report_output_file << "\n";
+      return false;
+    }
+    fprintf(spine_report_file,
+            "time_ns,rank,sequence,spine,arrivals,marked,trimmed,moved,"
+            "mark_fraction,delay_ns,held,grade,last_hop_trims,edge\n");
+    for (uint32_t i = 0; i < node_num; i++)
+      if (n.Get(i)->GetNodeType() == 0)
+        n.Get(i)->GetObject<RdmaDriver>()->m_rdma->TraceConnectWithoutContext(
+            "SpineReport", MakeBoundCallback(&write_spine_report, i));
   }
   std::set<uint64_t> failure_times;
   for (const LinkFailure &failure : link_failures) {
