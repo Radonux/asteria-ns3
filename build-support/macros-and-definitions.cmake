@@ -228,7 +228,7 @@ macro(process_options)
         add_compile_options(/WX)
       endif()
     else()
-      add_compile_options(-Wall -O0) # -Wextra
+      add_compile_options(-Wall) # -Wextra
       if(${GCC_WORKING_PEDANTIC_SEMICOLON})
         add_compile_options(-Wpedantic)
       endif()
