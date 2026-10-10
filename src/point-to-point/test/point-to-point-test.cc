@@ -48,6 +48,7 @@
 #include <random>
 #include <set>
 #include <string>
+#include <tuple>
 #include <vector>
 
 using namespace ns3;
@@ -1845,7 +1846,8 @@ class NsccCutTest : public TestCase
 {
   public:
     NsccCutTest()
-        : TestCase("NSCC cuts the window by a trimmed send and by each send declared lost")
+        : TestCase("NSCC cuts the window by a trimmed send and by each send declared lost, "
+                   "and reports each change once")
     {
     }
 
@@ -1855,11 +1857,20 @@ class NsccCutTest : public TestCase
         const uint16_t spine = SpineIdentification(3, 3);
         IsolatedHost sender(LoadBalancingMode::SprayUniform, kTestReceiver, 8);
         sender.hw->m_retransmission_timeout_ns = 0;
-        Ptr<RdmaQueuePair> qp = Started(sender, 3);
+        // Every change of the window, as the NsccWindow trace source reports it.
+        Changes changes;
+        NS_TEST_ASSERT_MSG_EQ(
+            sender.hw->TraceConnectWithoutContext(
+                "NsccWindow",
+                MakeBoundCallback(&NsccCutTest::Record, &changes)),
+            true,
+            "RdmaHw offers the NsccWindow trace source");
+        Ptr<RdmaQueuePair> qp = Started(sender, 4);
         for (uint32_t i = 0; i < 3; ++i)
         {
             qp->m_outstanding.Add(i * kMtu, kMtu, 3, 0);
         }
+        qp->m_outstanding.Add(3 * kMtu, kMtu, 4, 0);
         Simulator::Schedule(NanoSeconds(12000), [this, &sender, qp, spine]() {
             sender.ReceiveTrimNack(qp, kTestReceiver, 0, spine);
             NS_TEST_EXPECT_MSG_EQ(qp->GetWin(),
@@ -1874,9 +1885,24 @@ class NsccCutTest : public TestCase
             NS_TEST_EXPECT_MSG_EQ(qp->GetWin(),
                                   NsccPath::kCeiling - 2 * kMtu,
                                   "a send declared lost cuts the window by its bytes");
+            // The same acknowledgement again matches no send, and a marked
+            // acknowledgement below the target delay on another spine is
+            // read but moves nothing: neither is reported.
+            sender.ReceiveAck(kTestReceiver, 0, 2 * kMtu, spine, true);
+            sender.ReceiveAck(kTestReceiver, 0, 3 * kMtu, SpineIdentification(4, 4), true);
+            NS_TEST_EXPECT_MSG_EQ(qp->m_outstanding.Bytes(), 0, "every send is answered");
+            NS_TEST_EXPECT_MSG_EQ(qp->GetWin(),
+                                  NsccPath::kCeiling - 2 * kMtu,
+                                  "a mark below the target leaves the window");
         });
         Simulator::Run();
         Simulator::Destroy();
+        const Changes expected{{qp, 0, NsccPath::kCeiling},
+                               {qp, NsccPath::kCeiling, NsccPath::kCeiling - kMtu},
+                               {qp, NsccPath::kCeiling - kMtu, NsccPath::kCeiling - 2 * kMtu}};
+        NS_TEST_EXPECT_MSG_EQ((changes == expected),
+                              true,
+                              "the trace reports the start, the trim and the loss, once each");
 
         IsolatedHost timed(LoadBalancingMode::SprayUniform, kTestReceiver, 8);
         Ptr<RdmaQueuePair> waiting = Started(timed, 1);
@@ -1892,6 +1918,13 @@ class NsccCutTest : public TestCase
     }
 
   private:
+    using Changes = std::vector<std::tuple<Ptr<RdmaQueuePair>, uint64_t, uint64_t>>;
+
+    static void Record(Changes* changes, Ptr<RdmaQueuePair> qp, uint64_t from, uint64_t to)
+    {
+        changes->emplace_back(qp, from, to);
+    }
+
     static Ptr<RdmaQueuePair> Started(IsolatedHost& sender, uint32_t packets)
     {
         sender.hw->m_cc_mode = 11;

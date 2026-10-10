@@ -340,6 +340,12 @@ TypeId RdmaHw::GetTypeId (void)
 				DoubleValue(1.0),
 				MakeDoubleAccessor(&RdmaHw::m_nscc_adjust_period),
 				MakeDoubleChecker<double>(0))
+		.AddTraceSource("NsccWindow",
+				"Under CC mode 11, the window a queue pair may keep in flight "
+				"changed: the queue pair, then the old and the new window in "
+				"bytes. Fired once per change, at the queue pair's start too.",
+				MakeTraceSourceAccessor(&RdmaHw::m_traceNsccWindow),
+				"ns3::RdmaHw::NsccWindowTracedCallback")
 		.AddAttribute("PintSmplThresh",
 				"PINT's sampling threshold in rand()%65536",
 				UintegerValue(65536),
@@ -2079,7 +2085,11 @@ void RdmaHw::HandleAckNscc(Ptr<RdmaQueuePair> qp, uint64_t seq, uint16_t path,
 }
 
 void RdmaHw::ApplyNsccWindow(Ptr<RdmaQueuePair> qp){
-	qp->SetWin(static_cast<uint32_t>(qp->nscc.Cwnd()));
+	const uint32_t previous = qp->m_win;
+	const uint32_t window = static_cast<uint32_t>(qp->nscc.Cwnd());
+	qp->SetWin(window);
+	if (window != previous)
+		m_traceNsccWindow(qp, previous, window);
 }
 
 }

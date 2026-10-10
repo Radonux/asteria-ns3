@@ -6,6 +6,7 @@
 #include <ns3/node.h>
 #include <ns3/custom-header.h>
 #include <ns3/random-variable-stream.h>
+#include <ns3/traced-callback.h>
 #include "qbb-net-device.h"
 #include "load-balancing.h"
 #include "nscc-window.h"
@@ -323,6 +324,10 @@ public:
 	// The window the NIC enforces follows the controller's, as the rate does
 	// under the rate-based modes.
 	void ApplyNsccWindow(Ptr<RdmaQueuePair> qp);
+	// The NsccWindow trace source: queue pair, old window, new window.
+	typedef void (*NsccWindowTracedCallback)(Ptr<RdmaQueuePair> qp,
+		uint64_t oldWindow, uint64_t newWindow);
+	TracedCallback<Ptr<RdmaQueuePair>, uint64_t, uint64_t> m_traceNsccWindow;
 };
 
 } /* namespace ns3 */
