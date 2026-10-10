@@ -25,6 +25,14 @@ enum class RdmaFailureReason : uint32_t {
 	NoForwardProgress,
 };
 
+// The data packets that arrived over one spine, by the carrying spine their
+// identification names.
+struct SpineArrivals {
+	uint64_t packets;
+	uint64_t payloadBytes;
+	uint64_t folded; // carried on a request for another spine
+};
+
 struct RdmaInterfaceMgr{
 	Ptr<QbbNetDevice> dev;
 	Ptr<RdmaQueuePairGroup> qpGrp;
@@ -71,6 +79,9 @@ public:
 	uint32_t m_loadBalancing;
 	uint32_t m_spineCount;
 	Ptr<UniformRandomVariable> m_pathRandom;
+	// Indexed by carrying spine; kept under SprayUniform, where the
+	// identification names one.
+	std::vector<SpineArrivals> m_spineArrivals;
 	bool m_var_win, m_fast_react;
 	bool m_rateBound;
 	uint32_t m_total_pause_times; 
@@ -161,6 +172,8 @@ public:
 	void DeleteRxQp(uint32_t dip, uint16_t pg, uint16_t dport);
 
 	int ReceiveUdp(Ptr<Packet> p, CustomHeader &ch);
+	void CountArrival(Ptr<RdmaRxQueuePair> q, uint16_t identification,
+		uint32_t payloadSize);
 	int ReceiveCnp(Ptr<Packet> p, CustomHeader &ch);
 	int ReceiveAck(Ptr<Packet> p, CustomHeader &ch); // handle both ACK and NACK
 	int ReceiveTrim(Ptr<Packet> p, CustomHeader &ch);

@@ -528,6 +528,8 @@ RdmaRxQueuePair::RdmaRxQueuePair(){
 	m_lastNACK = 0;
 	m_forgiveness_eligible = false;
 	m_highest_seen_end = 0;
+	m_data_arrivals = 0;
+	m_folded_arrivals = 0;
 }
 
 uint32_t RdmaRxQueuePair::GetHash(void){

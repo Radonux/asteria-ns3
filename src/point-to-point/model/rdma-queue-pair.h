@@ -290,6 +290,10 @@ public:
 	// Everything below it and not settled is a hole, and the budget report is
 	// measured against the sum of those.
 	uint64_t m_highest_seen_end;
+	// Data packets that arrived for this flow, and those among them a source
+	// leaf carried on a spine other than the one requested.
+	uint64_t m_data_arrivals;
+	uint64_t m_folded_arrivals;
 	// Whether the experiment layer may forgive this flow on this step, asked
 	// once when the queue pair is created. Every acknowledgement this queue
 	// pair emits carries it, and an acknowledgement carrying it without the

@@ -1610,6 +1610,71 @@ class AckNamesPacketTest : public TestCase
     }
 };
 
+class SpineArrivalsTest : public TestCase
+{
+  public:
+    SpineArrivalsTest()
+        : TestCase("A receiver counts arrivals by carrying spine and the folded ones apart")
+    {
+    }
+
+    void DoRun() override
+    {
+        constexpr uint32_t kMtu = IsolatedHost::kMtu;
+        const bool savedPacketSeq = CustomHeader::ackCarriesPacketSeq;
+        CustomHeader::ackCarriesPacketSeq = true;
+        IsolatedHost receiver(LoadBalancingMode::SprayUniform, kTestSender, 8);
+        // Requested spine 2 and carried by 5, then spine 6 twice, the second
+        // a duplicate, and spine 1.
+        receiver.ReceiveData(kTestSender, kTestReceiver, 0, SpineIdentification(2, 5));
+        receiver.ReceiveData(kTestSender, kTestReceiver, 2 * kMtu, SpineIdentification(6, 6));
+        receiver.ReceiveData(kTestSender, kTestReceiver, kMtu, SpineIdentification(1, 1));
+        receiver.ReceiveData(kTestSender, kTestReceiver, 2 * kMtu, SpineIdentification(6, 6));
+        const std::vector<SpineArrivals>& spines = receiver.hw->m_spineArrivals;
+        NS_TEST_ASSERT_MSG_GT(spines.size(), 6, "every carrying spine has a count");
+        const std::map<uint32_t, std::tuple<uint64_t, uint64_t, uint64_t>> expected = {
+            {1, {1, kMtu, 0}},
+            {5, {1, kMtu, 1}},
+            {6, {2, 2 * kMtu, 0}},
+        };
+        for (uint32_t spine = 0; spine < spines.size(); ++spine)
+        {
+            const auto found = expected.find(spine);
+            const auto [packets, bytes, folded] =
+                found == expected.end() ? std::tuple<uint64_t, uint64_t, uint64_t>{} : found->second;
+            NS_TEST_EXPECT_MSG_EQ(spines[spine].packets, packets, "arrivals by carrying spine");
+            NS_TEST_EXPECT_MSG_EQ(spines[spine].payloadBytes, bytes, "payload by carrying spine");
+            NS_TEST_EXPECT_MSG_EQ(spines[spine].folded, folded, "folded arrivals by carrying spine");
+        }
+        Ptr<RdmaRxQueuePair> flow = receiver.hw->GetRxQp(kTestReceiver.Get(),
+                                                         kTestSender.Get(),
+                                                         IsolatedHost::kReceiverPort,
+                                                         IsolatedHost::kSenderPort,
+                                                         IsolatedHost::kPriorityGroup,
+                                                         false);
+        NS_TEST_ASSERT_MSG_NE(flow, nullptr, "the flow has a receive queue pair");
+        NS_TEST_EXPECT_MSG_EQ(flow->m_data_arrivals, 4, "the flow counts every arrival");
+        NS_TEST_EXPECT_MSG_EQ(flow->m_folded_arrivals, 1, "the flow counts the folded arrival");
+        CustomHeader::ackCarriesPacketSeq = savedPacketSeq;
+
+        IsolatedHost ecmp(LoadBalancingMode::Ecmp, kTestSender);
+        ecmp.ReceiveData(kTestSender, kTestReceiver, 0, SpineIdentification(2, 5));
+        NS_TEST_EXPECT_MSG_EQ(ecmp.hw->m_spineArrivals.size(),
+                              0,
+                              "where the identification names no spine nothing is counted by one");
+        NS_TEST_EXPECT_MSG_EQ(ecmp.hw->GetRxQp(kTestReceiver.Get(),
+                                               kTestSender.Get(),
+                                               IsolatedHost::kReceiverPort,
+                                               IsolatedHost::kSenderPort,
+                                               IsolatedHost::kPriorityGroup,
+                                               false)
+                                  ->m_data_arrivals,
+                              1,
+                              "the flow still counts its arrival");
+        Simulator::Destroy();
+    }
+};
+
 class ReorderGapTest : public TestCase
 {
   public:
@@ -2513,6 +2578,7 @@ PointToPointTestSuite::PointToPointTestSuite()
     AddTestCase(new LoadBalancingSenderTest, TestCase::Duration::QUICK);
     AddTestCase(new AckPacketSeqHeaderTest, TestCase::Duration::QUICK);
     AddTestCase(new AckNamesPacketTest, TestCase::Duration::QUICK);
+    AddTestCase(new SpineArrivalsTest, TestCase::Duration::QUICK);
     AddTestCase(new ReorderGapTest, TestCase::Duration::QUICK);
     AddTestCase(new OutstandingPacketsModelTest, TestCase::Duration::QUICK);
     AddTestCase(new SelectiveTimeoutTest, TestCase::Duration::QUICK);

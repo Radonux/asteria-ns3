@@ -580,6 +580,7 @@ int RdmaHw::ReceiveUdp(Ptr<Packet> p, CustomHeader &ch){
 		rxQp->m_ecn_source.qfb++;
 	}
 	rxQp->m_ecn_source.total++;
+	CountArrival(rxQp, ch.ipid, payload_size);
 	rxQp->m_milestone_rx = m_ack_interval;
 
 	// No logging on the non-ACK paths: behind a trim- or drop-induced gap,
@@ -617,6 +618,22 @@ int RdmaHw::ReceiveUdp(Ptr<Packet> p, CustomHeader &ch){
 	if (accepted > 0 && !m_remainderVerdictCallback.IsNull())
 		AskRemainderOnArrival(rxQp);
 	return 0;
+}
+
+void RdmaHw::CountArrival(Ptr<RdmaRxQueuePair> q, uint16_t identification,
+		uint32_t payloadSize){
+	q->m_data_arrivals++;
+	if (m_loadBalancing != static_cast<uint32_t>(LoadBalancingMode::SprayUniform))
+		return;
+	const uint8_t carrying = CarryingSpine(identification);
+	if (carrying >= m_spineArrivals.size())
+		m_spineArrivals.resize(carrying + 1, SpineArrivals{});
+	const bool folded = RequestedSpine(identification) != carrying;
+	SpineArrivals &spine = m_spineArrivals[carrying];
+	spine.packets++;
+	spine.payloadBytes += payloadSize;
+	spine.folded += folded;
+	q->m_folded_arrivals += folded;
 }
 
 // The receiver's cumulative acknowledgement, shared by the in-order data path
