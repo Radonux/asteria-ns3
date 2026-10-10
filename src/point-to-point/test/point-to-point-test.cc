@@ -3988,6 +3988,50 @@ class SpineTrimCostTest : public TestCase
     }
 };
 
+class SpineDelayReferenceTest : public TestCase
+{
+  public:
+    SpineDelayReferenceTest()
+        : TestCase("With one-way delay, a spine's delay above its least is graded against the "
+                   "median spine's, after its marks and trims")
+    {
+    }
+
+    void DoRun() override
+    {
+        // Base RTT 10 us: delay bands from 2.5, 5 and 7.5 us of excess. Every
+        // spine queues 6 us; spine 3 queues 6 us more, spine 6 too but is
+        // marked at 0.4.
+        SpineGrader grader(GraderFixture::Defaults(true));
+        NS_TEST_ASSERT_MSG_EQ(uint32_t(GraderFixture::Defaults(true).reference),
+                              uint32_t(SpineGrader::GradeReference::Median),
+                              "the default reference is the median");
+        for (uint32_t interval = 0; interval < 4; ++interval)
+        {
+            grader.Advance(interval * GraderFixture::kInterval);
+            for (uint32_t spine = 0; spine < GraderFixture::kSpines; ++spine)
+            {
+                const uint64_t queued = spine == 3 || spine == 6 ? 12000 : 6000;
+                // One packet at the least delay, so that the excess is what the
+                // others carry.
+                grader.OnArrival(spine, spine, false, 3000);
+                for (uint32_t i = 0; i < 99; ++i)
+                {
+                    grader.OnArrival(spine, spine, spine == 6 && i < 40, 3000 + queued);
+                }
+            }
+            grader.Advance((interval + 1) * GraderFixture::kInterval);
+        }
+        const uint32_t expected[GraderFixture::kSpines] = {3, 3, 3, 1, 3, 3, 2, 3};
+        for (uint32_t spine = 0; spine < GraderFixture::kSpines; ++spine)
+        {
+            NS_TEST_EXPECT_MSG_EQ(uint32_t(grader.Report().Grade(spine)),
+                                  expected[spine],
+                                  "a delay alike earns the top grade, one standing out loses");
+        }
+    }
+};
+
 class SpineGradeReferenceTest : public TestCase
 {
   public:
@@ -5057,6 +5101,7 @@ PointToPointTestSuite::PointToPointTestSuite()
     AddTestCase(new SpineGradeTest, TestCase::Duration::QUICK);
     AddTestCase(new SpineTrimCostTest, TestCase::Duration::QUICK);
     AddTestCase(new SpineGradeReferenceTest, TestCase::Duration::QUICK);
+    AddTestCase(new SpineDelayReferenceTest, TestCase::Duration::QUICK);
     AddTestCase(new SpineAbsenceTest, TestCase::Duration::QUICK);
     AddTestCase(new SpineScoresDrainTest, TestCase::Duration::QUICK);
     AddTestCase(new SpineScoresFloorTest, TestCase::Duration::QUICK);
