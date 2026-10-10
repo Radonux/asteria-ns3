@@ -95,6 +95,7 @@ const int64_t path_rng_stream = 0;
 const int64_t device_rng_block = int64_t(1) << 40;
 enum class DeviceRngBlock : int64_t {
   LinkError = 1,
+  EcnMarking = 2,
 };
 
 int64_t device_rng_stream(DeviceRngBlock block, Ptr<NetDevice> dev) {
@@ -1674,7 +1675,8 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),
         NS_ASSERT_MSG(rate2pmax.find(rate) != rate2pmax.end(),
                       "must set pmax for each link speed");
         sw->m_mmu->ConfigEcn(j, rate2kmin[rate], rate2kmax[rate],
-                             rate2pmax[rate]);
+                             rate2pmax[rate],
+                             device_rng_stream(DeviceRngBlock::EcnMarking, dev));
         // set pfc
         uint64_t delay = DynamicCast<QbbChannel>(dev->GetChannel())
                              ->GetDelay()

@@ -5,6 +5,7 @@
 #include "ns3/simulator.h"
 #include "ns3/object-vector.h"
 #include "ns3/uinteger.h"
+#include "ns3/integer.h"
 #include "ns3/log.h"
 #include "ns3/assert.h"
 #include "ns3/global-value.h"
@@ -108,18 +109,18 @@ namespace ns3 {
 			return true;
 		if (egress_bytes[ifindex][qIndex] > kmin[ifindex]){
 			double p = pmax[ifindex] * double(egress_bytes[ifindex][qIndex] - kmin[ifindex]) / (kmax[ifindex] - kmin[ifindex]);
-			Ptr<UniformRandomVariable> rng_generator = CreateObject<UniformRandomVariable> ();
-			rng_generator->SetAttribute ("Min", DoubleValue (0));
-			rng_generator->SetAttribute ("Max", DoubleValue (1));
-			if (rng_generator->GetValue() < p)
+			if (markingRandom[ifindex]->GetValue() < p)
 				return true;
 		}
 		return false;
 	}
-	void SwitchMmu::ConfigEcn(uint32_t port, uint32_t _kmin, uint32_t _kmax, double _pmax){
+	void SwitchMmu::ConfigEcn(uint32_t port, uint32_t _kmin, uint32_t _kmax, double _pmax,
+			int64_t markingStream){
 		kmin[port] = _kmin * 1000;
 		kmax[port] = _kmax * 1000;
 		pmax[port] = _pmax;
+		markingRandom[port] = CreateObjectWithAttributes<UniformRandomVariable>(
+			"Stream", IntegerValue(markingStream));
 	}
 	void SwitchMmu::ConfigHdrm(uint32_t port, uint32_t size){
 		headroom[port] = size;

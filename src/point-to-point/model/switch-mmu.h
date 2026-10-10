@@ -3,6 +3,7 @@
 
 #include <unordered_map>
 #include <ns3/node.h>
+#include <ns3/random-variable-stream.h>
 
 namespace ns3 {
 
@@ -36,7 +37,9 @@ public:
 
 	bool ShouldSendCN(uint32_t ifindex, uint32_t qIndex);
 
-	void ConfigEcn(uint32_t port, uint32_t _kmin, uint32_t _kmax, double _pmax);
+	// markingStream is the ns-3 stream the port's marking draws come from.
+	void ConfigEcn(uint32_t port, uint32_t _kmin, uint32_t _kmax, double _pmax,
+		int64_t markingStream);
 	void ConfigHdrm(uint32_t port, uint32_t size);
 	void ConfigNPort(uint32_t n_port);
 	void ConfigBufferSize(uint32_t size);
@@ -55,6 +58,9 @@ public:
 	uint32_t resume_offset;
 	uint32_t kmin[pCnt], kmax[pCnt];
 	double pmax[pCnt];
+	// One variable per port, so that a port's marks depend on its own
+	// occupancy sequence and on no other draw in the run.
+	Ptr<UniformRandomVariable> markingRandom[pCnt];
 	uint32_t total_hdrm;
 	uint32_t total_rsrv;
 	uint32_t egress_threshold[qCnt]; // 0 = unbounded

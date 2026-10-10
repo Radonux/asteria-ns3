@@ -36,6 +36,7 @@
 #include "ns3/random-variable-stream.h"
 #include "ns3/rdma-hw.h"
 #include "ns3/rng-seed-manager.h"
+#include "ns3/switch-mmu.h"
 #include "ns3/switch-node.h"
 #include "ns3/node.h"
 #include "ns3/nscc-window.h"
@@ -1230,7 +1231,7 @@ class PortCountersTest : public TestCase
         {
             sw->m_mmu->ConfigHdrm(port->GetIfIndex(), 0);
             sw->m_mmu->pfc_a_shift[port->GetIfIndex()] = 3;
-            sw->m_mmu->ConfigEcn(port->GetIfIndex(), 0, 0, 1.0);
+            sw->m_mmu->ConfigEcn(port->GetIfIndex(), 0, 0, 1.0, port->GetIfIndex());
         }
         sw->m_mmu->ConfigNPort(2);
         sw->m_mmu->ConfigBufferSize(32 * 1024 * 1024);
@@ -1260,6 +1261,63 @@ class PortCountersTest : public TestCase
                               0,
                               "a port that sent nothing counts nothing");
         Simulator::Destroy();
+    }
+};
+
+/**
+ * One switch port held halfway between its ECN thresholds, where it marks with
+ * probability one half, asked the same sequence of marking decisions alone and
+ * amid the draws of another port and of automatically streamed variables.
+ */
+class MarkingStreamTest : public TestCase
+{
+  public:
+    MarkingStreamTest()
+        : TestCase("A port draws its marks from its own stream, whatever else is drawn")
+    {
+    }
+
+    void DoRun() override
+    {
+        RngSeedManager::SetSeed(1);
+        RngSeedManager::SetRun(1);
+        // Reading the next automatic stream takes it, so with no automatic
+        // stream taken between them two readings differ by one.
+        const uint64_t before = RngSeedManager::GetNextStreamIndex();
+        const std::vector<bool> alone = Marks(false);
+        const uint64_t after = RngSeedManager::GetNextStreamIndex();
+        NS_TEST_EXPECT_MSG_EQ(after, before + 1, "marking takes no automatic stream");
+        const std::vector<bool> amid = Marks(true);
+        NS_TEST_EXPECT_MSG_EQ((alone == amid), true, "the same occupancies draw the same marks");
+        // 1000 expected with a standard deviation of 22.
+        const auto marked = std::count(alone.begin(), alone.end(), true);
+        NS_TEST_EXPECT_MSG_GT(marked, 900, "the port marks at its probability");
+        NS_TEST_EXPECT_MSG_LT(marked, 1100, "the port marks at its probability");
+        Simulator::Destroy();
+    }
+
+  private:
+    static std::vector<bool> Marks(bool amidOtherDraws)
+    {
+        constexpr uint32_t kPort = 1;
+        constexpr uint32_t kOtherPort = 2;
+        constexpr uint32_t kQueue = 3;
+        Ptr<SwitchMmu> mmu = CreateObject<SwitchMmu>();
+        mmu->ConfigEcn(kPort, 0, 100, 1.0, 11);
+        mmu->ConfigEcn(kOtherPort, 0, 100, 1.0, 12);
+        mmu->egress_bytes[kPort][kQueue] = 50000;
+        mmu->egress_bytes[kOtherPort][kQueue] = 50000;
+        std::vector<bool> marks;
+        for (uint32_t i = 0; i < 2000; ++i)
+        {
+            if (amidOtherDraws)
+            {
+                mmu->ShouldSendCN(kOtherPort, kQueue);
+                CreateObject<UniformRandomVariable>()->GetValue();
+            }
+            marks.push_back(mmu->ShouldSendCN(kPort, kQueue));
+        }
+        return marks;
     }
 };
 
@@ -2614,6 +2672,7 @@ PointToPointTestSuite::PointToPointTestSuite()
     AddTestCase(new BlackholeTest, TestCase::Duration::QUICK);
     AddTestCase(new LinkRateChangeTest, TestCase::Duration::QUICK);
     AddTestCase(new PortCountersTest, TestCase::Duration::QUICK);
+    AddTestCase(new MarkingStreamTest, TestCase::Duration::QUICK);
     AddTestCase(new LoadBalancingSenderTest, TestCase::Duration::QUICK);
     AddTestCase(new AckPacketSeqHeaderTest, TestCase::Duration::QUICK);
     AddTestCase(new AckNamesPacketTest, TestCase::Duration::QUICK);
