@@ -202,6 +202,12 @@ namespace ns3 {
 				PointerValue(),
 				MakePointerAccessor(&QbbNetDevice::m_linkErrorModel),
 				MakePointerChecker<ErrorModel>())
+			.AddAttribute("PfcIdentificationStream",
+				"The ns-3 stream PFC frame identifications are drawn from; -1 takes "
+				"an automatic one.",
+				IntegerValue(-1),
+				MakeIntegerAccessor(&QbbNetDevice::m_pfcIdentificationStream),
+				MakeIntegerChecker<int64_t>())
 			.AddAttribute("DataLossErrorModel",
 				"Error model applied only to classified data-plane packets.",
 				PointerValue(),
@@ -551,11 +557,7 @@ namespace ns3 {
 		ipv4h.SetDestination(Ipv4Address("255.255.255.255"));
 		ipv4h.SetPayloadSize(p->GetSize());
 		ipv4h.SetTtl(1);
-
-		Ptr<UniformRandomVariable> rng_generator = CreateObject<UniformRandomVariable> ();
-		rng_generator->SetAttribute ("Min", DoubleValue (0));
-		rng_generator->SetAttribute ("Max", DoubleValue (65536));
-		ipv4h.SetIdentification(rng_generator->GetValue());
+		ipv4h.SetIdentification(DrawPfcIdentification());
 		p->AddHeader(ipv4h);
 		AddHeader(p, 0x800);
 		CustomHeader ch(CustomHeader::L2_Header | CustomHeader::L3_Header | CustomHeader::L4_Header);
@@ -577,14 +579,17 @@ namespace ns3 {
 	ipv4h.SetDestination(Ipv4Address("255.255.255.255"));
 	ipv4h.SetPayloadSize(p->GetSize());
 	ipv4h.SetTtl(1);
-
-	Ptr<UniformRandomVariable> rng_generator = CreateObject<UniformRandomVariable> ();
-    rng_generator->SetAttribute ("Min", DoubleValue (0));
-    rng_generator->SetAttribute ("Max", DoubleValue (65536));
-	ipv4h.SetIdentification(rng_generator->GetValue());
+	ipv4h.SetIdentification(DrawPfcIdentification());
 	p->AddHeader(ipv4h);
 	AddHeader(p, 0x800);
 	return p;
+	}
+
+	uint16_t QbbNetDevice::DrawPfcIdentification(){
+		if (!m_pfcIdentification)
+			m_pfcIdentification = CreateObjectWithAttributes<UniformRandomVariable>(
+				"Stream", IntegerValue(m_pfcIdentificationStream));
+		return static_cast<uint16_t>(m_pfcIdentification->GetValue(0, 65536));
 	}
 
 	bool

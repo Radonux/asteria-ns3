@@ -24,6 +24,7 @@
 #include "ns3/qbb-channel.h"
 //#include "ns3/fivetuple.h"
 #include "ns3/error-model.h"
+#include "ns3/random-variable-stream.h"
 #include "ns3/event-id.h"
 #include "ns3/broadcom-egress-queue.h"
 #include "ns3/ipv4.h"
@@ -136,6 +137,8 @@ public:
 
 	void SendPfc(uint32_t qIndex, uint32_t type); // type: 0 = pause, 1 = resume
   Ptr<Packet> NICSendPfc(uint32_t qIndex, uint32_t type);
+  // The IPv4 identification of the next PFC frame this device sends.
+  uint16_t DrawPfcIdentification();
 
 	TracedCallback<Ptr<const Packet>, uint32_t> m_traceEnqueue;
 	TracedCallback<Ptr<const Packet>, uint32_t> m_traceDequeue;
@@ -184,6 +187,11 @@ protected:
 
   // Loss on the link itself: it corrupts any packet, whatever it carries.
   Ptr<ErrorModel> m_linkErrorModel;
+
+  // The stream PFC frame identifications are drawn from, -1 for an
+  // automatic one, and the variable, made at the first frame.
+  int64_t m_pfcIdentificationStream;
+  Ptr<UniformRandomVariable> m_pfcIdentification;
 
   // Data-plane-only impairment. Control packets are deliberately excluded
   // from this model after their protocol has been classified.

@@ -96,6 +96,7 @@ const int64_t device_rng_block = int64_t(1) << 40;
 enum class DeviceRngBlock : int64_t {
   LinkError = 1,
   EcnMarking = 2,
+  PfcIdentification = 3,
 };
 
 int64_t device_rng_stream(DeviceRngBlock block, Ptr<NetDevice> dev) {
@@ -1605,6 +1606,10 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),
     }
     connect_transport_traces(src_dev);
     connect_transport_traces(dst_dev);
+    for (Ptr<QbbNetDevice> dev : {src_dev, dst_dev})
+      dev->SetAttribute(
+          "PfcIdentificationStream",
+          IntegerValue(device_rng_stream(DeviceRngBlock::PfcIdentification, dev)));
     if (snode->GetNodeType() == 0) {
       Ptr<Ipv4> ipv4 = snode->GetObject<Ipv4>();
       ipv4->AddInterface(d.Get(0));

@@ -1321,6 +1321,47 @@ class MarkingStreamTest : public TestCase
     }
 };
 
+class PfcIdentificationTest : public TestCase
+{
+  public:
+    PfcIdentificationTest()
+        : TestCase("A device draws its PFC frame identifications from its fixed stream")
+    {
+    }
+
+    void DoRun() override
+    {
+        RngSeedManager::SetSeed(1);
+        RngSeedManager::SetRun(1);
+        // Reading the next automatic stream takes it, so with no automatic
+        // stream taken between them two readings differ by one.
+        const uint64_t before = RngSeedManager::GetNextStreamIndex();
+        const std::vector<uint16_t> first = Identifications();
+        const uint64_t after = RngSeedManager::GetNextStreamIndex();
+        NS_TEST_EXPECT_MSG_EQ(after, before + 1, "the draw takes no automatic stream");
+        NS_TEST_EXPECT_MSG_EQ((Identifications() == first),
+                              true,
+                              "another device on the stream draws the same frames");
+        const std::set<uint16_t> distinct(first.begin(), first.end());
+        // 1000 draws from 65536 values repeat about 8 times.
+        NS_TEST_EXPECT_MSG_GT(distinct.size(), 950, "the draw spans 16 bits");
+        Simulator::Destroy();
+    }
+
+  private:
+    static std::vector<uint16_t> Identifications()
+    {
+        Ptr<QbbNetDevice> device = CreateObject<QbbNetDevice>();
+        device->SetAttribute("PfcIdentificationStream", IntegerValue(21));
+        std::vector<uint16_t> identifications;
+        for (uint32_t i = 0; i < 1000; ++i)
+        {
+            identifications.push_back(device->DrawPfcIdentification());
+        }
+        return identifications;
+    }
+};
+
 class LoadBalancingSenderTest : public TestCase
 {
   public:
@@ -2673,6 +2714,7 @@ PointToPointTestSuite::PointToPointTestSuite()
     AddTestCase(new LinkRateChangeTest, TestCase::Duration::QUICK);
     AddTestCase(new PortCountersTest, TestCase::Duration::QUICK);
     AddTestCase(new MarkingStreamTest, TestCase::Duration::QUICK);
+    AddTestCase(new PfcIdentificationTest, TestCase::Duration::QUICK);
     AddTestCase(new LoadBalancingSenderTest, TestCase::Duration::QUICK);
     AddTestCase(new AckPacketSeqHeaderTest, TestCase::Duration::QUICK);
     AddTestCase(new AckNamesPacketTest, TestCase::Duration::QUICK);
