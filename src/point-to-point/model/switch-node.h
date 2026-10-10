@@ -43,6 +43,14 @@ enum class PacketTrimTrigger : uint32_t {
 	EgressQueueLastHop,
 };
 
+// What a switch port has transmitted over the run.
+struct SwitchPortCounters {
+	uint64_t txPackets;
+	uint64_t txBytes;
+	uint64_t dataPackets; // untrimmed data
+	uint64_t ecnMarks;    // packets this port marked CE
+};
+
 class SwitchNode : public Node{
 	static const uint32_t pCnt = 1025;	// Number of ports used
 	static const uint32_t qCnt = 8;	// Number of queues/priorities used
@@ -52,7 +60,7 @@ class SwitchNode : public Node{
 	// monitor of PFC
 	uint32_t m_bytes[pCnt][pCnt][qCnt]; // m_bytes[inDev][outDev][qidx] is the bytes from inDev enqueued for outDev at qidx
 	
-	uint64_t m_txBytes[pCnt]; // counter of tx bytes
+	SwitchPortCounters m_portCounters[pCnt];
 
 	uint32_t m_lastPktSize[pCnt];
 	uint64_t m_lastPktTs[pCnt]; // ns
@@ -106,6 +114,7 @@ public:
 	void SetEcmpSeed(uint32_t seed);
 	void SetSpinePorts(const std::vector<uint32_t> &ports);
 	void SetBlackhole(uint32_t port);
+	const SwitchPortCounters &GetPortCounters(uint32_t port) const;
 	void AddTableEntry(Ipv4Address &dstAddr, uint32_t intf_idx);
 	void ClearTable();
 	bool SwitchReceiveFromDevice(Ptr<NetDevice> device, Ptr<Packet> packet, CustomHeader &ch);

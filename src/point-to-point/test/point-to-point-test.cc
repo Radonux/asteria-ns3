@@ -1205,6 +1205,64 @@ class LinkRateChangeTest : public TestCase
     }
 };
 
+/**
+ * A switch that marks every data packet it sends while more wait behind it,
+ * sending five data packets and an acknowledgement up one port.
+ */
+class PortCountersTest : public TestCase
+{
+  public:
+    PortCountersTest()
+        : TestCase("A switch port counts what it sends, the data among it and its marks")
+    {
+    }
+
+    void DoRun() override
+    {
+        constexpr uint32_t kData = 5;
+        Ptr<SwitchNode> sw = CreateObject<SwitchNode>();
+        sw->SetAttribute("PfcEnabled", BooleanValue(false));
+        sw->SetAttribute("EcnEnabled", BooleanValue(true));
+        sw->SetAttribute("AckHighPrio", UintegerValue(1));
+        Ptr<QbbNetDevice> hostPort = AttachSwitchPort(sw, CreateObject<Node>());
+        Ptr<QbbNetDevice> uplink = AttachSwitchPort(sw, CreateObject<SwitchNode>());
+        for (Ptr<QbbNetDevice> port : {hostPort, uplink})
+        {
+            sw->m_mmu->ConfigHdrm(port->GetIfIndex(), 0);
+            sw->m_mmu->pfc_a_shift[port->GetIfIndex()] = 3;
+            sw->m_mmu->ConfigEcn(port->GetIfIndex(), 0, 0, 1.0);
+        }
+        sw->m_mmu->ConfigNPort(2);
+        sw->m_mmu->ConfigBufferSize(32 * 1024 * 1024);
+        Ipv4Address sender("11.0.1.1");
+        Ipv4Address remote("11.0.2.1");
+        sw->AddTableEntry(remote, uplink->GetIfIndex());
+        uint64_t sentBytes = 0;
+        uplink->m_traceDequeue.ConnectWithoutContext(Callback<void, Ptr<const Packet>, uint32_t>(
+            [&sentBytes](Ptr<const Packet> packet, uint32_t) { sentBytes += packet->GetSize(); }));
+
+        for (uint32_t i = 0; i < kData; ++i)
+        {
+            ArriveAtSwitch(sw, hostPort, sender, remote, 3);
+        }
+        ArriveAtSwitch(sw, hostPort, sender, remote, 3, 0xFC);
+        Simulator::Run();
+
+        const SwitchPortCounters& sent = sw->GetPortCounters(uplink->GetIfIndex());
+        NS_TEST_EXPECT_MSG_EQ(sent.txPackets, kData + 1, "every packet sent is counted");
+        NS_TEST_EXPECT_MSG_EQ(sent.txBytes, sentBytes, "every byte sent is counted");
+        NS_TEST_EXPECT_MSG_EQ(sent.dataPackets, kData, "the acknowledgement is not data");
+        // The first leaves at once and the last with nothing behind it; the
+        // acknowledgement rides queue 0, which is never marked.
+        NS_TEST_EXPECT_MSG_EQ(sent.ecnMarks, kData - 2, "each mark the port sets is counted");
+        const SwitchPortCounters& idle = sw->GetPortCounters(hostPort->GetIfIndex());
+        NS_TEST_EXPECT_MSG_EQ(idle.txPackets + idle.txBytes + idle.dataPackets + idle.ecnMarks,
+                              0,
+                              "a port that sent nothing counts nothing");
+        Simulator::Destroy();
+    }
+};
+
 class LoadBalancingSenderTest : public TestCase
 {
   public:
@@ -2451,6 +2509,7 @@ PointToPointTestSuite::PointToPointTestSuite()
     AddTestCase(new LinkErrorTest, TestCase::Duration::QUICK);
     AddTestCase(new BlackholeTest, TestCase::Duration::QUICK);
     AddTestCase(new LinkRateChangeTest, TestCase::Duration::QUICK);
+    AddTestCase(new PortCountersTest, TestCase::Duration::QUICK);
     AddTestCase(new LoadBalancingSenderTest, TestCase::Duration::QUICK);
     AddTestCase(new AckPacketSeqHeaderTest, TestCase::Duration::QUICK);
     AddTestCase(new AckNamesPacketTest, TestCase::Duration::QUICK);

@@ -110,7 +110,7 @@ SwitchNode::SwitchNode(){
 			for (uint32_t k = 0; k < qCnt; k++)
 				m_bytes[i][j][k] = 0;
 	for (uint32_t i = 0; i < pCnt; i++)
-		m_txBytes[i] = 0;
+		m_portCounters[i] = SwitchPortCounters{};
 	for (uint32_t i = 0; i < pCnt; i++)
 		m_lastPktSize[i] = m_lastPktTs[i] = 0;
 	for (uint32_t i = 0; i < pCnt; i++)
@@ -516,6 +516,10 @@ void SwitchNode::SetSpinePorts(const std::vector<uint32_t> &ports){
 	m_spinePort = ports;
 }
 
+const SwitchPortCounters &SwitchNode::GetPortCounters(uint32_t port) const{
+	return m_portCounters[port];
+}
+
 void SwitchNode::SetBlackhole(uint32_t port){
 	if (m_blackholed.size() <= port)
 		m_blackholed.resize(port + 1, false);
@@ -577,6 +581,7 @@ void SwitchNode::SwitchNotifyDequeue(uint32_t ifIndex, uint32_t qIndex, Ptr<Pack
 		if (m_ecnEnabled && !isTrimmed){
 			bool egressCongested = m_mmu->ShouldSendCN(ifIndex, qIndex);
 			if (egressCongested){
+				m_portCounters[ifIndex].ecnMarks++;
 				PppHeader ppp;
 				Ipv4Header h;
 				p->RemoveHeader(ppp);
@@ -592,10 +597,11 @@ void SwitchNode::SwitchNotifyDequeue(uint32_t ifIndex, uint32_t qIndex, Ptr<Pack
 	if (!isTrimmed){
 		uint8_t* buf = p->GetBuffer();
 		if (buf[PppHeader::GetStaticSize() + 9] == 0x11){ // udp packet
+			m_portCounters[ifIndex].dataPackets++;
 			IntHeader *ih = (IntHeader*)&buf[PppHeader::GetStaticSize() + 20 + 8 + 6]; // ppp, ip, udp, SeqTs, INT
 			Ptr<QbbNetDevice> dev = DynamicCast<QbbNetDevice>(m_devices[ifIndex]);
 			if (m_ccMode == 3){ // HPCC
-				ih->PushHop(Simulator::Now().GetTimeStep(), m_txBytes[ifIndex], dev->GetQueue()->GetNBytesTotal(), dev->GetDataRate().GetBitRate());
+				ih->PushHop(Simulator::Now().GetTimeStep(), m_portCounters[ifIndex].txBytes, dev->GetQueue()->GetNBytesTotal(), dev->GetDataRate().GetBitRate());
 			}else if (m_ccMode == 10){ // HPCC-PINT
 				uint64_t t = Simulator::Now().GetTimeStep();
 				uint64_t dt = t - m_lastPktTs[ifIndex];
@@ -673,7 +679,8 @@ void SwitchNode::SwitchNotifyDequeue(uint32_t ifIndex, uint32_t qIndex, Ptr<Pack
 			}
 		}
 	}
-	m_txBytes[ifIndex] += p->GetSize();
+	m_portCounters[ifIndex].txPackets++;
+	m_portCounters[ifIndex].txBytes += p->GetSize();
 	m_lastPktSize[ifIndex] = p->GetSize();
 	m_lastPktTs[ifIndex] = Simulator::Now().GetTimeStep();
 }
