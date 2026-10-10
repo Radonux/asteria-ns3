@@ -593,6 +593,12 @@ class UecTrimRecoveryTest : public TestCase
         NS_TEST_EXPECT_MSG_EQ(m_repairPayloadBytes,
                               kTrimmedBytes,
                               "the trim NACK must preserve the missing payload length");
+        NS_TEST_EXPECT_MSG_EQ(m_repairMarked, false, "an unmarked trim's NACK carries no mark");
+
+        trimmed.m_tos = kUetDscpTrimmed << 2 | Ipv4Header::ECN_CE;
+        receiverHw->Receive(Create<Packet>(), trimmed);
+        NS_TEST_EXPECT_MSG_EQ(m_repairCount, 2, "every trimmed packet produces a NACK");
+        NS_TEST_EXPECT_MSG_EQ(m_repairMarked, true, "a NACK echoes the trimmed packet's CE");
     }
 
   private:
@@ -606,9 +612,11 @@ class UecTrimRecoveryTest : public TestCase
         m_repairProtocol = parsed.l3Prot;
         m_repairSequence = parsed.ack.seq;
         m_repairPayloadBytes = parsed.ack.trim_payload_size;
+        m_repairMarked = (parsed.ack.flags >> qbbHeader::FLAG_CNP) & 1;
         NS_TEST_ASSERT_MSG_EQ(queue, 0, "trim repair must use strict-priority control");
     }
 
+    bool m_repairMarked = false;
     uint32_t m_repairCount = 0;
     uint32_t m_repairProtocol = 0;
     uint32_t m_repairSequence = 0;

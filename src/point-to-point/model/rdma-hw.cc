@@ -857,6 +857,10 @@ void RdmaHw::SendTrimNack(const CustomHeader &ch, uint32_t sourceIp,
 	repair.SetDport(dport);
 	repair.SetTrimPayloadSize(payloadSize);
 	repair.SetTrimLastHop(lastHop);
+	// UEC 1.0.3 section 3.6.12.4: the NACK reports whether the trimmed packet
+	// arrived with CE, which a switch before the trimming one may have set.
+	if (ch.GetIpv4EcnBits() != 0)
+		repair.SetCnp();
 	repair.SetAllowanceExhausted(spent);
 	// The report is only a report where the receiver says it may forgive this
 	// flow; without this flag a clear bit means nothing, because a receiver
