@@ -250,8 +250,8 @@ TypeId RdmaHw::GetTypeId (void)
 		.AddAttribute("SprayEstimatorIntervalSamples",
 				"Under LoadBalancing 3, the packets from which an interval's mark "
 				"fraction and mean delay replace a spine's averages instead of "
-				"moving them by the gain. Zero, the default, never replaces them.",
-				UintegerValue(0),
+				"moving them by the gain; zero never replaces them. Default 32.",
+				UintegerValue(32),
 				MakeUintegerAccessor(&RdmaHw::m_sprayEstimatorIntervalSamples),
 				MakeUintegerChecker<uint32_t>())
 		.AddAttribute("SprayFractionCusumSlack",
@@ -354,9 +354,9 @@ TypeId RdmaHw::GetTypeId (void)
 				"Under LoadBalancing 3, what a spine's averages are graded "
 				"against: 0=nothing, the averages themselves; 1=the median of "
 				"the spines' averages, which the averages' excess is graded by. "
-				"Default 0.",
+				"Default 1.",
 				UintegerValue(static_cast<uint32_t>(
-					SpineGrader::GradeReference::Absolute)),
+					SpineGrader::GradeReference::Median)),
 				MakeUintegerAccessor(&RdmaHw::m_sprayGradeReference),
 				MakeUintegerChecker<uint32_t>(
 					static_cast<uint32_t>(SpineGrader::GradeReference::Absolute),

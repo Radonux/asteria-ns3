@@ -141,7 +141,7 @@ std::set<std::string> path_selector_parameters_given;
 // parameters, each RdmaHw's default; times in base RTTs.
 double spray_report_interval_base_rtts = 2.0;
 double spray_estimator_gain = 1.0 / 16;
-uint32_t spray_estimator_interval_samples = 0;
+uint32_t spray_estimator_interval_samples = 32;
 double spray_fraction_cusum_slack = 0.125;
 double spray_fraction_cusum_threshold = 0.5;
 double spray_congestion_thresholds[3] = {0.25, 0.5, 0.75};
@@ -149,7 +149,7 @@ double spray_absence_fraction_of_median = 0.125;
 uint32_t spray_absence_minimum_median = 16;
 double spray_release_fraction_of_floor = 0.5;
 uint32_t spray_one_way_delay = 0;
-std::string spray_grade_reference = "absolute";
+std::string spray_grade_reference = "median";
 double spray_delay_cusum_slack_base_rtts = 0.125;
 double spray_delay_cusum_threshold_base_rtts = 0.5;
 double spray_delay_thresholds_base_rtts[3] = {0.25, 0.5, 0.75};
