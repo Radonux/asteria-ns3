@@ -8,6 +8,7 @@
 #include <ns3/random-variable-stream.h>
 #include "qbb-net-device.h"
 #include "load-balancing.h"
+#include "nscc-window.h"
 #include <unordered_map>
 #include "pint.h"
 
@@ -298,6 +299,23 @@ public:
 	void SetPintSmplThresh(double p);
 	void HandleAckHpPint(Ptr<RdmaQueuePair> qp, Ptr<Packet> p, CustomHeader &ch);
 	void UpdateRateHpPint(Ptr<RdmaQueuePair> qp, Ptr<Packet> p, CustomHeader &ch, bool fast_react);
+
+	/*********************
+	 * NSCC
+	 ********************/
+	double m_nscc_target_qdelay;
+	double m_nscc_max_window;
+	double m_nscc_gamma;
+	double m_nscc_max_md_jump;
+	double m_nscc_fair_increase;
+	double m_nscc_fast_increase_scale;
+	double m_nscc_eta;
+	double m_nscc_alpha;
+	uint32_t m_nscc_qa_gate;
+	double m_nscc_qa_threshold;
+	uint32_t m_nscc_adjust_bytes;
+	double m_nscc_adjust_period;
+	NsccWindow::Parameters NsccParameters() const;
 };
 
 } /* namespace ns3 */

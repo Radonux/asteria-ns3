@@ -22,6 +22,7 @@ build_lib(
     helper/point-to-point-helper.cc
     helper/qbb-helper.cc
     model/cn-header.cc
+    model/nscc-window.cc
     model/pause-header.cc
     model/pint.cc
     model/point-to-point-channel.cc
@@ -44,6 +45,7 @@ build_lib(
     helper/sim-setting.h
     model/cn-header.h
     model/load-balancing.h
+    model/nscc-window.h
     model/pause-header.h
     model/pint.h
     model/point-to-point-channel.h

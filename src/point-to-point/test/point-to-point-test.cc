@@ -37,6 +37,7 @@
 #include "ns3/rng-seed-manager.h"
 #include "ns3/switch-node.h"
 #include "ns3/node.h"
+#include "ns3/nscc-window.h"
 #include "ns3/seq-ts-header.h"
 #include "ns3/simulator.h"
 #include "ns3/test.h"
@@ -1586,6 +1587,305 @@ class PathLossRuleTest : public TestCase
 };
 
 /**
+ * An NSCC window on a path of 1000-byte packets with a 10 us base RTT and a
+ * bandwidth-delay product of 1500 packets, which makes scaling_a 10: fi is
+ * 50000 bytes, fi_scale 2.5, eta 1500 bytes and alpha 10/3 bytes per byte and
+ * nanosecond below the target. The parameters are the transport's defaults
+ * unless a test says otherwise.
+ */
+class NsccPath
+{
+  public:
+    static constexpr uint32_t kMtu = 1000;
+    static constexpr uint64_t kBdp = 1500 * kMtu;
+    static constexpr uint64_t kBaseRtt = 10000;
+    // target_qdelay, 0.75 base RTTs, and MaxWnd, 1.5 BDPs.
+    static constexpr uint64_t kTarget = 7500;
+    static constexpr uint64_t kCeiling = 2250000;
+    // The QuickAdapt period, base RTT plus target_qdelay.
+    static constexpr uint64_t kQuickAdaptPeriod = kBaseRtt + kTarget;
+
+    static NsccWindow::Parameters Defaults()
+    {
+        return CreateObject<RdmaHw>()->NsccParameters();
+    }
+
+    // Defaults with no adjustment period inside a test, so that eta, which is
+    // added per period whatever the acknowledgements say, moves nothing.
+    static NsccWindow::Parameters WithoutEta()
+    {
+        NsccWindow::Parameters parameters = Defaults();
+        parameters.adjust_period = 1000;
+        return parameters;
+    }
+
+    static NsccWindow Started(const NsccWindow::Parameters& parameters)
+    {
+        NsccWindow window;
+        window.Start(parameters, kMtu, kBdp, kBaseRtt, 0);
+        return window;
+    }
+
+    // Acknowledgements of count packets at one instant, each with the given
+    // mark and queueing delay.
+    static void Acknowledge(NsccWindow& window,
+                            uint32_t count,
+                            bool marked,
+                            uint64_t delay,
+                            uint64_t now,
+                            uint64_t inflight = 0)
+    {
+        for (uint32_t i = 0; i < count; ++i)
+        {
+            window.OnAck(kMtu, marked, kBaseRtt + delay, inflight, now);
+        }
+    }
+};
+
+class NsccCaseTableTest : public TestCase
+{
+  public:
+    NsccCaseTableTest()
+        : TestCase("NSCC moves the window by the case of mark and queueing delay")
+    {
+    }
+
+    void DoRun() override
+    {
+        constexpr uint64_t kWindow = 1000000;
+        // Nine acknowledgements, so that the ninth applies what the cases
+        // accumulated, two base RTTs in, so that a decrease is allowed.
+        constexpr uint64_t kNow = 2 * NsccPath::kBaseRtt;
+        auto after = [](bool marked, uint64_t delay) {
+            NsccWindow window = NsccPath::Started(NsccPath::WithoutEta());
+            window.OnLoss(NsccPath::kCeiling - kWindow);
+            NsccPath::Acknowledge(window, 9, marked, delay, kNow);
+            return window.Cwnd();
+        };
+        constexpr uint64_t kLow = 2000;
+        constexpr uint64_t kHigh = 2 * NsccPath::kTarget;
+        // Proportional increase: 9 * (10/3) * 1000 * (7500 - 2000) over the window.
+        NS_TEST_EXPECT_MSG_EQ_TOL(after(false, kLow),
+                                  kWindow + 165,
+                                  1,
+                                  "no mark at low delay increases in proportion to the headroom");
+        // Fair increase: 9 * 50000 * 1000 over the window.
+        NS_TEST_EXPECT_MSG_EQ_TOL(after(false, kHigh),
+                                  kWindow + 450,
+                                  1,
+                                  "no mark at high delay increases by the fair constant");
+        // Multiplicative decrease once: 1 - 0.8 * (15000 - 7500) / 15000.
+        NS_TEST_EXPECT_MSG_EQ_TOL(after(true, kHigh),
+                                  kWindow * 6 / 10,
+                                  1,
+                                  "a mark at high delay decreases by the delay's excess");
+        NS_TEST_EXPECT_MSG_EQ(after(true, kLow), kWindow, "a mark at low delay changes nothing");
+    }
+};
+
+class NsccLightMarkTest : public TestCase
+{
+  public:
+    NsccLightMarkTest()
+        : TestCase("NSCC leaves the window alone on a mark below the target delay")
+    {
+    }
+
+    void DoRun() override
+    {
+        NsccWindow window = NsccPath::Started(NsccPath::WithoutEta());
+        window.OnLoss(NsccPath::kCeiling / 2);
+        // An unmarked packet three targets late raises the average delay well
+        // past the target, so only the answered packet's own delay can spare
+        // the window from the marks that follow it.
+        uint64_t now = 2 * NsccPath::kBaseRtt;
+        window.OnAck(NsccPath::kMtu, false, NsccPath::kBaseRtt + 3 * NsccPath::kTarget, 0, now);
+        const uint64_t before = window.Cwnd();
+        for (uint32_t i = 0; i < 6; ++i)
+        {
+            window.OnAck(NsccPath::kMtu,
+                         true,
+                         NsccPath::kBaseRtt + NsccPath::kTarget - 1,
+                         0,
+                         ++now);
+            NS_TEST_EXPECT_MSG_EQ(window.Cwnd(),
+                                  before,
+                                  "a mark one nanosecond under the target is left to load balancing");
+        }
+        window.OnAck(NsccPath::kMtu, true, NsccPath::kBaseRtt + NsccPath::kTarget, 0, ++now);
+        NS_TEST_EXPECT_MSG_LT(window.Cwnd(), before, "a mark at the target decreases");
+    }
+};
+
+class NsccQuickAdaptTest : public TestCase
+{
+  public:
+    NsccQuickAdaptTest()
+        : TestCase("NSCC QuickAdapt sets the window once its period has run and its gate is open")
+    {
+    }
+
+    void DoRun() override
+    {
+        constexpr uint64_t kMtu = NsccPath::kMtu;
+        constexpr uint64_t kTrim = 1000;
+        constexpr uint64_t kEnd = kTrim + NsccPath::kQuickAdaptPeriod;
+        constexpr uint64_t kInflight = 40 * kMtu;
+        // The first trim opens the first period and is cut by its own size.
+        NsccWindow window = NsccPath::Started(NsccPath::WithoutEta());
+        window.OnTrim(kMtu, NsccWindow::kNoRtt, kInflight, kTrim);
+        const uint64_t trimmed = NsccPath::kCeiling - kMtu;
+        NS_TEST_ASSERT_MSG_EQ(window.Cwnd(), trimmed, "the trim cuts its own bytes");
+        // Marks at low delay leave the window alone while the period runs.
+        for (uint64_t now = 2000; now <= 11000; now += 1000)
+        {
+            NsccPath::Acknowledge(window, 1, true, 2000, now, kInflight);
+        }
+        NsccPath::Acknowledge(window, 1, true, 2000, kEnd - 1, kInflight);
+        NS_TEST_EXPECT_MSG_EQ(window.Cwnd(), trimmed, "QuickAdapt waits out its period");
+        NsccPath::Acknowledge(window, 1, true, 2000, kEnd, kInflight);
+        NS_TEST_EXPECT_MSG_EQ(window.Cwnd(),
+                              12 * kMtu,
+                              "QuickAdapt sets the window to the bytes acknowledged in the period");
+        // The marks on the bytes in flight when the window was set are
+        // ignored: a decrease is otherwise due, three targets late and well
+        // past a base RTT since the last.
+        constexpr uint64_t kLate = 3 * NsccPath::kTarget;
+        for (uint64_t i = 0; i + 1 < kInflight / kMtu; ++i)
+        {
+            NsccPath::Acknowledge(window, 1, true, kLate, 30000 + i, kInflight);
+        }
+        NS_TEST_EXPECT_MSG_EQ(window.Cwnd(), 12 * kMtu, "the bytes in flight are ignored");
+        NsccPath::Acknowledge(window, 1, true, kLate, 30000 + kInflight / kMtu, kInflight);
+        NS_TEST_EXPECT_MSG_EQ(window.Cwnd(),
+                              6 * kMtu,
+                              "past them, a mark at high delay decreases again");
+
+        // MaxWnd / 2^3 bytes acknowledged in the period close the gate.
+        NsccWindow open = NsccPath::Started(NsccPath::WithoutEta());
+        open.OnTrim(kMtu, NsccWindow::kNoRtt, kInflight, kTrim);
+        for (uint64_t i = 0; i < (NsccPath::kCeiling >> 3) / kMtu + 1; ++i)
+        {
+            NsccPath::Acknowledge(open, 1, true, 2000, 2000 + i * 50, kInflight);
+        }
+        NsccPath::Acknowledge(open, 1, true, 2000, kEnd, kInflight);
+        NS_TEST_EXPECT_MSG_EQ(open.Cwnd(),
+                              trimmed,
+                              "a flow that delivered an eighth of MaxWnd keeps its window");
+
+        // Without a trim, a delay past qa_threshold target delays triggers it.
+        NsccWindow::Parameters delayed = NsccPath::WithoutEta();
+        delayed.qa_threshold = 4;
+        constexpr uint64_t kThreshold = 4 * NsccPath::kTarget;
+        for (const uint64_t delay : {kThreshold, kThreshold + 1})
+        {
+            // The first acknowledgement opens the period, and three more
+            // arrive inside it.
+            NsccWindow late = NsccPath::Started(delayed);
+            NsccPath::Acknowledge(late, 1, true, 2000, kTrim, kInflight);
+            NsccPath::Acknowledge(late, 3, true, 2000, kTrim + 1, kInflight);
+            NsccPath::Acknowledge(late, 1, false, delay, kEnd, kInflight);
+            const bool adapted = late.Cwnd() == 4 * kMtu;
+            const bool past = delay > kThreshold;
+            NS_TEST_EXPECT_MSG_EQ(adapted, past, "a delay past qa_threshold alone sets the window");
+        }
+    }
+};
+
+class NsccFastIncreaseTest : public TestCase
+{
+  public:
+    NsccFastIncreaseTest()
+        : TestCase("NSCC fast increase takes over after a window of clean acknowledgements")
+    {
+    }
+
+    void DoRun() override
+    {
+        constexpr uint64_t kMtu = NsccPath::kMtu;
+        constexpr uint64_t kWindow = 3 * kMtu;
+        // fi_scale is 2.5, so each clean packet adds two and a half.
+        constexpr uint64_t kStep = 2500;
+        NsccWindow window = NsccPath::Started(NsccPath::WithoutEta());
+        window.OnLoss(NsccPath::kCeiling - kWindow);
+        uint64_t now = 2 * NsccPath::kBaseRtt;
+        for (uint32_t i = 0; i < 3; ++i)
+        {
+            NsccPath::Acknowledge(window, 1, false, 0, ++now);
+            NS_TEST_EXPECT_MSG_EQ(window.Cwnd(), kWindow, "up to a window of clean bytes waits");
+        }
+        NsccPath::Acknowledge(window, 1, false, 0, ++now);
+        NS_TEST_EXPECT_MSG_EQ(window.Cwnd(), kWindow + kStep, "more than a window starts it");
+        NsccPath::Acknowledge(window, 1, false, 0, ++now);
+        NS_TEST_EXPECT_MSG_EQ(window.Cwnd(), kWindow + 2 * kStep, "once started it continues");
+        // A microsecond of queueing ends it, and the count starts over.
+        NsccPath::Acknowledge(window, 1, false, 1000, ++now);
+        NS_TEST_EXPECT_MSG_EQ(window.Cwnd(), kWindow + 2 * kStep, "a queue ends it");
+        NsccPath::Acknowledge(window, 1, false, 0, ++now);
+        NS_TEST_EXPECT_MSG_EQ(window.Cwnd(),
+                              kWindow + 2 * kStep,
+                              "after a queue a window of clean bytes is needed again");
+        // Enough clean packets to climb by fast increase to MaxWnd and stay.
+        for (uint32_t i = 0; i < NsccPath::kCeiling / kStep + 100; ++i)
+        {
+            NsccPath::Acknowledge(window, 1, false, 0, ++now);
+            NS_TEST_ASSERT_MSG_LT_OR_EQ(window.Cwnd(),
+                                        NsccPath::kCeiling,
+                                        "fast increase stops at MaxWnd");
+        }
+        NS_TEST_EXPECT_MSG_EQ(window.Cwnd(), NsccPath::kCeiling, "fast increase reaches MaxWnd");
+    }
+};
+
+class NsccBoundsTest : public TestCase
+{
+  public:
+    NsccBoundsTest()
+        : TestCase("NSCC keeps the window between one packet and MaxWnd")
+    {
+    }
+
+    void DoRun() override
+    {
+        constexpr uint32_t kMtu = NsccPath::kMtu;
+        NsccWindow window = NsccPath::Started(NsccPath::Defaults());
+        std::mt19937 random(1);
+        uint64_t now = 0;
+        uint64_t atFloor = 0;
+        uint64_t atCeiling = 0;
+        for (uint32_t step = 0; step < 50000; ++step)
+        {
+            // Alternating stretches of a clear path and of congestion, so that
+            // both bounds are pressed.
+            const bool congested = step / 2000 % 2 == 1;
+            now += random() % 2000;
+            const uint64_t inflight = random() % (2 * NsccPath::kBdp);
+            const uint32_t event = random() % 100;
+            if (congested && event < 10)
+            {
+                window.OnTrim(kMtu, NsccPath::kBaseRtt + random() % 30000, inflight, now);
+            }
+            else if (congested && event < 15)
+            {
+                window.OnLoss((1 + random() % 50) * kMtu);
+            }
+            else
+            {
+                const bool marked = congested ? random() % 2 == 0 : random() % 50 == 0;
+                const uint64_t delay = congested ? random() % 30000 : random() % 1500;
+                window.OnAck(kMtu, marked, NsccPath::kBaseRtt + delay, inflight, now);
+            }
+            NS_TEST_ASSERT_MSG_GT_OR_EQ(window.Cwnd(), kMtu, "the window holds a packet");
+            NS_TEST_ASSERT_MSG_LT_OR_EQ(window.Cwnd(), window.MaxWnd(), "the window stays under MaxWnd");
+            atFloor += window.Cwnd() == kMtu;
+            atCeiling += window.Cwnd() == window.MaxWnd();
+        }
+        NS_TEST_EXPECT_MSG_GT(atFloor, 0, "the floor was pressed");
+        NS_TEST_EXPECT_MSG_GT(atCeiling, 0, "the ceiling was pressed");
+    }
+};
+
+/**
  * \brief TestSuite for PointToPoint module
  */
 class PointToPointTestSuite : public TestSuite
@@ -1620,6 +1920,11 @@ PointToPointTestSuite::PointToPointTestSuite()
     AddTestCase(new OutstandingWindowTest, TestCase::Duration::QUICK);
     AddTestCase(new TrimRepairedOnceTest, TestCase::Duration::QUICK);
     AddTestCase(new PathLossRuleTest, TestCase::Duration::QUICK);
+    AddTestCase(new NsccCaseTableTest, TestCase::Duration::QUICK);
+    AddTestCase(new NsccLightMarkTest, TestCase::Duration::QUICK);
+    AddTestCase(new NsccQuickAdaptTest, TestCase::Duration::QUICK);
+    AddTestCase(new NsccFastIncreaseTest, TestCase::Duration::QUICK);
+    AddTestCase(new NsccBoundsTest, TestCase::Duration::QUICK);
 }
 
 static PointToPointTestSuite g_pointToPointTestSuite; //!< The testsuite

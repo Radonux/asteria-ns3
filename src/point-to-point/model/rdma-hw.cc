@@ -244,6 +244,88 @@ TypeId RdmaHw::GetTypeId (void)
 				DataRateValue(DataRate("1000Mb/s")),
 				MakeDataRateAccessor(&RdmaHw::m_dctcp_rai),
 				MakeDataRateChecker())
+		.AddAttribute("NsccTargetQdelay",
+				"NSCC target_qdelay, the queueing delay from which an acknowledgement "
+				"counts as congested, in base RTTs. Default 0.75, UEC 1.0.3 section "
+				"3.6.13.3's value where switches trim.",
+				DoubleValue(0.75),
+				MakeDoubleAccessor(&RdmaHw::m_nscc_target_qdelay),
+				MakeDoubleChecker<double>(0))
+		.AddAttribute("NsccMaxWindow",
+				"NSCC MaxWnd, the ceiling and the initial value of the window, in "
+				"bandwidth-delay products. Default 1.5, UEC 1.0.3 Table 3-82.",
+				DoubleValue(1.5),
+				MakeDoubleAccessor(&RdmaHw::m_nscc_max_window),
+				MakeDoubleChecker<double>(0))
+		.AddAttribute("NsccGamma",
+				"NSCC gamma, the gain of a multiplicative decrease on the average "
+				"queueing delay's excess over the target, relative to that average. "
+				"Default 0.8, UEC 1.0.3 Table 3-82.",
+				DoubleValue(0.8),
+				MakeDoubleAccessor(&RdmaHw::m_nscc_gamma),
+				MakeDoubleChecker<double>(0, 1))
+		.AddAttribute("NsccMaxMdJump",
+				"NSCC max_md_jump, the smallest factor one multiplicative decrease "
+				"scales the window by. Default 0.5, UEC 1.0.3 Table 3-82.",
+				DoubleValue(0.5),
+				MakeDoubleAccessor(&RdmaHw::m_nscc_max_md_jump),
+				MakeDoubleChecker<double>(0, 1))
+		.AddAttribute("NsccFairIncrease",
+				"NSCC fi, the fair increase constant, in MTUs times scaling_a, the "
+				"queue pair's bandwidth-delay product over 150000 bytes. Default 5, "
+				"UEC 1.0.3 Table 3-82.",
+				DoubleValue(5.0),
+				MakeDoubleAccessor(&RdmaHw::m_nscc_fair_increase),
+				MakeDoubleChecker<double>(0))
+		.AddAttribute("NsccFastIncreaseScale",
+				"NSCC fi_scale, the window bytes fast increase adds per byte "
+				"acknowledged, in units of scaling_a. Default 0.25, UEC 1.0.3 "
+				"Table 3-82.",
+				DoubleValue(0.25),
+				MakeDoubleAccessor(&RdmaHw::m_nscc_fast_increase_scale),
+				MakeDoubleChecker<double>(0))
+		.AddAttribute("NsccEta",
+				"NSCC eta, the additive increase applied once per adjustment period, "
+				"in MTUs times scaling_a. Default 0.15, UEC 1.0.3 Table 3-82.",
+				DoubleValue(0.15),
+				MakeDoubleAccessor(&RdmaHw::m_nscc_eta),
+				MakeDoubleChecker<double>(0))
+		.AddAttribute("NsccAlpha",
+				"NSCC alpha, the proportional increase gain, in MTUs times scaling_a "
+				"times scaling_b per target_qdelay, scaling_b being target_qdelay "
+				"over 12 us. Default 4, UEC 1.0.3 section 3.6.13.3.",
+				DoubleValue(4.0),
+				MakeDoubleAccessor(&RdmaHw::m_nscc_alpha),
+				MakeDoubleChecker<double>(0))
+		.AddAttribute("NsccQaGate",
+				"NSCC qa_gate: QuickAdapt sets the window only if the bytes "
+				"acknowledged over its last period are below MaxWnd / 2^qa_gate. "
+				"Default 3, UEC 1.0.3 Table 3-82.",
+				UintegerValue(3),
+				MakeUintegerAccessor(&RdmaHw::m_nscc_qa_gate),
+				MakeUintegerChecker<uint32_t>(0, 63))
+		.AddAttribute("NsccQaThreshold",
+				"NSCC qa_threshold, the queueing delay that triggers QuickAdapt "
+				"without a trim, in target_qdelays. Zero disables it, as UEC 1.0.3 "
+				"section 3.6.13.3 prescribes where switches trim; its value without "
+				"trimming is 4. Default 0.",
+				DoubleValue(0),
+				MakeDoubleAccessor(&RdmaHw::m_nscc_qa_threshold),
+				MakeDoubleChecker<double>(0))
+		.AddAttribute("NsccAdjustBytes",
+				"NSCC adjust_bytes_threshold, in MTUs: the increases accumulated "
+				"since the last adjustment are applied once more bytes than this "
+				"are acknowledged. Default 8, UEC 1.0.3 Table 3-82.",
+				UintegerValue(8),
+				MakeUintegerAccessor(&RdmaHw::m_nscc_adjust_bytes),
+				MakeUintegerChecker<uint32_t>())
+		.AddAttribute("NsccAdjustPeriod",
+				"NSCC adjust_period_threshold, in base RTTs: the accumulated "
+				"increases are applied, and eta added, at least this often. "
+				"Default 1, UEC 1.0.3 Table 3-82.",
+				DoubleValue(1.0),
+				MakeDoubleAccessor(&RdmaHw::m_nscc_adjust_period),
+				MakeDoubleChecker<double>(0))
 		.AddAttribute("PintSmplThresh",
 				"PINT's sampling threshold in rand()%65536",
 				UintegerValue(65536),
@@ -1916,6 +1998,16 @@ void RdmaHw::UpdateRateHpPint(Ptr<RdmaQueuePair> qp, Ptr<Packet> p, CustomHeader
                                qp->hpccPint.m_lastUpdateSeq = next_seq; //+ rand() % 2 * m_mtu;
                }
        }
+}
+
+/*********************
+ * NSCC
+ ********************/
+NsccWindow::Parameters RdmaHw::NsccParameters() const{
+	return NsccWindow::Parameters{m_nscc_target_qdelay, m_nscc_max_window,
+		m_nscc_gamma, m_nscc_max_md_jump, m_nscc_fair_increase,
+		m_nscc_fast_increase_scale, m_nscc_eta, m_nscc_alpha, m_nscc_qa_gate,
+		m_nscc_qa_threshold, m_nscc_adjust_bytes, m_nscc_adjust_period};
 }
 
 }
