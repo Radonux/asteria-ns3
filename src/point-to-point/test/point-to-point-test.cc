@@ -832,6 +832,99 @@ class LoadBalancingSwitchTest : public TestCase
     }
 };
 
+/**
+ * A switch with a host port and an uplink that queues data, its buffer
+ * configured as common.h configures a best-effort switch.
+ */
+class PortDownBufferTest : public TestCase
+{
+  public:
+    PortDownBufferTest()
+        : TestCase("A port taken down returns its queued packets' buffer")
+    {
+    }
+
+    void DoRun() override
+    {
+        constexpr uint32_t kPriorityGroup = 3;
+        constexpr uint32_t kPackets = 5;
+        Ptr<SwitchNode> sw = CreateObject<SwitchNode>();
+        sw->SetAttribute("PfcEnabled", BooleanValue(false));
+        const uint32_t hostPort = Attach(sw, CreateObject<Node>());
+        const uint32_t uplink = Attach(sw, CreateObject<SwitchNode>());
+        for (uint32_t port : {hostPort, uplink})
+        {
+            sw->m_mmu->ConfigHdrm(port, 0);
+            sw->m_mmu->pfc_a_shift[port] = 3;
+        }
+        sw->m_mmu->ConfigNPort(2);
+        sw->m_mmu->ConfigBufferSize(32 * 1024 * 1024);
+        Ipv4Address remote("11.0.2.1");
+        sw->AddTableEntry(remote, uplink);
+
+        uint32_t packetBytes = 0;
+        for (uint32_t i = 0; i < kPackets; ++i)
+        {
+            Ptr<Packet> packet = Create<Packet>(1000);
+            SeqTsHeader seqTs;
+            seqTs.SetSeq(i * 1000);
+            seqTs.SetPG(kPriorityGroup);
+            packet->AddHeader(seqTs);
+            UdpHeader udp;
+            udp.SetSourcePort(10000);
+            udp.SetDestinationPort(10001);
+            packet->AddHeader(udp);
+            Ipv4Header ip;
+            ip.SetSource(Ipv4Address("11.0.1.1"));
+            ip.SetDestination(remote);
+            ip.SetProtocol(0x11);
+            ip.SetPayloadSize(packet->GetSize());
+            packet->AddHeader(ip);
+            PppHeader ppp;
+            ppp.SetProtocol(0x0021);
+            packet->AddHeader(ppp);
+            packet->AddPacketTag(FlowIdTag(hostPort));
+            packetBytes = packet->GetSize();
+            CustomHeader parsed(CustomHeader::L2_Header | CustomHeader::L3_Header |
+                                CustomHeader::L4_Header);
+            parsed.getInt = 1;
+            packet->PeekHeader(parsed);
+            sw->SwitchReceiveFromDevice(nullptr, packet, parsed);
+        }
+        // The first packet went onto the wire and released its buffer then.
+        const uint32_t queued = (kPackets - 1) * packetBytes;
+        NS_TEST_ASSERT_MSG_EQ(sw->m_mmu->egress_bytes[uplink][kPriorityGroup],
+                              queued,
+                              "the uplink holds every packet behind the one on the wire");
+        NS_TEST_ASSERT_MSG_EQ(sw->m_mmu->ingress_bytes[hostPort][kPriorityGroup],
+                              queued,
+                              "the host port is charged for what the uplink holds");
+
+        DynamicCast<QbbNetDevice>(sw->GetDevice(uplink))->TakeDown();
+        NS_TEST_EXPECT_MSG_EQ(sw->m_mmu->egress_bytes[uplink][kPriorityGroup],
+                              0,
+                              "a downed port holds no buffer");
+        NS_TEST_EXPECT_MSG_EQ(sw->m_mmu->ingress_bytes[hostPort][kPriorityGroup],
+                              0,
+                              "the ports that fed it are charged nothing for discarded packets");
+        Simulator::Destroy();
+    }
+
+  private:
+    static uint32_t Attach(Ptr<SwitchNode> sw, Ptr<Node> peerNode)
+    {
+        Ptr<QbbNetDevice> port = CreateObject<QbbNetDevice>();
+        port->SetQueue(CreateObject<BEgressQueue>());
+        sw->AddDevice(port);
+        Ptr<QbbNetDevice> peer = CreateObject<QbbNetDevice>();
+        peerNode->AddDevice(peer);
+        Ptr<QbbChannel> channel = CreateObject<QbbChannel>();
+        port->Attach(channel);
+        peer->Attach(channel);
+        return port->GetIfIndex();
+    }
+};
+
 class LoadBalancingSenderTest : public TestCase
 {
   public:
@@ -2074,6 +2167,7 @@ PointToPointTestSuite::PointToPointTestSuite()
     AddTestCase(new UecTrimRecoveryTest, TestCase::Duration::QUICK);
     AddTestCase(new SpineIdentificationTest, TestCase::Duration::QUICK);
     AddTestCase(new LoadBalancingSwitchTest, TestCase::Duration::QUICK);
+    AddTestCase(new PortDownBufferTest, TestCase::Duration::QUICK);
     AddTestCase(new LoadBalancingSenderTest, TestCase::Duration::QUICK);
     AddTestCase(new AckPacketSeqHeaderTest, TestCase::Duration::QUICK);
     AddTestCase(new AckNamesPacketTest, TestCase::Duration::QUICK);

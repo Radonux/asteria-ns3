@@ -510,9 +510,23 @@ bool SwitchNode::SwitchReceiveFromDevice(Ptr<NetDevice> device, Ptr<Packet> pack
 	return true;
 }
 
-void SwitchNode::SwitchNotifyDequeue(uint32_t ifIndex, uint32_t qIndex, Ptr<Packet> p){
+uint32_t SwitchNode::ReleaseBuffer(uint32_t ifIndex, uint32_t qIndex, Ptr<const Packet> p){
 	FlowIdTag t;
 	p->PeekPacketTag(t);
+	const uint32_t inDev = t.GetFlowId();
+	m_mmu->RemoveFromIngressAdmission(inDev, qIndex, p->GetSize());
+	m_mmu->RemoveFromEgressAdmission(ifIndex, qIndex, p->GetSize());
+	m_bytes[inDev][ifIndex][qIndex] -= p->GetSize();
+	return inDev;
+}
+
+void SwitchNode::DiscardQueued(uint32_t ifIndex, uint32_t qIndex, Ptr<const Packet> p){
+	// Queue 0 is admitted unchecked, so it holds nothing to return.
+	if (qIndex != 0)
+		CheckAndSendResume(ReleaseBuffer(ifIndex, qIndex, p), qIndex);
+}
+
+void SwitchNode::SwitchNotifyDequeue(uint32_t ifIndex, uint32_t qIndex, Ptr<Packet> p){
 	// UEC 1.0.3 section 4.1.1: "A switch SHOULD NOT perform ECN marking on
 	// trimmed packets", so they keep the ECN bits of the original data packet.
 	// Section 4.1.3 likewise forbids editing headers beyond the outer IP header,
@@ -523,10 +537,7 @@ void SwitchNode::SwitchNotifyDequeue(uint32_t ifIndex, uint32_t qIndex, Ptr<Pack
 		isTrimmed = IsUetTrimmedDscp((buf[PppHeader::GetStaticSize() + 1] >> 2) & 0x3f);
 	}
 	if (qIndex != 0){
-		uint32_t inDev = t.GetFlowId();
-		m_mmu->RemoveFromIngressAdmission(inDev, qIndex, p->GetSize());
-		m_mmu->RemoveFromEgressAdmission(ifIndex, qIndex, p->GetSize());
-		m_bytes[inDev][ifIndex][qIndex] -= p->GetSize();
+		const uint32_t inDev = ReleaseBuffer(ifIndex, qIndex, p);
 		if (m_ecnEnabled && !isTrimmed){
 			bool egressCongested = m_mmu->ShouldSendCN(ifIndex, qIndex);
 			if (egressCongested){

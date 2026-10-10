@@ -86,6 +86,9 @@ private:
 	static uint32_t EcmpHash(const uint8_t* key, size_t len, uint32_t seed);
 	void CheckAndSendPfc(uint32_t inDev, uint32_t qIndex);
 	void CheckAndSendResume(uint32_t inDev, uint32_t qIndex);
+	// Return a queued packet's bytes to the buffer it was admitted against.
+	// Returns the port it arrived on, whose pause the caller may lift.
+	uint32_t ReleaseBuffer(uint32_t ifIndex, uint32_t qIndex, Ptr<const Packet> p);
 public:
 	Ptr<SwitchMmu> m_mmu;
 	TracedCallback<Ptr<const Packet>, uint32_t> m_traceDrop;
@@ -99,6 +102,9 @@ public:
 	void ClearTable();
 	bool SwitchReceiveFromDevice(Ptr<NetDevice> device, Ptr<Packet> packet, CustomHeader &ch);
 	void SwitchNotifyDequeue(uint32_t ifIndex, uint32_t qIndex, Ptr<Packet> p);
+	// A packet that leaves the egress queue of ifIndex without being sent,
+	// because the port went down under it.
+	void DiscardQueued(uint32_t ifIndex, uint32_t qIndex, Ptr<const Packet> p);
 
 	// for approximate calc in PINT
 	int logres_shift(int b, int l);

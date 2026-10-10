@@ -38,6 +38,7 @@
 #include "ns3/simulator.h"
 #include "ns3/point-to-point-channel.h"
 #include "ns3/qbb-channel.h"
+#include "ns3/switch-node.h"
 #include "ns3/flow-id-tag.h"
 #include "ns3/qbb-header.h"
 #include "ns3/error-model.h"
@@ -665,10 +666,12 @@ namespace ns3 {
 			// clean the queue
 			for (uint32_t i = 0; i < qCnt; i++)
 				m_paused[i] = false;
+			Ptr<SwitchNode> sw = DynamicCast<SwitchNode>(m_node);
 			while (1){
 				Ptr<Packet> p = m_queue->DequeueRR(m_paused);
 				if (!p)
 					 break;
+				sw->DiscardQueued(m_ifIndex, m_queue->GetLastQueue(), p);
 				m_traceDrop(p, m_queue->GetLastQueue());
 			}
 			// TODO: Notify switch that this link is down
