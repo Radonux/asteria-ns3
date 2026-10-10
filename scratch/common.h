@@ -117,11 +117,15 @@ std::string load_balancing = "ecmp";
 std::string path_selector = "ops";
 uint32_t reps_buffer_size = 8;
 uint64_t reps_freezing_timeout_ns = 10000000;
+uint32_t ue_ev_set_size = 256;
+double ue_saturation_fraction = 0.5;
 // The selectors each parameter belongs to. A parameter given under another
 // selector would be read by nothing, so it is refused.
 const std::map<std::string, std::set<std::string>> path_selector_parameter_owners = {
     {"REPS_BUFFER_SIZE", {"reps"}},
     {"REPS_FREEZING_TIMEOUT_NS", {"reps"}},
+    {"UE_EV_SET_SIZE", {"ue_oblivious", "ue_aware"}},
+    {"UE_SATURATION_FRACTION", {"ue_aware"}},
 };
 std::set<std::string> path_selector_parameters_given;
 // UEC 1.0.3 section 4.1.4.1 RECOMMENDS three traffic classes: TC_low for data,
@@ -585,6 +589,10 @@ uint32_t path_selector_value() {
     return static_cast<uint32_t>(PathSelectorKind::Ops);
   if (path_selector == "reps")
     return static_cast<uint32_t>(PathSelectorKind::Reps);
+  if (path_selector == "ue_oblivious")
+    return static_cast<uint32_t>(PathSelectorKind::UeOblivious);
+  if (path_selector == "ue_aware")
+    return static_cast<uint32_t>(PathSelectorKind::UeAware);
   return std::numeric_limits<uint32_t>::max();
 }
 
@@ -1083,6 +1091,10 @@ bool ReadConf(string network_configuration) {
       conf >> reps_buffer_size;
     } else if (key.compare("REPS_FREEZING_TIMEOUT_NS") == 0) {
       conf >> reps_freezing_timeout_ns;
+    } else if (key.compare("UE_EV_SET_SIZE") == 0) {
+      conf >> ue_ev_set_size;
+    } else if (key.compare("UE_SATURATION_FRACTION") == 0) {
+      conf >> ue_saturation_fraction;
 	} else if (key.compare("PACKET_TRIM_MODE") == 0) {
 	  conf >> packet_trim_mode;
 	} else if (key.compare("PACKET_TRIM_QUEUE") == 0) {
@@ -1347,7 +1359,7 @@ bool ReadConf(string network_configuration) {
     return false;
   }
   if (path_selector_value() == std::numeric_limits<uint32_t>::max()) {
-    std::cerr << "PATH_SELECTOR must be ops or reps\n";
+    std::cerr << "PATH_SELECTOR must be ops, reps, ue_oblivious or ue_aware\n";
     return false;
   }
   if (path_selector != "ops" &&
@@ -1833,6 +1845,9 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),
       rdmaHw->SetAttribute("RepsBufferSize", UintegerValue(reps_buffer_size));
       rdmaHw->SetAttribute("RepsFreezingTimeoutNs",
                            UintegerValue(reps_freezing_timeout_ns));
+      rdmaHw->SetAttribute("UeEvSetSize", UintegerValue(ue_ev_set_size));
+      rdmaHw->SetAttribute("UeSaturationFraction",
+                           DoubleValue(ue_saturation_fraction));
       // A PointerValue cannot carry null, which is the ECMP default.
       if (path_random)
         rdmaHw->SetAttribute("PathRandomVariable", PointerValue(path_random));
