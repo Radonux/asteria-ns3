@@ -1156,6 +1156,21 @@ bool ReadConf(string network_configuration) {
               << " requires SELECTIVE_RETRANSMISSION 1 and PACKET_TRIM_MODE ftd\n";
     return false;
   }
+  // CC_MODE 11 (NSCC) clocks its window on the acknowledgement of every data
+  // packet and times each from the packet's send record; under ECMP the
+  // receiver acknowledges cumulatively and the sender keeps no records.
+  if (cc_mode == 11 &&
+      load_balancing_value() == static_cast<uint32_t>(LoadBalancingMode::Ecmp)) {
+    std::cerr << "CC_MODE 11 (NSCC) requires LOAD_BALANCING ev_hash or "
+                 "spray_uniform, which acknowledge every data packet\n";
+    return false;
+  }
+  // HAS_WIN 0 hands a queue pair no bandwidth-delay product, and NSCC sizes
+  // its window from it.
+  if (cc_mode == 11 && has_win == 0) {
+    std::cerr << "CC_MODE 11 (NSCC) requires HAS_WIN 1\n";
+    return false;
+  }
   if (load_balancing_value() != static_cast<uint32_t>(LoadBalancingMode::Ecmp) &&
       data_loss_duration_ns != 0 &&
       data_loss_rng_stream == static_cast<uint64_t>(path_rng_stream)) {
