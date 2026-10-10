@@ -1,5 +1,7 @@
 #include "path-selector.h"
 #include "load-balancing.h"
+#include <ns3/assert.h>
+#include <utility>
 
 namespace ns3 {
 
@@ -103,6 +105,85 @@ void RepsSelector::OnTimeout(uint64_t nowNs){
 		return;
 	m_frozen = true;
 	m_exitFreezingNs = nowNs + m_freezingTimeoutNs;
+}
+
+EntropyRotation::EntropyRotation(Ptr<UniformRandomVariable> random,
+		uint32_t size)
+	: m_random(random), m_order(size), m_next(0)
+{
+	NS_ASSERT_MSG(size > 0 && size <= UINT16_MAX + 1,
+		"an entropy value is 16 bits");
+	for (uint32_t ev = 0; ev < size; ev++)
+		m_order[ev] = ev;
+	Shuffle();
+}
+
+uint16_t EntropyRotation::Next(){
+	if (m_next == m_order.size()){
+		Shuffle();
+		m_next = 0;
+	}
+	return m_order[m_next++];
+}
+
+uint32_t EntropyRotation::Size() const{
+	return m_order.size();
+}
+
+// Fisher-Yates over the whole set.
+void EntropyRotation::Shuffle(){
+	for (uint32_t i = m_order.size() - 1; i > 0; i--)
+		std::swap(m_order[i], m_order[m_random->GetInteger(0, i)]);
+}
+
+UeObliviousSelector::UeObliviousSelector(Ptr<UniformRandomVariable> random,
+		uint32_t size)
+	: m_rotation(random, size)
+{
+}
+
+uint16_t UeObliviousSelector::Choose(uint64_t){
+	return m_rotation.Next();
+}
+
+UeAwareSelector::UeAwareSelector(Ptr<UniformRandomVariable> random,
+		uint32_t size, double saturationFraction)
+	: m_rotation(random, size), m_marked(size, false), m_markedCount(0),
+	  m_saturationFraction(saturationFraction)
+{
+}
+
+uint16_t UeAwareSelector::Choose(uint64_t){
+	for (;;){
+		const uint16_t ev = m_rotation.Next();
+		if (!m_marked[ev])
+			return ev;
+		const bool saturated =
+			m_markedCount > m_saturationFraction * m_rotation.Size();
+		m_marked[ev] = false;
+		m_markedCount--;
+		if (saturated)
+			return ev;
+	}
+}
+
+void UeAwareSelector::OnAck(uint16_t path, bool marked, uint64_t){
+	if (marked)
+		Mark(path);
+}
+
+void UeAwareSelector::OnTrim(uint16_t path, bool lastHop, bool marked,
+		uint64_t){
+	if (!lastHop || marked)
+		Mark(path);
+}
+
+void UeAwareSelector::Mark(uint16_t ev){
+	NS_ASSERT_MSG(ev < m_marked.size(), "every send takes a value of the space");
+	if (m_marked[ev])
+		return;
+	m_marked[ev] = true;
+	m_markedCount++;
 }
 
 } /* namespace ns3 */

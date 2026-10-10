@@ -12,6 +12,8 @@ namespace ns3 {
 enum class PathSelectorKind : uint32_t {
 	Ops = 0,
 	Reps,
+	UeOblivious,
+	UeAware,
 };
 
 // A queue pair's choice of the path each of its data packets takes, and what
@@ -99,6 +101,59 @@ private:
 	uint64_t m_exitFreezingNs;
 	uint32_t m_explorePackets;
 	uint32_t m_exploreCounter;
+};
+
+// The entropy values 0 to size - 1, visited in a pseudo-random order that
+// uses each once before any repeats and is drawn anew for every pass (UEC
+// 1.0.3 section 3.6.16.3).
+class EntropyRotation {
+public:
+	EntropyRotation(Ptr<UniformRandomVariable> random, uint32_t size);
+	uint16_t Next();
+	uint32_t Size() const;
+
+private:
+	void Shuffle();
+
+	Ptr<UniformRandomVariable> m_random;
+	std::vector<uint16_t> m_order;
+	uint32_t m_next;
+};
+
+// UEC 1.0.3 section 3.6.16.3, oblivious multipath spraying: the values of an
+// entropy space in a pseudo-random order, whatever comes back.
+class UeObliviousSelector : public PathSelector {
+public:
+	UeObliviousSelector(Ptr<UniformRandomVariable> random, uint32_t size);
+	uint16_t Choose(uint64_t nowNs) override;
+
+private:
+	EntropyRotation m_rotation;
+};
+
+// UEC 1.0.3 section 3.6.16.4, path-aware multipath spraying with the
+// section's congestion bitmap: a value reported congested is marked, and the
+// rotation skips a marked value once, clearing its mark, unless more than a
+// fraction of the space is marked, when the signal no longer tells paths apart
+// and nothing is skipped.
+class UeAwareSelector : public PathSelector {
+public:
+	UeAwareSelector(Ptr<UniformRandomVariable> random, uint32_t size,
+		double saturationFraction);
+	uint16_t Choose(uint64_t nowNs) override;
+	void OnAck(uint16_t path, bool marked, uint64_t nowNs) override;
+	// A trim before the last hop reports the path congested; a last-hop trim
+	// only through its echoed mark, the destination's own link being on every
+	// path (UEC 1.0.3 section 3.6.12.3).
+	void OnTrim(uint16_t path, bool lastHop, bool marked, uint64_t nowNs) override;
+
+private:
+	void Mark(uint16_t ev);
+
+	EntropyRotation m_rotation;
+	std::vector<bool> m_marked;
+	uint32_t m_markedCount;
+	double m_saturationFraction;
 };
 
 } /* namespace ns3 */

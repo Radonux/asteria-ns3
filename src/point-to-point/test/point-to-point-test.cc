@@ -2008,6 +2008,108 @@ class RepsSelectorTest : public TestCase
     }
 };
 
+class UeSelectorTest : public TestCase
+{
+  public:
+    UeSelectorTest()
+        : TestCase("UEC spraying uses every value once per pass and skips a marked one once")
+    {
+    }
+
+    void DoRun() override
+    {
+        Rotation();
+        SkipOnce();
+        Saturation(4, 4);
+        Saturation(5, 0);
+    }
+
+  private:
+    static constexpr uint32_t kValues = 16;
+
+    // Oblivious spraying: each pass is a permutation of the space, drawn anew.
+    void Rotation()
+    {
+        UeObliviousSelector oblivious(SelectorStream(), kValues);
+        std::vector<std::vector<uint16_t>> passes(4);
+        for (auto& pass : passes)
+        {
+            for (uint32_t i = 0; i < kValues; ++i)
+            {
+                pass.push_back(oblivious.Choose(0));
+            }
+            std::vector<uint16_t> values(pass);
+            std::sort(values.begin(), values.end());
+            for (uint32_t ev = 0; ev < kValues; ++ev)
+            {
+                NS_TEST_EXPECT_MSG_EQ(values[ev], ev, "a pass uses every value once");
+            }
+        }
+        std::set<std::vector<uint16_t>> orders(passes.begin(), passes.end());
+        NS_TEST_EXPECT_MSG_EQ(orders.size(), passes.size(), "every pass has its own order");
+    }
+
+    // Path-aware spraying rotates as oblivious spraying does, on the same
+    // stream, and leaves out a marked value the first time it comes round.
+    void SkipOnce()
+    {
+        UeAwareSelector aware(SelectorStream(), kValues, 0.5);
+        EntropyRotation order(SelectorStream(), kValues);
+        std::vector<uint16_t> expected;
+        for (uint32_t i = 0; i < 3 * kValues; ++i)
+        {
+            expected.push_back(order.Next());
+        }
+        // Marked by an acknowledgement, a trim before the last hop and a
+        // marked last-hop trim; an unmarked acknowledgement and an unmarked
+        // last-hop trim say nothing.
+        const uint16_t skipped[] = {expected[3], expected[5], expected[9]};
+        aware.OnAck(skipped[0], true, 0);
+        aware.OnTrim(skipped[1], false, false, 0);
+        aware.OnTrim(skipped[2], true, true, 0);
+        aware.OnAck(expected[1], false, 0);
+        aware.OnTrim(expected[2], true, false, 0);
+        for (uint32_t position : {9, 5, 3})
+        {
+            expected.erase(expected.begin() + position);
+        }
+        std::vector<uint16_t> sent;
+        for (uint32_t i = 0; i < expected.size(); ++i)
+        {
+            sent.push_back(aware.Choose(0));
+        }
+        NS_TEST_EXPECT_MSG_EQ((sent == expected),
+                              true,
+                              "a marked value is skipped once, and nothing else is");
+    }
+
+    // Eight values, half of them the saturation point, the marked ones the
+    // first the rotation reaches. The first send takes the first unmarked
+    // value unless more than half are marked, when it takes the first marked
+    // one; with that one's mark spent, the second send skips the rest.
+    void Saturation(uint32_t marked, uint32_t firstSent)
+    {
+        constexpr uint32_t kSmall = 8;
+        UeAwareSelector aware(SelectorStream(), kSmall, 0.5);
+        EntropyRotation order(SelectorStream(), kSmall);
+        std::vector<uint16_t> pass;
+        for (uint32_t i = 0; i < kSmall; ++i)
+        {
+            pass.push_back(order.Next());
+        }
+        for (uint32_t i = 0; i < marked; ++i)
+        {
+            aware.OnAck(pass[i], true, 0);
+        }
+        // Marking a marked value again marks nothing more.
+        aware.OnAck(pass[0], true, 0);
+        const uint16_t first = aware.Choose(0);
+        const uint16_t second = aware.Choose(0);
+        NS_TEST_EXPECT_MSG_EQ(first, pass[firstSent], "skipping stops above saturation");
+        NS_TEST_EXPECT_MSG_EQ(second, pass[5], "and resumes at saturation");
+    }
+};
+
 class SpineArrivalsTest : public TestCase
 {
   public:
@@ -3019,6 +3121,7 @@ PointToPointTestSuite::PointToPointTestSuite()
     AddTestCase(new AckNamesPacketTest, TestCase::Duration::QUICK);
     AddTestCase(new PathSelectorHooksTest, TestCase::Duration::QUICK);
     AddTestCase(new RepsSelectorTest, TestCase::Duration::QUICK);
+    AddTestCase(new UeSelectorTest, TestCase::Duration::QUICK);
     AddTestCase(new SpineArrivalsTest, TestCase::Duration::QUICK);
     AddTestCase(new ReorderGapTest, TestCase::Duration::QUICK);
     AddTestCase(new OutstandingPacketsModelTest, TestCase::Duration::QUICK);

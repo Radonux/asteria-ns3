@@ -83,6 +83,8 @@ public:
 	uint32_t m_pathSelectorKind;
 	uint32_t m_repsBufferSize;
 	uint64_t m_repsFreezingTimeoutNs;
+	uint32_t m_ueEvSetSize;
+	double m_ueSaturationFraction;
 	// Indexed by carrying spine; kept under SprayUniform, where the
 	// identification names one.
 	std::vector<SpineArrivals> m_spineArrivals;

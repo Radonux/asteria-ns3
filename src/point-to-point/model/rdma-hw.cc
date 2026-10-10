@@ -145,12 +145,14 @@ TypeId RdmaHw::GetTypeId (void)
 				MakePointerChecker<UniformRandomVariable>())
 		.AddAttribute("PathSelector",
 				"Under LoadBalancing 1, what chooses each data packet's entropy "
-				"value: 0=OPS, a fresh value drawn per packet; 1=REPS.",
+				"value: 0=OPS, a fresh value drawn per packet; 1=REPS; 2=UEC "
+				"oblivious spraying; 3=UEC path-aware spraying with the "
+				"congestion bitmap.",
 				UintegerValue(static_cast<uint32_t>(PathSelectorKind::Ops)),
 				MakeUintegerAccessor(&RdmaHw::m_pathSelectorKind),
 				MakeUintegerChecker<uint32_t>(
 					static_cast<uint32_t>(PathSelectorKind::Ops),
-					static_cast<uint32_t>(PathSelectorKind::Reps)))
+					static_cast<uint32_t>(PathSelectorKind::UeAware)))
 		.AddAttribute("RepsBufferSize",
 				"REPS: the entries of the circular buffer of entropy values to "
 				"reuse. Default 8, REPS section 3.1.",
@@ -163,6 +165,19 @@ TypeId RdmaHw::GetTypeId (void)
 				UintegerValue(10000000),
 				MakeUintegerAccessor(&RdmaHw::m_repsFreezingTimeoutNs),
 				MakeUintegerChecker<uint64_t>())
+		.AddAttribute("UeEvSetSize",
+				"UEC spraying: the entropy values a queue pair sprays over. "
+				"Default 256, UEC 1.0.3 section 3.6.16.3's typical size.",
+				UintegerValue(256),
+				MakeUintegerAccessor(&RdmaHw::m_ueEvSetSize),
+				MakeUintegerChecker<uint32_t>(1, UINT16_MAX + 1))
+		.AddAttribute("UeSaturationFraction",
+				"UEC path-aware spraying: with more than this fraction of the "
+				"values marked congested, none is skipped. Default 0.5, UEC "
+				"1.0.3 section 3.6.16.4.",
+				DoubleValue(0.5),
+				MakeDoubleAccessor(&RdmaHw::m_ueSaturationFraction),
+				MakeDoubleChecker<double>(0, 1))
 		.AddAttribute("EwmaGain",
 				"Control gain parameter which determines the level of rate decrease",
 				DoubleValue(1.0 / 16),
@@ -1600,6 +1615,14 @@ void RdmaHw::StartPathSelection(Ptr<RdmaQueuePair> qp, uint64_t bdpBytes){
 		// its exploration from the bandwidth-delay product.
 		qp->m_pathSelector = std::make_unique<RepsSelector>(m_pathRandom,
 			m_repsBufferSize, m_repsFreezingTimeoutNs, bdpBytes / m_mtu);
+		break;
+	case PathSelectorKind::UeOblivious:
+		qp->m_pathSelector =
+			std::make_unique<UeObliviousSelector>(m_pathRandom, m_ueEvSetSize);
+		break;
+	case PathSelectorKind::UeAware:
+		qp->m_pathSelector = std::make_unique<UeAwareSelector>(m_pathRandom,
+			m_ueEvSetSize, m_ueSaturationFraction);
 		break;
 	}
 }
