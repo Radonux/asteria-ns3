@@ -85,10 +85,12 @@ uint64_t NsccWindow::BaseRtt() const{
 }
 
 void NsccWindow::OnAck(uint32_t bytes, bool marked, uint64_t rtt,
-		uint64_t inflight, uint64_t now){
+		uint64_t inflight, uint64_t now, uint32_t rcvCwndPend){
 	m_bytes_ignored += bytes;
 	m_received_bytes += bytes;
 	m_achieved_bytes += bytes;
+	const bool increase = !ApplyCwndPenalty(rcvCwndPend, bytes, inflight) &&
+		!marked;
 	if (rtt == kNoRtt)
 		return;
 	UpdateBaseRtt(rtt);
@@ -96,16 +98,16 @@ void NsccWindow::OnAck(uint32_t bytes, bool marked, uint64_t rtt,
 	UpdateDelay(delay, now);
 	if (QuickAdapt(false, marked, delay, inflight, now))
 		return;
-	if (!marked && delay >= m_target_qdelay){
+	if (increase && delay >= m_target_qdelay){
 		// fair_increase: the same bytes for every competing window, so a small
 		// window grows by a larger fraction of itself.
 		m_inc_bytes += m_fi * bytes;
-	}else if (!marked){
+	}else if (increase){
 		// proportional_increase, which fast_increase overrides on a clear path.
 		FastIncrease(bytes, delay);
 		if (!m_increase_mode)
 			m_inc_bytes += m_alpha * bytes * (m_target_qdelay - delay);
-	}else if (delay >= m_target_qdelay){
+	}else if (marked && delay >= m_target_qdelay){
 		MultiplicativeDecrease(now);
 	}
 	// A mark at a delay below the target leaves the window alone: the queue
@@ -138,6 +140,15 @@ void NsccWindow::OnTrim(uint32_t bytes, uint64_t rtt, uint64_t inflight,
 void NsccWindow::OnLoss(uint64_t bytes){
 	Shrink(bytes);
 	m_bytes_ignored += bytes;
+}
+
+bool NsccWindow::ApplyCwndPenalty(uint32_t rcvCwndPend, uint32_t bytes,
+		uint64_t inflight){
+	if (rcvCwndPend == 0)
+		return false;
+	m_cwnd = std::min(m_cwnd, inflight);
+	Shrink((static_cast<uint64_t>(rcvCwndPend) * bytes) >> 7);
+	return true;
 }
 
 bool NsccWindow::QuickAdapt(bool loss, bool marked, uint64_t delay,

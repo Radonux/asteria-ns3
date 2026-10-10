@@ -2259,7 +2259,7 @@ void RdmaHw::HandleAckNscc(Ptr<RdmaQueuePair> qp, uint64_t seq, uint16_t path,
 	const uint64_t rtt = AnswerRtt(qp->m_outstanding, packet);
 	const uint64_t lost = qp->AcknowledgePacket(seq, path);
 	qp->nscc.OnAck(bytes, marked, rtt, qp->GetOnTheFly(),
-		Simulator::Now().GetNanoSeconds());
+		Simulator::Now().GetNanoSeconds(), 0);
 	if (lost > 0)
 		qp->nscc.OnLoss(lost);
 	ApplyNsccWindow(qp);

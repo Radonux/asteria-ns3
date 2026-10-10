@@ -42,9 +42,10 @@ public:
 	uint64_t BaseRtt() const;
 	// NSCC.OnACK for an acknowledgement of bytes that left the network, with
 	// the answered packet's mark and round trip; inflight is what is still
-	// outstanding once those bytes are not.
+	// outstanding once those bytes are not. rcvCwndPend is the destination's
+	// Rcv_Cwnd_Pend (section 3.6.13.2), 0 to 127, with Restore_Cwnd clear.
 	void OnAck(uint32_t bytes, bool marked, uint64_t rtt, uint64_t inflight,
-		uint64_t now);
+		uint64_t now, uint32_t rcvCwndPend);
 	// NSCC.OnNACK for a trim of bytes, inflight as for OnAck.
 	void OnTrim(uint32_t bytes, uint64_t rtt, uint64_t inflight, uint64_t now);
 	// NSCC.OnInferredLoss for bytes declared lost by a timeout or by an
@@ -52,6 +53,9 @@ public:
 	void OnLoss(uint64_t bytes);
 
 private:
+	// apply_cwnd_penalty: true while the destination holds the window down.
+	bool ApplyCwndPenalty(uint32_t rcvCwndPend, uint32_t bytes,
+		uint64_t inflight);
 	bool QuickAdapt(bool loss, bool marked, uint64_t delay, uint64_t inflight,
 		uint64_t now);
 	void FastIncrease(uint32_t bytes, uint64_t delay);

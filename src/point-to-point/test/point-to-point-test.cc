@@ -3031,7 +3031,7 @@ class NsccPath
     {
         for (uint32_t i = 0; i < count; ++i)
         {
-            window.OnAck(kMtu, marked, kBaseRtt + delay, inflight, now);
+            window.OnAck(kMtu, marked, kBaseRtt + delay, inflight, now, 0);
         }
     }
 };
@@ -3093,7 +3093,7 @@ class NsccLightMarkTest : public TestCase
         // past the target, so only the answered packet's own delay can spare
         // the window from the marks that follow it.
         uint64_t now = 2 * NsccPath::kBaseRtt;
-        window.OnAck(NsccPath::kMtu, false, NsccPath::kBaseRtt + 3 * NsccPath::kTarget, 0, now);
+        window.OnAck(NsccPath::kMtu, false, NsccPath::kBaseRtt + 3 * NsccPath::kTarget, 0, now, 0);
         const uint64_t before = window.Cwnd();
         for (uint32_t i = 0; i < 6; ++i)
         {
@@ -3101,12 +3101,13 @@ class NsccLightMarkTest : public TestCase
                          true,
                          NsccPath::kBaseRtt + NsccPath::kTarget - 1,
                          0,
-                         ++now);
+                         ++now,
+                         0);
             NS_TEST_EXPECT_MSG_EQ(window.Cwnd(),
                                   before,
                                   "a mark one nanosecond under the target is left to load balancing");
         }
-        window.OnAck(NsccPath::kMtu, true, NsccPath::kBaseRtt + NsccPath::kTarget, 0, ++now);
+        window.OnAck(NsccPath::kMtu, true, NsccPath::kBaseRtt + NsccPath::kTarget, 0, ++now, 0);
         NS_TEST_EXPECT_MSG_LT(window.Cwnd(), before, "a mark at the target decreases");
     }
 };
@@ -3368,7 +3369,7 @@ class NsccBoundsTest : public TestCase
             {
                 const bool marked = congested ? random() % 2 == 0 : random() % 50 == 0;
                 const uint64_t delay = congested ? random() % 30000 : random() % 1500;
-                window.OnAck(kMtu, marked, NsccPath::kBaseRtt + delay, inflight, now);
+                window.OnAck(kMtu, marked, NsccPath::kBaseRtt + delay, inflight, now, 0);
             }
             NS_TEST_ASSERT_MSG_GT_OR_EQ(window.Cwnd(), kMtu, "the window holds a packet");
             NS_TEST_ASSERT_MSG_LT_OR_EQ(window.Cwnd(), window.MaxWnd(), "the window stays under MaxWnd");
@@ -4321,6 +4322,46 @@ class SpineScoresDrawTest : public TestCase
     }
 };
 
+class NsccReceiverPenaltyTest : public TestCase
+{
+  public:
+    NsccReceiverPenaltyTest()
+        : TestCase("NSCC follows a destination's Rcv_Cwnd_Pend: the window falls with every "
+                   "acknowledgement and does not grow")
+    {
+    }
+
+    void DoRun() override
+    {
+        constexpr uint64_t kNow = 2 * NsccPath::kBaseRtt;
+        constexpr uint64_t kWindow = 1000000;
+        constexpr uint64_t kInflight = 800000;
+        NsccWindow window = NsccPath::Started(NsccPath::WithoutEta());
+        window.OnLoss(NsccPath::kCeiling - kWindow);
+        // Half a packet per packet acknowledged, from the bytes in flight.
+        window.OnAck(NsccPath::kMtu, false, NsccPath::kBaseRtt + 2000, kInflight, kNow, 64);
+        NS_TEST_EXPECT_MSG_EQ(window.Cwnd(),
+                              kInflight - NsccPath::kMtu / 2,
+                              "the window drops to what is in flight less pend/128 of the bytes");
+        for (uint32_t i = 0; i < 8; ++i)
+        {
+            window.OnAck(NsccPath::kMtu, false, NsccPath::kBaseRtt + 2000, kInflight, kNow, 64);
+        }
+        NS_TEST_EXPECT_MSG_EQ(window.Cwnd(),
+                              kInflight - 9 * NsccPath::kMtu / 2,
+                              "and grows by neither increase while held down");
+        const uint64_t held = window.Cwnd();
+        for (uint32_t i = 0; i < 9; ++i)
+        {
+            window.OnAck(NsccPath::kMtu, false, NsccPath::kBaseRtt + 2000, kInflight, kNow, 0);
+        }
+        NS_TEST_EXPECT_MSG_GT(window.Cwnd(), held, "with the penalty gone it grows again");
+        NsccWindow floor = NsccPath::Started(NsccPath::WithoutEta());
+        floor.OnAck(NsccPath::kMtu, false, NsccPath::kBaseRtt, 0, kNow, 127);
+        NS_TEST_EXPECT_MSG_EQ(floor.Cwnd(), NsccPath::kMtu, "the window keeps one packet");
+    }
+};
+
 class PointToPointTestSuite : public TestSuite
 {
   public:
@@ -4382,6 +4423,7 @@ PointToPointTestSuite::PointToPointTestSuite()
     AddTestCase(new SpineScoresFloorTest, TestCase::Duration::QUICK);
     AddTestCase(new SpineScoresFlapTest, TestCase::Duration::QUICK);
     AddTestCase(new SpineScoresDrawTest, TestCase::Duration::QUICK);
+    AddTestCase(new NsccReceiverPenaltyTest, TestCase::Duration::QUICK);
 }
 
 static PointToPointTestSuite g_pointToPointTestSuite; //!< The testsuite
