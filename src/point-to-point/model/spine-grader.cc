@@ -96,12 +96,17 @@ uint32_t SpineGrader::LastIntervalLastHopTrims() const{
 
 void SpineGrader::Close(uint64_t nowNs){
 	const uint32_t spines = m_spines.size();
-	std::array<double, SpineReport::kMaxSpines> arrivals{}, marks{}, trims{},
-		delays{};
+	std::array<double, SpineReport::kMaxSpines> marks{}, trims{}, delays{};
 	for (uint32_t k = 0; k < spines; k++){
 		Spine &spine = m_spines[k];
-		const SpineInterval &counted = spine.counting;
-		arrivals[k] = counted.arrivals;
+		SpineInterval &counted = spine.counting;
+		spine.windowArrivals += counted.arrivals;
+		if (counted.moved > 0 && !spine.held){
+			// Counted afresh from the hold, so that the arrivals before it
+			// cannot release it.
+			spine.held = true;
+			spine.windowArrivals = 0;
+		}
 		if (counted.arrivals > 0){
 			spine.markFraction.Add(
 				static_cast<double>(counted.marked) / counted.arrivals,
@@ -120,7 +125,7 @@ void SpineGrader::Close(uint64_t nowNs){
 		trims[k] = spine.trimFraction.Value();
 		delays[k] = spine.delayNs.Value();
 	}
-	const double medianArrivals = Median(arrivals);
+	JudgeWindow();
 	// Spines alike all earn the top grade against their median, so the
 	// median reference, unlike a rank, has no loser on a healthy fabric.
 	const bool median = m_parameters.reference == GradeReference::Median;
@@ -131,14 +136,6 @@ void SpineGrader::Close(uint64_t nowNs){
 	for (uint32_t k = 0; k < spines; k++){
 		Spine &spine = m_spines[k];
 		SpineInterval &counted = spine.counting;
-		// A spine the report in force graded 0 is sent next to nothing, so
-		// its arrivals are no evidence of absence.
-		counted.absent = medianArrivals >= m_parameters.absenceMinimumMedian &&
-			m_report.Grade(k) > 0 &&
-			counted.arrivals < m_parameters.absenceFractionOfMedian * medianArrivals;
-		if (counted.moved > 0 || counted.absent)
-			spine.heldUntilNs = m_intervalEndNs +
-				m_parameters.holdDownIntervals * m_parameters.intervalNs;
 		// A trimmed packet and a marked one both met a queue past a threshold,
 		// so whichever kind stands out more is the spine's congestion; adding
 		// them would count one queue twice.
@@ -150,7 +147,7 @@ void SpineGrader::Close(uint64_t nowNs){
 		counted.markFraction = marks[k];
 		counted.trimFraction = trims[k];
 		counted.delayNs = delays[k];
-		counted.held = nowNs < spine.heldUntilNs;
+		counted.held = spine.held;
 		m_report.SetGrade(k, counted.held ? 0 : earned);
 		m_lastInterval[k] = counted;
 		counted = SpineInterval{};
@@ -161,6 +158,32 @@ void SpineGrader::Close(uint64_t nowNs){
 	m_report.sequence++;
 	m_lastIntervalLastHopTrims = m_lastHopTrims;
 	m_lastHopTrims = 0;
+}
+
+void SpineGrader::JudgeWindow(){
+	const uint32_t spines = m_spines.size();
+	std::array<double, SpineReport::kMaxSpines> arrivals{};
+	for (uint32_t k = 0; k < spines; k++)
+		arrivals[k] = m_spines[k].windowArrivals;
+	const double median = Median(arrivals);
+	if (median < m_parameters.absenceMinimumMedian)
+		return;
+	// A held spine is sent only the exploration floor, a small share of what
+	// the median spine is sent; that share, and not the median's, is what its
+	// arrivals return to while its path works.
+	const double release = m_parameters.releaseFractionOfFloor *
+		m_parameters.floorShareOfMedian * median;
+	for (uint32_t k = 0; k < spines; k++){
+		Spine &spine = m_spines[k];
+		if (spine.held){
+			spine.held = spine.windowArrivals < release;
+		}else{
+			spine.counting.absent = spine.windowArrivals <
+				m_parameters.absenceFractionOfMedian * median;
+			spine.held = spine.counting.absent;
+		}
+		spine.windowArrivals = 0;
+	}
 }
 
 uint8_t SpineGrader::Earned(double congestionCost, double delayCostNs) const{

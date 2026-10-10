@@ -3623,9 +3623,10 @@ class GraderFixture
         parameters.delayThresholdsNs[1] = hw->m_sprayDelayThreshold2BaseRtts * 10000;
         parameters.delayThresholdsNs[2] = hw->m_sprayDelayThreshold3BaseRtts * 10000;
         parameters.reference = static_cast<SpineGrader::GradeReference>(hw->m_sprayGradeReference);
-        parameters.holdDownIntervals = hw->m_sprayHoldDownIntervals;
         parameters.absenceFractionOfMedian = hw->m_sprayAbsenceFractionOfMedian;
         parameters.absenceMinimumMedian = hw->m_sprayAbsenceMinimumMedian;
+        parameters.releaseFractionOfFloor = hw->m_sprayReleaseFractionOfFloor;
+        parameters.floorShareOfMedian = hw->m_sprayEpsilon;
         return parameters;
     }
 
@@ -3725,7 +3726,7 @@ class SpineGradeTest : public TestCase
   public:
     SpineGradeTest()
         : TestCase("A spine's grade follows absolute thresholds, marks before delay, a move "
-                   "holds it down for a while, and the edge bit needs every spine")
+                   "holds it until its arrivals return, and the edge bit needs every spine")
     {
     }
 
@@ -3799,71 +3800,67 @@ class SpineGradeTest : public TestCase
                                   "the delay is the mean excess over the spine's least");
     }
 
+    // A moved packet holds its requested spine until arrivals on that spine
+    // release it; a trim grades its spine for its interval and holds nothing.
     void HoldDown()
     {
-        const SpineGrader::Parameters parameters = GraderFixture::Defaults();
-        const uint32_t hold = parameters.holdDownIntervals;
-        NS_TEST_ASSERT_MSG_GT(hold, 1, "the hold lasts more than one interval");
-        SpineGrader grader(parameters);
+        SpineGrader grader(GraderFixture::Defaults());
         const std::vector<double> clean(GraderFixture::kSpines, 0.0);
         GraderFixture::Interval(grader, 0, clean);
-        // Interval 1: a trim on spine 4 before the last hop, which grades it
-        // by its trimmed fraction and holds nothing, one at the last hop on
-        // spine 6, and a packet requested on spine 5 carried by 7.
+        // Interval 1: a trim on spine 4 before the last hop, one at the last
+        // hop on spine 6, and a packet requested on spine 5 carried by 7.
         grader.Advance(GraderFixture::kInterval);
         grader.OnTrim(4, false);
         grader.OnTrim(6, true);
         grader.OnArrival(5, 7, false, 0);
-        for (uint32_t interval = 1; interval < 1 + hold + 2; ++interval)
+        grader.Advance(2 * GraderFixture::kInterval);
+        for (uint32_t spine = 0; spine < GraderFixture::kSpines; ++spine)
         {
-            if (interval > 1)
+            NS_TEST_EXPECT_MSG_EQ(uint32_t(grader.Report().Grade(spine)),
+                                  (spine == 4 || spine == 5) ? 0u : 3u,
+                                  "a move holds its spine and a trim grades its own");
+            NS_TEST_EXPECT_MSG_EQ(grader.LastInterval()[spine].held,
+                                  (spine == 5),
+                                  "the interval records the hold");
+        }
+        NS_TEST_EXPECT_MSG_EQ(grader.Report().edgeCongested,
+                              true,
+                              "a last-hop trim sets the edge bit for its interval");
+        // A move in an interval the spine also had arrivals in holds it all
+        // the same: arrivals before the hold do not count towards its release.
+        SpineGrader busy(GraderFixture::Defaults());
+        busy.Advance(0);
+        for (uint32_t spine = 0; spine < GraderFixture::kSpines; ++spine)
+        {
+            for (uint32_t i = 0; i < 100; ++i)
             {
-                GraderFixture::Interval(grader, interval, clean);
+                busy.OnArrival(spine, spine, false, 0);
             }
-            else
-            {
-                grader.Advance(2 * GraderFixture::kInterval);
-            }
-            const bool held = interval < 1 + hold;
+        }
+        busy.OnArrival(5, 7, false, 0);
+        busy.Advance(GraderFixture::kInterval);
+        NS_TEST_EXPECT_MSG_EQ(busy.LastInterval()[5].held, true, "a move holds a busy spine");
+        // Spine 5 silent while the others arrive stays held; its arrivals
+        // returning release it.
+        for (uint32_t interval = 2; interval < 12; ++interval)
+        {
+            grader.Advance(interval * GraderFixture::kInterval);
             for (uint32_t spine = 0; spine < GraderFixture::kSpines; ++spine)
             {
-                const bool heldSpine = held && spine == 5;
-                const bool trimmed = interval == 1 && spine == 4;
-                NS_TEST_EXPECT_MSG_EQ(uint32_t(grader.Report().Grade(spine)),
-                                      heldSpine || trimmed ? 0u : 3u,
-                                      "a move holds its spine at 0 for the hold's intervals, "
-                                      "and a trim grades its spine for its interval");
-                NS_TEST_EXPECT_MSG_EQ(grader.LastInterval()[spine].held,
-                                      heldSpine,
-                                      "the interval records the hold");
+                for (uint32_t i = 0; i < (spine == 5 && interval < 10 ? 0 : 100); ++i)
+                {
+                    grader.OnArrival(spine, spine, false, 0);
+                }
             }
-            NS_TEST_EXPECT_MSG_EQ(grader.Report().edgeCongested,
-                                  (interval == 1),
-                                  "a last-hop trim sets the edge bit for its interval");
+            grader.Advance((interval + 1) * GraderFixture::kInterval);
+            NS_TEST_EXPECT_MSG_EQ(grader.LastInterval()[5].held,
+                                  (interval < 10),
+                                  "the hold lasts until the spine's arrivals return");
+            NS_TEST_EXPECT_MSG_EQ(uint32_t(grader.Report().Grade(4)),
+                                  3u,
+                                  "the trimmed spine grades 3 again without trims");
+            NS_TEST_EXPECT_MSG_EQ(grader.Report().edgeCongested, false, "and the edge clears");
         }
-        // A move during the hold extends it from its own interval.
-        SpineGrader again(parameters);
-        again.OnArrival(2, 7, false, 0);
-        again.Advance(GraderFixture::kInterval);
-        again.Advance(2 * GraderFixture::kInterval - 1);
-        again.OnArrival(2, 7, false, 0);
-        for (uint32_t interval = 1; interval < hold + 1; ++interval)
-        {
-            again.Advance((interval + 1) * GraderFixture::kInterval);
-            NS_TEST_EXPECT_MSG_EQ(uint32_t(again.Report().Grade(2)),
-                                  0u,
-                                  "a second move extends the hold");
-        }
-        again.Advance((hold + 2) * GraderFixture::kInterval);
-        NS_TEST_EXPECT_MSG_EQ(uint32_t(again.Report().Grade(2)), 3u, "and the hold ends");
-        // An idle stretch counts against the hold like any other interval.
-        SpineGrader idle(parameters);
-        idle.OnArrival(1, 7, false, 0);
-        idle.Advance(GraderFixture::kInterval);
-        NS_TEST_EXPECT_MSG_EQ(uint32_t(idle.Report().Grade(1)), 0u, "the move holds its spine");
-        idle.Advance((hold + 1) * GraderFixture::kInterval);
-        NS_TEST_EXPECT_MSG_EQ(uint32_t(idle.Report().Grade(1)), 3u, "idle intervals run it out");
-        NS_TEST_EXPECT_MSG_EQ(uint32_t(idle.Report().sequence), 2u, "one report per closing");
     }
 
     void Edge()
@@ -4005,23 +4002,24 @@ class SpineAbsenceTest : public TestCase
 {
   public:
     SpineAbsenceTest()
-        : TestCase("A spine whose arrivals stop while the others' continue is held down until "
-                   "they resume, and binomial variation never holds one")
+        : TestCase("A spine whose arrivals stop while the others' continue is held until its "
+                   "floor's arrivals return, judged over enough arrivals, and binomial "
+                   "variation never holds one")
     {
     }
 
     void DoRun() override
     {
-        Collapse();
+        Dead();
+        Returns();
         Healthy();
         Sparse();
         GradedDown();
     }
 
   private:
-    // 300 arrivals per interval, each over a spine drawn uniformly, the
-    // fixture's rate at a report interval of two base RTTs; spine 5 gets none
-    // in [from, to).
+    // perInterval arrivals per interval, each over a spine drawn uniformly;
+    // spine 5 gets none in [from, to).
     static void Interval(SpineGrader& grader,
                          std::mt19937& random,
                          uint32_t interval,
@@ -4043,17 +4041,23 @@ class SpineAbsenceTest : public TestCase
         grader.Advance((interval + 1) * GraderFixture::kInterval);
     }
 
-    void Collapse()
+    // 300 arrivals per interval, the kill fixture's rate at a report interval
+    // of two base RTTs; spine 5 silent from interval 10 for 50 intervals.
+    void Dead()
     {
-        const SpineGrader::Parameters parameters = GraderFixture::Defaults();
-        const uint32_t hold = parameters.holdDownIntervals;
-        SpineGrader grader(parameters);
+        SpineGrader grader(GraderFixture::Defaults());
         std::mt19937 random(11);
-        std::vector<uint8_t> grades;
+        uint32_t holds = 0;
+        bool held = false;
         for (uint32_t interval = 0; interval < 60; ++interval)
         {
-            Interval(grader, random, interval, 300, 10, 30);
-            grades.push_back(grader.Report().Grade(5));
+            Interval(grader, random, interval, 300, 10, 60);
+            const bool now = grader.LastInterval()[5].held;
+            holds += now && !held;
+            held = now;
+            NS_TEST_EXPECT_MSG_EQ(uint32_t(grader.Report().Grade(5)),
+                                  (interval < 10) ? 3u : 0u,
+                                  "a silent spine is held from its first silent interval on");
             for (uint32_t spine = 0; spine < GraderFixture::kSpines; ++spine)
             {
                 if (spine != 5)
@@ -4064,37 +4068,60 @@ class SpineAbsenceTest : public TestCase
                 }
             }
         }
-        for (uint32_t interval = 0; interval < 10; ++interval)
+        NS_TEST_EXPECT_MSG_EQ(holds, 1, "and held once");
+    }
+
+    // Arrivals that return release the spine within two intervals, whether at
+    // a top-graded spine's rate or at about the exploration floor's, one per
+    // interval against a median of 43.
+    void Returns()
+    {
+        for (const uint32_t returned : {300u, 6u})
         {
-            NS_TEST_EXPECT_MSG_EQ(uint32_t(grades[interval]),
-                                  3u,
-                                  "a spine with arrivals is not held");
-        }
-        NS_TEST_EXPECT_MSG_EQ(grader.LastInterval()[5].absent, false, "nor marked absent");
-        NS_TEST_EXPECT_MSG_EQ(uint32_t(grades[10]),
-                              0u,
-                              "a spine is held in the first interval its arrivals stop");
-        // Held for the hold's intervals, released for one, in which the
-        // report in force grades it 0 so its silence is not judged, then held
-        // again as long as it stays silent.
-        for (uint32_t interval = 10; interval < 30; ++interval)
-        {
-            const bool released = (interval - 10) % (hold + 1) == hold;
-            NS_TEST_EXPECT_MSG_EQ(uint32_t(grades[interval]),
-                                  released ? 3u : 0u,
-                                  "a silent spine is held but for one interval in hold + 1");
-        }
-        uint32_t resumed = 30;
-        while (grades[resumed] == 0)
-        {
-            ++resumed;
-        }
-        NS_TEST_EXPECT_MSG_LT_OR_EQ(resumed,
-                                    30 + hold,
-                                    "the hold ends on schedule once arrivals resume");
-        for (uint32_t interval = resumed; interval < grades.size(); ++interval)
-        {
-            NS_TEST_EXPECT_MSG_EQ(uint32_t(grades[interval]), 3u, "and stays ended");
+            SpineGrader grader(GraderFixture::Defaults());
+            std::mt19937 random(14);
+            std::uniform_int_distribution<uint32_t> spine(0, GraderFixture::kSpines - 2);
+            uint32_t released = UINT32_MAX;
+            for (uint32_t interval = 0; interval < 40; ++interval)
+            {
+                grader.Advance(interval * GraderFixture::kInterval);
+                // 300 arrivals over the other seven spines, and spine 7's share
+                // of returned arrivals on spine 7 from interval 20.
+                for (uint32_t i = 0; i < 300; ++i)
+                {
+                    const uint8_t k = spine(random);
+                    grader.OnArrival(k, k, false, 0);
+                }
+                if (interval >= 20)
+                {
+                    for (uint32_t i = 0; i < returned / 8 + (returned < 8 ? 1 : 0); ++i)
+                    {
+                        grader.OnArrival(7, 7, false, 0);
+                    }
+                }
+                grader.Advance((interval + 1) * GraderFixture::kInterval);
+                if (interval >= 20 && released == UINT32_MAX && !grader.LastInterval()[7].held)
+                {
+                    released = interval;
+                }
+                if (interval > 0 && interval < 20)
+                {
+                    NS_TEST_EXPECT_MSG_EQ(grader.LastInterval()[7].held,
+                                          true,
+                                          "a silent spine stays held");
+                }
+            }
+            NS_TEST_EXPECT_MSG_LT(released,
+                                  22,
+                                  "returned arrivals release it within two intervals");
+            // At the floor's rate it is judged absent again, as a sender that
+            // never raised its share would leave it.
+            if (returned == 300)
+            {
+                NS_TEST_EXPECT_MSG_EQ(uint32_t(grader.Report().Grade(7)),
+                                      3u,
+                                      "and at a top-graded spine's rate it stays released");
+            }
         }
     }
 
@@ -4118,22 +4145,44 @@ class SpineAbsenceTest : public TestCase
         NS_TEST_EXPECT_MSG_EQ(held, 0, "binomial variation never holds a spine");
     }
 
-    // Below the minimum median nothing is judged absent.
+    // At a median of 5 arrivals per interval the counts accumulate for four
+    // intervals before the median of 20 clears the minimum of 16 and a silent
+    // spine is judged; a sparse healthy stream holds nothing.
     void Sparse()
     {
         SpineGrader grader(GraderFixture::Defaults());
-        std::mt19937 random(13);
-        for (uint32_t interval = 0; interval < 20; ++interval)
+        for (uint32_t interval = 0; interval < 8; ++interval)
         {
-            Interval(grader, random, interval, 100, 0, 20);
-            NS_TEST_EXPECT_MSG_EQ(uint32_t(grader.Report().Grade(5)),
-                                  3u,
-                                  "a median below the minimum judges no absence");
+            grader.Advance(interval * GraderFixture::kInterval);
+            for (uint32_t spine = 0; spine < GraderFixture::kSpines; ++spine)
+            {
+                for (uint32_t i = 0; i < (spine == 5 ? 0 : 5); ++i)
+                {
+                    grader.OnArrival(spine, spine, false, 0);
+                }
+            }
+            grader.Advance((interval + 1) * GraderFixture::kInterval);
+            NS_TEST_EXPECT_MSG_EQ(grader.LastInterval()[5].held,
+                                  (interval >= 3),
+                                  "a silent spine is judged once four intervals hold enough");
         }
+        SpineGrader healthy(GraderFixture::Defaults());
+        std::mt19937 random(13);
+        uint32_t held = 0;
+        for (uint32_t interval = 0; interval < 10000; ++interval)
+        {
+            Interval(healthy, random, interval, 40);
+            for (uint32_t spine = 0; spine < GraderFixture::kSpines; ++spine)
+            {
+                held += healthy.LastInterval()[spine].held;
+            }
+        }
+        NS_TEST_EXPECT_MSG_EQ(held, 0, "a sparse healthy stream holds nothing");
     }
 
-    // A spine its marks grade 0 is sent next to nothing; its scarce arrivals
-    // do not hold it, so it returns to the top grade once the marks stop.
+    // A spine its marks grade 0 is sent next to nothing and may be held for
+    // it, but the hold lets go once its arrivals return, and the spine earns
+    // the top grade back when its marks stop.
     void GradedDown()
     {
         SpineGrader grader(GraderFixture::Defaults());
@@ -4149,13 +4198,9 @@ class SpineAbsenceTest : public TestCase
                 }
             }
             grader.Advance((interval + 1) * GraderFixture::kInterval);
-            NS_TEST_EXPECT_MSG_EQ(grader.LastInterval()[2].held,
-                                  false,
-                                  "a spine graded 0 is not held for arriving little");
         }
-        NS_TEST_EXPECT_MSG_EQ(uint32_t(grader.Report().Grade(2)),
-                              3u,
-                              "and earns the top grade back");
+        NS_TEST_EXPECT_MSG_EQ(grader.LastInterval()[2].held, false, "the hold lets go");
+        NS_TEST_EXPECT_MSG_EQ(uint32_t(grader.Report().Grade(2)), 3u, "and the spine earns 3 back");
     }
 };
 

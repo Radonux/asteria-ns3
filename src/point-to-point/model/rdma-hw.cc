@@ -287,28 +287,29 @@ TypeId RdmaHw::GetTypeId (void)
 				DoubleValue(0.75),
 				MakeDoubleAccessor(&RdmaHw::m_sprayCongestionThreshold3),
 				MakeDoubleChecker<double>(0, 1))
-		.AddAttribute("SprayHoldDownIntervals",
-				"Under LoadBalancing 3, the report intervals a spine grades 0 "
-				"after a packet requested on it was moved to another, or its "
-				"arrivals fell short of the median spine's. Default 4.",
-				UintegerValue(4),
-				MakeUintegerAccessor(&RdmaHw::m_sprayHoldDownIntervals),
-				MakeUintegerChecker<uint32_t>())
 		.AddAttribute("SprayAbsenceFractionOfMedian",
-				"Under LoadBalancing 3, a spine whose arrivals in an interval are "
-				"below this fraction of the median spine's is held down as a "
-				"trimmed one is, once the median is at least "
-				"SprayAbsenceMinimumMedian and the report in force grades the "
-				"spine above 0. Zero never holds one. Default 1/8.",
+				"Under LoadBalancing 3, a spine whose arrivals over a window are "
+				"below this fraction of the median spine's is held at grade 0, "
+				"as one a packet requested on was moved off is. A window closes "
+				"once the median is at least SprayAbsenceMinimumMedian. Zero "
+				"never holds one for its arrivals. Default 1/8.",
 				DoubleValue(0.125),
 				MakeDoubleAccessor(&RdmaHw::m_sprayAbsenceFractionOfMedian),
 				MakeDoubleChecker<double>(0, 1))
 		.AddAttribute("SprayAbsenceMinimumMedian",
-				"Under LoadBalancing 3, the median arrivals per spine in an "
-				"interval from which a spine's absence is judged. Default 16.",
+				"Under LoadBalancing 3, the median arrivals per spine at which a "
+				"window of intervals closes and every spine is judged. Default "
+				"16.",
 				UintegerValue(16),
 				MakeUintegerAccessor(&RdmaHw::m_sprayAbsenceMinimumMedian),
 				MakeUintegerChecker<uint32_t>(1))
+		.AddAttribute("SprayReleaseFractionOfFloor",
+				"Under LoadBalancing 3, a held spine whose arrivals over a window "
+				"reach this fraction of its exploration floor's, SprayEpsilon of "
+				"the median spine's, is released. Default 1/2.",
+				DoubleValue(0.5),
+				MakeDoubleAccessor(&RdmaHw::m_sprayReleaseFractionOfFloor),
+				MakeDoubleChecker<double>(0))
 		.AddAttribute("SprayOneWayDelay",
 				"Under LoadBalancing 3, grade a spine with no marks by the one-way "
 				"delay of its packets, which needs IntHeader::mode TS: eight bytes "
@@ -951,9 +952,11 @@ SpineGrader &RdmaHw::Grader(){
 	parameters.delayThresholdsNs[2] = m_sprayDelayThreshold3BaseRtts * rtt;
 	parameters.reference =
 		static_cast<SpineGrader::GradeReference>(m_sprayGradeReference);
-	parameters.holdDownIntervals = m_sprayHoldDownIntervals;
 	parameters.absenceFractionOfMedian = m_sprayAbsenceFractionOfMedian;
 	parameters.absenceMinimumMedian = m_sprayAbsenceMinimumMedian;
+	parameters.releaseFractionOfFloor = m_sprayReleaseFractionOfFloor;
+	// A held spine is drawn at epsilon / N and a top-graded one at about 1 / N.
+	parameters.floorShareOfMedian = m_sprayEpsilon;
 	m_spineGrader = std::make_unique<SpineGrader>(parameters);
 	return *m_spineGrader;
 }

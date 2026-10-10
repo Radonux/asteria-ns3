@@ -100,9 +100,9 @@ public:
 	double m_sprayFractionCusumSlack;
 	double m_sprayFractionCusumThreshold;
 	double m_sprayCongestionThreshold1, m_sprayCongestionThreshold2, m_sprayCongestionThreshold3;
-	uint32_t m_sprayHoldDownIntervals;
 	double m_sprayAbsenceFractionOfMedian;
 	uint32_t m_sprayAbsenceMinimumMedian;
+	double m_sprayReleaseFractionOfFloor;
 	bool m_sprayOneWayDelay;
 	uint32_t m_sprayGradeReference; // SpineGrader::GradeReference
 	double m_sprayDelayCusumSlackBaseRtts;

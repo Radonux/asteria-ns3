@@ -51,10 +51,14 @@ private:
 // where delay is measured, grades it. Under the absolute reference a cost is
 // the average itself; under the median reference it is the average's excess
 // over the median of the spines' averages. The congestion cost is the larger
-// of the marked and the trimmed fraction's costs. A moved packet holds the
-// spine at grade 0 for a fixed number of intervals from the end of the
-// interval it was counted in, whatever the costs say, and so does an interval
-// in which the spine's arrivals fall below a fraction of the median spine's.
+// of the marked and the trimmed fraction's costs.
+//
+// A held spine grades 0 whatever its costs. A moved packet holds the spine it
+// was requested on at once. Arrivals are counted per spine over a window of
+// intervals that closes once the median spine's count reaches a minimum, and
+// at its close a spine whose count is below a fraction of the median's is
+// held, while a held spine whose count reaches a fraction of what the
+// exploration floor sends it, a share of the median's, is released.
 // The edge bit is set when the receiver's own downlink trimmed a packet in the
 // interval, or when no spine's averages earn it the top grade under the
 // absolute reference.
@@ -78,11 +82,14 @@ public:
 		// The delays above a spine's least from which it grades 2, 1 and 0.
 		double delayThresholdsNs[3];
 		GradeReference reference;
-		uint32_t holdDownIntervals;
-		// A spine is held down for arriving less than this fraction of the
-		// median spine's arrivals, once that median is at least the minimum.
+		// A spine is held for arriving less than this fraction of the median
+		// spine's arrivals over a window whose median reaches the minimum.
 		double absenceFractionOfMedian;
 		uint32_t absenceMinimumMedian;
+		// A held spine is released for arriving at least this fraction of
+		// its floor's share of the median spine's arrivals over a window.
+		double releaseFractionOfFloor;
+		double floorShareOfMedian;
 	};
 	// What one spine showed over the last interval that ended, and what it
 	// was graded on that.
@@ -122,8 +129,12 @@ private:
 		SupervisedEwma trimFraction;
 		SupervisedEwma delayNs;
 		uint64_t leastDelayNs = UINT64_MAX;
-		uint64_t heldUntilNs = 0;
+		uint32_t windowArrivals = 0;
+		bool held = false;
 	};
+	// Close the arrivals window if its median has reached the minimum, and
+	// hold or release each spine by its count.
+	void JudgeWindow();
 	void Close(uint64_t nowNs);
 	// The grade a spine's congestion and delay costs earn it.
 	uint8_t Earned(double congestionCost, double delayCostNs) const;
