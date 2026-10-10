@@ -81,8 +81,20 @@ int32_t data_loss_receiver_node = -1;
 uint64_t data_loss_rng_stream = 51;
 // Fixed ns-3 stream indices. Data loss takes DATA_LOSS_RNG_STREAM upward, two
 // per link; the hosts' per-packet path draw takes stream 0, so a change of
-// LOAD_BALANCING moves no other draw of a run with the same seed.
+// LOAD_BALANCING moves no other draw of a run with the same seed. Draws made
+// per device take one stream each from their own block above every data-loss
+// stream, so no two of them share a sequence.
 const int64_t path_rng_stream = 0;
+const int64_t device_rng_block = int64_t(1) << 40;
+enum class DeviceRngBlock : int64_t {
+  LinkError = 1,
+};
+
+int64_t device_rng_stream(DeviceRngBlock block, Ptr<NetDevice> dev) {
+  return static_cast<int64_t>(block) * device_rng_block +
+         static_cast<int64_t>(dev->GetNode()->GetId()) * SwitchMmu::pCnt +
+         dev->GetIfIndex();
+}
 uint64_t retransmission_timeout_ns = 0;
 uint32_t max_retransmission_retries = 0;
 uint64_t no_progress_timeout_ns = 0;
@@ -557,6 +569,17 @@ void configure_data_loss(Ptr<QbbNetDevice> dev, uint64_t stream_offset) {
   dev->SetAttribute("DataLossErrorModel", PointerValue(model));
 }
 
+// Loss on the link itself, which every packet arriving at dev is exposed to.
+void configure_link_error(Ptr<QbbNetDevice> dev, double error_rate) {
+  Ptr<RateErrorModel> model = CreateObject<RateErrorModel>();
+  model->SetRandomVariable(CreateObjectWithAttributes<UniformRandomVariable>(
+      "Stream",
+      IntegerValue(device_rng_stream(DeviceRngBlock::LinkError, dev))));
+  model->SetAttribute("ErrorRate", DoubleValue(error_rate));
+  model->SetAttribute("ErrorUnit", StringValue("ERROR_UNIT_PACKET"));
+  dev->SetAttribute("LinkErrorModel", PointerValue(model));
+}
+
 void connect_transport_traces(Ptr<QbbNetDevice> dev) {
   if (data_loss_duration_ns != 0 ||
       packet_trim_mode_value() !=
@@ -579,6 +602,9 @@ void connect_transport_traces(Ptr<QbbNetDevice> dev) {
   }
   dev->TraceConnectWithoutContext(
       "QbbDrop", MakeBoundCallback(&get_queue_event, "qbb_drop", dev));
+  dev->TraceConnectWithoutContext(
+      "LinkErrorDrop", MakeBoundCallback(&get_transport_event,
+                                         "link_error_drop", dev));
 }
 
 struct QlenDistribution {
@@ -1307,6 +1333,14 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),
   topof >> node_num >> switch_num >> link_num;
   flowf >> flow_num;
   tracef >> trace_num;
+  if (data_loss_duration_ns != 0 &&
+      data_loss_rng_stream + 2 * static_cast<uint64_t>(link_num) >
+          static_cast<uint64_t>(device_rng_block)) {
+    std::cerr << "DATA_LOSS_RNG_STREAM " << data_loss_rng_stream
+              << " leaves too few streams below the per-device streams for "
+              << link_num << " links\n";
+    return false;
+  }
 
   std::vector<uint32_t> node_type(node_num, 0);
   for (uint32_t i = 0; i < switch_num; i++) {
@@ -1401,8 +1435,9 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),
     std::string data_rate, link_delay;
     double error_rate;
     topof >> src >> dst >> data_rate >> link_delay >> error_rate;
-    if (error_rate != 0.0) {
-      std::cerr << "Topology link error rates are unsupported; use DATA_LOSS_* controls\n";
+    if (!std::isfinite(error_rate) || error_rate < 0.0 || error_rate > 1.0) {
+      std::cerr << "Topology link " << src << " " << dst
+                << " has an error rate outside [0, 1]\n";
       return false;
     }
     Ptr<Node> snode = n.Get(src), dnode = n.Get(dst);
@@ -1421,6 +1456,10 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),
     Ptr<QbbNetDevice> dst_dev = DynamicCast<QbbNetDevice>(d.Get(1));
     configure_data_loss(src_dev, static_cast<uint64_t>(i) * 2);
     configure_data_loss(dst_dev, static_cast<uint64_t>(i) * 2 + 1);
+    if (error_rate != 0.0) {
+      configure_link_error(src_dev, error_rate);
+      configure_link_error(dst_dev, error_rate);
+    }
     connect_transport_traces(src_dev);
     connect_transport_traces(dst_dev);
     if (snode->GetNodeType() == 0) {

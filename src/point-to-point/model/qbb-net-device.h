@@ -144,6 +144,7 @@ public:
   TracedCallback<Ptr<const Packet>, uint32_t> m_traceDataPlaneAttempt;
   TracedCallback<Ptr<const Packet>, uint32_t> m_traceDataPlaneDeliver;
   TracedCallback<Ptr<const Packet>, uint32_t> m_traceDataPlaneLoss;
+  TracedCallback<Ptr<const Packet>, uint32_t> m_traceLinkErrorDrop;
   TracedCallback<Ptr<const Packet>, uint32_t> m_traceControlPlaneAttempt;
   TracedCallback<Ptr<const Packet>, uint32_t> m_traceControlPlaneDeliver;
   TracedCallback<Ptr<const Packet>, uint32_t> m_traceQueueEnqueue;
@@ -180,6 +181,9 @@ protected:
   bool m_dynamicth;
   uint32_t m_pausetime;	//< Time for each Pause
   bool m_paused[qCnt];	//< Whether a queue paused
+
+  // Loss on the link itself: it corrupts any packet, whatever it carries.
+  Ptr<ErrorModel> m_linkErrorModel;
 
   // Data-plane-only impairment. Control packets are deliberately excluded
   // from this model after their protocol has been classified.

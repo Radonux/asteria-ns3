@@ -18,6 +18,7 @@
  */
 
 #include "ns3/drop-tail-queue.h"
+#include "ns3/error-model.h"
 #include "ns3/custom-header.h"
 #include "ns3/broadcom-egress-queue.h"
 #include "ns3/flow-id-tag.h"
@@ -40,6 +41,7 @@
 #include "ns3/nscc-window.h"
 #include "ns3/seq-ts-header.h"
 #include "ns3/simulator.h"
+#include "ns3/string.h"
 #include "ns3/test.h"
 #include "ns3/udp-header.h"
 
@@ -922,6 +924,87 @@ class PortDownBufferTest : public TestCase
         port->Attach(channel);
         peer->Attach(channel);
         return port->GetIfIndex();
+    }
+};
+
+/**
+ * A host's device on a lossy link: whatever arrives either reaches the
+ * transport or is dropped by the link's error model, whatever it carries.
+ */
+class LinkErrorTest : public TestCase
+{
+  public:
+    LinkErrorTest()
+        : TestCase("A lossy link drops data and control at its configured rate")
+    {
+    }
+
+    void DoRun() override
+    {
+        RngSeedManager::SetSeed(1);
+        RngSeedManager::SetRun(1);
+        Ptr<QbbNetDevice> device = CreateObject<QbbNetDevice>();
+        CreateObject<Node>()->AddDevice(device);
+        Ptr<QbbNetDevice> peer = CreateObject<QbbNetDevice>();
+        CreateObject<Node>()->AddDevice(peer);
+        Ptr<QbbChannel> channel = CreateObject<QbbChannel>();
+        device->Attach(channel);
+        peer->Attach(channel);
+        uint32_t delivered = 0;
+        uint32_t dropped = 0;
+        device->m_rdmaReceiveCb = Callback<int, Ptr<Packet>, CustomHeader&>(
+            [&delivered](Ptr<Packet>, CustomHeader&) {
+                ++delivered;
+                return 0;
+            });
+        device->TraceConnectWithoutContext(
+            "LinkErrorDrop",
+            Callback<void, Ptr<const Packet>, uint32_t>(
+                [&dropped](Ptr<const Packet>, uint32_t) { ++dropped; }));
+
+        constexpr uint32_t kPackets = 4000;
+        Receive(device, kPackets);
+        NS_TEST_EXPECT_MSG_EQ(delivered, kPackets, "a link without an error model loses nothing");
+        NS_TEST_EXPECT_MSG_EQ(dropped, 0, "a link without an error model reports no loss");
+
+        delivered = 0;
+        Ptr<RateErrorModel> model = CreateObject<RateErrorModel>();
+        model->SetAttribute("ErrorRate", DoubleValue(0.25));
+        model->SetAttribute("ErrorUnit", StringValue("ERROR_UNIT_PACKET"));
+        model->SetRandomVariable(
+            CreateObjectWithAttributes<UniformRandomVariable>("Stream", IntegerValue(7)));
+        device->SetAttribute("LinkErrorModel", PointerValue(model));
+        Receive(device, kPackets);
+        NS_TEST_EXPECT_MSG_EQ(delivered + dropped, kPackets, "every packet is delivered or dropped");
+        // 1000 expected with a standard deviation of 27.
+        NS_TEST_EXPECT_MSG_GT(dropped, 900, "the link drops at its configured rate");
+        NS_TEST_EXPECT_MSG_LT(dropped, 1100, "the link drops at its configured rate");
+
+        delivered = dropped = 0;
+        model->SetAttribute("ErrorRate", DoubleValue(1.0));
+        Receive(device, 10, 0xFC);
+        NS_TEST_EXPECT_MSG_EQ(dropped, 10, "a link loses acknowledgements as it loses data");
+        NS_TEST_EXPECT_MSG_EQ(delivered, 0, "a link that loses everything delivers nothing");
+        Simulator::Destroy();
+    }
+
+  private:
+    static void Receive(Ptr<QbbNetDevice> device, uint32_t packets, uint8_t protocol = 0x11)
+    {
+        for (uint32_t i = 0; i < packets; ++i)
+        {
+            Ptr<Packet> packet = Create<Packet>(1000);
+            Ipv4Header ip;
+            ip.SetSource(Ipv4Address("11.0.1.1"));
+            ip.SetDestination(Ipv4Address("11.0.2.1"));
+            ip.SetProtocol(protocol);
+            ip.SetPayloadSize(packet->GetSize());
+            packet->AddHeader(ip);
+            PppHeader ppp;
+            ppp.SetProtocol(0x0021);
+            packet->AddHeader(ppp);
+            device->Receive(packet);
+        }
     }
 };
 
@@ -2168,6 +2251,7 @@ PointToPointTestSuite::PointToPointTestSuite()
     AddTestCase(new SpineIdentificationTest, TestCase::Duration::QUICK);
     AddTestCase(new LoadBalancingSwitchTest, TestCase::Duration::QUICK);
     AddTestCase(new PortDownBufferTest, TestCase::Duration::QUICK);
+    AddTestCase(new LinkErrorTest, TestCase::Duration::QUICK);
     AddTestCase(new LoadBalancingSenderTest, TestCase::Duration::QUICK);
     AddTestCase(new AckPacketSeqHeaderTest, TestCase::Duration::QUICK);
     AddTestCase(new AckNamesPacketTest, TestCase::Duration::QUICK);

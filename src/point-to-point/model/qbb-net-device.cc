@@ -197,6 +197,11 @@ namespace ns3 {
 				BooleanValue(false),
 				MakeBooleanAccessor(&QbbNetDevice::m_dynamicth),
 				MakeBooleanChecker())
+			.AddAttribute("LinkErrorModel",
+				"Error model applied to every packet received over the link.",
+				PointerValue(),
+				MakePointerAccessor(&QbbNetDevice::m_linkErrorModel),
+				MakePointerChecker<ErrorModel>())
 			.AddAttribute("DataLossErrorModel",
 				"Error model applied only to classified data-plane packets.",
 				PointerValue(),
@@ -272,6 +277,9 @@ namespace ns3 {
 				"ns3::Packet::TracedCallback")
 			.AddTraceSource ("DataPlaneLoss", "Configured data-plane impairment dropped a packet.",
 				MakeTraceSourceAccessor (&QbbNetDevice::m_traceDataPlaneLoss),
+				"ns3::Packet::TracedCallback")
+			.AddTraceSource ("LinkErrorDrop", "The link's error model dropped a received packet.",
+				MakeTraceSourceAccessor (&QbbNetDevice::m_traceLinkErrorDrop),
 				"ns3::Packet::TracedCallback")
 			.AddTraceSource ("ControlPlaneAttempt", "Classified control packet reached the receive boundary.",
 				MakeTraceSourceAccessor (&QbbNetDevice::m_traceControlPlaneAttempt),
@@ -470,6 +478,10 @@ namespace ns3 {
 		CustomHeader ch(CustomHeader::L2_Header | CustomHeader::L3_Header | CustomHeader::L4_Header);
 		ch.getInt = 1; // parse INT header
 		packet->PeekHeader(ch);
+		if (m_linkErrorModel && m_linkErrorModel->IsCorrupt(packet)) {
+			m_traceLinkErrorDrop(packet, ch.l3Prot);
+			return;
+		}
 		// A trimmed packet carries no payload; it is loss notification, so it is
 		// not subject to the configured data-plane impairment and is accounted on
 		// the control plane instead.
