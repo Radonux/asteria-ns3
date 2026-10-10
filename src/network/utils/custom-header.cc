@@ -96,9 +96,7 @@ uint32_t CustomHeader::GetSerializedSize (void) const{
 			len += tcp.length * 4;
 		else if (l3Prot == 0x11) // UDP
 			len += GetUdpHeaderSize();
-		else if (l3Prot == 0xFC || l3Prot == 0xFD ||
-				 l3Prot == kUecTrimRepairProtocol ||
-				 l3Prot == kUecTrimNotificationProtocol)
+		else if (CarriesQbbHeader(l3Prot))
 			len += GetAckSerializedSize();
 		else if (l3Prot == 0xFF)
 			len += 8;
@@ -172,9 +170,7 @@ void CustomHeader::Serialize (Buffer::Iterator start) const{
 		  i.WriteU8(cnp.ecnBits);
 		  i.WriteU16(cnp.qfb);
 		  i.WriteU16(cnp.total);
-	  }else if (l3Prot == 0xFC || l3Prot == 0xFD ||
-			l3Prot == kUecTrimRepairProtocol ||
-			l3Prot == kUecTrimNotificationProtocol){ // ACK, NACK, or trim control
+	  }else if (CarriesQbbHeader(l3Prot)){
 		  i.WriteU16(ack.sport);
 		  i.WriteU16(ack.dport);
 		  i.WriteU16(ack.flags);
@@ -316,9 +312,7 @@ CustomHeader::Deserialize (Buffer::Iterator start)
 		  cnp.qfb = i.ReadU16();
 		  cnp.total = i.ReadU16();
 		  l4Size = 8;
-	  }else if (l3Prot == 0xFC || l3Prot == 0xFD ||
-			l3Prot == kUecTrimRepairProtocol ||
-			l3Prot == kUecTrimNotificationProtocol){ // ACK, NACK, or trim control
+	  }else if (CarriesQbbHeader(l3Prot)){
 		  ack.sport = i.ReadU16();
 		  ack.dport = i.ReadU16();
 		  ack.flags = i.ReadU16();

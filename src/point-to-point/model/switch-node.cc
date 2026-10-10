@@ -165,9 +165,7 @@ void SwitchNode::FillFlowKey(const CustomHeader &ch, uint32_t key[3]){
 		key[2] = ch.tcp.sport | ((uint32_t)ch.tcp.dport << 16);
 	else if (ch.l3Prot == 0x11)
 		key[2] = ch.udp.sport | ((uint32_t)ch.udp.dport << 16);
-	else if (ch.l3Prot == 0xFC || ch.l3Prot == 0xFD ||
-			 ch.l3Prot == kUecTrimRepairProtocol ||
-			 ch.l3Prot == kUecTrimNotificationProtocol)
+	else if (CarriesQbbHeader(ch.l3Prot))
 		key[2] = ch.ack.sport | ((uint32_t)ch.ack.dport << 16);
 	else
 		key[2] = 0;

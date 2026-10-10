@@ -29,6 +29,14 @@ namespace ns3 {
 constexpr uint8_t kUecTrimRepairProtocol = 0xFA;
 constexpr uint8_t kUecTrimNotificationProtocol = 0xFB;
 
+// Whether a packet of this IPv4 protocol carries a qbbHeader after its IP
+// header: an ACK, a NACK, or a trim's repair request or notification.
+constexpr bool CarriesQbbHeader(uint8_t protocol){
+	return protocol == 0xFC || protocol == 0xFD ||
+		protocol == kUecTrimRepairProtocol ||
+		protocol == kUecTrimNotificationProtocol;
+}
+
 // UET diffserv codepoints. UEC 1.0.3 section 3.6.4.7.1 names the codepoints
 // abstractly and section 4.1 states that "this spec does not place any
 // constraints on the values of the DSCPs used"; only distinctness is

@@ -434,9 +434,7 @@ void write_transport_event(const char *event, Ptr<QbbNetDevice> dev,
   if (protocol == 0x11) {
     source_port = ch.udp.sport;
     sequence = ch.udp.seq;
-  } else if (protocol == 0xFC || protocol == 0xFD ||
-             protocol == kUecTrimRepairProtocol ||
-             protocol == kUecTrimNotificationProtocol) {
+  } else if (CarriesQbbHeader(protocol)) {
     source_port = ch.ack.sport;
     sequence = ch.ack.seq;
   }
