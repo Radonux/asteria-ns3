@@ -659,7 +659,10 @@ void CalculateRoute(Ptr<Node> host) {
   delay[host] = 0;
   txDelay[host] = 0;
   bw[host] = 0xfffffffffffffffflu;
-  // BFS.
+  // BFS. Among the shortest-hop paths to a node, the delay, serialization and
+  // bottleneck bandwidth are each the best any of them offers, so that a slow
+  // link the routing may avoid sets no base RTT or BDP; BFS order makes each
+  // node's values final before it is expanded.
   for (int i = 0; i < (int)q.size(); i++) {
     Ptr<Node> now = q[i];
     int d = dis[now];
@@ -668,14 +671,21 @@ void CalculateRoute(Ptr<Node> host) {
       if (!it->second.up)
         continue;
       Ptr<Node> next = it->first;
+      const uint64_t pathDelay = delay[now] + it->second.delay;
+      const uint64_t pathTxDelay =
+          txDelay[now] + packet_payload_size * 1000000000lu * 8 / it->second.bw;
+      const uint64_t pathBw = std::min(bw[now], it->second.bw);
       if (dis.find(next) == dis.end()) {
         dis[next] = d + 1;
-        delay[next] = delay[now] + it->second.delay;
-        txDelay[next] = txDelay[now] +
-                        packet_payload_size * 1000000000lu * 8 / it->second.bw;
-        bw[next] = std::min(bw[now], it->second.bw);
+        delay[next] = pathDelay;
+        txDelay[next] = pathTxDelay;
+        bw[next] = pathBw;
         if (next->GetNodeType() == 1)
           q.push_back(next);
+      } else if (d + 1 == dis[next]) {
+        delay[next] = std::min(delay[next], pathDelay);
+        txDelay[next] = std::min(txDelay[next], pathTxDelay);
+        bw[next] = std::max(bw[next], pathBw);
       }
       if (d + 1 == dis[next]) {
         nextHop[next][host].push_back(now);
