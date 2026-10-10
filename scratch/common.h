@@ -37,8 +37,10 @@
 #include <sstream>
 #include <cmath>
 #include <limits>
+#include <map>
 #include <zstd.h>
 #include <ns3/load-balancing.h>
+#include <ns3/path-selector.h>
 #include <ns3/rdma-client-helper.h>
 #include <ns3/rdma-client.h>
 #include <ns3/rdma-driver.h>
@@ -110,6 +112,18 @@ uint64_t no_progress_timeout_ns = 0;
 uint32_t selective_retransmission = 0;
 std::string packet_trim_mode = "disabled";
 std::string load_balancing = "ecmp";
+// Under LOAD_BALANCING ev_hash, what chooses each data packet's entropy value,
+// and the parameters of the selectors, each the default of its source.
+std::string path_selector = "ops";
+uint32_t reps_buffer_size = 8;
+uint64_t reps_freezing_timeout_ns = 10000000;
+// The selectors each parameter belongs to. A parameter given under another
+// selector would be read by nothing, so it is refused.
+const std::map<std::string, std::set<std::string>> path_selector_parameter_owners = {
+    {"REPS_BUFFER_SIZE", {"reps"}},
+    {"REPS_FREEZING_TIMEOUT_NS", {"reps"}},
+};
+std::set<std::string> path_selector_parameters_given;
 // UEC 1.0.3 section 4.1.4.1 RECOMMENDS three traffic classes: TC_low for data,
 // TC_med for trimmed packets, TC_high for control. Queue 0 is TC_high here, so
 // the trimmed queue must be a distinct non-zero index.
@@ -566,6 +580,14 @@ uint32_t packet_trim_mode_value() {
   return std::numeric_limits<uint32_t>::max();
 }
 
+uint32_t path_selector_value() {
+  if (path_selector == "ops")
+    return static_cast<uint32_t>(PathSelectorKind::Ops);
+  if (path_selector == "reps")
+    return static_cast<uint32_t>(PathSelectorKind::Reps);
+  return std::numeric_limits<uint32_t>::max();
+}
+
 uint32_t load_balancing_value() {
   if (load_balancing == "ecmp")
     return static_cast<uint32_t>(LoadBalancingMode::Ecmp);
@@ -942,6 +964,8 @@ bool ReadConf(string network_configuration) {
   while (!conf.eof()) {
     std::string key;
     conf >> key;
+    if (path_selector_parameter_owners.count(key) > 0)
+      path_selector_parameters_given.insert(key);
 
     if (key.compare("ENABLE_QCN") == 0) {
       uint32_t v;
@@ -1053,6 +1077,12 @@ bool ReadConf(string network_configuration) {
       conf >> selective_retransmission;
     } else if (key.compare("LOAD_BALANCING") == 0) {
       conf >> load_balancing;
+    } else if (key.compare("PATH_SELECTOR") == 0) {
+      conf >> path_selector;
+    } else if (key.compare("REPS_BUFFER_SIZE") == 0) {
+      conf >> reps_buffer_size;
+    } else if (key.compare("REPS_FREEZING_TIMEOUT_NS") == 0) {
+      conf >> reps_freezing_timeout_ns;
 	} else if (key.compare("PACKET_TRIM_MODE") == 0) {
 	  conf >> packet_trim_mode;
 	} else if (key.compare("PACKET_TRIM_QUEUE") == 0) {
@@ -1315,6 +1345,24 @@ bool ReadConf(string network_configuration) {
   if (load_balancing_value() == std::numeric_limits<uint32_t>::max()) {
     std::cerr << "LOAD_BALANCING must be ecmp, ev_hash, or spray_uniform\n";
     return false;
+  }
+  if (path_selector_value() == std::numeric_limits<uint32_t>::max()) {
+    std::cerr << "PATH_SELECTOR must be ops or reps\n";
+    return false;
+  }
+  if (path_selector != "ops" &&
+      load_balancing_value() !=
+          static_cast<uint32_t>(LoadBalancingMode::EntropyHash)) {
+    std::cerr << "PATH_SELECTOR " << path_selector
+              << " chooses entropy values and requires LOAD_BALANCING ev_hash\n";
+    return false;
+  }
+  for (const std::string &key : path_selector_parameters_given) {
+    if (path_selector_parameter_owners.at(key).count(path_selector) == 0) {
+      std::cerr << key << " is not a parameter of PATH_SELECTOR "
+                << path_selector << "\n";
+      return false;
+    }
   }
   // Outside ECMP the packets of one flow take different paths and arrive out
   // of order: the receiver must hold out-of-order data instead of dropping it,
@@ -1781,6 +1829,10 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),
       rdmaHw->SetAttribute("LoadBalancing",
                            UintegerValue(load_balancing_value()));
       rdmaHw->SetAttribute("SpineCount", UintegerValue(spine_count));
+      rdmaHw->SetAttribute("PathSelector", UintegerValue(path_selector_value()));
+      rdmaHw->SetAttribute("RepsBufferSize", UintegerValue(reps_buffer_size));
+      rdmaHw->SetAttribute("RepsFreezingTimeoutNs",
+                           UintegerValue(reps_freezing_timeout_ns));
       // A PointerValue cannot carry null, which is the ECMP default.
       if (path_random)
         rdmaHw->SetAttribute("PathRandomVariable", PointerValue(path_random));
