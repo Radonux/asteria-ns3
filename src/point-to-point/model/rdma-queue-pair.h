@@ -49,6 +49,9 @@ public:
 	void Remove(uint64_t packet);
 	// Remove the record of a send declared lost.
 	void RemoveLost(uint64_t packet);
+	// Note a repair send of seq. True when seq's packet was repaired before,
+	// so that this send repeats a repair.
+	bool RepairsAgain(uint64_t seq);
 	// Remove the record of every packet that starts below seq.
 	void RemoveBelow(uint64_t seq);
 	uint64_t Bytes() const;
@@ -78,6 +81,8 @@ private:
 	// The packets whose last send was declared lost and that have not been
 	// sent since.
 	std::set<uint64_t> m_lost;
+	// The packets repaired at least once.
+	std::set<uint64_t> m_repaired;
 };
 
 class RdmaQueuePair : public Object {
@@ -98,6 +103,9 @@ public:
 	uint32_t m_trim_recovery_events;
 	uint32_t m_stale_trim_notifications;
 	uint32_t m_recovery_retries;
+	// Repair sends of a packet already repaired once, kept where every data
+	// packet has a send record.
+	uint32_t m_duplicate_repairs;
 	// Cumulative retransmission-timeout firings. m_recovery_retries resets on
 	// every acknowledgement advance, so it cannot answer how often the sender
 	// waited out a timeout over the life of the transfer.

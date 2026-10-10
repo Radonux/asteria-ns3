@@ -2019,6 +2019,45 @@ class TrimRepairedOnceTest : public TestCase
     }
 };
 
+class DuplicateRepairTest : public TestCase
+{
+  public:
+    DuplicateRepairTest()
+        : TestCase("A repair of a packet already repaired is counted as a duplicate")
+    {
+    }
+
+    void DoRun() override
+    {
+        constexpr uint32_t kMtu = IsolatedHost::kMtu;
+        IsolatedHost sender(LoadBalancingMode::SprayUniform, kTestReceiver, 8);
+        Ptr<RdmaQueuePair> qp = sender.AddSender(kTestSender, kTestReceiver, 4 * kMtu);
+        for (uint32_t i = 0; i < 2; ++i)
+        {
+            sender.hw->GetNxtPacket(qp);
+        }
+        NS_TEST_EXPECT_MSG_EQ(qp->DeclareLostSentBy(0), 2 * kMtu, "both sends are lost");
+        for (uint32_t i = 0; i < 2; ++i)
+        {
+            sender.hw->GetNxtPacket(qp);
+        }
+        NS_TEST_EXPECT_MSG_EQ(qp->m_duplicate_repairs, 0, "a first repair is no duplicate");
+        NS_TEST_EXPECT_MSG_EQ(qp->DeclareLostSentBy(0), 2 * kMtu, "both repairs are lost");
+        CustomHeader again(CustomHeader::L2_Header | CustomHeader::L3_Header |
+                           CustomHeader::L4_Header);
+        sender.hw->GetNxtPacket(qp)->PeekHeader(again);
+        NS_TEST_EXPECT_MSG_EQ(again.udp.seq, 0, "the first packet is repaired again");
+        NS_TEST_EXPECT_MSG_EQ(qp->m_duplicate_repairs, 1, "its second repair is a duplicate");
+
+        // Once the acknowledgement passes both packets the next send is new
+        // data, which repairs nothing.
+        sender.ReceiveAck(kTestReceiver, 2 * kMtu, 0, again.ipid);
+        sender.hw->GetNxtPacket(qp);
+        NS_TEST_EXPECT_MSG_EQ(qp->m_duplicate_repairs, 1, "new data repairs nothing");
+        Simulator::Destroy();
+    }
+};
+
 class PathLossRuleTest : public TestCase
 {
   public:
@@ -2584,6 +2623,7 @@ PointToPointTestSuite::PointToPointTestSuite()
     AddTestCase(new SelectiveTimeoutTest, TestCase::Duration::QUICK);
     AddTestCase(new OutstandingWindowTest, TestCase::Duration::QUICK);
     AddTestCase(new TrimRepairedOnceTest, TestCase::Duration::QUICK);
+    AddTestCase(new DuplicateRepairTest, TestCase::Duration::QUICK);
     AddTestCase(new PathLossRuleTest, TestCase::Duration::QUICK);
     AddTestCase(new NsccCaseTableTest, TestCase::Duration::QUICK);
     AddTestCase(new NsccLightMarkTest, TestCase::Duration::QUICK);

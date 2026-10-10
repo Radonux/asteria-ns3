@@ -1512,6 +1512,8 @@ Ptr<Packet> RdmaHw::GetNxtPacket(Ptr<RdmaQueuePair> qp){
 		qp->m_outstanding.Add(seq, payload_size,
 			PathOf(static_cast<LoadBalancingMode>(m_loadBalancing), identification),
 			Simulator::Now().GetNanoSeconds());
+		if (is_repair && qp->m_outstanding.RepairsAgain(seq))
+			qp->m_duplicate_repairs++;
 	}else{
 		ipHeader.SetIdentification(qp->m_ipid);
 	}

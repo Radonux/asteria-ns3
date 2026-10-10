@@ -140,11 +140,16 @@ void OutstandingPackets::RemoveLost(uint64_t packet){
 	m_lost.insert(packet);
 }
 
+bool OutstandingPackets::RepairsAgain(uint64_t seq){
+	return !m_repaired.insert(seq / m_packet_size).second;
+}
+
 void OutstandingPackets::RemoveBelow(uint64_t seq){
 	// Rounded up so that the flow's last packet, the only one shorter than the
 	// packet size, is removed once the acknowledgement covers it.
 	const uint64_t end = (seq + m_packet_size - 1) / m_packet_size;
 	m_lost.erase(m_lost.begin(), m_lost.lower_bound(end));
+	m_repaired.erase(m_repaired.begin(), m_repaired.lower_bound(end));
 	for (; m_first < end; m_first++){
 		if (!m_ring.empty() && At(m_first).outstanding)
 			Remove(m_first);
@@ -188,6 +193,7 @@ RdmaQueuePair::RdmaQueuePair(uint16_t pg, Ipv4Address _sip, Ipv4Address _dip, ui
 	m_trim_recovery_events = 0;
 	m_stale_trim_notifications = 0;
 	m_recovery_retries = 0;
+	m_duplicate_repairs = 0;
 	m_timeouts = 0;
 	m_cnp_received = 0;
 	m_cc_exempt = false;
