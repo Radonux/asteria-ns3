@@ -8,6 +8,7 @@
 #include <ns3/event-id.h>
 #include <ns3/custom-header.h>
 #include <ns3/int-header.h>
+#include "nscc-window.h"
 #include <map>
 #include <set>
 #include <unordered_map>
@@ -207,6 +208,7 @@ public:
 		DataRate m_curRate;
 		uint32_t m_incStage;
 	}hpccPint;
+	NsccWindow nscc;
 
 	/***********
 	 * methods

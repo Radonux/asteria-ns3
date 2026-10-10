@@ -16,6 +16,20 @@
 
 namespace ns3{
 
+namespace {
+
+// The round trip an answer to the outstanding send `packet` measures, from the
+// send's record. An answer to the resend of a send declared lost may be the
+// late answer to that send, so such a resend is not timed (UEC 1.0.3 section
+// 3.6.13.1); a trimmed send is answered by its trim, so its resend is.
+uint64_t AnswerRtt(const OutstandingPackets &outstanding, uint64_t packet){
+	if (packet == OutstandingPackets::kNone || outstanding.ResendsLost(packet))
+		return NsccWindow::kNoRtt;
+	return Simulator::Now().GetNanoSeconds() - outstanding.SentNs(packet);
+}
+
+} // namespace
+
 TypeId RdmaHw::GetTypeId (void)
 {
 	static TypeId tid = TypeId ("ns3::RdmaHw")
@@ -372,6 +386,10 @@ void RdmaHw::Setup(QpCompleteCallback cb, QpFailureCallback failure_cb){
 	NS_ABORT_MSG_IF(IsPathPerPacket() && !CustomHeader::ackCarriesPacketSeq,
 		"A LoadBalancing mode other than ECMP finds the send an acknowledgement "
 		"answers by the packet sequence the acknowledgement carries");
+	NS_ABORT_MSG_IF(m_cc_mode == 11 && !IsPathPerPacket(),
+		"CC mode 11 (NSCC) clocks its window on the acknowledgement of each data "
+		"packet and times it from the packet's send record, which only a "
+		"LoadBalancing mode other than ECMP provides");
 	for (uint32_t i = 0; i < m_nic.size(); i++){
 		Ptr<QbbNetDevice> dev = m_nic[i].dev;
 		if (!dev)
@@ -451,6 +469,17 @@ void RdmaHw::AddQueuePair(uint32_t src, uint32_t dest, uint64_t tag, uint64_t si
 		qp->tmly.m_curRate = m_bps;
 	}else if (m_cc_mode == 10){
 		qp->hpccPint.m_curRate = m_bps;
+	}else if (m_cc_mode == 11){
+		// The window the frontend hands over is the path's bandwidth-delay
+		// product, which NSCC sizes its own window from. The rate stays at the
+		// line rate, so VarWin scales nothing.
+		NS_ABORT_MSG_IF(win == 0, "CC mode 11 sizes its window from the queue "
+			"pair's bandwidth-delay product");
+		qp->nscc.Start(NsccParameters(), m_mtu, win, baseRtt,
+			Simulator::Now().GetNanoSeconds());
+		NS_ABORT_MSG_IF(qp->nscc.MaxWnd() > UINT32_MAX,
+			"a queue pair's window is 32 bits");
+		ApplyNsccWindow(qp);
 	}
 
 	// Notify Nic
@@ -704,9 +733,14 @@ int RdmaHw::ReceiveAck(Ptr<Packet> p, CustomHeader &ch){
 	else {
 		// Before the cumulative advance, which would remove the answered send
 		// without asking what was sent ahead of it on its path.
-		if (qp->m_outstanding.IsKept())
-			qp->AcknowledgePacket(ch.ack.packet_seq,
-				PathOf(static_cast<LoadBalancingMode>(m_loadBalancing), ch.ipid));
+		if (qp->m_outstanding.IsKept()){
+			const uint16_t path =
+				PathOf(static_cast<LoadBalancingMode>(m_loadBalancing), ch.ipid);
+			if (m_cc_mode == 11 && DeliverCongestionSignal(qp))
+				HandleAckNscc(qp, ch.ack.packet_seq, path, cnp);
+			else
+				qp->AcknowledgePacket(ch.ack.packet_seq, path);
+		}
 		const uint64_t acknowledged_before = qp->snd_una;
 		if (!m_backto0){
 			qp->Acknowledge(seq);
@@ -940,19 +974,32 @@ void RdmaHw::RecoverTrimmedQueue(Ptr<RdmaQueuePair> qp,
 	if (m_cc_mode == 1 && DeliverCongestionSignal(qp)) {
 		cnp_received_mlx(qp);
 	}
+	const uint16_t path =
+		PathOf(static_cast<LoadBalancingMode>(m_loadBalancing), ch.ipid);
+	// Timed before the release below removes the trimmed send's record.
+	const uint64_t trimmedRtt = m_cc_mode == 11
+		? AnswerRtt(qp->m_outstanding, qp->m_outstanding.Find(trimStart, path))
+		: NsccWindow::kNoRtt;
 	if (m_selective_retransmission){
 		// The notification names the exact trimmed byte range, so repair
 		// only that range instead of rewinding the whole window. The
 		// receiver accepts the out-of-order remainder, so nothing else
 		// needs resending. With send records, a trimmed send that is no longer
 		// outstanding was already declared lost and is being repaired.
-		if (!qp->m_outstanding.IsKept() || qp->ReleasePacket(trimStart,
-				PathOf(static_cast<LoadBalancingMode>(m_loadBalancing), ch.ipid))){
+		if (!qp->m_outstanding.IsKept() || qp->ReleasePacket(trimStart, path)){
 			qp->m_recovery_events++;
 			qp->AddRepairRange(trimStart, trimEnd);
 		}
 	}else{
 		RecoverQueue(qp);
+	}
+	// After the release, so that the bytes QuickAdapt leaves in flight no
+	// longer count the trimmed send. A trim whose send was already declared
+	// lost is congestion all the same, and cuts the window again.
+	if (m_cc_mode == 11 && DeliverCongestionSignal(qp)){
+		qp->nscc.OnTrim(ch.ack.trim_payload_size, trimmedRtt, qp->GetOnTheFly(),
+			Simulator::Now().GetNanoSeconds());
+		ApplyNsccWindow(qp);
 	}
 	const uint32_t nicIdx = GetNicIdxOfQp(qp);
 	m_nic[nicIdx].dev->TriggerTransmit();
@@ -1302,6 +1349,10 @@ void RdmaHw::HandleRetransmissionTimeout(Ptr<RdmaQueuePair> qp){
 		const uint64_t lost = qp->DeclareLostSentBy(
 			Simulator::Now().GetNanoSeconds() - m_retransmission_timeout_ns);
 		NS_ASSERT_MSG(lost > 0, "the timer expires with the oldest send");
+		if (m_cc_mode == 11 && DeliverCongestionSignal(qp)){
+			qp->nscc.OnLoss(lost);
+			ApplyNsccWindow(qp);
+		}
 	}else{
 		RecoverQueue(qp);
 	}
@@ -2008,6 +2059,27 @@ NsccWindow::Parameters RdmaHw::NsccParameters() const{
 		m_nscc_gamma, m_nscc_max_md_jump, m_nscc_fair_increase,
 		m_nscc_fast_increase_scale, m_nscc_eta, m_nscc_alpha, m_nscc_qa_gate,
 		m_nscc_qa_threshold, m_nscc_adjust_bytes, m_nscc_adjust_period};
+}
+
+void RdmaHw::HandleAckNscc(Ptr<RdmaQueuePair> qp, uint64_t seq, uint16_t path,
+		bool marked){
+	const uint64_t packet = qp->m_outstanding.Find(seq, path);
+	// A repeated or late answer: its bytes already left the window.
+	if (packet == OutstandingPackets::kNone)
+		return;
+	// Read before the acknowledgement removes the record.
+	const uint32_t bytes = qp->m_outstanding.Size(packet);
+	const uint64_t rtt = AnswerRtt(qp->m_outstanding, packet);
+	const uint64_t lost = qp->AcknowledgePacket(seq, path);
+	qp->nscc.OnAck(bytes, marked, rtt, qp->GetOnTheFly(),
+		Simulator::Now().GetNanoSeconds());
+	if (lost > 0)
+		qp->nscc.OnLoss(lost);
+	ApplyNsccWindow(qp);
+}
+
+void RdmaHw::ApplyNsccWindow(Ptr<RdmaQueuePair> qp){
+	qp->SetWin(static_cast<uint32_t>(qp->nscc.Cwnd()));
 }
 
 }

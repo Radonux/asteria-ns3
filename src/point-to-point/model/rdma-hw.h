@@ -316,6 +316,13 @@ public:
 	uint32_t m_nscc_adjust_bytes;
 	double m_nscc_adjust_period;
 	NsccWindow::Parameters NsccParameters() const;
+	// The acknowledgement of the send of seq along path, as AcknowledgePacket
+	// takes it, with the window following what it says.
+	void HandleAckNscc(Ptr<RdmaQueuePair> qp, uint64_t seq, uint16_t path,
+		bool marked);
+	// The window the NIC enforces follows the controller's, as the rate does
+	// under the rate-based modes.
+	void ApplyNsccWindow(Ptr<RdmaQueuePair> qp);
 };
 
 } /* namespace ns3 */

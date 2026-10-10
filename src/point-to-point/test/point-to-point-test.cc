@@ -1084,13 +1084,17 @@ class IsolatedHost
 
     // The acknowledgement of the send of seq along the path that
     // identification names, with the receiver's cumulative sequence.
-    void ReceiveAck(Ipv4Address from, uint32_t cumulative, uint32_t seq, uint16_t identification)
+    void ReceiveAck(Ipv4Address from,
+                    uint32_t cumulative,
+                    uint32_t seq,
+                    uint16_t identification,
+                    bool marked = false)
     {
         CustomHeader ack;
         ack.l3Prot = 0xFC;
         ack.sip = from.Get();
         ack.ipid = identification;
-        ack.ack.flags = 0;
+        ack.ack.flags = marked ? 1 << qbbHeader::FLAG_CNP : 0;
         ack.ack.sport = kReceiverPort;
         ack.ack.dport = kSenderPort;
         ack.ack.pg = kPriorityGroup;
@@ -1837,6 +1841,75 @@ class NsccFastIncreaseTest : public TestCase
     }
 };
 
+class NsccCutTest : public TestCase
+{
+  public:
+    NsccCutTest()
+        : TestCase("NSCC cuts the window by a trimmed send and by each send declared lost")
+    {
+    }
+
+    void DoRun() override
+    {
+        constexpr uint32_t kMtu = IsolatedHost::kMtu;
+        const uint16_t spine = SpineIdentification(3, 3);
+        IsolatedHost sender(LoadBalancingMode::SprayUniform, kTestReceiver, 8);
+        sender.hw->m_retransmission_timeout_ns = 0;
+        Ptr<RdmaQueuePair> qp = Started(sender, 3);
+        for (uint32_t i = 0; i < 3; ++i)
+        {
+            qp->m_outstanding.Add(i * kMtu, kMtu, 3, 0);
+        }
+        Simulator::Schedule(NanoSeconds(12000), [this, &sender, qp, spine]() {
+            sender.ReceiveTrimNack(qp, kTestReceiver, 0, spine);
+            NS_TEST_EXPECT_MSG_EQ(qp->GetWin(),
+                                  NsccPath::kCeiling - kMtu,
+                                  "a trim cuts the window the NIC enforces by its bytes");
+        });
+        // Marked, three microseconds late: the acknowledgement itself changes
+        // nothing, and the send before it on its spine is declared lost.
+        Simulator::Schedule(NanoSeconds(13000), [this, &sender, qp, spine]() {
+            sender.ReceiveAck(kTestReceiver, 0, 2 * kMtu, spine, true);
+            NS_TEST_EXPECT_MSG_EQ(qp->m_recovery_events, 2, "the trim and one loss are repaired");
+            NS_TEST_EXPECT_MSG_EQ(qp->GetWin(),
+                                  NsccPath::kCeiling - 2 * kMtu,
+                                  "a send declared lost cuts the window by its bytes");
+        });
+        Simulator::Run();
+        Simulator::Destroy();
+
+        IsolatedHost timed(LoadBalancingMode::SprayUniform, kTestReceiver, 8);
+        Ptr<RdmaQueuePair> waiting = Started(timed, 1);
+        waiting->m_outstanding.Add(0, kMtu, 3, 0);
+        timed.hw->ArmRetransmissionTimeout(waiting);
+        Simulator::Stop(NanoSeconds(IsolatedHost::kTimeoutNs + 1));
+        Simulator::Run();
+        NS_TEST_EXPECT_MSG_EQ(waiting->m_timeouts, 1, "the send times out");
+        NS_TEST_EXPECT_MSG_EQ(waiting->GetWin(),
+                              NsccPath::kCeiling - kMtu,
+                              "a send lost to the timeout cuts the window by its bytes");
+        Simulator::Destroy();
+    }
+
+  private:
+    static Ptr<RdmaQueuePair> Started(IsolatedHost& sender, uint32_t packets)
+    {
+        sender.hw->m_cc_mode = 11;
+        sender.hw->m_nscc_adjust_period = 1000;
+        Ptr<RdmaQueuePair> qp =
+            sender.AddSender(kTestSender, kTestReceiver, 10 * IsolatedHost::kMtu);
+        qp->snd_nxt = packets * IsolatedHost::kMtu;
+        qp->m_highest_sent = qp->snd_nxt;
+        qp->nscc.Start(sender.hw->NsccParameters(),
+                       IsolatedHost::kMtu,
+                       NsccPath::kBdp,
+                       NsccPath::kBaseRtt,
+                       0);
+        sender.hw->ApplyNsccWindow(qp);
+        return qp;
+    }
+};
+
 class NsccBoundsTest : public TestCase
 {
   public:
@@ -1885,6 +1958,63 @@ class NsccBoundsTest : public TestCase
     }
 };
 
+class NsccRttTest : public TestCase
+{
+  public:
+    NsccRttTest()
+        : TestCase("NSCC times an acknowledgement from the answered send's record")
+    {
+    }
+
+    void DoRun() override
+    {
+        constexpr uint32_t kMtu = IsolatedHost::kMtu;
+        IsolatedHost sender(LoadBalancingMode::SprayUniform, kTestReceiver, 8);
+        sender.hw->m_cc_mode = 11;
+        sender.hw->m_retransmission_timeout_ns = 0;
+        Ptr<RdmaQueuePair> qp = sender.AddSender(kTestSender, kTestReceiver, 10 * kMtu);
+        qp->snd_nxt = 4 * kMtu;
+        qp->m_highest_sent = 4 * kMtu;
+        qp->nscc.Start(sender.hw->NsccParameters(), kMtu, NsccPath::kBdp, NsccPath::kBaseRtt, 0);
+        // Sends on four spines at 50, 60, 100 and 400 ns. The first is declared
+        // lost and the second trimmed, and each is sent again on its spine.
+        qp->m_outstanding.Add(2 * kMtu, kMtu, 4, 50);
+        qp->m_outstanding.Add(3 * kMtu, kMtu, 5, 60);
+        qp->m_outstanding.Add(0, kMtu, 1, 100);
+        qp->m_outstanding.Add(kMtu, kMtu, 2, 400);
+        NS_TEST_ASSERT_MSG_EQ(qp->DeclareLostSentBy(50), kMtu, "the first send is lost");
+        qp->m_outstanding.Add(2 * kMtu, kMtu, 4, 4900);
+        NS_TEST_ASSERT_MSG_EQ(qp->ReleasePacket(3 * kMtu, 5), true, "the second send is trimmed");
+        qp->m_outstanding.Add(3 * kMtu, kMtu, 5, 5000);
+        Simulator::Schedule(NanoSeconds(5000), [this, &sender, qp]() {
+            sender.ReceiveAck(kTestReceiver, 0, kMtu, SpineIdentification(2, 2));
+            NS_TEST_EXPECT_MSG_EQ(qp->nscc.BaseRtt(),
+                                  4600,
+                                  "the round trip runs from the answered send's own send time");
+            sender.ReceiveAck(kTestReceiver, 0, 2 * kMtu, SpineIdentification(4, 4));
+            NS_TEST_EXPECT_MSG_EQ(qp->nscc.BaseRtt(),
+                                  4600,
+                                  "the resend of a lost send, which the lost send's late "
+                                  "answer would also name, is not timed");
+        });
+        Simulator::Schedule(NanoSeconds(5100), [this, &sender, qp]() {
+            sender.ReceiveAck(kTestReceiver, 0, 0, SpineIdentification(1, 1));
+            NS_TEST_EXPECT_MSG_EQ(qp->nscc.BaseRtt(), 4600, "a longer round trip keeps the base");
+            NS_TEST_EXPECT_MSG_EQ(qp->nscc.MaxWnd(),
+                                  NsccPath::kCeiling * 4600 / NsccPath::kBaseRtt,
+                                  "MaxWnd follows the base RTT");
+        });
+        Simulator::Schedule(NanoSeconds(5200), [this, &sender, qp]() {
+            sender.ReceiveAck(kTestReceiver, 0, 3 * kMtu, SpineIdentification(5, 5));
+            NS_TEST_EXPECT_MSG_EQ(qp->nscc.BaseRtt(),
+                                  200,
+                                  "the resend of a trimmed send, which only it can answer, is timed");
+        });
+        Simulator::Run();
+        Simulator::Destroy();
+    }
+};
+
 /**
  * \brief TestSuite for PointToPoint module
  */
@@ -1924,7 +2054,9 @@ PointToPointTestSuite::PointToPointTestSuite()
     AddTestCase(new NsccLightMarkTest, TestCase::Duration::QUICK);
     AddTestCase(new NsccQuickAdaptTest, TestCase::Duration::QUICK);
     AddTestCase(new NsccFastIncreaseTest, TestCase::Duration::QUICK);
+    AddTestCase(new NsccCutTest, TestCase::Duration::QUICK);
     AddTestCase(new NsccBoundsTest, TestCase::Duration::QUICK);
+    AddTestCase(new NsccRttTest, TestCase::Duration::QUICK);
 }
 
 static PointToPointTestSuite g_pointToPointTestSuite; //!< The testsuite
