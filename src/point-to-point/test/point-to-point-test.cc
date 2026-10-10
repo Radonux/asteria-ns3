@@ -4103,6 +4103,7 @@ class SpineAbsenceTest : public TestCase
         Healthy();
         Sparse();
         GradedDown();
+        EvenMedian();
     }
 
   private:
@@ -4266,6 +4267,31 @@ class SpineAbsenceTest : public TestCase
             }
         }
         NS_TEST_EXPECT_MSG_EQ(held, 0, "a sparse healthy stream holds nothing");
+    }
+
+    // With eight spines the median is the mean of the two middle counts: of
+    // 40, 40, 40, 40, 8, 8, 8 and spine 7's, it is 24, so 2 arrivals are
+    // absent and 4 are not; the lower middle, 8, would hold neither and the
+    // upper, 40, both.
+    void EvenMedian()
+    {
+        for (const uint32_t tested : {2u, 4u})
+        {
+            SpineGrader grader(GraderFixture::Defaults());
+            grader.Advance(0);
+            const uint32_t counts[GraderFixture::kSpines] = {40, 40, 40, 40, 8, 8, 8, tested};
+            for (uint32_t spine = 0; spine < GraderFixture::kSpines; ++spine)
+            {
+                for (uint32_t i = 0; i < counts[spine]; ++i)
+                {
+                    grader.OnArrival(spine, spine, false, 0);
+                }
+            }
+            grader.Advance(GraderFixture::kInterval);
+            NS_TEST_EXPECT_MSG_EQ(grader.LastInterval()[7].held,
+                                  (tested == 2),
+                                  "absence is judged against the mean of the middle counts");
+        }
     }
 
     // A spine its marks grade 0 is sent next to nothing and may be held for
