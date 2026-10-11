@@ -162,6 +162,8 @@ public:
 	double m_sprayEpsilon;
 	uint32_t m_sprayCandidates;
 	uint32_t m_sprayCandidateDraw; // SpineScores::CandidateDraw
+	// SpineScores::Parameters::edgeFreeze.
+	bool m_sprayEdgeFreeze;
 	// The Rcv_Cwnd_Pend NSCC is handed for an acknowledgement whose report has
 	// the edge bit set.
 	uint32_t m_sprayEdgeWindowPenalty;
@@ -172,6 +174,11 @@ public:
 	// queue pair its own scores.
 	std::unique_ptr<SpineGrader> m_spineGrader;
 	std::unordered_map<uint32_t, SpineScores> m_spineScores;
+	// With m_spraySenderPoolWeight above zero, the host's pooled scores,
+	// which every queue pair's scores are mixed with (SpineScores::Pool),
+	// made at the first queue pair; null otherwise.
+	double m_spraySenderPoolWeight;
+	std::unique_ptr<SpineScores> m_senderSpineScores;
 	// The SpineReport trace source: the time, the grader that has just issued
 	// a report, and under PerConnection the receive queue pair that owns it,
 	// null under PerReceiver.

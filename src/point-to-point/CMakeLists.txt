@@ -22,6 +22,7 @@ build_lib(
     helper/point-to-point-helper.cc
     helper/qbb-helper.cc
     model/cn-header.cc
+    model/link-events.cc
     model/nscc-window.cc
     model/path-selector.cc
     model/pause-header.cc
@@ -48,6 +49,7 @@ build_lib(
     helper/qbb-helper.h
     helper/sim-setting.h
     model/cn-header.h
+    model/link-events.h
     model/load-balancing.h
     model/nscc-window.h
     model/path-selector.h

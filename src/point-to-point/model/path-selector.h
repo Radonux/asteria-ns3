@@ -95,6 +95,7 @@ private:
 // highest-scored of them, the candidates drawn from p or uniformly. While a
 // report's edge bit is set the scores stay as they are, and without reports
 // they decay once per report interval from two intervals after the last.
+// With edgeFreeze unset, a report with the edge bit set is taken as any other.
 //
 // A score is fixed-point, 1/256 of a grade, and a decay removes the rounded-up
 // fraction gamma of it, so that a score left without deposits reaches zero.
@@ -111,16 +112,31 @@ public:
 		uint32_t candidates;
 		CandidateDraw candidateDraw;
 		uint64_t reportIntervalNs;
+		bool edgeFreeze = true;
 	};
 	SpineScores(uint32_t spines, const Parameters &parameters);
 	void OnReport(const SpineReport &report, uint64_t nowNs);
 	uint8_t Choose(UniformRandomVariable &random, uint64_t nowNs);
+	// Mix these scores with pool's, which outlive them. Every report these
+	// scores take, pool takes too, by the same rule; and with weight w above
+	// zero, every draw and every p use w * pool's score + (1 - w) * this
+	// score of each spine in place of this score. Several scores may share a
+	// pool.
+	void Pool(SpineScores &pool, double weight);
 	// p for spine, as the scores stand.
 	double Share(uint32_t spine) const;
 	uint32_t Score(uint32_t spine) const;
 
 private:
 	static constexpr uint32_t kGradeScale = 256;
+	// Decay the scores and add report's grades, unless its edge bit holds
+	// them; whether report is newer than the last is the caller's test.
+	void Take(const SpineReport &report, uint64_t nowNs);
+	bool IsPooled() const;
+	// The score a pooled draw weighs spine by, and the sum over the spines.
+	double Mixed(uint32_t spine) const;
+	double MixedSum() const;
+	uint8_t DrawFromMixed(UniformRandomVariable &random) const;
 	void Decay();
 	// Decay the scores for every report interval missed by now.
 	void Age(uint64_t nowNs);
@@ -137,6 +153,9 @@ private:
 	uint8_t m_sequence;
 	uint64_t m_reportedNs;
 	uint64_t m_nextDecayNs;
+	// Null, or the scores mixed with these, and the weight of theirs.
+	SpineScores *m_pool;
+	double m_poolWeight;
 };
 
 // A spine drawn per packet from the scores towards the queue pair's

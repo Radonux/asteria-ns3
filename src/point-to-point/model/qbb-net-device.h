@@ -240,6 +240,10 @@ public:
 
 	Ptr<RdmaEgressQueue> GetRdmaQueue();
 	void TakeDown(); // take down this device
+	// The LinkErrorModel attribute's model, which may be null, unlike through
+	// the attribute.
+	Ptr<ErrorModel> GetLinkErrorModel() const;
+	void SetLinkErrorModel(Ptr<ErrorModel> model);
 	void UpdateNextAvail(Time t);
 
 	TracedCallback<Ptr<const Packet>, Ptr<RdmaQueuePair> > m_traceQpDequeue; // the trace for printing dequeue

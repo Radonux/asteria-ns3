@@ -672,6 +672,14 @@ namespace ns3 {
 		m_rdmaEQ->EnqueueHighPrioQ(p);
 	}
 
+	Ptr<ErrorModel> QbbNetDevice::GetLinkErrorModel() const{
+		return m_linkErrorModel;
+	}
+
+	void QbbNetDevice::SetLinkErrorModel(Ptr<ErrorModel> model){
+		m_linkErrorModel = model;
+	}
+
 	void QbbNetDevice::TakeDown(){
 		// TODO: delete packets in the queue, set link down
 		if (m_node->GetNodeType() == 0){

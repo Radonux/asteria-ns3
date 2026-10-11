@@ -458,6 +458,21 @@ TypeId RdmaHw::GetTypeId (void)
 				MakeUintegerChecker<uint32_t>(
 					static_cast<uint32_t>(SpineScores::CandidateDraw::Proportional),
 					static_cast<uint32_t>(SpineScores::CandidateDraw::Uniform)))
+		.AddAttribute("SprayEdgeFreeze",
+				"Under LoadBalancing 3, whether a report whose edge bit is set "
+				"leaves the sender's spine scores as they are; when false it "
+				"moves them as any other report. Default true.",
+				BooleanValue(true),
+				MakeBooleanAccessor(&RdmaHw::m_sprayEdgeFreeze),
+				MakeBooleanChecker())
+		.AddAttribute("SpraySenderPoolWeight",
+				"Under LoadBalancing 3, the weight w of the host's pooled spine "
+				"scores, which every report the host's scores take moves too: "
+				"a spine is drawn by w times its pooled score plus 1 - w times "
+				"its score towards the destination, in [0, 1]. Default 0.",
+				DoubleValue(0),
+				MakeDoubleAccessor(&RdmaHw::m_spraySenderPoolWeight),
+				MakeDoubleChecker<double>(0, 1))
 		.AddAttribute("SprayEdgeWindowPenalty",
 				"Under LoadBalancing 3 and CC mode 11, the Rcv_Cwnd_Pend (UEC "
 				"1.0.3 section 3.6.13.2) of an acknowledgement whose report says "
@@ -2224,14 +2239,22 @@ void RdmaHw::StartPathSelection(Ptr<RdmaQueuePair> qp, uint64_t bdpBytes,
 		const SpineScores::Parameters parameters{m_sprayGamma, m_sprayEpsilon,
 			m_sprayCandidates,
 			static_cast<SpineScores::CandidateDraw>(m_sprayCandidateDraw),
-			SprayReportIntervalNs()};
+			SprayReportIntervalNs(), m_sprayEdgeFreeze};
+		if (m_spraySenderPoolWeight > 0 && !m_senderSpineScores)
+			m_senderSpineScores =
+				std::make_unique<SpineScores>(m_spineCount, parameters);
 		if (IsPerConnectionGrading()){
+			auto scores = std::make_unique<SpineScores>(m_spineCount, parameters);
+			if (m_senderSpineScores)
+				scores->Pool(*m_senderSpineScores, m_spraySenderPoolWeight);
 			qp->m_pathSelector = std::make_unique<PolicySpineSelector>(
-				m_pathRandom, std::make_unique<SpineScores>(m_spineCount, parameters));
+				m_pathRandom, std::move(scores));
 			return;
 		}
 		SpineScores &scores = m_spineScores.try_emplace(qp->dip.Get(),
 			m_spineCount, parameters).first->second;
+		if (m_senderSpineScores)
+			scores.Pool(*m_senderSpineScores, m_spraySenderPoolWeight);
 		qp->m_pathSelector =
 			std::make_unique<PolicySpineSelector>(m_pathRandom, scores);
 		return;

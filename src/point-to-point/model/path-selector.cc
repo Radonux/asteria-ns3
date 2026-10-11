@@ -64,7 +64,8 @@ SpineScores::SpineScores(uint32_t spines, const Parameters &parameters)
 	: m_parameters(parameters),
 	  m_decay(std::llround(parameters.gamma * 65536)),
 	  m_accumulated(spines), m_reported(false), m_sequence(0),
-	  m_reportedNs(0), m_nextDecayNs(UINT64_MAX)
+	  m_reportedNs(0), m_nextDecayNs(UINT64_MAX), m_pool(nullptr),
+	  m_poolWeight(0)
 {
 	NS_ASSERT_MSG(spines > 0 && spines <= SpineReport::kMaxSpines,
 		"a report grades at most SpineReport::kMaxSpines spines");
@@ -85,14 +86,20 @@ void SpineScores::OnReport(const SpineReport &report, uint64_t nowNs){
 	if (m_reported && !newer &&
 			nowNs - m_reportedNs < 128 * m_parameters.reportIntervalNs)
 		return;
-	Age(nowNs);
 	m_reported = true;
 	m_sequence = report.sequence;
+	Take(report, nowNs);
+	if (m_pool != nullptr)
+		m_pool->Take(report, nowNs);
+}
+
+void SpineScores::Take(const SpineReport &report, uint64_t nowNs){
+	Age(nowNs);
 	m_reportedNs = nowNs;
 	// A report is due every interval, and the acknowledgements carrying one
 	// arrive with an interval of jitter.
 	m_nextDecayNs = nowNs + 2 * m_parameters.reportIntervalNs;
-	if (report.edgeCongested)
+	if (report.edgeCongested && m_parameters.edgeFreeze)
 		return;
 	Decay();
 	for (uint32_t k = 0; k < m_scores.size(); k++)
@@ -100,9 +107,38 @@ void SpineScores::OnReport(const SpineReport &report, uint64_t nowNs){
 	Accumulate();
 }
 
+void SpineScores::Pool(SpineScores &pool, double weight){
+	NS_ASSERT_MSG(&pool != this, "scores are not their own pool");
+	NS_ASSERT_MSG(pool.m_scores.size() == m_scores.size(),
+		"a pool scores the same spines");
+	NS_ASSERT_MSG(weight >= 0 && weight <= 1, "a pool's weight is in [0, 1]");
+	m_pool = &pool;
+	m_poolWeight = weight;
+}
+
+bool SpineScores::IsPooled() const{
+	return m_pool != nullptr && m_poolWeight > 0;
+}
+
 uint8_t SpineScores::Choose(UniformRandomVariable &random, uint64_t nowNs){
 	if (nowNs >= m_nextDecayNs)
 		Age(nowNs);
+	if (IsPooled()){
+		if (nowNs >= m_pool->m_nextDecayNs)
+			m_pool->Age(nowNs);
+		auto candidate = [&]() -> uint8_t {
+			return m_parameters.candidateDraw == CandidateDraw::Proportional
+				? DrawFromMixed(random)
+				: random.GetInteger(0, m_scores.size() - 1);
+		};
+		uint8_t chosen = candidate();
+		for (uint32_t i = 1; i < m_parameters.candidates; i++){
+			const uint8_t next = candidate();
+			if (Mixed(next) > Mixed(chosen))
+				chosen = next;
+		}
+		return chosen;
+	}
 	auto candidate = [&]() -> uint8_t {
 		return m_parameters.candidateDraw == CandidateDraw::Proportional
 			? DrawFromShares(random)
@@ -119,6 +155,13 @@ uint8_t SpineScores::Choose(UniformRandomVariable &random, uint64_t nowNs){
 
 double SpineScores::Share(uint32_t spine) const{
 	const double spines = m_scores.size();
+	if (IsPooled()){
+		const double sum = MixedSum();
+		if (sum == 0)
+			return 1 / spines;
+		return (1 - m_parameters.epsilon) * Mixed(spine) / sum +
+			m_parameters.epsilon / spines;
+	}
 	const uint64_t sum = m_accumulated.back();
 	if (sum == 0)
 		return 1 / spines;
@@ -165,6 +208,40 @@ uint8_t SpineScores::DrawFromShares(UniformRandomVariable &random) const{
 	const uint64_t target = std::min(static_cast<uint64_t>(v * sum), sum - 1);
 	return std::upper_bound(m_accumulated.begin(), m_accumulated.end(), target) -
 		m_accumulated.begin();
+}
+
+double SpineScores::Mixed(uint32_t spine) const{
+	return m_poolWeight * m_pool->m_scores[spine] +
+		(1 - m_poolWeight) * m_scores[spine];
+}
+
+double SpineScores::MixedSum() const{
+	double sum = 0;
+	for (uint32_t k = 0; k < m_scores.size(); k++)
+		sum += Mixed(k);
+	return sum;
+}
+
+uint8_t SpineScores::DrawFromMixed(UniformRandomVariable &random) const{
+	const uint32_t spines = m_scores.size();
+	const double epsilon = m_parameters.epsilon;
+	const double u = random.GetValue();
+	if (u < epsilon)
+		return std::min(static_cast<uint32_t>(u / epsilon * spines), spines - 1);
+	const double v = (u - epsilon) / (1 - epsilon);
+	const double sum = MixedSum();
+	if (sum == 0)
+		return std::min(static_cast<uint32_t>(v * spines), spines - 1);
+	// The first spine whose running sum exceeds the target, as DrawFromShares
+	// finds it.
+	const double target = v * sum;
+	double accumulated = 0;
+	for (uint32_t k = 0; k + 1 < spines; k++){
+		accumulated += Mixed(k);
+		if (accumulated > target)
+			return k;
+	}
+	return spines - 1;
 }
 
 PolicySpineSelector::PolicySpineSelector(Ptr<UniformRandomVariable> random,

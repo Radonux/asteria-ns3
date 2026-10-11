@@ -115,6 +115,7 @@ public:
 	void SetEcmpSeed(uint32_t seed);
 	void SetSpinePorts(const std::vector<uint32_t> &ports);
 	void SetBlackhole(uint32_t port);
+	void ClearBlackhole(uint32_t port);
 	bool IsBlackholed(uint32_t port) const;
 	bool IsEcnEnabled() const;
 	// The data bytes queued for port: every queue but control queue 0 and the
