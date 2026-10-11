@@ -361,6 +361,18 @@ TypeId RdmaHw::GetTypeId (void)
 				MakeUintegerChecker<uint32_t>(
 					static_cast<uint32_t>(SpineGrader::GradeReference::Absolute),
 					static_cast<uint32_t>(SpineGrader::GradeReference::Median)))
+		.AddAttribute("SprayGradeScope",
+				"Under LoadBalancing 3, whose arrivals one grader counts: 0=every "
+				"connection into the receiving host, whose acknowledgements all "
+				"carry its report and whose senders share one set of scores per "
+				"destination host; 1=each receive queue pair alone, reported on "
+				"its own acknowledgements and scored by its own sending queue "
+				"pair. Default 0.",
+				UintegerValue(static_cast<uint32_t>(GradeScope::PerReceiver)),
+				MakeUintegerAccessor(&RdmaHw::m_sprayGradeScope),
+				MakeUintegerChecker<uint32_t>(
+					static_cast<uint32_t>(GradeScope::PerReceiver),
+					static_cast<uint32_t>(GradeScope::PerConnection)))
 		.AddAttribute("SprayGamma",
 				"Under LoadBalancing 3, the fraction of every spine score a "
 				"report decays. Default 0.25.",
@@ -398,8 +410,9 @@ TypeId RdmaHw::GetTypeId (void)
 				MakeUintegerChecker<uint32_t>(0, 127))
 		.AddTraceSource("SpineReport",
 				"Under LoadBalancing 3, a receiver issued a spine report: the "
-				"time, then the grader, which holds the report and the interval "
-				"it closed.",
+				"time, the grader, which holds the report and the interval it "
+				"closed, and under SprayGradeScope 1 the receive queue pair the "
+				"grader belongs to, else null.",
 				MakeTraceSourceAccessor(&RdmaHw::m_traceSpineReport),
 				"ns3::RdmaHw::SpineReportTracedCallback")
 		.AddAttribute("EwmaGain",
@@ -859,7 +872,7 @@ int RdmaHw::ReceiveUdp(Ptr<Packet> p, CustomHeader &ch){
 	rxQp->m_ecn_source.total++;
 	CountArrival(rxQp, ch.ipid, payload_size);
 	if (IsSprayPolicy())
-		GradeArrival(ch, ecnbits != 0);
+		GradeArrival(rxQp, ch, ecnbits != 0);
 	rxQp->m_milestone_rx = m_ack_interval;
 
 	// No logging on the non-ACK paths: behind a trim- or drop-induced gap,
@@ -919,17 +932,20 @@ bool RdmaHw::IsSprayPolicy() const{
 	return m_loadBalancing == static_cast<uint32_t>(LoadBalancingMode::SprayPolicy);
 }
 
+bool RdmaHw::IsPerConnectionGrading() const{
+	return IsSprayPolicy() &&
+		m_sprayGradeScope == static_cast<uint32_t>(GradeScope::PerConnection);
+}
+
 uint64_t RdmaHw::SprayReportIntervalNs() const{
 	NS_ABORT_MSG_IF(m_sprayBaseRttNs == 0,
 		"LoadBalancing 3 counts its report interval in SprayBaseRttNs");
 	return static_cast<uint64_t>(m_sprayReportIntervalBaseRtts * m_sprayBaseRttNs);
 }
 
-// Made at the first event, because the base RTT is set only after every host
+// Read at the first event, because the base RTT is set only after every host
 // is built.
-SpineGrader &RdmaHw::Grader(){
-	if (m_spineGrader)
-		return *m_spineGrader;
+SpineGrader::Parameters RdmaHw::GraderParameters() const{
 	const double rtt = m_sprayBaseRttNs;
 	SpineGrader::Parameters parameters;
 	parameters.spines = m_spineCount;
@@ -957,28 +973,47 @@ SpineGrader &RdmaHw::Grader(){
 	parameters.releaseFractionOfFloor = m_sprayReleaseFractionOfFloor;
 	// A held spine is drawn at epsilon / N and a top-graded one at about 1 / N.
 	parameters.floorShareOfMedian = m_sprayEpsilon;
-	m_spineGrader = std::make_unique<SpineGrader>(parameters);
+	return parameters;
+}
+
+SpineGrader &RdmaHw::Grader(){
+	if (!m_spineGrader)
+		m_spineGrader = std::make_unique<SpineGrader>(GraderParameters());
 	return *m_spineGrader;
 }
 
-SpineGrader &RdmaHw::GraderNow(){
+// A connection's grader keeps its host's phase, so the scope changes whose
+// arrivals are counted and not when the intervals close.
+SpineGrader &RdmaHw::GraderOf(Ptr<RdmaRxQueuePair> q){
+	if (!IsPerConnectionGrading())
+		return Grader();
+	NS_ASSERT_MSG(q, "a connection's grader belongs to its receive queue pair");
+	if (!q->m_spineGrader)
+		q->m_spineGrader = std::make_unique<SpineGrader>(GraderParameters());
+	return *q->m_spineGrader;
+}
+
+SpineGrader &RdmaHw::GraderNow(Ptr<RdmaRxQueuePair> q){
 	const uint64_t now = Simulator::Now().GetNanoSeconds();
-	SpineGrader &grader = Grader();
+	SpineGrader &grader = GraderOf(q);
 	if (grader.Advance(now))
-		m_traceSpineReport(now, grader);
+		m_traceSpineReport(now, grader,
+			IsPerConnectionGrading() ? PeekPointer(q) : nullptr);
 	return grader;
 }
 
-void RdmaHw::GradeArrival(const CustomHeader &ch, bool marked){
+void RdmaHw::GradeArrival(Ptr<RdmaRxQueuePair> q, const CustomHeader &ch,
+		bool marked){
 	// One clock serves the whole simulation, so the difference is the delay.
 	const uint64_t delay = m_sprayOneWayDelay
 		? (Simulator::Now() - TimeStep(ch.udp.ih.ts)).GetNanoSeconds() : 0;
-	GraderNow().OnArrival(RequestedSpine(ch.ipid), CarryingSpine(ch.ipid), marked,
-		delay);
+	GraderNow(q).OnArrival(RequestedSpine(ch.ipid), CarryingSpine(ch.ipid),
+		marked, delay);
 }
 
-void RdmaHw::GradeTrim(const CustomHeader &ch, bool lastHop){
-	GraderNow().OnTrim(CarryingSpine(ch.ipid), lastHop);
+void RdmaHw::GradeTrim(Ptr<RdmaRxQueuePair> q, const CustomHeader &ch,
+		bool lastHop){
+	GraderNow(q).OnTrim(CarryingSpine(ch.ipid), lastHop);
 }
 
 // The receiver's cumulative acknowledgement, shared by the in-order data path
@@ -1005,7 +1040,7 @@ void RdmaHw::SendAck(Ptr<RdmaRxQueuePair> q, uint32_t sourceIp,
 		seqh.SetProbeAnswer();
 	seqh.SetAllowanceExhausted(spent);
 	if (IsSprayPolicy())
-		seqh.SetSpineReport(Grader().Report());
+		seqh.SetSpineReport(GraderOf(q).Report());
 	// The grant is this flag without the report above. A receiver that may not
 	// forgive this flow, or a step that is critical, never sets it, so those
 	// senders obey their controller throughout.
@@ -1226,10 +1261,10 @@ int RdmaHw::ReceivePathProbe(Ptr<Packet> p, CustomHeader &ch){
 // UEC 1.0.3 Table 3-61: a trimmed RUD/ROD/RUDI Request MUST produce a NACK with
 // pds.nack_code UET_TRIMMED or UET_TRIMMED_LASTHOP. The NACK is a control packet
 // (DSCP_CONTROL / TC_high) and carries only the identity of the lost packet.
-void RdmaHw::SendTrimNack(const CustomHeader &ch, uint32_t sourceIp,
-		uint32_t destinationIp, uint16_t sport, uint16_t dport, uint16_t pg,
-		uint32_t seq, uint32_t payloadSize, bool lastHop, bool spent,
-		bool eligible){
+void RdmaHw::SendTrimNack(Ptr<RdmaRxQueuePair> q, const CustomHeader &ch,
+		uint32_t sourceIp, uint32_t destinationIp, uint16_t sport,
+		uint16_t dport, uint16_t pg, uint32_t seq, uint32_t payloadSize,
+		bool lastHop, bool spent, bool eligible){
 	qbbHeader repair;
 	repair.SetSeq(seq);
 	repair.SetPG(pg);
@@ -1247,7 +1282,7 @@ void RdmaHw::SendTrimNack(const CustomHeader &ch, uint32_t sourceIp,
 	// with no budget at all also sends one.
 	repair.SetForgivenessEligible(eligible);
 	if (IsSprayPolicy())
-		repair.SetSpineReport(Grader().Report());
+		repair.SetSpineReport(GraderOf(q).Report());
 	Ptr<Packet> packet = Create<Packet>(
 		std::max(60 - 14 - 20 - static_cast<int>(repair.GetSerializedSize()), 0));
 	packet->AddHeader(repair);
@@ -1443,8 +1478,8 @@ void RdmaHw::ReceiveTrimmedData(const CustomHeader &ch, uint32_t payloadSize,
 	Ptr<RdmaRxQueuePair> q = GetRxQp(ch.dip, ch.sip, ch.udp.dport, ch.udp.sport,
 		ch.udp.pg, false);
 	if (q == nullptr){
-		SendTrimNack(ch, ch.dip, ch.sip, ch.udp.dport, ch.udp.sport, ch.udp.pg,
-			ch.udp.seq, payloadSize, lastHop, false, false);
+		SendTrimNack(q, ch, ch.dip, ch.sip, ch.udp.dport, ch.udp.sport,
+			ch.udp.pg, ch.udp.seq, payloadSize, lastHop, false, false);
 		return;
 	}
 	const uint64_t start = ch.udp.seq;
@@ -1493,7 +1528,7 @@ void RdmaHw::ReceiveTrimmedData(const CustomHeader &ch, uint32_t payloadSize,
 	}
 	// The refused range stays a hole, so the report is computed after the
 	// frontier moved and counts it.
-	SendTrimNack(ch, ch.dip, ch.sip, ch.udp.dport, ch.udp.sport, ch.udp.pg,
+	SendTrimNack(q, ch, ch.dip, ch.sip, ch.udp.dport, ch.udp.sport, ch.udp.pg,
 		ch.udp.seq, payloadSize, lastHop, AllowanceGone(q),
 		q->m_forgiveness_eligible);
 }
@@ -1573,14 +1608,19 @@ int RdmaHw::ReceiveTrim(Ptr<Packet> p, CustomHeader &ch){
 		const uint32_t originalPayload = ch.udp.payload_size > udpHeaderBytes
 			? ch.udp.payload_size - udpHeaderBytes : 0;
 		const bool lastHop = ch.GetIpv4Dscp() == kUetDscpTrimmedLastHop;
+		// A trim can reach a flow before any of its data does; the receive
+		// state it makes is what that data would have made.
+		const Ptr<RdmaRxQueuePair> q = IsPerConnectionGrading()
+			? GetRxQp(ch.dip, ch.sip, ch.udp.dport, ch.udp.sport, ch.udp.pg, true)
+			: nullptr;
 		if (IsSprayPolicy())
-			GradeTrim(ch, lastHop);
+			GradeTrim(q, ch, lastHop);
 		if (m_forgiveness && originalPayload > 0){
 			ReceiveTrimmedData(ch, originalPayload, lastHop);
 			return 0;
 		}
-		SendTrimNack(ch, ch.dip, ch.sip, ch.udp.dport, ch.udp.sport, ch.udp.pg,
-			ch.udp.seq, originalPayload, lastHop, false, false);
+		SendTrimNack(q, ch, ch.dip, ch.sip, ch.udp.dport, ch.udp.sport,
+			ch.udp.pg, ch.udp.seq, originalPayload, lastHop, false, false);
 		return 0;
 	}
 
@@ -1988,6 +2028,11 @@ void RdmaHw::StartPathSelection(Ptr<RdmaQueuePair> qp, uint64_t bdpBytes,
 			m_sprayCandidates,
 			static_cast<SpineScores::CandidateDraw>(m_sprayCandidateDraw),
 			SprayReportIntervalNs()};
+		if (IsPerConnectionGrading()){
+			qp->m_pathSelector = std::make_unique<PolicySpineSelector>(
+				m_pathRandom, std::make_unique<SpineScores>(m_spineCount, parameters));
+			return;
+		}
 		SpineScores &scores = m_spineScores.try_emplace(qp->dip.Get(),
 			m_spineCount, parameters).first->second;
 		qp->m_pathSelector =

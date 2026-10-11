@@ -105,6 +105,7 @@ public:
 	double m_sprayReleaseFractionOfFloor;
 	bool m_sprayOneWayDelay;
 	uint32_t m_sprayGradeReference; // SpineGrader::GradeReference
+	uint32_t m_sprayGradeScope; // GradeScope
 	double m_sprayDelayCusumSlackBaseRtts;
 	double m_sprayDelayCusumThresholdBaseRtts;
 	double m_sprayDelayThreshold1BaseRtts, m_sprayDelayThreshold2BaseRtts,
@@ -116,24 +117,35 @@ public:
 	// The Rcv_Cwnd_Pend NSCC is handed for an acknowledgement whose report has
 	// the edge bit set.
 	uint32_t m_sprayEdgeWindowPenalty;
-	// The receiver's grader, made at the first event it counts, and the
-	// sender's scores towards each destination host by address, shared by
-	// every queue pair to that host.
+	// Under GradeScope::PerReceiver, the receiver's grader, made at the first
+	// event it counts, and the sender's scores towards each destination host
+	// by address, shared by every queue pair to that host. Under
+	// PerConnection each receive queue pair keeps its own grader and each
+	// queue pair its own scores.
 	std::unique_ptr<SpineGrader> m_spineGrader;
 	std::unordered_map<uint32_t, SpineScores> m_spineScores;
-	// The SpineReport trace source: the time and the grader that has just
-	// issued a report.
+	// The SpineReport trace source: the time, the grader that has just issued
+	// a report, and under PerConnection the receive queue pair that owns it,
+	// null under PerReceiver.
 	typedef void (*SpineReportTracedCallback)(uint64_t nowNs,
-		const SpineGrader &grader);
-	TracedCallback<uint64_t, const SpineGrader &> m_traceSpineReport;
+		const SpineGrader &grader, const RdmaRxQueuePair *connection);
+	TracedCallback<uint64_t, const SpineGrader &, const RdmaRxQueuePair *>
+		m_traceSpineReport;
 	bool IsSprayPolicy() const;
+	bool IsPerConnectionGrading() const;
 	uint64_t SprayReportIntervalNs() const;
+	SpineGrader::Parameters GraderParameters() const;
+	// The host's grader.
 	SpineGrader &Grader();
-	// The grader once it has closed the interval that ended by now.
-	SpineGrader &GraderNow();
-	// The data packet or trimmed header of ch counted by the grader.
-	void GradeArrival(const CustomHeader &ch, bool marked);
-	void GradeTrim(const CustomHeader &ch, bool lastHop);
+	// The grader q's arrivals feed and q's answers report: the host's, or
+	// under PerConnection q's own, in which case q is not null.
+	SpineGrader &GraderOf(Ptr<RdmaRxQueuePair> q);
+	// That grader once it has closed the interval that ended by now.
+	SpineGrader &GraderNow(Ptr<RdmaRxQueuePair> q);
+	// The data packet or trimmed header of ch counted by q's grader.
+	void GradeArrival(Ptr<RdmaRxQueuePair> q, const CustomHeader &ch,
+		bool marked);
+	void GradeTrim(Ptr<RdmaRxQueuePair> q, const CustomHeader &ch, bool lastHop);
 	// Indexed by carrying spine; kept where the identification names one.
 	std::vector<SpineArrivals> m_spineArrivals;
 	bool m_var_win, m_fast_react;
@@ -246,10 +258,12 @@ public:
 
 	void RecoverQueue(Ptr<RdmaQueuePair> qp);
 	void RecoverTrimmedQueue(Ptr<RdmaQueuePair> qp, const CustomHeader &ch);
-	void SendTrimNack(const CustomHeader &ch, uint32_t sourceIp,
-		uint32_t destinationIp, uint16_t sport, uint16_t dport, uint16_t pg,
-		uint32_t seq, uint32_t payloadSize, bool lastHop, bool spent,
-		bool eligible);
+	// q is the receive queue pair of the trimmed packet's flow, which may be
+	// null unless its answers carry state of their own.
+	void SendTrimNack(Ptr<RdmaRxQueuePair> q, const CustomHeader &ch,
+		uint32_t sourceIp, uint32_t destinationIp, uint16_t sport,
+		uint16_t dport, uint16_t pg, uint32_t seq, uint32_t payloadSize,
+		bool lastHop, bool spent, bool eligible);
 	// packetSeq and identification describe the data packet answered, or with
 	// probeAnswer the probe.
 	void SendAck(Ptr<RdmaRxQueuePair> q, uint32_t sourceIp,

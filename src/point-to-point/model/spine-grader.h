@@ -8,6 +8,14 @@
 
 namespace ns3 {
 
+// Whose arrivals one grader counts and whose acknowledgements carry its
+// report, and so which senders share one set of scores: every connection into
+// a receiving host, or each connection alone.
+enum class GradeScope : uint32_t {
+	PerReceiver = 0,
+	PerConnection,
+};
+
 // An exponentially weighted moving average of a sample taken once per
 // interval, supervised by a two-sided CUSUM (Page, 1954): the sums of the
 // samples' excess over the average, and of their shortfall below it, each net

@@ -153,6 +153,12 @@ PolicySpineSelector::PolicySpineSelector(Ptr<UniformRandomVariable> random,
 {
 }
 
+PolicySpineSelector::PolicySpineSelector(Ptr<UniformRandomVariable> random,
+		std::unique_ptr<SpineScores> scores)
+	: m_random(random), m_ownScores(std::move(scores)), m_scores(*m_ownScores)
+{
+}
+
 uint16_t PolicySpineSelector::Choose(uint64_t nowNs){
 	const uint8_t spine = m_scores.Choose(*m_random, nowNs);
 	return SpineIdentification(spine, spine);

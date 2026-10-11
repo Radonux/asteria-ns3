@@ -5,6 +5,7 @@
 #include <ns3/random-variable-stream.h>
 #include "spine-report.h"
 #include <deque>
+#include <memory>
 #include <stdint.h>
 #include <utility>
 #include <vector>
@@ -117,15 +118,20 @@ private:
 
 // A spine drawn per packet from the scores towards the queue pair's
 // destination, named as both the requested and the carrying spine
-// (spray_policy).
+// (spray_policy). The scores are shared with every queue pair to the same
+// host, or owned by this queue pair alone.
 class PolicySpineSelector : public PathSelector {
 public:
 	PolicySpineSelector(Ptr<UniformRandomVariable> random, SpineScores &scores);
+	PolicySpineSelector(Ptr<UniformRandomVariable> random,
+		std::unique_ptr<SpineScores> scores);
 	uint16_t Choose(uint64_t nowNs) override;
 	void OnReport(const SpineReport &report, uint64_t nowNs) override;
 
 private:
 	Ptr<UniformRandomVariable> m_random;
+	// Declared before m_scores, which refers to it when it is set.
+	std::unique_ptr<SpineScores> m_ownScores;
 	SpineScores &m_scores;
 };
 
