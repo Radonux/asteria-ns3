@@ -75,8 +75,11 @@ std::string transport_event_summary_output_file = "transport_summary.csv";
 // writes neither.
 std::string port_counter_output_file, spine_arrival_output_file;
 std::string spine_report_output_file;
+// Each host's pooled loss intervals under SPRAY_LOSS_THRESHOLDS: one row per
+// host, closed interval and spine. Empty writes none.
+std::string spine_loss_output_file;
 FILE *port_counter_file = nullptr, *spine_arrival_file = nullptr;
-FILE *spine_report_file = nullptr;
+FILE *spine_report_file = nullptr, *spine_loss_file = nullptr;
 
 double alpha_resume_interval = 55, rp_timer, ewma_gain = 1 / 16;
 double rate_decrease_interval = 4;
@@ -164,6 +167,12 @@ double spray_congestion_thresholds[3] = {0.25, 0.5, 0.75};
 // Zero, unless SPRAY_TRIM_THRESHOLDS is given: the trimmed fraction is graded
 // through spray_congestion_thresholds.
 double spray_trim_thresholds[3] = {0, 0, 0};
+// Zero, unless SPRAY_LOSS_THRESHOLDS is given: the sender counts no loss, and
+// the switch_queue grader grades the loss fraction through
+// spray_congestion_thresholds. Zero spray_loss_interval_ns is the report
+// interval.
+double spray_loss_thresholds[3] = {0, 0, 0};
+uint64_t spray_loss_interval_ns = 0;
 double spray_absence_fraction_of_median = 0.125;
 uint32_t spray_absence_minimum_median = 16;
 double spray_release_fraction_of_floor = 0.5;
@@ -187,12 +196,14 @@ const std::set<std::string> spray_policy_keys = {
     "SPRAY_REPORT_INTERVAL_BASE_RTTS", "SPRAY_ESTIMATOR_GAIN",
     "SPRAY_FRACTION_CUSUM_SLACK", "SPRAY_FRACTION_CUSUM_THRESHOLD",
     "SPRAY_CONGESTION_THRESHOLDS", "SPRAY_TRIM_THRESHOLDS",
+    "SPRAY_LOSS_THRESHOLDS", "SPRAY_LOSS_INTERVAL_NS",
     "SPRAY_RELEASE_FRACTION_OF_FLOOR",
     "SPRAY_ONE_WAY_DELAY", "SPRAY_DELAY_CUSUM_SLACK_BASE_RTTS",
     "SPRAY_DELAY_CUSUM_THRESHOLD_BASE_RTTS", "SPRAY_DELAY_THRESHOLDS_BASE_RTTS",
     "SPRAY_GAMMA", "SPRAY_EPSILON", "SPRAY_CANDIDATES", "SPRAY_CANDIDATE_DRAW",
     "SPRAY_EDGE_WINDOW_PENALTY", "SPRAY_EDGE_FREEZE",
     "SPRAY_SENDER_POOL_WEIGHT", "SPINE_REPORT_OUTPUT_FILE",
+    "SPINE_LOSS_OUTPUT_FILE",
     "SPRAY_ABSENCE_FRACTION_OF_MEDIAN", "SPRAY_ABSENCE_MINIMUM_MEDIAN",
     "SPRAY_GRADE_REFERENCE", "SPRAY_GRADE_SCOPE", "SPRAY_GRADE_COST_SOURCE",
     "SPRAY_ESTIMATOR_INTERVAL_SAMPLES"};
@@ -250,7 +261,28 @@ uint64_t link_down_time = 0;
 uint32_t link_down_A = 0, link_down_B = 0;
 
 // The LINK_FAILURE and LINK_RESTORE lines, put in the order they apply in
-// once the configuration is read.
+// once the configuration is read. Each is one line:
+//   LINK_FAILURE <time_ns> down <a> <b>
+//   LINK_FAILURE <time_ns> blackhole <a> <b>
+//   LINK_FAILURE <time_ns> loss <a> <b> <error_rate> [forward|both]
+//   LINK_FAILURE <time_ns> rate <a> <b> <data_rate> [forward|both]
+//   LINK_RESTORE <time_ns> <a> <b>
+// down takes the link down for the rest of the run. blackhole needs b to be a
+// switch, which then drops whatever arrives on its port from a: the direction
+// from a to b loses everything, the direction from b to a is unchanged. loss
+// sets the link's error rate, in (0, 1], and rate its data rate. Without a
+// direction, or with both, they apply in both directions; with forward, in the
+// direction from a to b alone, as blackhole does: under loss b drops that
+// fraction of what it receives from a, and under rate a transmits toward b at
+// the data rate, while what b sends to a is unchanged. LINK_RESTORE takes no
+// direction: it puts back what one failure of the link changed, in that
+// failure's directions, and nothing may follow its two nodes. It restores the
+// failure named with the same two nodes in the same order if one is not yet
+// restored, else the one named in the other order, so the two directions of a
+// link fail and restore independently when each failure and its restore name
+// the nodes in the same order. A later failure named in the same order
+// replaces the one before it, which a restore then no longer puts back; a link
+// taken down is not restored.
 vector<LinkEvent> link_events;
 
 uint32_t enable_trace = 1;
@@ -1095,7 +1127,8 @@ void write_fabric_counters() {
       }
     }
   }
-  for (FILE *file : {port_counter_file, spine_arrival_file, spine_report_file})
+  for (FILE *file : {port_counter_file, spine_arrival_file, spine_report_file,
+                     spine_loss_file})
     if (file != nullptr)
       fflush(file);
 }
@@ -1144,6 +1177,19 @@ void write_spine_report(uint32_t rank, uint64_t now_ns,
               ip_to_node_id(Ipv4Address(connection->dip)), connection->dport);
     fputc('\n', spine_report_file);
   }
+}
+
+// A loss interval the host's pooled scores closed: one row per spine, under
+// the time the interval ended at, with the sends and losses counted in it and
+// the grade its lost fraction earns.
+void write_spine_loss_interval(uint32_t rank, uint64_t end_ns,
+                               const std::vector<uint32_t> &sent,
+                               const std::vector<uint32_t> &lost,
+                               const std::vector<uint8_t> &grades) {
+  for (uint32_t spine = 0; spine < sent.size(); spine++)
+    fprintf(spine_loss_file, "%lu,%u,%u,%u,%u,%u\n",
+            static_cast<unsigned long>(end_ns), rank, spine, sent[spine],
+            lost[spine], grades[spine]);
 }
 
 // The link events' applier, which keeps what a restore puts back.
@@ -1206,6 +1252,27 @@ bool valid_spray_policy() {
       (!increasing(spray_trim_thresholds) || spray_trim_thresholds[2] > 1)) {
     std::cerr << "SPRAY_TRIM_THRESHOLDS must be three increasing "
                  "fractions in (0, 1]\n";
+    return false;
+  }
+  if (spray_policy_keys_given.count("SPRAY_LOSS_THRESHOLDS") > 0 &&
+      (!increasing(spray_loss_thresholds) || spray_loss_thresholds[2] > 1)) {
+    std::cerr << "SPRAY_LOSS_THRESHOLDS must be three increasing "
+                 "fractions in (0, 1]\n";
+    return false;
+  }
+  if (spray_policy_keys_given.count("SPRAY_LOSS_INTERVAL_NS") > 0 &&
+      spray_policy_keys_given.count("SPRAY_LOSS_THRESHOLDS") == 0) {
+    std::cerr << "SPRAY_LOSS_INTERVAL_NS is read only with "
+                 "SPRAY_LOSS_THRESHOLDS\n";
+    return false;
+  }
+  // The sender declares a send lost only from the send records selective
+  // retransmission keeps; under switch_queue the thresholds grade the paths'
+  // loss read from the switches instead.
+  if (spray_policy_keys_given.count("SPRAY_LOSS_THRESHOLDS") > 0 &&
+      spray_grade_cost_source != "switch_queue" &&
+      selective_retransmission == 0) {
+    std::cerr << "SPRAY_LOSS_THRESHOLDS requires SELECTIVE_RETRANSMISSION 1\n";
     return false;
   }
   if (!increasing(spray_delay_thresholds_base_rtts)) {
@@ -1279,6 +1346,17 @@ bool valid_spray_policy() {
   }
   if (!(spray_sender_pool_weight >= 0 && spray_sender_pool_weight <= 1)) {
     std::cerr << "SPRAY_SENDER_POOL_WEIGHT must be in [0, 1]\n";
+    return false;
+  }
+  // Only the host's pool counts over loss intervals, and only the sender's
+  // own counting, outside switch_queue, feeds it.
+  if (!spine_loss_output_file.empty() &&
+      (spray_policy_keys_given.count("SPRAY_LOSS_THRESHOLDS") == 0 ||
+       spray_sender_pool_weight == 0 ||
+       spray_grade_cost_source == "switch_queue")) {
+    std::cerr << "SPINE_LOSS_OUTPUT_FILE requires SPRAY_LOSS_THRESHOLDS and "
+                 "SPRAY_SENDER_POOL_WEIGHT above zero, outside "
+                 "SPRAY_GRADE_COST_SOURCE switch_queue\n";
     return false;
   }
   return true;
@@ -1488,6 +1566,11 @@ bool ReadConf(string network_configuration) {
     } else if (key.compare("SPRAY_TRIM_THRESHOLDS") == 0) {
       conf >> spray_trim_thresholds[0] >> spray_trim_thresholds[1] >>
           spray_trim_thresholds[2];
+    } else if (key.compare("SPRAY_LOSS_THRESHOLDS") == 0) {
+      conf >> spray_loss_thresholds[0] >> spray_loss_thresholds[1] >>
+          spray_loss_thresholds[2];
+    } else if (key.compare("SPRAY_LOSS_INTERVAL_NS") == 0) {
+      conf >> spray_loss_interval_ns;
     } else if (key.compare("SPRAY_RELEASE_FRACTION_OF_FLOOR") == 0) {
       conf >> spray_release_fraction_of_floor;
     } else if (key.compare("SPRAY_ONE_WAY_DELAY") == 0) {
@@ -1594,6 +1677,8 @@ bool ReadConf(string network_configuration) {
       conf >> spine_arrival_output_file;
     } else if (key.compare("SPINE_REPORT_OUTPUT_FILE") == 0) {
       conf >> spine_report_output_file;
+    } else if (key.compare("SPINE_LOSS_OUTPUT_FILE") == 0) {
+      conf >> spine_loss_output_file;
     } else if (key.compare("LINK_DOWN") == 0) {
       conf >> link_down_time >> link_down_A >> link_down_B;
     } else if (key.compare("LINK_FAILURE") == 0) {
@@ -1626,11 +1711,41 @@ bool ReadConf(string network_configuration) {
         std::cerr << "LINK_FAILURE kind must be down, blackhole, loss or rate\n";
         return false;
       }
+      if (failure.kind == LinkEventKind::Loss ||
+          failure.kind == LinkEventKind::Rate) {
+        // An optional last token on the line: both, the default, or forward,
+        // the direction from the first node named to the second alone.
+        std::string rest, direction, extra;
+        std::getline(conf, rest);
+        std::istringstream tokens(rest);
+        tokens >> direction >> extra;
+        if (direction == "forward") {
+          failure.direction = LinkDirection::Forward;
+        } else if (!direction.empty() && direction != "both") {
+          std::cerr << "LINK_FAILURE " << kind
+                    << " direction must be forward or both\n";
+          return false;
+        }
+        if (!extra.empty()) {
+          std::cerr << "LINK_FAILURE " << kind
+                    << " takes nothing after its direction\n";
+          return false;
+        }
+      }
       link_events.push_back(failure);
     } else if (key.compare("LINK_RESTORE") == 0) {
       LinkEvent restore;
       restore.kind = LinkEventKind::Restore;
       conf >> restore.timeNs >> restore.a >> restore.b;
+      // A restore puts back what its failure set, in the failure's
+      // directions, so it takes no direction.
+      std::string rest, extra;
+      std::getline(conf, rest);
+      std::istringstream tokens(rest);
+      if (tokens >> extra) {
+        std::cerr << "LINK_RESTORE takes nothing after its two nodes\n";
+        return false;
+      }
       link_events.push_back(restore);
     } else if (key.compare("ENABLE_TRACE") == 0) {
       conf >> enable_trace;
@@ -2372,6 +2487,14 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),
                            DoubleValue(spray_trim_thresholds[1]));
       rdmaHw->SetAttribute("SprayTrimThreshold3",
                            DoubleValue(spray_trim_thresholds[2]));
+      rdmaHw->SetAttribute("SprayLossThreshold1",
+                           DoubleValue(spray_loss_thresholds[0]));
+      rdmaHw->SetAttribute("SprayLossThreshold2",
+                           DoubleValue(spray_loss_thresholds[1]));
+      rdmaHw->SetAttribute("SprayLossThreshold3",
+                           DoubleValue(spray_loss_thresholds[2]));
+      rdmaHw->SetAttribute("SprayLossIntervalNs",
+                           UintegerValue(spray_loss_interval_ns));
       rdmaHw->SetAttribute("SprayReleaseFractionOfFloor",
                            DoubleValue(spray_release_fraction_of_floor));
       rdmaHw->SetAttribute("SprayOneWayDelay",
@@ -2603,6 +2726,19 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),
           hw->TraceConnectWithoutContext(
               "SpineReport", MakeBoundCallback(&write_spine_report, i));
       }
+  }
+  if (!spine_loss_output_file.empty()) {
+    spine_loss_file = fopen(spine_loss_output_file.c_str(), "w");
+    if (spine_loss_file == nullptr) {
+      std::cerr << "Error: cannot open " << spine_loss_output_file << "\n";
+      return false;
+    }
+    fprintf(spine_loss_file, "time_ns,rank,spine,sent,lost,grade\n");
+    for (uint32_t i = 0; i < node_num; i++)
+      if (n.Get(i)->GetNodeType() == 0)
+        n.Get(i)->GetObject<RdmaDriver>()->m_rdma->TraceConnectWithoutContext(
+            "SpineLossInterval",
+            MakeBoundCallback(&write_spine_loss_interval, i));
   }
   std::set<uint64_t> event_times;
   for (const LinkEvent &event : link_events) {

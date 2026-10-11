@@ -127,6 +127,18 @@ public:
 	double m_sprayCongestionThreshold1, m_sprayCongestionThreshold2, m_sprayCongestionThreshold3;
 	// Zero leaves the trimmed fraction on the congestion thresholds.
 	double m_sprayTrimThreshold1, m_sprayTrimThreshold2, m_sprayTrimThreshold3;
+	// Zero counts no loss at the sender and leaves the loss fraction the
+	// grader grades under SwitchQueue on the congestion thresholds.
+	double m_sprayLossThreshold1, m_sprayLossThreshold2, m_sprayLossThreshold3;
+	// SpineScores::Parameters::lossIntervalNs.
+	uint64_t m_sprayLossIntervalNs;
+	// The loss thresholds, unset while SprayLossThreshold1 is zero.
+	std::optional<std::array<double, 3>> SprayLossThresholds() const;
+	// Whether the sender's scores count sends and losses: under SprayPolicy
+	// with the loss thresholds set, outside SwitchQueue.
+	bool CountsSprayLoss() const;
+	// Whether the loss counting has the send records it needs.
+	bool ValidSprayLoss() const;
 	double m_sprayAbsenceFractionOfMedian;
 	uint32_t m_sprayAbsenceMinimumMedian;
 	double m_sprayReleaseFractionOfFloor;
@@ -181,6 +193,16 @@ public:
 	// made at the first queue pair; null otherwise.
 	double m_spraySenderPoolWeight;
 	std::unique_ptr<SpineScores> m_senderSpineScores;
+	// The SpineLossInterval trace source: the host's pooled scores closed a
+	// loss interval (SpineScores::LossIntervalCallback): the time it ended
+	// at and, per spine, the sends and losses counted in it and the grade
+	// its lost fraction earns.
+	typedef void (*SpineLossIntervalTracedCallback)(uint64_t endNs,
+		const std::vector<uint32_t> &sent, const std::vector<uint32_t> &lost,
+		const std::vector<uint8_t> &grades);
+	TracedCallback<uint64_t, const std::vector<uint32_t> &,
+		const std::vector<uint32_t> &, const std::vector<uint8_t> &>
+		m_traceSpineLossInterval;
 	// The SpineReport trace source: the time, the grader that has just issued
 	// a report, and under PerConnection the receive queue pair that owns it,
 	// null under PerReceiver.

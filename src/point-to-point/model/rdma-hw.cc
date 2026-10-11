@@ -354,6 +354,38 @@ TypeId RdmaHw::GetTypeId (void)
 				DoubleValue(0),
 				MakeDoubleAccessor(&RdmaHw::m_sprayTrimThreshold3),
 				MakeDoubleChecker<double>(0, 1))
+		.AddAttribute("SprayLossThreshold1",
+				"Under LoadBalancing 3, the fraction of a spine's sends declared "
+				"lost from which the sender grades it 2, depositing the lower of "
+				"that grade and the report's; under SprayGradeCostSource 1, the "
+				"loss fraction's cost from which the grader grades a spine 2. "
+				"Default 0, which counts no loss at the sender and grades the "
+				"loss fraction through the congestion thresholds; the three are "
+				"set together.",
+				DoubleValue(0),
+				MakeDoubleAccessor(&RdmaHw::m_sprayLossThreshold1),
+				MakeDoubleChecker<double>(0, 1))
+		.AddAttribute("SprayLossThreshold2",
+				"Under LoadBalancing 3, the lost fraction or cost from which a "
+				"spine grades 1. Default 0, as SprayLossThreshold1.",
+				DoubleValue(0),
+				MakeDoubleAccessor(&RdmaHw::m_sprayLossThreshold2),
+				MakeDoubleChecker<double>(0, 1))
+		.AddAttribute("SprayLossThreshold3",
+				"Under LoadBalancing 3, the lost fraction or cost from which a "
+				"spine grades 0. Default 0, as SprayLossThreshold1.",
+				DoubleValue(0),
+				MakeDoubleAccessor(&RdmaHw::m_sprayLossThreshold3),
+				MakeDoubleChecker<double>(0, 1))
+		.AddAttribute("SprayLossIntervalNs",
+				"Under LoadBalancing 3 with SprayLossThreshold1 set and "
+				"SpraySenderPoolWeight above zero, the interval over which the "
+				"host's pooled scores count the sends and losses of all its "
+				"queue pairs and grade the spines by them. Default 0, the report "
+				"interval.",
+				UintegerValue(0),
+				MakeUintegerAccessor(&RdmaHw::m_sprayLossIntervalNs),
+				MakeUintegerChecker<uint64_t>())
 		.AddAttribute("SprayAbsenceFractionOfMedian",
 				"Under LoadBalancing 3, a spine whose arrivals over a window are "
 				"below this fraction of the median spine's is held at grade 0, "
@@ -515,6 +547,14 @@ TypeId RdmaHw::GetTypeId (void)
 				"values read from the switches and the report they earned.",
 				MakeTraceSourceAccessor(&RdmaHw::m_traceSwitchQueueReport),
 				"ns3::RdmaHw::SwitchQueueReportTracedCallback")
+		.AddTraceSource("SpineLossInterval",
+				"Under LoadBalancing 3 with SprayLossThreshold1 set and "
+				"SpraySenderPoolWeight above zero, the host's pooled scores "
+				"closed a loss interval: the time it ended at and, per spine, "
+				"the sends and losses counted in it and the grade its lost "
+				"fraction earns.",
+				MakeTraceSourceAccessor(&RdmaHw::m_traceSpineLossInterval),
+				"ns3::RdmaHw::SpineLossIntervalTracedCallback")
 		.AddAttribute("EwmaGain",
 				"Control gain parameter which determines the level of rate decrease",
 				DoubleValue(1.0 / 16),
@@ -754,6 +794,9 @@ void RdmaHw::Setup(QpCompleteCallback cb, QpFailureCallback failure_cb){
 			!m_selective_retransmission,
 		"The step stop needs SelectiveRetransmission: a forgiven remainder is "
 		"absorbed as an accepted out-of-order range");
+	NS_ABORT_MSG_IF(!ValidSprayLoss(),
+		"SprayLossThreshold1-3 need SelectiveRetransmission: a send is declared "
+		"lost only from the send records it keeps");
 	NS_ABORT_MSG_IF(m_loadBalancing !=
 				static_cast<uint32_t>(LoadBalancingMode::Ecmp) && !m_pathRandom,
 		"A LoadBalancing mode other than ECMP draws the identification of every "
@@ -1138,6 +1181,23 @@ void RdmaHw::GradeFromSwitchQueues(uint64_t nowNs, const SpineGrader &grader){
 	}
 }
 
+bool RdmaHw::CountsSprayLoss() const{
+	// Under the switches' state the paths' loss is read into the reports, so
+	// the sender counts none of its own.
+	return IsSprayPolicy() && m_sprayLossThreshold1 > 0 && !IsSwitchQueueCost();
+}
+
+bool RdmaHw::ValidSprayLoss() const{
+	return !CountsSprayLoss() || m_selective_retransmission;
+}
+
+std::optional<std::array<double, 3>> RdmaHw::SprayLossThresholds() const{
+	if (m_sprayLossThreshold1 == 0)
+		return std::nullopt;
+	return std::array<double, 3>{m_sprayLossThreshold1, m_sprayLossThreshold2,
+		m_sprayLossThreshold3};
+}
+
 bool RdmaHw::IsPerConnectionGrading() const{
 	return IsSprayPolicy() &&
 		m_sprayGradeScope == static_cast<uint32_t>(GradeScope::PerConnection);
@@ -1168,6 +1228,7 @@ SpineGrader::Parameters RdmaHw::GraderParameters() const{
 	if (m_sprayTrimThreshold1 > 0)
 		parameters.trimThresholds = std::array<double, 3>{m_sprayTrimThreshold1,
 			m_sprayTrimThreshold2, m_sprayTrimThreshold3};
+	parameters.lossThresholds = SprayLossThresholds();
 	parameters.oneWayDelay = m_sprayOneWayDelay;
 	parameters.delayNs = {m_sprayEstimatorGain,
 		m_sprayDelayCusumSlackBaseRtts * rtt,
@@ -2260,13 +2321,25 @@ void RdmaHw::StartPathSelection(Ptr<RdmaQueuePair> qp, uint64_t bdpBytes,
 		return;
 	}
 	if (IsSprayPolicy()){
-		const SpineScores::Parameters parameters{m_sprayGamma, m_sprayEpsilon,
+		SpineScores::Parameters parameters{m_sprayGamma, m_sprayEpsilon,
 			m_sprayCandidates,
 			static_cast<SpineScores::CandidateDraw>(m_sprayCandidateDraw),
 			SprayReportIntervalNs(), m_sprayEdgeFreeze};
-		if (m_spraySenderPoolWeight > 0 && !m_senderSpineScores)
+		if (CountsSprayLoss()){
+			parameters.lossThresholds = SprayLossThresholds();
+			parameters.lossIntervalNs = m_sprayLossIntervalNs;
+		}
+		if (m_spraySenderPoolWeight > 0 && !m_senderSpineScores){
 			m_senderSpineScores =
 				std::make_unique<SpineScores>(m_spineCount, parameters);
+			if (parameters.lossThresholds)
+				m_senderSpineScores->SetLossIntervalCallback(
+					[this](uint64_t endNs, const std::vector<uint32_t> &sent,
+							const std::vector<uint32_t> &lost,
+							const std::vector<uint8_t> &grades){
+						m_traceSpineLossInterval(endNs, sent, lost, grades);
+					});
+		}
 		if (IsPerConnectionGrading()){
 			auto scores = std::make_unique<SpineScores>(m_spineCount, parameters);
 			if (m_senderSpineScores)
