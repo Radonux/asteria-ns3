@@ -11,6 +11,7 @@
 #include "load-balancing.h"
 #include "nscc-window.h"
 #include "spine-grader.h"
+#include "spine-redirect.h"
 #include <memory>
 #include <unordered_map>
 #include "pint.h"
@@ -97,6 +98,13 @@ public:
 	double m_ackRedirectFlag;
 	double m_ackRedirectValidityBaseRtts;
 	uint32_t m_ackRedirectTrimScoring;
+	// GradeScope of the redirect: PerConnection scores each arrival in its
+	// receive queue pair's SpineRedirect; PerReceiver scores the spines from
+	// the averages of the host's grader, as m_hostRedirect.
+	uint32_t m_ackRedirectScope;
+	HostSpineRedirect m_hostRedirect;
+	bool IsHostRedirect() const;
+	HostSpineRedirect::Parameters HostRedirectParameters() const;
 	// The addresses of the hosts on this host's leaf, sorted. Their packets
 	// cross no spine, so they are not scored for a redirect.
 	std::vector<uint32_t> m_ownLeafHosts;
@@ -148,6 +156,9 @@ public:
 	TracedCallback<uint64_t, const SpineGrader &, const RdmaRxQueuePair *>
 		m_traceSpineReport;
 	bool IsSprayPolicy() const;
+	// Whether the host keeps a grader: under SprayPolicy, and for the
+	// redirect of PathSelectorKind::AckRedirect at GradeScope::PerReceiver.
+	bool IsGrading() const;
 	bool IsPerConnectionGrading() const;
 	uint64_t SprayReportIntervalNs() const;
 	SpineGrader::Parameters GraderParameters() const;
