@@ -116,7 +116,9 @@ uint32_t selective_retransmission = 0;
 std::string packet_trim_mode = "disabled";
 std::string load_balancing = "ecmp";
 // Under LOAD_BALANCING ev_hash, what chooses each data packet's entropy value,
-// and the parameters of the selectors, each the default of its source.
+// and under spray_uniform whether ack_redirect chooses its spine instead of a
+// uniform draw; and the parameters of the selectors, each the default of its
+// source.
 std::string path_selector = "ops";
 uint32_t reps_buffer_size = 8;
 uint64_t reps_freezing_timeout_ns = 10000000;
@@ -125,6 +127,10 @@ double ue_saturation_fraction = 0.5;
 uint32_t mrc_ev_set_size = 128;
 double mrc_skip_base_rtts = 1.0;
 double mrc_probe_timeouts = 1.0;
+double ack_redirect_omega = 0.5;
+double ack_redirect_flag = 0.1;
+double ack_redirect_validity_base_rtts = 2.0;
+std::string ack_redirect_trim_scoring = "mark";
 // The selectors each parameter belongs to. A parameter given under another
 // selector would be read by nothing, so it is refused.
 const std::map<std::string, std::set<std::string>> path_selector_parameter_owners = {
@@ -135,6 +141,10 @@ const std::map<std::string, std::set<std::string>> path_selector_parameter_owner
     {"MRC_EV_SET_SIZE", {"mrc"}},
     {"MRC_SKIP_BASE_RTTS", {"mrc"}},
     {"MRC_PROBE_TIMEOUTS", {"mrc"}},
+    {"ACK_REDIRECT_OMEGA", {"ack_redirect"}},
+    {"ACK_REDIRECT_FLAG", {"ack_redirect"}},
+    {"ACK_REDIRECT_VALIDITY_BASE_RTTS", {"ack_redirect"}},
+    {"ACK_REDIRECT_TRIM_SCORING", {"ack_redirect"}},
 };
 std::set<std::string> path_selector_parameters_given;
 // Under LOAD_BALANCING spray_policy, the receiver's and the sender's
@@ -642,6 +652,16 @@ uint32_t path_selector_value() {
     return static_cast<uint32_t>(PathSelectorKind::UeAware);
   if (path_selector == "mrc")
     return static_cast<uint32_t>(PathSelectorKind::Mrc);
+  if (path_selector == "ack_redirect")
+    return static_cast<uint32_t>(PathSelectorKind::AckRedirect);
+  return std::numeric_limits<uint32_t>::max();
+}
+
+uint32_t ack_redirect_trim_scoring_value() {
+  if (ack_redirect_trim_scoring == "mark")
+    return static_cast<uint32_t>(TrimScoring::Mark);
+  if (ack_redirect_trim_scoring == "ignore")
+    return static_cast<uint32_t>(TrimScoring::Ignore);
   return std::numeric_limits<uint32_t>::max();
 }
 
@@ -934,6 +954,19 @@ uint32_t AssignSpinePorts(NodeContainer &n) {
   return spines.size();
 }
 
+// The addresses of the hosts attached to the switch host is attached to,
+// sorted, host's own among them.
+std::vector<uint32_t> own_leaf_hosts(Ptr<Node> host) {
+  std::vector<uint32_t> addresses;
+  for (const auto &uplink : nbr2if[host]) {
+    for (const auto &link : nbr2if[uplink.first])
+      if (link.first->GetNodeType() == 0)
+        addresses.push_back(node_id_to_ip(link.first->GetId()).Get());
+  }
+  std::sort(addresses.begin(), addresses.end());
+  return addresses;
+}
+
 // take down the link between a and b, and redo the routing
 void TakeDownLink(NodeContainer n, Ptr<Node> a, Ptr<Node> b) {
   if (!nbr2if[a][b].up)
@@ -1148,6 +1181,35 @@ bool valid_spray_policy() {
   return true;
 }
 
+// The ack_redirect parameters within the ranges their RdmaHw attributes take.
+bool valid_ack_redirect() {
+  if (!(ack_redirect_omega >= 0 && ack_redirect_omega <= 1)) {
+    std::cerr << "ACK_REDIRECT_OMEGA must be in [0, 1]\n";
+    return false;
+  }
+  if (!(ack_redirect_flag >= 0)) {
+    std::cerr << "ACK_REDIRECT_FLAG must be at least zero\n";
+    return false;
+  }
+  if (!(ack_redirect_validity_base_rtts > 0)) {
+    std::cerr << "ACK_REDIRECT_VALIDITY_BASE_RTTS must be positive\n";
+    return false;
+  }
+  if (ack_redirect_trim_scoring_value() ==
+      std::numeric_limits<uint32_t>::max()) {
+    std::cerr << "ACK_REDIRECT_TRIM_SCORING must be mark or ignore\n";
+    return false;
+  }
+  // The score reads the send timestamp IntHeader::mode TS carries, which
+  // HPCC's modes would replace with their own.
+  if (cc_mode == 3 || cc_mode == 10) {
+    std::cerr << "PATH_SELECTOR ack_redirect needs the timestamp CC_MODE "
+              << cc_mode << " replaces\n";
+    return false;
+  }
+  return true;
+}
+
 bool ReadConf(string network_configuration) {
   // Read the configuration file
   std::ifstream conf;
@@ -1292,6 +1354,14 @@ bool ReadConf(string network_configuration) {
       conf >> mrc_skip_base_rtts;
     } else if (key.compare("MRC_PROBE_TIMEOUTS") == 0) {
       conf >> mrc_probe_timeouts;
+    } else if (key.compare("ACK_REDIRECT_OMEGA") == 0) {
+      conf >> ack_redirect_omega;
+    } else if (key.compare("ACK_REDIRECT_FLAG") == 0) {
+      conf >> ack_redirect_flag;
+    } else if (key.compare("ACK_REDIRECT_VALIDITY_BASE_RTTS") == 0) {
+      conf >> ack_redirect_validity_base_rtts;
+    } else if (key.compare("ACK_REDIRECT_TRIM_SCORING") == 0) {
+      conf >> ack_redirect_trim_scoring;
     } else if (key.compare("SPRAY_REPORT_INTERVAL_BASE_RTTS") == 0) {
       conf >> spray_report_interval_base_rtts;
     } else if (key.compare("SPRAY_ESTIMATOR_GAIN") == 0) {
@@ -1614,12 +1684,21 @@ bool ReadConf(string network_configuration) {
   if (load_balancing == "spray_policy" && !valid_spray_policy())
     return false;
   if (path_selector_value() == std::numeric_limits<uint32_t>::max()) {
-    std::cerr << "PATH_SELECTOR must be ops, reps, ue_oblivious, ue_aware or mrc\n";
+    std::cerr << "PATH_SELECTOR must be ops, reps, ue_oblivious, ue_aware, mrc "
+                 "or ack_redirect\n";
     return false;
   }
-  if (path_selector != "ops" &&
-      load_balancing_value() !=
-          static_cast<uint32_t>(LoadBalancingMode::EntropyHash)) {
+  if (path_selector == "ack_redirect") {
+    if (load_balancing != "spray_uniform") {
+      std::cerr << "PATH_SELECTOR ack_redirect names spines and requires "
+                   "LOAD_BALANCING spray_uniform\n";
+      return false;
+    }
+    if (!valid_ack_redirect())
+      return false;
+  } else if (path_selector != "ops" &&
+             load_balancing_value() !=
+                 static_cast<uint32_t>(LoadBalancingMode::EntropyHash)) {
     std::cerr << "PATH_SELECTOR " << path_selector
               << " chooses entropy values and requires LOAD_BALANCING ev_hash\n";
     return false;
@@ -1708,14 +1787,15 @@ void SetConfig() {
     IntHeader::mode = IntHeader::NORMAL;
   else if (cc_mode == 10) // hpcc-pint
     IntHeader::mode = IntHeader::PINT;
-  else if (spray_one_way_delay == 1) // the send time of every data packet
-    IntHeader::mode = IntHeader::TS;
+  else if (spray_one_way_delay == 1 || path_selector == "ack_redirect")
+    IntHeader::mode = IntHeader::TS; // the send time of every data packet
   else // others, no extra header
     IntHeader::mode = IntHeader::NONE;
   // Outside ECMP the sender matches each acknowledgement to the data packet
   // that triggered it; ECMP keeps the header at its old size.
   CustomHeader::ackCarriesPacketSeq =
       load_balancing_value() != static_cast<uint32_t>(LoadBalancingMode::Ecmp);
+  CustomHeader::ackRedirectBytes = path_selector == "ack_redirect" ? 1 : 0;
 
   // Set Pint
   if (cc_mode == 10) {
@@ -2114,6 +2194,14 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),
       rdmaHw->SetAttribute("MrcEvSetSize", UintegerValue(mrc_ev_set_size));
       rdmaHw->SetAttribute("MrcSkipBaseRtts", DoubleValue(mrc_skip_base_rtts));
       rdmaHw->SetAttribute("MrcProbeTimeouts", DoubleValue(mrc_probe_timeouts));
+      rdmaHw->SetAttribute("AckRedirectOmega", DoubleValue(ack_redirect_omega));
+      rdmaHw->SetAttribute("AckRedirectFlag", DoubleValue(ack_redirect_flag));
+      rdmaHw->SetAttribute("AckRedirectValidityBaseRtts",
+                           DoubleValue(ack_redirect_validity_base_rtts));
+      rdmaHw->SetAttribute("AckRedirectTrimScoring",
+                           UintegerValue(ack_redirect_trim_scoring_value()));
+      if (path_selector == "ack_redirect")
+        rdmaHw->m_ownLeafHosts = own_leaf_hosts(n.Get(i));
       rdmaHw->SetAttribute("SprayReportIntervalBaseRtts",
                            DoubleValue(spray_report_interval_base_rtts));
       rdmaHw->SetAttribute("SprayEstimatorGain",
@@ -2228,7 +2316,7 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),
   }
   printf("maxRtt=%lu maxBdp=%lu\n", maxRtt, maxBdp);
   // Known only now that every route is, and read from the first packet on.
-  if (load_balancing == "spray_policy") {
+  if (load_balancing == "spray_policy" || path_selector == "ack_redirect") {
     for (uint32_t i = 0; i < node_num; i++)
       if (n.Get(i)->GetNodeType() == 0)
         n.Get(i)->GetObject<RdmaDriver>()->m_rdma->SetAttribute(
