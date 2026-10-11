@@ -174,6 +174,11 @@ public:
 	// queue pair its own scores.
 	std::unique_ptr<SpineGrader> m_spineGrader;
 	std::unordered_map<uint32_t, SpineScores> m_spineScores;
+	// With m_spraySenderPoolWeight above zero, the host's pooled scores,
+	// which every queue pair's scores are mixed with (SpineScores::Pool),
+	// made at the first queue pair; null otherwise.
+	double m_spraySenderPoolWeight;
+	std::unique_ptr<SpineScores> m_senderSpineScores;
 	// The SpineReport trace source: the time, the grader that has just issued
 	// a report, and under PerConnection the receive queue pair that owns it,
 	// null under PerReceiver.

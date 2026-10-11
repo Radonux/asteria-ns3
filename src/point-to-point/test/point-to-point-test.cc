@@ -4848,6 +4848,214 @@ class SpineScoresEdgeFreezeTest : public TestCase
     }
 };
 
+class SpineScoresPoolTest : public TestCase
+{
+  public:
+    SpineScoresPoolTest()
+        : TestCase("Pooled scores: at weight 0 the draws and shares are unchanged, at 1 every "
+                   "destination follows the pool, at 0.5 their arithmetic mixture")
+    {
+    }
+
+    void DoRun() override
+    {
+        DoubleValue attribute;
+        CreateObject<RdmaHw>()->GetAttribute("SpraySenderPoolWeight", attribute);
+        NS_TEST_EXPECT_MSG_EQ(attribute.Get(), 0.0, "SpraySenderPoolWeight is 0 by default");
+        WeightZero();
+        WeightOne();
+        WeightHalf();
+        EdgeBit();
+        Simulator::Destroy();
+    }
+
+  private:
+    static Ptr<UniformRandomVariable> Stream()
+    {
+        return CreateObjectWithAttributes<UniformRandomVariable>("Stream", IntegerValue(0));
+    }
+
+    // Reports with varied grades, some with the edge bit, some out of order
+    // and some after a silence; a draw after each.
+    static std::vector<uint8_t> Run(SpineScores& scores, UniformRandomVariable& random)
+    {
+        std::mt19937 grades(7);
+        std::vector<uint8_t> draws;
+        uint64_t now = 0;
+        for (uint32_t i = 1; i < 400; ++i)
+        {
+            now += i % 50 == 0 ? 7 * ScoresFixture::kInterval : ScoresFixture::kInterval;
+            std::vector<uint8_t> graded(ScoresFixture::kSpines);
+            for (uint8_t& grade : graded)
+            {
+                grade = grades() % 4;
+            }
+            SpineReport report = ScoresFixture::Report(i % 3 == 0 ? i - 2 : i, graded);
+            report.edgeCongested = i % 11 == 0;
+            scores.OnReport(report, now);
+            for (uint32_t k = 0; k < 4; ++k)
+            {
+                draws.push_back(scores.Choose(random, now + k * 1000));
+            }
+        }
+        return draws;
+    }
+
+    void WeightZero()
+    {
+        for (uint32_t candidates : {1u, 2u})
+        {
+            SpineScores::Parameters parameters = ScoresFixture::Defaults();
+            parameters.candidates = candidates;
+            SpineScores alone(ScoresFixture::kSpines, parameters);
+            SpineScores pool(ScoresFixture::kSpines, parameters);
+            SpineScores pooled(ScoresFixture::kSpines, parameters);
+            pooled.Pool(pool, 0);
+            const uint32_t start = pool.Score(0);
+            Ptr<UniformRandomVariable> first = Stream();
+            Ptr<UniformRandomVariable> second = Stream();
+            const std::vector<uint8_t> drawn = Run(alone, *first);
+            NS_TEST_EXPECT_MSG_EQ((Run(pooled, *second) == drawn),
+                                  true,
+                                  "at weight 0 every draw is the unpooled one");
+            NS_TEST_EXPECT_MSG_EQ(first->GetValue(), second->GetValue(), "and no draw more");
+            for (uint32_t spine = 0; spine < ScoresFixture::kSpines; ++spine)
+            {
+                NS_TEST_EXPECT_MSG_EQ(pooled.Score(spine), alone.Score(spine), "scores match");
+                NS_TEST_EXPECT_MSG_EQ(pooled.Share(spine), alone.Share(spine), "shares match");
+            }
+            bool moved = false;
+            for (uint32_t spine = 0; spine < ScoresFixture::kSpines; ++spine)
+            {
+                moved |= pool.Score(spine) != start;
+            }
+            NS_TEST_EXPECT_MSG_EQ(moved, true, "the pool takes the reports all the same");
+        }
+    }
+
+    // A report towards one destination moves the other's p, which follows the
+    // pool exactly: the pool's own p, and a reference that took every report.
+    void WeightOne()
+    {
+        const SpineScores::Parameters parameters = ScoresFixture::Defaults();
+        SpineScores pool(ScoresFixture::kSpines, parameters);
+        SpineScores toFirst(ScoresFixture::kSpines, parameters);
+        SpineScores toSecond(ScoresFixture::kSpines, parameters);
+        SpineScores reference(ScoresFixture::kSpines, parameters);
+        toFirst.Pool(pool, 1);
+        toSecond.Pool(pool, 1);
+        const double before = toSecond.Share(3);
+        std::vector<uint8_t> grades(ScoresFixture::kSpines, 3);
+        grades[3] = 0;
+        for (uint32_t sequence = 1; sequence <= 6; ++sequence)
+        {
+            const SpineReport report = ScoresFixture::Report(sequence, grades);
+            toFirst.OnReport(report, sequence * ScoresFixture::kInterval);
+            reference.OnReport(report, sequence * ScoresFixture::kInterval);
+        }
+        NS_TEST_EXPECT_MSG_LT(toSecond.Share(3), before / 2, "a report to one moves the other");
+        for (uint32_t spine = 0; spine < ScoresFixture::kSpines; ++spine)
+        {
+            NS_TEST_EXPECT_MSG_EQ_TOL(toSecond.Share(spine),
+                                      reference.Share(spine),
+                                      1e-12,
+                                      "the other's p is the pool's");
+        }
+        Ptr<UniformRandomVariable> drawn = Stream();
+        Ptr<UniformRandomVariable> replayed = Stream();
+        for (uint32_t i = 0; i < 5000; ++i)
+        {
+            NS_TEST_ASSERT_MSG_EQ(uint32_t(toSecond.Choose(*drawn, 65000)),
+                                  uint32_t(reference.Choose(*replayed, 65000)),
+                                  "the other draws as the pool's scores do");
+        }
+    }
+
+    // gamma 0.25 from 3072 per spine: a decay takes 768 from a full score and
+    // 576 from 2304, and grade 3 deposits 768.
+    void WeightHalf()
+    {
+        const SpineScores::Parameters parameters = ScoresFixture::Defaults();
+        SpineScores pool(ScoresFixture::kSpines, parameters);
+        SpineScores toFirst(ScoresFixture::kSpines, parameters);
+        SpineScores toSecond(ScoresFixture::kSpines, parameters);
+        toFirst.Pool(pool, 0.5);
+        toSecond.Pool(pool, 0.5);
+        NS_TEST_ASSERT_MSG_EQ(pool.Score(0), 3072u, "every score starts at 3072");
+        auto expectShares = [&](const std::vector<double>& mixed, const std::string& when) {
+            double sum = 0;
+            for (double score : mixed)
+            {
+                sum += score;
+            }
+            for (uint32_t spine = 0; spine < ScoresFixture::kSpines; ++spine)
+            {
+                NS_TEST_EXPECT_MSG_EQ_TOL(toSecond.Share(spine),
+                                          0.98 * mixed[spine] / sum + 0.02 / 8,
+                                          1e-12,
+                                          "p is that of the mixed scores " + when);
+            }
+        };
+        std::vector<uint8_t> grades(ScoresFixture::kSpines, 3);
+        grades[0] = 0;
+        toFirst.OnReport(ScoresFixture::Report(1, grades), 10000);
+        // The pool and the first: 2304 on spine 0, 3072 elsewhere; the second
+        // untouched at 3072.
+        NS_TEST_EXPECT_MSG_EQ(pool.Score(0), 2304u, "the pool takes the first's report");
+        NS_TEST_EXPECT_MSG_EQ(toSecond.Score(0), 3072u, "the second's own scores stand");
+        expectShares({2688, 3072, 3072, 3072, 3072, 3072, 3072, 3072}, "after one report");
+        grades[0] = 3;
+        grades[1] = 0;
+        toSecond.OnReport(ScoresFixture::Report(1, grades), 20000);
+        // The pool: 2304 - 576 + 768 = 2496 on spine 0, 2304 on spine 1;
+        // the second: 2304 on spine 1.
+        NS_TEST_EXPECT_MSG_EQ(pool.Score(0), 2496u, "the pool decays and deposits again");
+        NS_TEST_EXPECT_MSG_EQ(pool.Score(1), 2304u, "the pool takes the second's report");
+        expectShares({2784, 2304, 3072, 3072, 3072, 3072, 3072, 3072}, "after two");
+
+        // A draw is p's inverse over the mixed scores.
+        const std::vector<double> byMixed = {2784, 5088, 8160, 11232, 14304, 17376, 20448, 23520};
+        Ptr<UniformRandomVariable> drawn = Stream();
+        Ptr<UniformRandomVariable> replayed = Stream();
+        for (uint32_t i = 0; i < 5000; ++i)
+        {
+            const double u = replayed->GetValue();
+            const uint32_t expected =
+                u < 0.02 ? uint32_t(u / 0.02 * 8)
+                         : std::upper_bound(byMixed.begin(),
+                                            byMixed.end(),
+                                            (u - 0.02) / 0.98 * byMixed.back()) -
+                               byMixed.begin();
+            NS_TEST_ASSERT_MSG_EQ(uint32_t(toSecond.Choose(*drawn, 25000)),
+                                  expected,
+                                  "the draw maps one uniform value through the mixed p");
+        }
+    }
+
+    // A report the edge bit holds the scores under holds the pool too.
+    void EdgeBit()
+    {
+        for (bool freeze : {true, false})
+        {
+            SpineScores::Parameters parameters = ScoresFixture::Defaults();
+            parameters.edgeFreeze = freeze;
+            SpineScores pool(ScoresFixture::kSpines, parameters);
+            SpineScores local(ScoresFixture::kSpines, parameters);
+            local.Pool(pool, 0.5);
+            std::vector<uint8_t> grades(ScoresFixture::kSpines, 3);
+            grades[4] = 0;
+            SpineReport edge = ScoresFixture::Report(1, grades);
+            edge.edgeCongested = true;
+            local.OnReport(edge, 10000);
+            const uint32_t expected = freeze ? 3072 : 2304;
+            NS_TEST_EXPECT_MSG_EQ(pool.Score(4),
+                                  expected,
+                                  "the pool is held exactly when the scores are");
+            NS_TEST_EXPECT_MSG_EQ(local.Score(4), pool.Score(4), "as the scores are");
+        }
+    }
+};
+
 class SprayPolicyTransportTest : public TestCase
 {
   public:
@@ -6468,6 +6676,7 @@ PointToPointTestSuite::PointToPointTestSuite()
     AddTestCase(new SpineScoresFlapTest, TestCase::Duration::QUICK);
     AddTestCase(new SpineScoresDrawTest, TestCase::Duration::QUICK);
     AddTestCase(new SpineScoresEdgeFreezeTest, TestCase::Duration::QUICK);
+    AddTestCase(new SpineScoresPoolTest, TestCase::Duration::QUICK);
     AddTestCase(new SprayPolicyTransportTest, TestCase::Duration::QUICK);
     AddTestCase(new NsccReceiverPenaltyTest, TestCase::Duration::QUICK);
     AddTestCase(new SprayPolicyDefaultsTest, TestCase::Duration::QUICK);
