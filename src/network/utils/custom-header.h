@@ -168,6 +168,10 @@ public:
 		  // then two bits per spine. On the wire, ackReportBytes of it, only
 		  // while that is not zero.
 		  uint8_t spine_report[9];
+		  // The spine the receiver asks the sender to move to, or 255 for
+		  // none. On the wire, after the report, only while ackRedirectBytes
+		  // is not zero.
+		  uint8_t redirect;
 		  IntHeader ih;
 	  } ack;
 	  // PauseHeader
@@ -185,6 +189,9 @@ public:
   // How many bytes of ack.spine_report acknowledgement headers carry, zero
   // for none. Process-wide for the same reason.
   static uint32_t ackReportBytes;
+  // How many bytes the redirect field takes, zero or one. Process-wide for
+  // the same reason.
+  static uint32_t ackRedirectBytes;
 
   uint8_t GetIpv4EcnBits (void) const;
   uint8_t GetIpv4Dscp (void) const;

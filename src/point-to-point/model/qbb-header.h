@@ -69,6 +69,9 @@ public:
   // The receiving host's latest spine report, serialized only while
   // CustomHeader::ackReportBytes is not zero; its edge bit is a flag.
   void SetSpineReport(const SpineReport &report);
+  // The spine the receiver asks the sender to move to, 255 for none, the
+  // default; serialized only while CustomHeader::ackRedirectBytes is not zero.
+  void SetRedirect(uint8_t spine);
   void SetIntHeader(const IntHeader &_ih);
 
 //Getters
@@ -87,6 +90,7 @@ public:
   bool IsAllowanceExhausted() const;
   uint32_t GetPacketSeq() const;
   const SpineReport &GetSpineReport() const;
+  uint8_t GetRedirect() const;
 
   static TypeId GetTypeId (void);
   virtual TypeId GetInstanceTypeId (void) const;
@@ -104,6 +108,7 @@ private:
   uint32_t m_trimPayloadSize;
   uint32_t m_packetSeq;
   SpineReport m_spineReport;
+  uint8_t m_redirect;
   IntHeader ih;
   
 };

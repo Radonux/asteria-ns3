@@ -11,6 +11,7 @@
 #include "nscc-window.h"
 #include "path-selector.h"
 #include "spine-grader.h"
+#include "spine-redirect.h"
 #include <map>
 #include <memory>
 #include <set>
@@ -317,6 +318,9 @@ public:
 	// connection's arrivals feed and its answers report, made at its first
 	// event.
 	std::unique_ptr<SpineGrader> m_spineGrader;
+	// Under PathSelectorKind::AckRedirect, the spine this connection's answers
+	// ask its sender to move to.
+	SpineRedirect m_spineRedirect;
 	static TypeId GetTypeId (void);
 	RdmaRxQueuePair();
 	uint32_t GetHash(void);

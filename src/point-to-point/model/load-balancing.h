@@ -60,6 +60,13 @@ inline uint16_t PathOf(LoadBalancingMode mode, uint16_t identification){
 // The value of an acknowledgement's redirect field that names no spine.
 constexpr uint8_t kNoRedirect = 255;
 
+// The spine an acknowledgement's redirect field names among spines, or
+// kNoRedirect. A receiver writes only a spine's index or kNoRedirect, so any
+// other value names no spine.
+inline uint8_t DecodeRedirect(uint8_t field, uint32_t spines){
+	return field < spines ? field : kNoRedirect;
+}
+
 } /* namespace ns3 */
 
 #endif /* LOAD_BALANCING_H */
