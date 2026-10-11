@@ -125,6 +125,8 @@ public:
 	double m_sprayFractionCusumSlack;
 	double m_sprayFractionCusumThreshold;
 	double m_sprayCongestionThreshold1, m_sprayCongestionThreshold2, m_sprayCongestionThreshold3;
+	// Zero leaves the trimmed fraction on the congestion thresholds.
+	double m_sprayTrimThreshold1, m_sprayTrimThreshold2, m_sprayTrimThreshold3;
 	double m_sprayAbsenceFractionOfMedian;
 	uint32_t m_sprayAbsenceMinimumMedian;
 	double m_sprayReleaseFractionOfFloor;

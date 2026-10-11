@@ -333,6 +333,27 @@ TypeId RdmaHw::GetTypeId (void)
 				DoubleValue(0.75),
 				MakeDoubleAccessor(&RdmaHw::m_sprayCongestionThreshold3),
 				MakeDoubleChecker<double>(0, 1))
+		.AddAttribute("SprayTrimThreshold1",
+				"Under LoadBalancing 3, the trimmed fraction's cost from which a "
+				"spine grades 2, in place of SprayCongestionThreshold1 for that "
+				"fraction alone. Default 0, which takes the congestion "
+				"thresholds for the trimmed fraction; the three are set "
+				"together.",
+				DoubleValue(0),
+				MakeDoubleAccessor(&RdmaHw::m_sprayTrimThreshold1),
+				MakeDoubleChecker<double>(0, 1))
+		.AddAttribute("SprayTrimThreshold2",
+				"Under LoadBalancing 3, the trimmed fraction's cost from which a "
+				"spine grades 1. Default 0, as SprayTrimThreshold1.",
+				DoubleValue(0),
+				MakeDoubleAccessor(&RdmaHw::m_sprayTrimThreshold2),
+				MakeDoubleChecker<double>(0, 1))
+		.AddAttribute("SprayTrimThreshold3",
+				"Under LoadBalancing 3, the trimmed fraction's cost from which a "
+				"spine grades 0. Default 0, as SprayTrimThreshold1.",
+				DoubleValue(0),
+				MakeDoubleAccessor(&RdmaHw::m_sprayTrimThreshold3),
+				MakeDoubleChecker<double>(0, 1))
 		.AddAttribute("SprayAbsenceFractionOfMedian",
 				"Under LoadBalancing 3, a spine whose arrivals over a window are "
 				"below this fraction of the median spine's is held at grade 0, "
@@ -1144,6 +1165,9 @@ SpineGrader::Parameters RdmaHw::GraderParameters() const{
 	parameters.congestionThresholds[0] = m_sprayCongestionThreshold1;
 	parameters.congestionThresholds[1] = m_sprayCongestionThreshold2;
 	parameters.congestionThresholds[2] = m_sprayCongestionThreshold3;
+	if (m_sprayTrimThreshold1 > 0)
+		parameters.trimThresholds = std::array<double, 3>{m_sprayTrimThreshold1,
+			m_sprayTrimThreshold2, m_sprayTrimThreshold3};
 	parameters.oneWayDelay = m_sprayOneWayDelay;
 	parameters.delayNs = {m_sprayEstimatorGain,
 		m_sprayDelayCusumSlackBaseRtts * rtt,
