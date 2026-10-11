@@ -18,10 +18,18 @@ class SwitchNode;
 
 // What befalls the link between nodes a and b at a time in the run. Down takes
 // the link down. Blackhole leaves it up while b, a switch, drops what arrives
-// on its port from a. Loss and Rate set the link's error rate or its speed in
-// both directions. Restore returns the link to the state it had before its
-// latest failure, which must not be a Down.
+// on its port from a, so the direction from a to b loses everything and the
+// direction from b to a is unchanged. Loss and Rate set the link's error rate
+// or its speed in the directions their LinkDirection names. Restore returns the
+// link to the state it had before its latest failure, which must not be a Down.
 enum class LinkEventKind { Down, Blackhole, Loss, Rate, Restore };
+
+// The directions a Loss or a Rate applies in. Both is the two directions.
+// Forward is the direction from a to b alone: under Loss b's device drops what
+// it receives from a, as a device's error model is applied on receipt, and
+// under Rate a's device serializes at the rate, as a device's data rate is its
+// transmitter's. The direction from b to a is unchanged.
+enum class LinkDirection { Both, Forward };
 
 struct LinkEvent {
 	uint64_t timeNs = 0;
@@ -31,6 +39,8 @@ struct LinkEvent {
 	double errorRate = 0;
 	// Rate's data rate.
 	DataRate rate;
+	// Loss's or Rate's directions; the other kinds ignore it.
+	LinkDirection direction = LinkDirection::Both;
 };
 
 // Sort events into the order they apply in: by time, a restore before a
@@ -38,8 +48,10 @@ struct LinkEvent {
 void OrderLinkEvents(std::vector<LinkEvent> &events);
 
 // For events in the order they apply in, why one of them cannot apply: a
-// restore of a link no failure came before, or of a link taken down. Empty
-// when every one can.
+// restore of a link taken down, or of a link with no failure before it that
+// no restore has put back. A restore puts back the failure named with the
+// same two nodes in the same order, else the one named in the other order.
+// Empty when every one can.
 std::string CheckLinkEvents(const std::vector<LinkEvent> &events);
 
 // A link's devices at a and at b, and b when b is a switch, else null.
@@ -49,10 +61,17 @@ struct LinkEnds {
 };
 
 // Applies link events and keeps, for each link, the state its latest failure
-// replaced, which a restore puts back: both ends' data rates under Rate, both
-// ends' error models and rates under Loss (a restore removes a model the
-// failure added), and b's port's black hole flag under Blackhole. A link is
-// named by its two nodes in either order.
+// replaced, which a restore puts back: the data rates of the ends it set under
+// Rate, the error models and rates of the ends it set under Loss (a restore
+// removes a model the failure added), and b's port's black hole flag under
+// Blackhole. A Loss or Rate in both directions sets both ends; a Forward Loss
+// sets b's end alone and a Forward Rate a's end alone. The state is kept per
+// failure under its two nodes in the order named, so that failures of the two
+// directions of a link, such as a black hole at each end, are put back
+// independently; a later failure named in the same order replaces the state
+// kept. A restore names a link by its two nodes in either order: it puts back
+// the failure named in the same order if one is kept, else the one named in
+// the other order, and forgets it.
 class LinkEventApplier {
 public:
 	// setErrorRate sets a device's link error rate, adding its error model
@@ -74,8 +93,9 @@ private:
 		LinkEnds ends;
 		EndState atA, atB;
 		bool blackholed = false;
+		// Whether the failure set a's end and b's end.
+		bool setA = false, setB = false;
 	};
-	static std::pair<uint32_t, uint32_t> Key(uint32_t a, uint32_t b);
 	static EndState Capture(Ptr<QbbNetDevice> device);
 	static void PutBack(Ptr<QbbNetDevice> device, const EndState &state,
 		LinkEventKind kind);
@@ -83,6 +103,7 @@ private:
 
 	SetErrorRate m_setErrorRate;
 	TakeDown m_takeDown;
+	// By the failure's a and b, in that order.
 	std::map<std::pair<uint32_t, uint32_t>, Saved> m_saved;
 };
 

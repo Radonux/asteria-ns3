@@ -1557,6 +1557,290 @@ class LinkRestoreTest : public TestCase
 };
 
 /**
+ * Two switches, a and b, linked to each other, each with a host behind it,
+ * failed in the direction from a to b alone.
+ */
+class DirectionalLinkFaultTest : public TestCase
+{
+  public:
+    DirectionalLinkFaultTest()
+        : TestCase("A forward link loss or rate applies in the direction from the first node "
+                   "to the second alone, its restore puts back the end it set, and failures of "
+                   "the two directions of a link restore independently")
+    {
+    }
+
+    void DoRun() override
+    {
+        Loss();
+        Rate();
+        Blackholes();
+        Check();
+    }
+
+  private:
+    struct Fabric
+    {
+        Ptr<SwitchNode> a, b;
+        // a's port toward b and b's toward a.
+        Ptr<QbbNetDevice> atA, atB;
+        // The ports toward the hosts behind a and b.
+        Ptr<QbbNetDevice> hostPortA, hostPortB;
+        Ipv4Address hostA{"11.0.1.1"}, hostB{"11.0.2.1"};
+        LinkEnds ends;
+    };
+
+    static Ptr<QbbNetDevice> SwitchPort(Ptr<SwitchNode> sw)
+    {
+        Ptr<QbbNetDevice> port = CreateObject<QbbNetDevice>();
+        port->SetQueue(CreateObject<BEgressQueue>());
+        port->SetDataRate(DataRate("400Gbps"));
+        sw->AddDevice(port);
+        return port;
+    }
+
+    static Ptr<QbbNetDevice> HostPort(Ptr<SwitchNode> sw)
+    {
+        Ptr<QbbNetDevice> port = SwitchPort(sw);
+        Ptr<QbbNetDevice> host = CreateObject<QbbNetDevice>();
+        host->SetDataRate(DataRate("400Gbps"));
+        CreateObject<Node>()->AddDevice(host);
+        host->m_rdmaReceiveCb =
+            Callback<int, Ptr<Packet>, CustomHeader&>([](Ptr<Packet>, CustomHeader&) { return 0; });
+        Ptr<QbbChannel> channel = CreateObject<QbbChannel>();
+        port->Attach(channel);
+        host->Attach(channel);
+        return port;
+    }
+
+    static Fabric MakeFabric()
+    {
+        Fabric fabric;
+        for (Ptr<SwitchNode>* sw : {&fabric.a, &fabric.b})
+        {
+            *sw = CreateObject<SwitchNode>();
+            (*sw)->SetAttribute("PfcEnabled", BooleanValue(false));
+        }
+        fabric.atA = SwitchPort(fabric.a);
+        fabric.atB = SwitchPort(fabric.b);
+        Ptr<QbbChannel> channel = CreateObject<QbbChannel>();
+        fabric.atA->Attach(channel);
+        fabric.atB->Attach(channel);
+        fabric.hostPortA = HostPort(fabric.a);
+        fabric.hostPortB = HostPort(fabric.b);
+        fabric.a->AddTableEntry(fabric.hostB, fabric.atA->GetIfIndex());
+        fabric.a->AddTableEntry(fabric.hostA, fabric.hostPortA->GetIfIndex());
+        fabric.b->AddTableEntry(fabric.hostA, fabric.atB->GetIfIndex());
+        fabric.b->AddTableEntry(fabric.hostB, fabric.hostPortB->GetIfIndex());
+        fabric.ends.atA = fabric.atA;
+        fabric.ends.atB = fabric.atB;
+        fabric.ends.switchAtB = fabric.b;
+        return fabric;
+    }
+
+    static LinkEventApplier Applier()
+    {
+        return LinkEventApplier(
+            [](Ptr<QbbNetDevice> device, double rate) {
+                PointerValue current;
+                device->GetAttribute("LinkErrorModel", current);
+                Ptr<RateErrorModel> model = current.Get<RateErrorModel>();
+                if (!model)
+                {
+                    model = CreateObject<RateErrorModel>();
+                    model->SetAttribute("ErrorUnit", StringValue("ERROR_UNIT_PACKET"));
+                    device->SetAttribute("LinkErrorModel", PointerValue(model));
+                }
+                model->SetRate(rate);
+            },
+            [](uint32_t, uint32_t) {});
+    }
+
+    static LinkEvent Event(LinkEventKind kind, LinkDirection direction)
+    {
+        LinkEvent event;
+        event.kind = kind;
+        event.a = 0;
+        event.b = 1;
+        event.direction = direction;
+        return event;
+    }
+
+    // Priority group 0 bypasses buffer admission, which is not under test.
+    static void Send(Fabric& fabric, bool fromA, uint32_t packets)
+    {
+        for (uint32_t i = 0; i < packets; ++i)
+        {
+            if (fromA)
+            {
+                ArriveAtSwitch(fabric.a, fabric.hostPortA, fabric.hostA, fabric.hostB, 0);
+            }
+            else
+            {
+                ArriveAtSwitch(fabric.b, fabric.hostPortB, fabric.hostB, fabric.hostA, 0);
+            }
+        }
+    }
+
+    static Ptr<RateErrorModel> ErrorModelOf(Ptr<QbbNetDevice> device)
+    {
+        PointerValue current;
+        device->GetAttribute("LinkErrorModel", current);
+        return current.Get<RateErrorModel>();
+    }
+
+    void Loss()
+    {
+        constexpr uint32_t kPackets = 10;
+        Fabric fabric = MakeFabric();
+        LinkEventApplier applier = Applier();
+        uint32_t deliveredAtA = 0, deliveredAtB = 0, droppedAtA = 0, droppedAtB = 0;
+        auto count = [](uint32_t* counter) {
+            return Callback<void, Ptr<const Packet>, uint32_t>(
+                [counter](Ptr<const Packet>, uint32_t) { ++*counter; });
+        };
+        fabric.atA->m_traceDataPlaneDeliver.ConnectWithoutContext(count(&deliveredAtA));
+        fabric.atB->m_traceDataPlaneDeliver.ConnectWithoutContext(count(&deliveredAtB));
+        fabric.atA->m_traceLinkErrorDrop.ConnectWithoutContext(count(&droppedAtA));
+        fabric.atB->m_traceLinkErrorDrop.ConnectWithoutContext(count(&droppedAtB));
+
+        LinkEvent loss = Event(LinkEventKind::Loss, LinkDirection::Forward);
+        loss.errorRate = 1.0;
+        Simulator::Schedule(NanoSeconds(0), [&]() {
+            applier.Apply(loss, fabric.ends);
+            Send(fabric, true, kPackets);
+            Send(fabric, false, kPackets);
+        });
+        Simulator::Schedule(MicroSeconds(10), [&]() {
+            NS_TEST_EXPECT_MSG_EQ(ErrorModelOf(fabric.atA), nullptr, "a's end has no model");
+            NS_TEST_EXPECT_MSG_EQ(droppedAtB, kPackets, "b drops all a sends it");
+            NS_TEST_EXPECT_MSG_EQ(deliveredAtB, 0, "and delivers none");
+            NS_TEST_EXPECT_MSG_EQ(droppedAtA, 0, "a drops nothing b sends it");
+            NS_TEST_EXPECT_MSG_EQ(deliveredAtA, kPackets, "and delivers all of it");
+            applier.Apply(Event(LinkEventKind::Restore, LinkDirection::Both), fabric.ends);
+            NS_TEST_EXPECT_MSG_EQ(ErrorModelOf(fabric.atB), nullptr, "the restore removes b's model");
+            Send(fabric, true, kPackets);
+        });
+        Simulator::Run();
+        NS_TEST_EXPECT_MSG_EQ(droppedAtB, kPackets, "after the restore b drops nothing more");
+        NS_TEST_EXPECT_MSG_EQ(deliveredAtB, kPackets, "and delivers what a sends");
+        Simulator::Destroy();
+    }
+
+    // A black hole at each end of the link, each restored by a restore naming
+    // its nodes in its order.
+    void Blackholes()
+    {
+        Fabric fabric = MakeFabric();
+        LinkEventApplier applier = Applier();
+        LinkEnds reversedEnds{fabric.atB, fabric.atA, fabric.a};
+        LinkEvent toB = Event(LinkEventKind::Blackhole, LinkDirection::Both);
+        LinkEvent toA = toB;
+        std::swap(toA.a, toA.b);
+        LinkEvent restoreToB = Event(LinkEventKind::Restore, LinkDirection::Both);
+        LinkEvent restoreToA = restoreToB;
+        std::swap(restoreToA.a, restoreToA.b);
+        const uint32_t portB = fabric.atB->GetIfIndex();
+        const uint32_t portA = fabric.atA->GetIfIndex();
+
+        applier.Apply(toB, fabric.ends);
+        applier.Apply(toA, reversedEnds);
+        NS_TEST_EXPECT_MSG_EQ(fabric.b->IsBlackholed(portB), true, "b drops what a sends");
+        NS_TEST_EXPECT_MSG_EQ(fabric.a->IsBlackholed(portA), true, "a drops what b sends");
+        applier.Apply(restoreToB, fabric.ends);
+        NS_TEST_EXPECT_MSG_EQ(fabric.b->IsBlackholed(portB), false, "the restore of a b clears b");
+        NS_TEST_EXPECT_MSG_EQ(fabric.a->IsBlackholed(portA), true, "and leaves a");
+        applier.Apply(restoreToA, reversedEnds);
+        NS_TEST_EXPECT_MSG_EQ(fabric.a->IsBlackholed(portA), false, "the restore of b a clears a");
+        NS_TEST_EXPECT_MSG_EQ(fabric.b->IsBlackholed(portB), false, "and b stays clear");
+
+        auto count = [](uint32_t* counter) {
+            return Callback<void, Ptr<const Packet>, uint32_t>(
+                [counter](Ptr<const Packet>, uint32_t) { ++*counter; });
+        };
+        uint32_t forwardedToHostA = 0, forwardedToHostB = 0;
+        fabric.hostPortA->m_traceEnqueue.ConnectWithoutContext(count(&forwardedToHostA));
+        fabric.hostPortB->m_traceEnqueue.ConnectWithoutContext(count(&forwardedToHostB));
+        Simulator::Schedule(NanoSeconds(0), [&]() {
+            Send(fabric, true, 3);
+            Send(fabric, false, 3);
+        });
+        Simulator::Run();
+        NS_TEST_EXPECT_MSG_EQ(forwardedToHostB, 3, "the link carries a's packets to b's host");
+        NS_TEST_EXPECT_MSG_EQ(forwardedToHostA, 3, "and b's to a's host");
+        Simulator::Destroy();
+    }
+
+    void Check()
+    {
+        LinkEvent toB = Event(LinkEventKind::Blackhole, LinkDirection::Both);
+        LinkEvent toA = toB;
+        std::swap(toA.a, toA.b);
+        LinkEvent restoreToB = Event(LinkEventKind::Restore, LinkDirection::Both);
+        LinkEvent restoreToA = restoreToB;
+        std::swap(restoreToA.a, restoreToA.b);
+        NS_TEST_EXPECT_MSG_EQ(CheckLinkEvents({toB, toA, restoreToB, restoreToA}),
+                              "",
+                              "each direction's failure has its restore");
+        NS_TEST_EXPECT_MSG_EQ(CheckLinkEvents({toB, restoreToA}),
+                              "",
+                              "a restore names the link in either order");
+        NS_TEST_EXPECT_MSG_NE(CheckLinkEvents({toB, toA, restoreToB, restoreToA, restoreToA}),
+                              "",
+                              "a third restore has no failure left to put back");
+    }
+
+    void Rate()
+    {
+        Fabric fabric = MakeFabric();
+        LinkEventApplier applier = Applier();
+        std::vector<int64_t> arrivalsAtA, arrivalsAtB;
+        uint32_t bytesFromA = 0, bytesFromB = 0;
+        auto arrival = [](std::vector<int64_t>* arrivals) {
+            return Callback<void, Ptr<const Packet>, uint32_t>(
+                [arrivals](Ptr<const Packet>, uint32_t) {
+                    arrivals->push_back(Simulator::Now().GetNanoSeconds());
+                });
+        };
+        auto size = [](uint32_t* bytes) {
+            return Callback<void, Ptr<const Packet>, uint32_t>(
+                [bytes](Ptr<const Packet> packet, uint32_t) { *bytes = packet->GetSize(); });
+        };
+        fabric.atA->m_traceDataPlaneDeliver.ConnectWithoutContext(arrival(&arrivalsAtA));
+        fabric.atB->m_traceDataPlaneDeliver.ConnectWithoutContext(arrival(&arrivalsAtB));
+        fabric.atA->m_traceDequeue.ConnectWithoutContext(size(&bytesFromA));
+        fabric.atB->m_traceDequeue.ConnectWithoutContext(size(&bytesFromB));
+
+        LinkEvent rate = Event(LinkEventKind::Rate, LinkDirection::Forward);
+        rate.rate = DataRate("100Gbps");
+        applier.Apply(rate, fabric.ends);
+        NS_TEST_EXPECT_MSG_EQ(fabric.atA->GetDataRate(), DataRate("100Gbps"), "a sends slower");
+        NS_TEST_EXPECT_MSG_EQ(fabric.atB->GetDataRate(), DataRate("400Gbps"), "b does not");
+        Simulator::Schedule(NanoSeconds(0), [&]() {
+            Send(fabric, true, 1);
+            Send(fabric, false, 1);
+        });
+        Simulator::Run();
+        NS_TEST_ASSERT_MSG_EQ(arrivalsAtB.size(), 1, "a's packet arrives at b");
+        NS_TEST_ASSERT_MSG_EQ(arrivalsAtA.size(), 1, "b's packet arrives at a");
+        NS_TEST_EXPECT_MSG_EQ(arrivalsAtB[0],
+                              DataRate("100Gbps").CalculateBytesTxTime(bytesFromA).GetNanoSeconds(),
+                              "from a to b at the new rate");
+        NS_TEST_EXPECT_MSG_EQ(arrivalsAtA[0],
+                              DataRate("400Gbps").CalculateBytesTxTime(bytesFromB).GetNanoSeconds(),
+                              "from b to a at the former rate");
+
+        fabric.atB->SetDataRate(DataRate("200Gbps"));
+        applier.Apply(Event(LinkEventKind::Restore, LinkDirection::Both), fabric.ends);
+        NS_TEST_EXPECT_MSG_EQ(fabric.atA->GetDataRate(), DataRate("400Gbps"), "a's rate back");
+        NS_TEST_EXPECT_MSG_EQ(fabric.atB->GetDataRate(),
+                              DataRate("200Gbps"),
+                              "the restore leaves b's end, which the failure did not set");
+        Simulator::Destroy();
+    }
+};
+
+/**
  * A switch that marks every data packet it sends while more wait behind it,
  * sending five data packets and an acknowledgement up one port.
  */
@@ -7396,6 +7680,7 @@ PointToPointTestSuite::PointToPointTestSuite()
     AddTestCase(new BlackholeTest, TestCase::Duration::QUICK);
     AddTestCase(new LinkRateChangeTest, TestCase::Duration::QUICK);
     AddTestCase(new LinkRestoreTest, TestCase::Duration::QUICK);
+    AddTestCase(new DirectionalLinkFaultTest, TestCase::Duration::QUICK);
     AddTestCase(new PortCountersTest, TestCase::Duration::QUICK);
     AddTestCase(new MarkingStreamTest, TestCase::Duration::QUICK);
     AddTestCase(new PfcIdentificationTest, TestCase::Duration::QUICK);

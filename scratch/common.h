@@ -257,7 +257,28 @@ uint64_t link_down_time = 0;
 uint32_t link_down_A = 0, link_down_B = 0;
 
 // The LINK_FAILURE and LINK_RESTORE lines, put in the order they apply in
-// once the configuration is read.
+// once the configuration is read. Each is one line:
+//   LINK_FAILURE <time_ns> down <a> <b>
+//   LINK_FAILURE <time_ns> blackhole <a> <b>
+//   LINK_FAILURE <time_ns> loss <a> <b> <error_rate> [forward|both]
+//   LINK_FAILURE <time_ns> rate <a> <b> <data_rate> [forward|both]
+//   LINK_RESTORE <time_ns> <a> <b>
+// down takes the link down for the rest of the run. blackhole needs b to be a
+// switch, which then drops whatever arrives on its port from a: the direction
+// from a to b loses everything, the direction from b to a is unchanged. loss
+// sets the link's error rate, in (0, 1], and rate its data rate. Without a
+// direction, or with both, they apply in both directions; with forward, in the
+// direction from a to b alone, as blackhole does: under loss b drops that
+// fraction of what it receives from a, and under rate a transmits toward b at
+// the data rate, while what b sends to a is unchanged. LINK_RESTORE takes no
+// direction: it puts back what one failure of the link changed, in that
+// failure's directions, and nothing may follow its two nodes. It restores the
+// failure named with the same two nodes in the same order if one is not yet
+// restored, else the one named in the other order, so the two directions of a
+// link fail and restore independently when each failure and its restore name
+// the nodes in the same order. A later failure named in the same order
+// replaces the one before it, which a restore then no longer puts back; a link
+// taken down is not restored.
 vector<LinkEvent> link_events;
 
 uint32_t enable_trace = 1;
@@ -1659,11 +1680,41 @@ bool ReadConf(string network_configuration) {
         std::cerr << "LINK_FAILURE kind must be down, blackhole, loss or rate\n";
         return false;
       }
+      if (failure.kind == LinkEventKind::Loss ||
+          failure.kind == LinkEventKind::Rate) {
+        // An optional last token on the line: both, the default, or forward,
+        // the direction from the first node named to the second alone.
+        std::string rest, direction, extra;
+        std::getline(conf, rest);
+        std::istringstream tokens(rest);
+        tokens >> direction >> extra;
+        if (direction == "forward") {
+          failure.direction = LinkDirection::Forward;
+        } else if (!direction.empty() && direction != "both") {
+          std::cerr << "LINK_FAILURE " << kind
+                    << " direction must be forward or both\n";
+          return false;
+        }
+        if (!extra.empty()) {
+          std::cerr << "LINK_FAILURE " << kind
+                    << " takes nothing after its direction\n";
+          return false;
+        }
+      }
       link_events.push_back(failure);
     } else if (key.compare("LINK_RESTORE") == 0) {
       LinkEvent restore;
       restore.kind = LinkEventKind::Restore;
       conf >> restore.timeNs >> restore.a >> restore.b;
+      // A restore puts back what its failure set, in the failure's
+      // directions, so it takes no direction.
+      std::string rest, extra;
+      std::getline(conf, rest);
+      std::istringstream tokens(rest);
+      if (tokens >> extra) {
+        std::cerr << "LINK_RESTORE takes nothing after its two nodes\n";
+        return false;
+      }
       link_events.push_back(restore);
     } else if (key.compare("ENABLE_TRACE") == 0) {
       conf >> enable_trace;
