@@ -557,6 +557,11 @@ void SwitchNode::SetBlackhole(uint32_t port){
 	m_blackholed[port] = true;
 }
 
+void SwitchNode::ClearBlackhole(uint32_t port){
+	if (port < m_blackholed.size())
+		m_blackholed[port] = false;
+}
+
 void SwitchNode::AddTableEntry(Ipv4Address &dstAddr, uint32_t intf_idx){
 	uint32_t dip = dstAddr.Get();
 	m_rtTable[dip].push_back(intf_idx);

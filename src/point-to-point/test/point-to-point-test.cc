@@ -24,6 +24,7 @@
 #include "ns3/flow-id-tag.h"
 #include "ns3/integer.h"
 #include "ns3/ipv4-header.h"
+#include "ns3/link-events.h"
 #include "ns3/load-balancing.h"
 #include "ns3/net-device-queue-interface.h"
 #include "ns3/ppp-header.h"
@@ -1332,6 +1333,223 @@ class LinkRateChangeTest : public TestCase
             arrivals[1] - 2000,
             DataRate("200Gbps").CalculateBytesTxTime(wireBytes).GetNanoSeconds(),
             "the second is serialized at 200 Gb/s");
+        Simulator::Destroy();
+    }
+};
+
+/**
+ * A link from a host to a switch port, failed and restored by link events.
+ */
+class LinkRestoreTest : public TestCase
+{
+  public:
+    LinkRestoreTest()
+        : TestCase("A link restore puts back the rate, loss or black hole its latest failure "
+                   "replaced, refuses a downed link, and applies before a failure at its time")
+    {
+    }
+
+    void DoRun() override
+    {
+        Order();
+        Check();
+        Restores();
+        Schedule();
+        Simulator::Destroy();
+    }
+
+  private:
+    static LinkEvent Event(uint64_t timeNs, LinkEventKind kind, DataRate rate = DataRate())
+    {
+        LinkEvent event;
+        event.timeNs = timeNs;
+        event.kind = kind;
+        event.a = 0;
+        event.b = 1;
+        event.rate = rate;
+        return event;
+    }
+
+    struct Link
+    {
+        Ptr<SwitchNode> sw;
+        LinkEnds ends;
+    };
+
+    // Node 0 a host at 400 Gb/s, node 1 a switch at 200 Gb/s.
+    static Link MakeLink()
+    {
+        Link link;
+        link.sw = CreateObject<SwitchNode>();
+        link.sw->SetAttribute("PfcEnabled", BooleanValue(false));
+        Ptr<QbbNetDevice> port = AttachSwitchPort(link.sw, CreateObject<Node>());
+        Ptr<QbbChannel> channel = DynamicCast<QbbChannel>(port->GetChannel());
+        link.ends.atB = port;
+        link.ends.atA = DynamicCast<QbbNetDevice>(
+            channel->GetDevice(0) == port ? channel->GetDevice(1) : channel->GetDevice(0));
+        link.ends.switchAtB = link.sw;
+        link.ends.atA->SetDataRate(DataRate("400Gbps"));
+        link.ends.atB->SetDataRate(DataRate("200Gbps"));
+        return link;
+    }
+
+    static LinkEventApplier Applier(uint32_t* downs = nullptr)
+    {
+        return LinkEventApplier(
+            [](Ptr<QbbNetDevice> device, double rate) {
+                PointerValue current;
+                device->GetAttribute("LinkErrorModel", current);
+                Ptr<RateErrorModel> model = current.Get<RateErrorModel>();
+                if (!model)
+                {
+                    model = CreateObject<RateErrorModel>();
+                    model->SetAttribute("ErrorUnit", StringValue("ERROR_UNIT_PACKET"));
+                    device->SetAttribute("LinkErrorModel", PointerValue(model));
+                }
+                model->SetRate(rate);
+            },
+            [downs](uint32_t, uint32_t) {
+                if (downs != nullptr)
+                {
+                    ++*downs;
+                }
+            });
+    }
+
+    static Ptr<RateErrorModel> ErrorModelOf(Ptr<QbbNetDevice> device)
+    {
+        PointerValue current;
+        device->GetAttribute("LinkErrorModel", current);
+        return current.Get<RateErrorModel>();
+    }
+
+    void Order()
+    {
+        std::vector<LinkEvent> events = {Event(20, LinkEventKind::Rate),
+                                         Event(20, LinkEventKind::Restore),
+                                         Event(10, LinkEventKind::Loss),
+                                         Event(30, LinkEventKind::Restore),
+                                         Event(20, LinkEventKind::Blackhole)};
+        OrderLinkEvents(events);
+        const std::vector<std::pair<uint64_t, LinkEventKind>> expected = {
+            {10, LinkEventKind::Loss},
+            {20, LinkEventKind::Restore},
+            {20, LinkEventKind::Rate},
+            {20, LinkEventKind::Blackhole},
+            {30, LinkEventKind::Restore}};
+        for (uint32_t i = 0; i < expected.size(); ++i)
+        {
+            NS_TEST_EXPECT_MSG_EQ(events[i].timeNs, expected[i].first, "by time");
+            NS_TEST_EXPECT_MSG_EQ(uint32_t(events[i].kind),
+                                  uint32_t(expected[i].second),
+                                  "a restore first at its time, the failures as given");
+        }
+    }
+
+    void Check()
+    {
+        NS_TEST_EXPECT_MSG_EQ(
+            CheckLinkEvents({Event(10, LinkEventKind::Rate), Event(20, LinkEventKind::Restore)}),
+            "",
+            "a restore after a failure applies");
+        NS_TEST_EXPECT_MSG_NE(
+            CheckLinkEvents({Event(10, LinkEventKind::Down), Event(20, LinkEventKind::Restore)}),
+            "",
+            "a downed link is not restored");
+        NS_TEST_EXPECT_MSG_NE(CheckLinkEvents({Event(10, LinkEventKind::Down),
+                                               Event(15, LinkEventKind::Rate),
+                                               Event(20, LinkEventKind::Restore)}),
+                              "",
+                              "nor after a later failure");
+        NS_TEST_EXPECT_MSG_NE(CheckLinkEvents({Event(20, LinkEventKind::Restore)}),
+                              "",
+                              "a restore needs a failure before it");
+        LinkEvent reversed = Event(20, LinkEventKind::Restore);
+        std::swap(reversed.a, reversed.b);
+        NS_TEST_EXPECT_MSG_EQ(CheckLinkEvents({Event(10, LinkEventKind::Loss), reversed}),
+                              "",
+                              "a link is named in either order");
+    }
+
+    void Restores()
+    {
+        Link link = MakeLink();
+        uint32_t downs = 0;
+        LinkEventApplier applier = Applier(&downs);
+
+        applier.Apply(Event(0, LinkEventKind::Rate, DataRate("100Gbps")), link.ends);
+        NS_TEST_EXPECT_MSG_EQ(link.ends.atA->GetDataRate(), DataRate("100Gbps"), "slowed at a");
+        NS_TEST_EXPECT_MSG_EQ(link.ends.atB->GetDataRate(), DataRate("100Gbps"), "slowed at b");
+        applier.Apply(Event(0, LinkEventKind::Restore), link.ends);
+        NS_TEST_EXPECT_MSG_EQ(link.ends.atA->GetDataRate(), DataRate("400Gbps"), "a's rate back");
+        NS_TEST_EXPECT_MSG_EQ(link.ends.atB->GetDataRate(), DataRate("200Gbps"), "b's rate back");
+
+        LinkEvent loss = Event(0, LinkEventKind::Loss);
+        loss.errorRate = 0.5;
+        applier.Apply(loss, link.ends);
+        NS_TEST_ASSERT_MSG_NE(ErrorModelOf(link.ends.atA), nullptr, "a loss adds a model");
+        NS_TEST_EXPECT_MSG_EQ(ErrorModelOf(link.ends.atB)->GetRate(), 0.5, "at its rate");
+        applier.Apply(Event(0, LinkEventKind::Restore), link.ends);
+        NS_TEST_EXPECT_MSG_EQ(ErrorModelOf(link.ends.atA), nullptr, "the added model is removed");
+        NS_TEST_EXPECT_MSG_EQ(ErrorModelOf(link.ends.atB), nullptr, "at both ends");
+
+        Ptr<RateErrorModel> standing = CreateObject<RateErrorModel>();
+        standing->SetRate(0.01);
+        link.ends.atA->SetAttribute("LinkErrorModel", PointerValue(standing));
+        loss.errorRate = 0.25;
+        applier.Apply(loss, link.ends);
+        NS_TEST_EXPECT_MSG_EQ(standing->GetRate(), 0.25, "a standing model takes the loss");
+        applier.Apply(Event(0, LinkEventKind::Restore), link.ends);
+        NS_TEST_EXPECT_MSG_EQ(ErrorModelOf(link.ends.atA), standing, "the standing model stays");
+        NS_TEST_EXPECT_MSG_EQ(standing->GetRate(), 0.01, "at its former rate");
+        NS_TEST_EXPECT_MSG_EQ(ErrorModelOf(link.ends.atB), nullptr, "b had none");
+
+        const uint32_t port = link.ends.atB->GetIfIndex();
+        applier.Apply(Event(0, LinkEventKind::Blackhole), link.ends);
+        NS_TEST_EXPECT_MSG_EQ(link.sw->IsBlackholed(port), true, "the port is a black hole");
+        applier.Apply(Event(0, LinkEventKind::Restore), link.ends);
+        NS_TEST_EXPECT_MSG_EQ(link.sw->IsBlackholed(port), false, "and no longer");
+
+        applier.Apply(Event(0, LinkEventKind::Down), link.ends);
+        NS_TEST_EXPECT_MSG_EQ(downs, 1, "a down takes the link down");
+    }
+
+    // A repeat schedule given out of order, with a failure at a restore's
+    // time listed before it.
+    void Schedule()
+    {
+        Link link = MakeLink();
+        LinkEventApplier applier = Applier();
+        std::vector<LinkEvent> events = {Event(400, LinkEventKind::Rate, DataRate("25Gbps")),
+                                         Event(100, LinkEventKind::Rate, DataRate("100Gbps")),
+                                         Event(200, LinkEventKind::Rate, DataRate("50Gbps")),
+                                         Event(200, LinkEventKind::Restore),
+                                         Event(300, LinkEventKind::Restore)};
+        OrderLinkEvents(events);
+        NS_TEST_ASSERT_MSG_EQ(CheckLinkEvents(events), "", "the schedule applies");
+        for (const LinkEvent& event : events)
+        {
+            Simulator::Schedule(NanoSeconds(event.timeNs),
+                                [&applier, &link, event]() { applier.Apply(event, link.ends); });
+        }
+        std::vector<uint64_t> rates;
+        for (uint64_t at : {50, 150, 250, 350, 450})
+        {
+            Simulator::Schedule(NanoSeconds(at), [&rates, &link]() {
+                rates.push_back(link.ends.atA->GetDataRate().GetBitRate());
+            });
+        }
+        Simulator::Run();
+        const std::vector<uint64_t> expected = {400000000000,
+                                                100000000000,
+                                                50000000000,
+                                                400000000000,
+                                                25000000000};
+        NS_TEST_ASSERT_MSG_EQ(rates.size(), expected.size(), "every probe ran");
+        for (uint32_t i = 0; i < expected.size(); ++i)
+        {
+            NS_TEST_EXPECT_MSG_EQ(rates[i], expected[i], "the rate follows the schedule in order");
+        }
         Simulator::Destroy();
     }
 };
@@ -6637,6 +6855,7 @@ PointToPointTestSuite::PointToPointTestSuite()
     AddTestCase(new LinkErrorTest, TestCase::Duration::QUICK);
     AddTestCase(new BlackholeTest, TestCase::Duration::QUICK);
     AddTestCase(new LinkRateChangeTest, TestCase::Duration::QUICK);
+    AddTestCase(new LinkRestoreTest, TestCase::Duration::QUICK);
     AddTestCase(new PortCountersTest, TestCase::Duration::QUICK);
     AddTestCase(new MarkingStreamTest, TestCase::Duration::QUICK);
     AddTestCase(new PfcIdentificationTest, TestCase::Duration::QUICK);

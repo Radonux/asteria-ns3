@@ -39,6 +39,7 @@
 #include <limits>
 #include <map>
 #include <zstd.h>
+#include <ns3/link-events.h>
 #include <ns3/load-balancing.h>
 #include <ns3/path-selector.h>
 #include <ns3/rdma-client-helper.h>
@@ -244,19 +245,9 @@ uint32_t ack_high_prio = 0;
 uint64_t link_down_time = 0;
 uint32_t link_down_A = 0, link_down_B = 0;
 
-// What befalls the link between two nodes at a time in the run. Down takes the
-// link down and reroutes around it. Blackhole leaves it up while the second
-// node drops the data that arrives from the first. Loss and Rate change the
-// link's error rate or its speed in both directions.
-enum class LinkFailureKind { Down, Blackhole, Loss, Rate };
-struct LinkFailure {
-  uint64_t start_ns;
-  LinkFailureKind kind;
-  uint32_t a, b;
-  double error_rate;
-  DataRate rate;
-};
-vector<LinkFailure> link_failures;
+// The LINK_FAILURE and LINK_RESTORE lines, put in the order they apply in
+// once the configuration is read.
+vector<LinkEvent> link_events;
 
 uint32_t enable_trace = 1;
 
@@ -1151,28 +1142,21 @@ void write_spine_report(uint32_t rank, uint64_t now_ns,
   }
 }
 
-void ApplyLinkFailure(NodeContainer n, LinkFailure failure) {
-  Ptr<Node> a = n.Get(failure.a), b = n.Get(failure.b);
-  Ptr<QbbNetDevice> device_at_a =
-      DynamicCast<QbbNetDevice>(a->GetDevice(nbr2if[a][b].idx));
-  Ptr<QbbNetDevice> device_at_b =
-      DynamicCast<QbbNetDevice>(b->GetDevice(nbr2if[b][a].idx));
-  switch (failure.kind) {
-  case LinkFailureKind::Down:
-    TakeDownLink(n, a, b);
-    break;
-  case LinkFailureKind::Blackhole:
-    DynamicCast<SwitchNode>(b)->SetBlackhole(nbr2if[b][a].idx);
-    break;
-  case LinkFailureKind::Loss:
-    set_link_error_rate(device_at_a, failure.error_rate);
-    set_link_error_rate(device_at_b, failure.error_rate);
-    break;
-  case LinkFailureKind::Rate:
-    device_at_a->SetDataRate(failure.rate);
-    device_at_b->SetDataRate(failure.rate);
-    break;
-  }
+// The link events' applier, which keeps what a restore puts back.
+std::unique_ptr<LinkEventApplier> link_event_applier;
+
+void ApplyLinkEvent(NodeContainer n, LinkEvent event) {
+  Ptr<Node> a = n.Get(event.a), b = n.Get(event.b);
+  LinkEnds ends;
+  ends.atA = DynamicCast<QbbNetDevice>(a->GetDevice(nbr2if[a][b].idx));
+  ends.atB = DynamicCast<QbbNetDevice>(b->GetDevice(nbr2if[b][a].idx));
+  ends.switchAtB = DynamicCast<SwitchNode>(b);
+  if (!link_event_applier)
+    link_event_applier = std::make_unique<LinkEventApplier>(
+        &set_link_error_rate, [n](uint32_t x, uint32_t y) {
+          TakeDownLink(n, n.Get(x), n.Get(y));
+        });
+  link_event_applier->Apply(event, ends);
 }
 
 uint64_t get_nic_rate(NodeContainer &n) {
@@ -1600,23 +1584,23 @@ bool ReadConf(string network_configuration) {
     } else if (key.compare("LINK_DOWN") == 0) {
       conf >> link_down_time >> link_down_A >> link_down_B;
     } else if (key.compare("LINK_FAILURE") == 0) {
-      LinkFailure failure = {};
+      LinkEvent failure;
       std::string kind;
-      conf >> failure.start_ns >> kind >> failure.a >> failure.b;
+      conf >> failure.timeNs >> kind >> failure.a >> failure.b;
       if (kind == "down") {
-        failure.kind = LinkFailureKind::Down;
+        failure.kind = LinkEventKind::Down;
       } else if (kind == "blackhole") {
-        failure.kind = LinkFailureKind::Blackhole;
+        failure.kind = LinkEventKind::Blackhole;
       } else if (kind == "loss") {
-        failure.kind = LinkFailureKind::Loss;
-        conf >> failure.error_rate;
-        if (!std::isfinite(failure.error_rate) || failure.error_rate <= 0.0 ||
-            failure.error_rate > 1.0) {
+        failure.kind = LinkEventKind::Loss;
+        conf >> failure.errorRate;
+        if (!std::isfinite(failure.errorRate) || failure.errorRate <= 0.0 ||
+            failure.errorRate > 1.0) {
           std::cerr << "LINK_FAILURE loss needs an error rate in (0, 1]\n";
           return false;
         }
       } else if (kind == "rate") {
-        failure.kind = LinkFailureKind::Rate;
+        failure.kind = LinkEventKind::Rate;
         std::string rate;
         conf >> rate;
         // Parsed apart from conf, whose failbit would end the key loop.
@@ -1629,7 +1613,12 @@ bool ReadConf(string network_configuration) {
         std::cerr << "LINK_FAILURE kind must be down, blackhole, loss or rate\n";
         return false;
       }
-      link_failures.push_back(failure);
+      link_events.push_back(failure);
+    } else if (key.compare("LINK_RESTORE") == 0) {
+      LinkEvent restore;
+      restore.kind = LinkEventKind::Restore;
+      conf >> restore.timeNs >> restore.a >> restore.b;
+      link_events.push_back(restore);
     } else if (key.compare("ENABLE_TRACE") == 0) {
       conf >> enable_trace;
     } else if (key.compare("KMAX_MAP") == 0) {
@@ -1751,6 +1740,12 @@ bool ReadConf(string network_configuration) {
   // retained prefix to cover any INT header the configured CC algorithm adds.
   if (min_trim_size < 24) {
     std::cerr << "MIN_TRIM_SIZE must be at least 24 bytes (UEC 1.0.3 Table 4-1)\n";
+    return false;
+  }
+  OrderLinkEvents(link_events);
+  const std::string unrestorable = CheckLinkEvents(link_events);
+  if (!unrestorable.empty()) {
+    std::cerr << unrestorable << "\n";
     return false;
   }
   if (packet_trim_queue_weight == 0 || packet_trim_queue_weight > 100) {
@@ -2590,28 +2585,30 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),
               "SpineReport", MakeBoundCallback(&write_spine_report, i));
       }
   }
-  std::set<uint64_t> failure_times;
-  for (const LinkFailure &failure : link_failures) {
-    if (failure.a >= node_num || failure.b >= node_num ||
-        nbr2if[n.Get(failure.a)].count(n.Get(failure.b)) == 0) {
-      std::cerr << "LINK_FAILURE names " << failure.a << " " << failure.b
+  std::set<uint64_t> event_times;
+  for (const LinkEvent &event : link_events) {
+    const char *key =
+        event.kind == LinkEventKind::Restore ? "LINK_RESTORE" : "LINK_FAILURE";
+    if (event.a >= node_num || event.b >= node_num ||
+        nbr2if[n.Get(event.a)].count(n.Get(event.b)) == 0) {
+      std::cerr << key << " names " << event.a << " " << event.b
                 << ", which no link joins\n";
       return false;
     }
-    if (failure.kind == LinkFailureKind::Blackhole &&
-        n.Get(failure.b)->GetNodeType() != 1) {
+    if (event.kind == LinkEventKind::Blackhole &&
+        n.Get(event.b)->GetNodeType() != 1) {
       std::cerr << "LINK_FAILURE blackhole needs a switch as its second node\n";
       return false;
     }
-    failure_times.insert(failure.start_ns);
+    event_times.insert(event.timeNs);
   }
   // Scheduled first, so that each set of counters is what stood before the
-  // failures at its time.
-  for (uint64_t start_ns : failure_times)
-    Simulator::Schedule(NanoSeconds(start_ns), &write_fabric_counters);
-  for (const LinkFailure &failure : link_failures)
-    Simulator::Schedule(NanoSeconds(failure.start_ns), &ApplyLinkFailure, n,
-                        failure);
+  // failures and restores at its time.
+  for (uint64_t time_ns : event_times)
+    Simulator::Schedule(NanoSeconds(time_ns), &write_fabric_counters);
+  // In order, which events at one time keep, a restore before a failure.
+  for (const LinkEvent &event : link_events)
+    Simulator::Schedule(NanoSeconds(event.timeNs), &ApplyLinkEvent, n, event);
 
   // schedule buffer monitor
   FILE *qlen_output = fopen(qlen_mon_file.c_str(), "w");
