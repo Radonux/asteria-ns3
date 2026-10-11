@@ -90,9 +90,25 @@ public:
 	uint32_t m_mrcEvSetSize;
 	double m_mrcSkipBaseRtts;
 	double m_mrcProbeTimeouts;
+	// PathSelectorKind::AckRedirect, under SprayUniform: SpineRedirect's omega
+	// and flag, its validity cycle in units of m_sprayBaseRttNs, and
+	// TrimScoring.
+	double m_ackRedirectOmega;
+	double m_ackRedirectFlag;
+	double m_ackRedirectValidityBaseRtts;
+	uint32_t m_ackRedirectTrimScoring;
+	// The addresses of the hosts on this host's leaf, sorted. Their packets
+	// cross no spine, so they are not scored for a redirect.
+	std::vector<uint32_t> m_ownLeafHosts;
+	bool IsAckRedirect() const;
+	// The redirect field of the answer to the data packet or trimmed header of
+	// ch arriving at q, which is scored unless its sender is on this host's
+	// leaf.
+	uint8_t ScoreForRedirect(Ptr<RdmaRxQueuePair> q, const CustomHeader &ch,
+		bool marked);
 	// SprayPolicy. Times are in units of m_sprayBaseRttNs, the fabric's base
-	// RTT; the receiver's parameters are those of SpineGrader and the sender's
-	// those of SpineScores.
+	// RTT, which AckRedirect also counts in; the receiver's parameters are
+	// those of SpineGrader and the sender's those of SpineScores.
 	uint64_t m_sprayBaseRttNs;
 	double m_sprayReportIntervalBaseRtts;
 	double m_sprayEstimatorGain;
@@ -265,11 +281,12 @@ public:
 		uint16_t dport, uint16_t pg, uint32_t seq, uint32_t payloadSize,
 		bool lastHop, bool spent, bool eligible);
 	// packetSeq and identification describe the data packet answered, or with
-	// probeAnswer the probe.
+	// probeAnswer the probe; redirect is the redirect field, kNoRedirect
+	// outside AckRedirect.
 	void SendAck(Ptr<RdmaRxQueuePair> q, uint32_t sourceIp,
 		uint32_t destinationIp, uint16_t sport, uint16_t dport, uint16_t pg,
 		const IntHeader &ih, uint32_t packetSeq, uint16_t identification,
-		bool nack, bool cnp, bool spent, bool probeAnswer);
+		bool nack, bool cnp, bool spent, bool probeAnswer, uint8_t redirect);
 	// Read the receiver's two bits off an arriving repair request or
 	// acknowledgement and follow them: eligible with room grants the
 	// exemption and eligible with none returns the sender to its controller,

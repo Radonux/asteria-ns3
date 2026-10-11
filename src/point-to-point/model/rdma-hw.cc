@@ -13,6 +13,7 @@
 #include "ppp-header.h"
 #include "qbb-header.h"
 #include "cn-header.h"
+#include "spine-redirect.h"
 #include <algorithm>
 #include <cmath>
 #include <utility>
@@ -173,12 +174,14 @@ TypeId RdmaHw::GetTypeId (void)
 				"Under LoadBalancing 1, what chooses each data packet's entropy "
 				"value: 0=OPS, a fresh value drawn per packet; 1=REPS; 2=UEC "
 				"oblivious spraying; 3=UEC path-aware spraying with the "
-				"congestion bitmap; 4=MRC.",
+				"congestion bitmap; 4=MRC. Under LoadBalancing 2, 0 draws each "
+				"spine uniformly and 5 sends on the spine the latest "
+				"acknowledgement redirects to, which needs IntHeader::mode TS.",
 				UintegerValue(static_cast<uint32_t>(PathSelectorKind::Ops)),
 				MakeUintegerAccessor(&RdmaHw::m_pathSelectorKind),
 				MakeUintegerChecker<uint32_t>(
 					static_cast<uint32_t>(PathSelectorKind::Ops),
-					static_cast<uint32_t>(PathSelectorKind::Mrc)))
+					static_cast<uint32_t>(PathSelectorKind::AckRedirect)))
 		.AddAttribute("RepsBufferSize",
 				"REPS: the entries of the circular buffer of entropy values to "
 				"reuse. Default 8, REPS section 3.1.",
@@ -227,9 +230,39 @@ TypeId RdmaHw::GetTypeId (void)
 				DoubleValue(1.0),
 				MakeDoubleAccessor(&RdmaHw::m_mrcProbeTimeouts),
 				MakeDoubleChecker<double>(0))
+		.AddAttribute("AckRedirectOmega",
+				"Under PathSelector 5, the weight of the one-way delay term of an "
+				"arrival's score against its ECN term. Default 0.5.",
+				DoubleValue(0.5),
+				MakeDoubleAccessor(&RdmaHw::m_ackRedirectOmega),
+				MakeDoubleChecker<double>(0, 1))
+		.AddAttribute("AckRedirectFlag",
+				"Under PathSelector 5, the fraction of the best spine's score an "
+				"arrival's may fall short of before its acknowledgement "
+				"redirects the sender to the best spine. Default 0.1.",
+				DoubleValue(0.1),
+				MakeDoubleAccessor(&RdmaHw::m_ackRedirectFlag),
+				MakeDoubleChecker<double>(0))
+		.AddAttribute("AckRedirectValidityBaseRtts",
+				"Under PathSelector 5, how long a receive queue pair keeps its "
+				"best spine before the next arrival starts a new cycle, in base "
+				"RTTs. Default 2.",
+				DoubleValue(2.0),
+				MakeDoubleAccessor(&RdmaHw::m_ackRedirectValidityBaseRtts),
+				MakeDoubleChecker<double>(0))
+		.AddAttribute("AckRedirectTrimScoring",
+				"Under PathSelector 5, how a header trimmed before the last hop "
+				"is scored: 0=as an arrival on its carrying spine marked with "
+				"CE, 1=not at all. A last-hop trim is never scored. Default 0.",
+				UintegerValue(static_cast<uint32_t>(TrimScoring::Mark)),
+				MakeUintegerAccessor(&RdmaHw::m_ackRedirectTrimScoring),
+				MakeUintegerChecker<uint32_t>(
+					static_cast<uint32_t>(TrimScoring::Mark),
+					static_cast<uint32_t>(TrimScoring::Ignore)))
 		.AddAttribute("SprayBaseRttNs",
-				"Under LoadBalancing 3, the base RTT the attributes below count "
-				"time in. Zero, the default, is refused at the first use.",
+				"Under LoadBalancing 3 and PathSelector 5, the base RTT the "
+				"attributes count time in. Zero, the default, is refused at the "
+				"first use.",
 				UintegerValue(0),
 				MakeUintegerAccessor(&RdmaHw::m_sprayBaseRttNs),
 				MakeUintegerChecker<uint64_t>())
@@ -672,9 +705,24 @@ void RdmaHw::Setup(QpCompleteCallback cb, QpFailureCallback failure_cb){
 		"timestamp of IntHeader::mode TS");
 	NS_ABORT_MSG_IF(m_pathSelectorKind !=
 				static_cast<uint32_t>(PathSelectorKind::Ops) &&
+			m_pathSelectorKind !=
+				static_cast<uint32_t>(PathSelectorKind::AckRedirect) &&
 			m_loadBalancing !=
 				static_cast<uint32_t>(LoadBalancingMode::EntropyHash),
-		"PathSelector chooses entropy values and needs LoadBalancing 1");
+		"PathSelector 1 to 4 choose entropy values and need LoadBalancing 1");
+	NS_ABORT_MSG_IF(m_pathSelectorKind ==
+				static_cast<uint32_t>(PathSelectorKind::AckRedirect) &&
+			m_loadBalancing !=
+				static_cast<uint32_t>(LoadBalancingMode::SprayUniform),
+		"PathSelector 5 names spines and needs LoadBalancing 2");
+	NS_ABORT_MSG_IF(IsAckRedirect() && IntHeader::mode != IntHeader::TS,
+		"PathSelector 5 scores each arrival by the one-way delay from the send "
+		"timestamp of IntHeader::mode TS");
+	NS_ABORT_MSG_IF(IsAckRedirect() && m_spineCount >= kNoRedirect,
+		"PathSelector 5 names a spine by an index below kNoRedirect");
+	NS_ABORT_MSG_IF(CustomHeader::ackRedirectBytes != (IsAckRedirect() ? 1 : 0),
+		"PathSelector 5 and only it carries the redirect field in every "
+		"acknowledgement");
 	NS_ABORT_MSG_IF(m_pathSelectorKind ==
 				static_cast<uint32_t>(PathSelectorKind::Mrc) &&
 			m_retransmission_timeout_ns == 0,
@@ -891,10 +939,13 @@ int RdmaHw::ReceiveUdp(Ptr<Packet> p, CustomHeader &ch){
 	rxQp->NoteSeen(range_end);
 	int x = ReceiverCheckSeq(ch.udp.seq, rxQp, payload_size);
 
+	// Scored whether or not it is answered, as the grader counts it.
+	const uint8_t redirect = IsAckRedirect()
+		? ScoreForRedirect(rxQp, ch, ecnbits != 0) : kNoRedirect;
 	if (x == 1 || x == 2){ //generate ACK or NACK
 		SendAck(rxQp, ch.dip, ch.sip, ch.udp.dport, ch.udp.sport, ch.udp.pg,
 			ch.udp.ih, ch.udp.seq, ch.ipid, x == 2, ecnbits != 0,
-			AllowanceGone(rxQp), false);
+			AllowanceGone(rxQp), false, redirect);
 	}
 	// After the acknowledgement, so this packet's answer carries the state
 	// this packet produced and anything the report below absorbs is
@@ -930,6 +981,32 @@ void RdmaHw::CountArrival(Ptr<RdmaRxQueuePair> q, uint16_t identification,
 
 bool RdmaHw::IsSprayPolicy() const{
 	return m_loadBalancing == static_cast<uint32_t>(LoadBalancingMode::SprayPolicy);
+}
+
+bool RdmaHw::IsAckRedirect() const{
+	return m_pathSelectorKind ==
+		static_cast<uint32_t>(PathSelectorKind::AckRedirect);
+}
+
+uint8_t RdmaHw::ScoreForRedirect(Ptr<RdmaRxQueuePair> q,
+		const CustomHeader &ch, bool marked){
+	if (std::binary_search(m_ownLeafHosts.begin(), m_ownLeafHosts.end(), ch.sip))
+		return kNoRedirect;
+	NS_ABORT_MSG_IF(m_sprayBaseRttNs == 0,
+		"PathSelector 5 counts its validity cycle in SprayBaseRttNs");
+	const Time now = Simulator::Now();
+	// The data packet's send timestamp, and the trimmed header's, which keeps
+	// the INT prefix; one clock serves the whole simulation.
+	const uint64_t delay = (now - TimeStep(ch.udp.ih.ts)).GetNanoSeconds();
+	const SpineRedirect::Parameters parameters{m_ackRedirectOmega,
+		m_ackRedirectFlag,
+		static_cast<uint64_t>(m_ackRedirectValidityBaseRtts * m_sprayBaseRttNs),
+		m_sprayBaseRttNs / 2};
+	const uint8_t redirect = q->m_spineRedirect.OnArrival(CarryingSpine(ch.ipid),
+		delay, marked, now.GetNanoSeconds(), parameters);
+	NS_ASSERT_MSG(redirect == kNoRedirect || redirect < m_spineCount,
+		"a redirect names a spine by its index");
+	return redirect;
 }
 
 bool RdmaHw::IsPerConnectionGrading() const{
@@ -1026,7 +1103,7 @@ void RdmaHw::GradeTrim(Ptr<RdmaRxQueuePair> q, const CustomHeader &ch,
 void RdmaHw::SendAck(Ptr<RdmaRxQueuePair> q, uint32_t sourceIp,
 		uint32_t destinationIp, uint16_t sport, uint16_t dport, uint16_t pg,
 		const IntHeader &ih, uint32_t packetSeq, uint16_t identification,
-		bool nack, bool cnp, bool spent, bool probeAnswer){
+		bool nack, bool cnp, bool spent, bool probeAnswer, uint8_t redirect){
 	qbbHeader seqh;
 	seqh.SetSeq(q->ReceiverNextExpectedSeq);
 	seqh.SetPacketSeq(packetSeq);
@@ -1041,6 +1118,7 @@ void RdmaHw::SendAck(Ptr<RdmaRxQueuePair> q, uint32_t sourceIp,
 	seqh.SetAllowanceExhausted(spent);
 	if (IsSprayPolicy())
 		seqh.SetSpineReport(GraderOf(q).Report());
+	seqh.SetRedirect(redirect);
 	// The grant is this flag without the report above. A receiver that may not
 	// forgive this flow, or a step that is critical, never sets it, so those
 	// senders obey their controller throughout.
@@ -1149,6 +1227,10 @@ int RdmaHw::ReceiveAck(Ptr<Packet> p, CustomHeader &ch){
 			if ((ch.ack.flags >> qbbHeader::FLAG_PROBE_ANSWER) & 1){
 				qp->m_pathSelector->OnProbeAnswer(path, cnp, now);
 			}else{
+				if (IsAckRedirect())
+					qp->m_pathSelector->OnRedirect(
+						DecodeRedirect(ch.ack.redirect, m_spineCount),
+						CarryingSpine(ch.ipid), now);
 				qp->m_pathSelector->OnAck(path, cnp, now);
 				// The destination's downlink being congested is the receiver's
 				// flow control of UEC 1.0.3 section 3.6.13.2.
@@ -1254,7 +1336,7 @@ int RdmaHw::ReceivePathProbe(Ptr<Packet> p, CustomHeader &ch){
 		return 0;
 	SendAck(q, ch.dip, ch.sip, ch.ack.dport, ch.ack.sport, ch.ack.pg,
 		IntHeader(), 0, ch.ipid, false, ch.GetIpv4EcnBits() != 0,
-		AllowanceGone(q), true);
+		AllowanceGone(q), true, kNoRedirect);
 	return 0;
 }
 
@@ -1490,7 +1572,8 @@ void RdmaHw::ReceiveTrimmedData(const CustomHeader &ch, uint32_t payloadSize,
 	const uint64_t unsettled = q->UnsettledBytes(start, end);
 	if (unsettled == 0){
 		SendAck(q, ch.dip, ch.sip, ch.udp.dport, ch.udp.sport, ch.udp.pg,
-			ch.udp.ih, ch.udp.seq, ch.ipid, false, false, AllowanceGone(q), false);
+			ch.udp.ih, ch.udp.seq, ch.ipid, false, false, AllowanceGone(q), false,
+			kNoRedirect);
 		return;
 	}
 	if (unsettled < payloadSize){
@@ -1523,7 +1606,8 @@ void RdmaHw::ReceiveTrimmedData(const CustomHeader &ch, uint32_t payloadSize,
 		// debt is owed for every trim the sender would otherwise have seen, and
 		// this ACK is what pays it.
 		SendAck(q, ch.dip, ch.sip, ch.udp.dport, ch.udp.sport, ch.udp.pg,
-			ch.udp.ih, ch.udp.seq, ch.ipid, false, true, AllowanceGone(q), false);
+			ch.udp.ih, ch.udp.seq, ch.ipid, false, true, AllowanceGone(q), false,
+			kNoRedirect);
 		return;
 	}
 	// The refused range stays a hole, so the report is computed after the
@@ -1573,7 +1657,7 @@ void RdmaHw::AskRemainderOnArrival(Ptr<RdmaRxQueuePair> q){
 	// pair with, and the group is part of the map key, so every packet that
 	// finds this queue pair carries that same group.
 	SendAck(q, q->sip, q->dip, q->sport, q->dport, q->m_ecn_source.qIndex,
-		IntHeader(), 0, 0, false, false, false, false);
+		IntHeader(), 0, 0, false, false, false, false, kNoRedirect);
 }
 
 // The frontend names a flow by (sender, receiver, sender's port); the receive
@@ -1610,11 +1694,16 @@ int RdmaHw::ReceiveTrim(Ptr<Packet> p, CustomHeader &ch){
 		const bool lastHop = ch.GetIpv4Dscp() == kUetDscpTrimmedLastHop;
 		// A trim can reach a flow before any of its data does; the receive
 		// state it makes is what that data would have made.
-		const Ptr<RdmaRxQueuePair> q = IsPerConnectionGrading()
+		const Ptr<RdmaRxQueuePair> q = IsPerConnectionGrading() || IsAckRedirect()
 			? GetRxQp(ch.dip, ch.sip, ch.udp.dport, ch.udp.sport, ch.udp.pg, true)
 			: nullptr;
 		if (IsSprayPolicy())
 			GradeTrim(q, ch, lastHop);
+		// A last-hop trim says nothing of the spine it crossed, and the repair
+		// request carries no redirect in any case.
+		if (IsAckRedirect() && !lastHop && m_ackRedirectTrimScoring ==
+				static_cast<uint32_t>(TrimScoring::Mark))
+			ScoreForRedirect(q, ch, true);
 		if (m_forgiveness && originalPayload > 0){
 			ReceiveTrimmedData(ch, originalPayload, lastHop);
 			return 0;
@@ -2018,6 +2107,11 @@ void RdmaHw::SendPathProbe(Ptr<RdmaQueuePair> qp, uint16_t path){
 void RdmaHw::StartPathSelection(Ptr<RdmaQueuePair> qp, uint64_t bdpBytes,
 		uint64_t baseRttNs){
 	qp->m_outstanding.SetPacketSize(m_mtu);
+	if (IsAckRedirect()){
+		qp->m_pathSelector =
+			std::make_unique<AckRedirectSelector>(m_pathRandom, m_spineCount);
+		return;
+	}
 	if (m_loadBalancing == static_cast<uint32_t>(LoadBalancingMode::SprayUniform)){
 		qp->m_pathSelector =
 			std::make_unique<UniformSpineSelector>(m_pathRandom, m_spineCount);

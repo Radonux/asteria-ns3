@@ -14,13 +14,13 @@ namespace ns3 {
 
 	qbbHeader::qbbHeader(uint16_t pg)
 		: sport(0), dport(0), flags(0), m_pg(pg), m_seq(0),
-		  m_trimPayloadSize(0), m_packetSeq(0)
+		  m_trimPayloadSize(0), m_packetSeq(0), m_redirect(0xff)
 	{
 	}
 
 	qbbHeader::qbbHeader()
 		: sport(0), dport(0), flags(0), m_pg(0), m_seq(0),
-		  m_trimPayloadSize(0), m_packetSeq(0)
+		  m_trimPayloadSize(0), m_packetSeq(0), m_redirect(0xff)
 	{}
 
 	qbbHeader::~qbbHeader()
@@ -84,6 +84,9 @@ namespace ns3 {
 		else
 			flags &= ~(1 << FLAG_EDGE_CONGESTED);
 	}
+	void qbbHeader::SetRedirect(uint8_t spine){
+		m_redirect = spine;
+	}
 	void qbbHeader::SetIntHeader(const IntHeader &_ih){
 		ih = _ih;
 	}
@@ -127,6 +130,9 @@ namespace ns3 {
 	const SpineReport &qbbHeader::GetSpineReport() const{
 		return m_spineReport;
 	}
+	uint8_t qbbHeader::GetRedirect() const{
+		return m_redirect;
+	}
 
 	TypeId
 		qbbHeader::GetTypeId(void)
@@ -154,7 +160,7 @@ namespace ns3 {
 		qbbHeader tmp;
 		return sizeof(tmp.sport) + sizeof(tmp.dport) + sizeof(tmp.flags) + sizeof(tmp.m_pg) + sizeof(tmp.m_seq) + sizeof(tmp.m_trimPayloadSize) +
 			(CustomHeader::ackCarriesPacketSeq ? sizeof(tmp.m_packetSeq) : 0) +
-			CustomHeader::ackReportBytes;
+			CustomHeader::ackReportBytes + CustomHeader::ackRedirectBytes;
 	}
 	void qbbHeader::Serialize(Buffer::Iterator start)  const
 	{
@@ -171,6 +177,8 @@ namespace ns3 {
 			i.WriteU8(m_spineReport.sequence);
 			i.Write(m_spineReport.grades, CustomHeader::ackReportBytes - 1);
 		}
+		if (CustomHeader::ackRedirectBytes > 0)
+			i.WriteU8(m_redirect);
 
 		// write IntHeader
 		ih.Serialize(i);
@@ -192,6 +200,8 @@ namespace ns3 {
 			i.Read(m_spineReport.grades, CustomHeader::ackReportBytes - 1);
 			m_spineReport.edgeCongested = (flags >> FLAG_EDGE_CONGESTED) & 1;
 		}
+		if (CustomHeader::ackRedirectBytes > 0)
+			m_redirect = i.ReadU8();
 
 		// read IntHeader
 		ih.Deserialize(i);

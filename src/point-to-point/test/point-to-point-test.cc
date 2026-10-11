@@ -1683,6 +1683,7 @@ class IsolatedHost
                                         CustomHeader::L4_Header);
                     packet->PeekHeader(parsed);
                     emitted.push_back(parsed);
+                    emittedSizes.push_back(packet->GetSize());
                 }));
         RdmaInterfaceMgr nic;
         nic.dev = device;
@@ -1715,12 +1716,18 @@ class IsolatedHost
                      uint32_t seq,
                      uint16_t identification,
                      bool marked = false,
-                     uint16_t senderPort = kSenderPort)
+                     uint16_t senderPort = kSenderPort,
+                     uint64_t delayNs = 0)
     {
         Ptr<Packet> packet = Create<Packet>(kMtu);
         SeqTsHeader seqTs;
         seqTs.SetSeq(seq);
         seqTs.SetPG(kPriorityGroup);
+        // Sent delayNs ago, where the header carries the send time.
+        if (IntHeader::mode == IntHeader::TS)
+        {
+            seqTs.ih.ts = (Simulator::Now() - NanoSeconds(delayNs)).GetTimeStep();
+        }
         packet->AddHeader(seqTs);
         UdpHeader udp;
         udp.SetSourcePort(senderPort);
@@ -1810,6 +1817,7 @@ class IsolatedHost
 
     Ptr<RdmaHw> hw;
     std::vector<CustomHeader> emitted;
+    std::vector<uint32_t> emittedSizes;
 };
 
 const Ipv4Address kTestSender("11.0.1.1");
@@ -5208,6 +5216,290 @@ class AckRedirectSelectorTest : public TestCase
     }
 };
 
+class AckRedirectTransportTest : public TestCase
+{
+  public:
+    AckRedirectTransportTest()
+        : TestCase("Under ack_redirect every acknowledgement carries its receive queue pair's "
+                   "redirect after the packet sequence, and the sender follows it")
+    {
+    }
+
+    void DoRun() override
+    {
+        const IntHeader::Mode savedIntMode = IntHeader::mode;
+        const bool savedPacketSeq = CustomHeader::ackCarriesPacketSeq;
+        const uint32_t savedRedirectBytes = CustomHeader::ackRedirectBytes;
+        IntHeader::mode = IntHeader::NONE;
+        CustomHeader::ackCarriesPacketSeq = true;
+        Wire();
+        IntHeader::mode = IntHeader::TS;
+        CustomHeader::ackRedirectBytes = 1;
+        Receiver(TrimScoring::Mark);
+        Receiver(TrimScoring::Ignore);
+        Sender();
+        CustomHeader::ackRedirectBytes = savedRedirectBytes;
+        CustomHeader::ackCarriesPacketSeq = savedPacketSeq;
+        IntHeader::mode = savedIntMode;
+    }
+
+  private:
+    static constexpr uint32_t kSpines = 8;
+    static constexpr uint64_t kBaseRtt = 10000;
+    static constexpr uint64_t kBase = kBaseRtt / 2;
+
+    // A serialized acknowledgement's bytes from the start of its header.
+    static std::vector<uint8_t> Bytes(const qbbHeader& ack)
+    {
+        Ptr<Packet> packet = Create<Packet>(0);
+        packet->AddHeader(ack);
+        std::vector<uint8_t> bytes(packet->GetSize());
+        packet->CopyData(bytes.data(), bytes.size());
+        return bytes;
+    }
+
+    void Wire()
+    {
+        CustomHeader::ackRedirectBytes = 0;
+        qbbHeader plain;
+        plain.SetSeq(3000);
+        plain.SetPacketSeq(7000);
+        qbbHeader redirected = plain;
+        redirected.SetRedirect(4);
+        NS_TEST_EXPECT_MSG_EQ(plain.GetSerializedSize(), 20, "without the field 20 bytes");
+        NS_TEST_EXPECT_MSG_EQ((Bytes(plain) == Bytes(redirected)),
+                              true,
+                              "and a redirect set outside ack_redirect is not on the wire");
+
+        CustomHeader::ackRedirectBytes = 1;
+        NS_TEST_EXPECT_MSG_EQ(redirected.GetSerializedSize(), 21, "the field adds one byte");
+        NS_TEST_EXPECT_MSG_EQ(CustomHeader::GetAckSerializedSize(), 21, "the parser agrees");
+        const std::vector<uint8_t> bytes = Bytes(redirected);
+        NS_TEST_EXPECT_MSG_EQ(uint32_t(bytes[20]), 4u, "the redirect is at offset 20");
+        NS_TEST_EXPECT_MSG_EQ(uint32_t(Bytes(plain)[20]),
+                              uint32_t(kNoRedirect),
+                              "and names no spine unless set");
+        Ptr<Packet> packet = Create<Packet>(0);
+        packet->AddHeader(redirected);
+        Ipv4Header ip;
+        ip.SetProtocol(0xFC);
+        ip.SetPayloadSize(packet->GetSize());
+        packet->AddHeader(ip);
+        PppHeader ppp;
+        ppp.SetProtocol(0x0021);
+        packet->AddHeader(ppp);
+        CustomHeader parsed(CustomHeader::L2_Header | CustomHeader::L3_Header |
+                            CustomHeader::L4_Header);
+        packet->PeekHeader(parsed);
+        NS_TEST_EXPECT_MSG_EQ(uint32_t(parsed.ack.redirect), 4u, "the redirect is parsed");
+        NS_TEST_EXPECT_MSG_EQ(parsed.ack.packet_seq, 7000, "the packet sequence keeps its place");
+        qbbHeader copy;
+        packet->RemoveHeader(ppp);
+        packet->RemoveHeader(ip);
+        packet->PeekHeader(copy);
+        NS_TEST_EXPECT_MSG_EQ(uint32_t(copy.GetRedirect()), 4u, "the header reads it back");
+
+        NS_TEST_EXPECT_MSG_EQ(uint32_t(DecodeRedirect(0, kSpines)), 0u, "spine 0 is a spine");
+        NS_TEST_EXPECT_MSG_EQ(uint32_t(DecodeRedirect(kSpines - 1, kSpines)),
+                              kSpines - 1,
+                              "and so is the last");
+        for (uint32_t field = kSpines; field <= kNoRedirect; ++field)
+        {
+            NS_TEST_EXPECT_MSG_EQ(uint32_t(DecodeRedirect(field, kSpines)),
+                                  uint32_t(kNoRedirect),
+                                  "no value from the spine count up names a spine");
+        }
+
+        // An answer still fits the minimum frame without a timestamp.
+        IsolatedHost receiver(LoadBalancingMode::SprayUniform, kTestSender, kSpines);
+        receiver.ReceiveData(kTestSender, kTestReceiver, 0, SpineIdentification(1, 1));
+        NS_TEST_ASSERT_MSG_EQ(receiver.emittedSizes.size(), 1, "the packet is answered");
+        NS_TEST_EXPECT_MSG_EQ(receiver.emittedSizes[0],
+                              PppHeader().GetSerializedSize() + 20 + (60 - 14 - 20),
+                              "in a minimum frame");
+        CustomHeader::ackRedirectBytes = 0;
+        Simulator::Destroy();
+    }
+
+    static void Redirect(IsolatedHost& host, TrimScoring trims)
+    {
+        host.hw->m_pathSelectorKind = static_cast<uint32_t>(PathSelectorKind::AckRedirect);
+        host.hw->m_sprayBaseRttNs = kBaseRtt;
+        host.hw->m_ackRedirectTrimScoring = static_cast<uint32_t>(trims);
+    }
+
+    // A data packet trimmed on spine, before the last hop or at it, sent
+    // delayNs ago.
+    static void Trim(IsolatedHost& receiver,
+                     uint32_t seq,
+                     uint8_t spine,
+                     bool lastHop,
+                     uint64_t delayNs)
+    {
+        CustomHeader trimmed;
+        trimmed.l3Prot = 0x11;
+        trimmed.m_tos = (lastHop ? kUetDscpTrimmedLastHop : kUetDscpTrimmed) << 2;
+        trimmed.sip = kTestSender.Get();
+        trimmed.dip = kTestReceiver.Get();
+        trimmed.ipid = SpineIdentification(spine, spine);
+        trimmed.udp.sport = IsolatedHost::kSenderPort;
+        trimmed.udp.dport = IsolatedHost::kReceiverPort;
+        trimmed.udp.pg = IsolatedHost::kPriorityGroup;
+        trimmed.udp.seq = seq;
+        trimmed.udp.payload_size = CustomHeader::GetUdpHeaderSize() + IsolatedHost::kMtu;
+        trimmed.udp.ih.ts = (Simulator::Now() - NanoSeconds(delayNs)).GetTimeStep();
+        receiver.hw->Receive(Create<Packet>(), trimmed);
+    }
+
+    void Receiver(TrimScoring trims)
+    {
+        IsolatedHost receiver(LoadBalancingMode::SprayUniform, kTestSender, kSpines);
+        Redirect(receiver, trims);
+        uint32_t seq = 0;
+        auto deliver = [&](uint16_t identification, uint64_t delayNs, bool marked = false) {
+            receiver.ReceiveData(kTestSender,
+                                 kTestReceiver,
+                                 seq,
+                                 identification,
+                                 marked,
+                                 IsolatedHost::kSenderPort,
+                                 delayNs);
+            seq += IsolatedHost::kMtu;
+            return uint32_t(receiver.emitted.back().ack.redirect);
+        };
+        auto state = [&]() {
+            return receiver.hw->GetRxQp(kTestReceiver.Get(),
+                                        kTestSender.Get(),
+                                        IsolatedHost::kReceiverPort,
+                                        IsolatedHost::kSenderPort,
+                                        IsolatedHost::kPriorityGroup,
+                                        false)
+                ->m_spineRedirect;
+        };
+        const uint32_t none = kNoRedirect;
+        Simulator::Schedule(NanoSeconds(100000), [&]() {
+            NS_TEST_EXPECT_MSG_EQ(deliver(SpineIdentification(1, 1), kBase), none, "a cycle starts");
+            NS_TEST_EXPECT_MSG_EQ(deliver(SpineIdentification(2, 2), 3 * kBase),
+                                  1u,
+                                  "a slow spine's answer redirects to the best");
+            NS_TEST_EXPECT_MSG_EQ(deliver(SpineIdentification(1, 1), kBase),
+                                  none,
+                                  "an answer on the best does not");
+            NS_TEST_EXPECT_MSG_EQ(deliver(SpineIdentification(4, 4), kBase, true),
+                                  1u,
+                                  "a marked answer on another spine redirects to the best");
+            // Moved by its leaf from spine 1 to spine 6, so scored as spine 6.
+            NS_TEST_EXPECT_MSG_EQ(deliver(SpineIdentification(1, 6), kBase / 2),
+                                  none,
+                                  "a packet moved off its spine is scored on the one it crossed");
+            NS_TEST_EXPECT_MSG_EQ(uint32_t(state().Best()), 6u, "and replaces the best");
+            const uint64_t cycleEnd = state().CycleEndNs();
+            const double best = state().BestScore();
+            receiver.hw->m_ownLeafHosts = {kTestSender.Get()};
+            NS_TEST_EXPECT_MSG_EQ(deliver(SpineIdentification(3, 3), 10 * kBase, true),
+                                  none,
+                                  "a sender on this leaf crossed no spine and is not redirected");
+            NS_TEST_EXPECT_MSG_EQ(uint32_t(state().Best()), 6u, "nor scored");
+            NS_TEST_EXPECT_MSG_EQ(state().BestScore(), best, "the best keeps its score");
+            receiver.hw->m_ownLeafHosts.clear();
+            Trim(receiver, seq, 5, false, 10 * kBase);
+            seq += IsolatedHost::kMtu;
+            const CustomHeader& repair = receiver.emitted.back();
+            NS_TEST_EXPECT_MSG_EQ(repair.l3Prot, kUecTrimRepairProtocol, "a trim is answered");
+            NS_TEST_EXPECT_MSG_EQ(uint32_t(repair.ack.redirect), none, "with no redirect");
+            NS_TEST_EXPECT_MSG_EQ(state().CycleEndNs(), cycleEnd, "within the cycle");
+        });
+        // The first event of the next cycle is a trim, which starts it only
+        // if trims are scored, and a last-hop trim never.
+        Simulator::Schedule(NanoSeconds(100000 + 2 * kBaseRtt), [&]() {
+            Trim(receiver, seq, 7, true, 0);
+            seq += IsolatedHost::kMtu;
+            NS_TEST_EXPECT_MSG_EQ(uint32_t(state().Best()), 6u, "a last-hop trim is not scored");
+            NS_TEST_EXPECT_MSG_EQ(uint32_t(receiver.emitted.back().ack.redirect),
+                                  none,
+                                  "and its repair request carries no redirect");
+            Trim(receiver, seq, 5, false, 0);
+            seq += IsolatedHost::kMtu;
+            NS_TEST_EXPECT_MSG_EQ(uint32_t(receiver.emitted.back().ack.redirect),
+                                  none,
+                                  "a repair request carries no redirect");
+            if (trims == TrimScoring::Mark)
+            {
+                NS_TEST_EXPECT_MSG_EQ(uint32_t(state().Best()),
+                                      5u,
+                                      "a trim before the last hop is an arrival on its spine");
+                NS_TEST_EXPECT_MSG_EQ_TOL(state().BestScore(),
+                                          SpineRedirect::Score(0.5, 0, kBase, true),
+                                          1e-9,
+                                          "marked");
+            }
+            else
+            {
+                NS_TEST_EXPECT_MSG_EQ(uint32_t(state().Best()), 6u, "or is ignored");
+            }
+        });
+        Simulator::Run();
+        Simulator::Destroy();
+    }
+
+    void Sender()
+    {
+        IsolatedHost sender(LoadBalancingMode::SprayUniform, kTestReceiver, kSpines);
+        Redirect(sender, TrimScoring::Mark);
+        Ptr<RdmaQueuePair> qp =
+            sender.AddSender(kTestSender, kTestReceiver, 100 * IsolatedHost::kMtu);
+        Ptr<UniformRandomVariable> reference =
+            CreateObjectWithAttributes<UniformRandomVariable>("Stream", IntegerValue(0));
+        UniformSpineSelector uniform(reference, kSpines);
+        auto sent = [&]() {
+            CustomHeader header(CustomHeader::L2_Header | CustomHeader::L3_Header);
+            sender.hw->GetNxtPacket(qp)->PeekHeader(header);
+            return header.ipid;
+        };
+        std::vector<uint16_t> window;
+        bool drawn = true;
+        for (uint32_t i = 0; i < 4; ++i)
+        {
+            window.push_back(sent());
+            drawn &= window.back() == uniform.Choose(0);
+        }
+        NS_TEST_EXPECT_MSG_EQ(drawn, true, "the first window's spines are drawn");
+        auto answer = [&](uint32_t packetSeq, uint16_t identification, uint8_t redirect) {
+            CustomHeader ack;
+            ack.l3Prot = 0xFC;
+            ack.sip = kTestReceiver.Get();
+            ack.ipid = identification;
+            ack.ack.sport = IsolatedHost::kReceiverPort;
+            ack.ack.dport = IsolatedHost::kSenderPort;
+            ack.ack.pg = IsolatedHost::kPriorityGroup;
+            ack.ack.flags = 0;
+            ack.ack.seq = 0;
+            ack.ack.packet_seq = packetSeq;
+            ack.ack.redirect = redirect;
+            sender.hw->ReceiveAck(Create<Packet>(), ack);
+        };
+        // The first send, moved by its leaf onto the next spine.
+        const uint8_t asked = RequestedSpine(window[0]);
+        const uint8_t crossed = (asked + 1) % kSpines;
+        answer(0, SpineIdentification(asked, crossed), kNoRedirect);
+        NS_TEST_EXPECT_MSG_EQ(sent(),
+                              SpineIdentification(crossed, crossed),
+                              "without a redirect the spine the send crossed, not the one asked");
+        answer(1000, window[1], 3);
+        NS_TEST_EXPECT_MSG_EQ(sent(), SpineIdentification(3, 3), "a redirect is followed");
+        answer(2000, window[2], 200);
+        NS_TEST_EXPECT_MSG_EQ(sent(), window[2], "a field naming no spine is no redirect");
+        answer(3000, window[3], 4);
+        qp->AddRepairRange(0, IsolatedHost::kMtu);
+        CustomHeader repair(CustomHeader::L2_Header | CustomHeader::L3_Header |
+                            CustomHeader::L4_Header);
+        sender.hw->GetNxtPacket(qp)->PeekHeader(repair);
+        NS_TEST_EXPECT_MSG_EQ(repair.udp.seq, 0, "the repair is sent next");
+        NS_TEST_EXPECT_MSG_EQ(repair.ipid, SpineIdentification(4, 4), "on the redirect too");
+        Simulator::Destroy();
+    }
+};
+
 class GradeScopeTest : public TestCase
 {
   public:
@@ -5566,6 +5858,7 @@ PointToPointTestSuite::PointToPointTestSuite()
     AddTestCase(new GradeScopeTest, TestCase::Duration::QUICK);
     AddTestCase(new SpineRedirectTest, TestCase::Duration::QUICK);
     AddTestCase(new AckRedirectSelectorTest, TestCase::Duration::QUICK);
+    AddTestCase(new AckRedirectTransportTest, TestCase::Duration::QUICK);
 }
 
 static PointToPointTestSuite g_pointToPointTestSuite; //!< The testsuite
