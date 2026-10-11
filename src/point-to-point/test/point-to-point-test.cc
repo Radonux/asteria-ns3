@@ -44,6 +44,7 @@
 #include "ns3/seq-ts-header.h"
 #include "ns3/simulator.h"
 #include "ns3/spine-grader.h"
+#include "ns3/spine-redirect.h"
 #include "ns3/string.h"
 #include "ns3/test.h"
 #include "ns3/udp-header.h"
@@ -5035,6 +5036,178 @@ class SprayPolicyDefaultsTest : public TestCase
     }
 };
 
+class SpineRedirectTest : public TestCase
+{
+  public:
+    SpineRedirectTest()
+        : TestCase("A receive queue pair scores each arrival by its one-way delay and mark, keeps "
+                   "the best spine for a validity cycle and redirects past the flag")
+    {
+    }
+
+    void DoRun() override
+    {
+        Score();
+        BestAndCycle();
+        Flag();
+    }
+
+  private:
+    static constexpr uint64_t kBase = 6000;
+    static constexpr uint64_t kCycle = 20000;
+
+    static SpineRedirect::Parameters Defaults(double flag = 0.1)
+    {
+        return SpineRedirect::Parameters{0.5, flag, kCycle, kBase};
+    }
+
+    // omega / (L / L0 + 0.001) + (1 - omega)(1 - m), worked by hand at the
+    // base delay and twice it.
+    void Score()
+    {
+        struct Case
+        {
+            double omega;
+            uint64_t delayNs;
+            bool marked;
+            double score;
+        };
+        const Case cases[] = {
+            {0.3, kBase, false, 0.9997002997002997},
+            {0.3, kBase, true, 0.2997002997002997},
+            {0.3, 2 * kBase, false, 0.8499250374812594},
+            {0.3, 2 * kBase, true, 0.1499250374812594},
+            {0.5, kBase, false, 0.9995004995004995},
+            {0.5, kBase, true, 0.4995004995004995},
+            {0.5, 2 * kBase, false, 0.7498750624687656},
+            {0.5, 2 * kBase, true, 0.2498750624687656},
+            {0.7, kBase, false, 0.9993006993006993},
+            {0.7, kBase, true, 0.6993006993006993},
+            {0.7, 2 * kBase, false, 0.6498250874562719},
+            {0.7, 2 * kBase, true, 0.3498250874562719},
+        };
+        for (const Case& c : cases)
+        {
+            NS_TEST_EXPECT_MSG_EQ_TOL(SpineRedirect::Score(c.omega, c.delayNs, kBase, c.marked),
+                                      c.score,
+                                      1e-12,
+                                      "equation 1 at omega " << c.omega);
+        }
+        NS_TEST_EXPECT_MSG_EQ_TOL(SpineRedirect::Score(0.5, 0, kBase, false),
+                                  0.5 / 0.001 + 0.5,
+                                  1e-9,
+                                  "no delay at all is bounded by epsilon");
+    }
+
+    void BestAndCycle()
+    {
+        const SpineRedirect::Parameters parameters = Defaults();
+        SpineRedirect redirect;
+        NS_TEST_EXPECT_MSG_EQ(uint32_t(redirect.Best()), uint32_t(kNoRedirect), "no best at first");
+        NS_TEST_EXPECT_MSG_EQ(uint32_t(redirect.OnArrival(4, 2 * kBase, false, 1000, parameters)),
+                              uint32_t(kNoRedirect),
+                              "the first arrival starts a cycle and redirects nothing");
+        NS_TEST_EXPECT_MSG_EQ(uint32_t(redirect.Best()), 4u, "its spine is the best");
+        NS_TEST_EXPECT_MSG_EQ(redirect.CycleEndNs(), 1000 + kCycle, "for one validity cycle");
+        NS_TEST_EXPECT_MSG_EQ(uint32_t(redirect.OnArrival(6, kBase, false, 2000, parameters)),
+                              uint32_t(kNoRedirect),
+                              "a higher score redirects nothing");
+        NS_TEST_EXPECT_MSG_EQ(uint32_t(redirect.Best()), 6u, "and replaces the best");
+        NS_TEST_EXPECT_MSG_EQ(redirect.CycleEndNs(), 1000 + kCycle, "within the same cycle");
+        NS_TEST_EXPECT_MSG_EQ(uint32_t(redirect.OnArrival(6, 8 * kBase, true, 3000, parameters)),
+                              uint32_t(kNoRedirect),
+                              "an arrival on the best redirects nothing, however low it scores");
+        NS_TEST_EXPECT_MSG_EQ_TOL(redirect.BestScore(),
+                                  SpineRedirect::Score(0.5, 8 * kBase, kBase, true),
+                                  1e-12,
+                                  "and refreshes the best's score");
+        NS_TEST_EXPECT_MSG_EQ(uint32_t(redirect.OnArrival(2, 4 * kBase, true, 4000, parameters)),
+                              uint32_t(kNoRedirect),
+                              "a score above the refreshed best's replaces it");
+        NS_TEST_EXPECT_MSG_EQ(uint32_t(redirect.Best()), 2u, "so spine 2 is the best");
+        NS_TEST_EXPECT_MSG_EQ(uint32_t(redirect.OnArrival(5,
+                                                          8 * kBase,
+                                                          true,
+                                                          1000 + kCycle - 1,
+                                                          parameters)),
+                              uint32_t(2),
+                              "just before the cycle ends a low score is redirected to it");
+        NS_TEST_EXPECT_MSG_EQ(uint32_t(redirect.OnArrival(5,
+                                                          8 * kBase,
+                                                          true,
+                                                          1000 + kCycle,
+                                                          parameters)),
+                              uint32_t(kNoRedirect),
+                              "the first arrival at the cycle's end starts a new cycle");
+        NS_TEST_EXPECT_MSG_EQ(uint32_t(redirect.Best()), 5u, "with its own spine as the best");
+        NS_TEST_EXPECT_MSG_EQ(redirect.CycleEndNs(), 1000 + 2 * kCycle, "for a cycle from then");
+    }
+
+    // An arrival scoring a fraction g below the best is redirected when the
+    // flag is below g and not when it is above.
+    void Flag()
+    {
+        const double best = SpineRedirect::Score(0.5, kBase, kBase, false);
+        const double worse = SpineRedirect::Score(0.5, 3 * kBase / 2, kBase, false);
+        const double gap = (best - worse) / best;
+        auto redirectAt = [&](double flag) {
+            SpineRedirect redirect;
+            redirect.OnArrival(1, kBase, false, 0, Defaults(flag));
+            return redirect.OnArrival(3, 3 * kBase / 2, false, 10, Defaults(flag));
+        };
+        NS_TEST_EXPECT_MSG_EQ(uint32_t(redirectAt(gap - 1e-9)),
+                              1u,
+                              "a gap just over the flag redirects to the best");
+        NS_TEST_EXPECT_MSG_EQ(uint32_t(redirectAt(gap + 1e-9)),
+                              uint32_t(kNoRedirect),
+                              "a gap just under it does not");
+        NS_TEST_EXPECT_MSG_GT(gap, 0.1, "half again the delay is past the default flag");
+        NS_TEST_EXPECT_MSG_EQ(uint32_t(redirectAt(0.1)), 1u, "so the default redirects it");
+    }
+};
+
+class AckRedirectSelectorTest : public TestCase
+{
+  public:
+    AckRedirectSelectorTest()
+        : TestCase("ack_redirect sends on the latest acknowledgement's redirect, else on the "
+                   "spine its send crossed, else on a uniform draw")
+    {
+    }
+
+    void DoRun() override
+    {
+        Ptr<UniformRandomVariable> drawn =
+            CreateObjectWithAttributes<UniformRandomVariable>("Stream", IntegerValue(0));
+        Ptr<UniformRandomVariable> reference =
+            CreateObjectWithAttributes<UniformRandomVariable>("Stream", IntegerValue(0));
+        AckRedirectSelector selector(drawn, 8);
+        UniformSpineSelector uniform(reference, 8);
+        bool alike = true;
+        for (uint32_t i = 0; i < 100; ++i)
+        {
+            alike &= selector.Choose(0) == uniform.Choose(0);
+        }
+        NS_TEST_EXPECT_MSG_EQ(alike, true, "before any acknowledgement each spine is drawn");
+        selector.OnRedirect(kNoRedirect, 5, 10);
+        NS_TEST_EXPECT_MSG_EQ(selector.Choose(20),
+                              SpineIdentification(5, 5),
+                              "without a redirect, the spine the answered send crossed");
+        selector.OnRedirect(3, 5, 30);
+        NS_TEST_EXPECT_MSG_EQ(selector.Choose(40),
+                              SpineIdentification(3, 3),
+                              "with one, the spine it names");
+        NS_TEST_EXPECT_MSG_EQ(selector.Choose(50), SpineIdentification(3, 3), "until the next");
+        selector.OnRedirect(kNoRedirect, 6, 60);
+        NS_TEST_EXPECT_MSG_EQ(selector.Choose(70),
+                              SpineIdentification(6, 6),
+                              "the latest acknowledgement wins");
+        NS_TEST_EXPECT_MSG_EQ(drawn->GetInteger(0, 1000),
+                              reference->GetInteger(0, 1000),
+                              "following acknowledgements draws nothing");
+    }
+};
+
 class GradeScopeTest : public TestCase
 {
   public:
@@ -5391,6 +5564,8 @@ PointToPointTestSuite::PointToPointTestSuite()
     AddTestCase(new NsccReceiverPenaltyTest, TestCase::Duration::QUICK);
     AddTestCase(new SprayPolicyDefaultsTest, TestCase::Duration::QUICK);
     AddTestCase(new GradeScopeTest, TestCase::Duration::QUICK);
+    AddTestCase(new SpineRedirectTest, TestCase::Duration::QUICK);
+    AddTestCase(new AckRedirectSelectorTest, TestCase::Duration::QUICK);
 }
 
 static PointToPointTestSuite g_pointToPointTestSuite; //!< The testsuite

@@ -19,6 +19,8 @@ enum class PathSelectorKind : uint32_t {
 	UeOblivious,
 	UeAware,
 	Mrc,
+	// Under SprayUniform: the spine the latest acknowledgement redirects to.
+	AckRedirect,
 };
 
 // A queue pair's choice of the path each of its data packets takes, and what
@@ -49,6 +51,10 @@ public:
 	// The receiving host's spine report an acknowledgement or a repair request
 	// carried, before the answer itself is told.
 	virtual void OnReport(const SpineReport &report, uint64_t nowNs);
+	// An acknowledgement's redirect field, the spine it asks this queue pair
+	// to send on or kNoRedirect, and the carrying spine of the send it
+	// answers, before the answer itself is told.
+	virtual void OnRedirect(uint8_t spine, uint8_t carrying, uint64_t nowNs);
 };
 
 // A spine drawn uniformly per packet, named as both the requested and the
@@ -61,6 +67,23 @@ public:
 private:
 	Ptr<UniformRandomVariable> m_random;
 	uint32_t m_spines;
+};
+
+// The sending side of ACK redirection, modelled on MPTR (Wang et al., IEEE
+// TII 2026): every packet, new data or repair, goes up the spine the latest
+// acknowledgement redirects to; failing a redirect, up the spine that carried
+// the send it answers; and before any acknowledgement, up a spine drawn
+// uniformly.
+class AckRedirectSelector : public PathSelector {
+public:
+	AckRedirectSelector(Ptr<UniformRandomVariable> random, uint32_t spines);
+	uint16_t Choose(uint64_t nowNs) override;
+	void OnRedirect(uint8_t spine, uint8_t carrying, uint64_t nowNs) override;
+
+private:
+	UniformSpineSelector m_uniform;
+	// kNoRedirect before the first acknowledgement.
+	uint8_t m_spine;
 };
 
 // A sender's scores of the spines towards one receiving host, which every

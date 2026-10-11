@@ -38,6 +38,7 @@ build_lib(
     model/rdma-hw.cc
     model/rdma-queue-pair.cc
     model/spine-grader.cc
+    model/spine-redirect.cc
     model/switch-mmu.cc
     model/switch-node.cc
   HEADER_FILES
@@ -63,6 +64,7 @@ build_lib(
     model/rdma-hw.h
     model/rdma-queue-pair.h
     model/spine-grader.h
+    model/spine-redirect.h
     model/spine-report.h
     model/switch-mmu.h
     model/switch-node.h

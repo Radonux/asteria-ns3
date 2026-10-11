@@ -29,6 +29,9 @@ void PathSelector::OnProbeAnswer(uint16_t, bool, uint64_t){
 void PathSelector::OnReport(const SpineReport &, uint64_t){
 }
 
+void PathSelector::OnRedirect(uint8_t, uint8_t, uint64_t){
+}
+
 UniformSpineSelector::UniformSpineSelector(Ptr<UniformRandomVariable> random,
 		uint32_t spines)
 	: m_random(random), m_spines(spines)
@@ -38,6 +41,23 @@ UniformSpineSelector::UniformSpineSelector(Ptr<UniformRandomVariable> random,
 uint16_t UniformSpineSelector::Choose(uint64_t){
 	const uint8_t spine = m_random->GetInteger(0, m_spines - 1);
 	return SpineIdentification(spine, spine);
+}
+
+AckRedirectSelector::AckRedirectSelector(Ptr<UniformRandomVariable> random,
+		uint32_t spines)
+	: m_uniform(random, spines), m_spine(kNoRedirect)
+{
+	NS_ASSERT_MSG(spines < kNoRedirect, "a spine's index is below kNoRedirect");
+}
+
+uint16_t AckRedirectSelector::Choose(uint64_t nowNs){
+	if (m_spine == kNoRedirect)
+		return m_uniform.Choose(nowNs);
+	return SpineIdentification(m_spine, m_spine);
+}
+
+void AckRedirectSelector::OnRedirect(uint8_t spine, uint8_t carrying, uint64_t){
+	m_spine = spine != kNoRedirect ? spine : carrying;
 }
 
 SpineScores::SpineScores(uint32_t spines, const Parameters &parameters)
