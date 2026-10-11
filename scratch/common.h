@@ -166,6 +166,7 @@ double spray_release_fraction_of_floor = 0.5;
 uint32_t spray_one_way_delay = 0;
 std::string spray_grade_reference = "median";
 std::string spray_grade_scope = "per_receiver";
+std::string spray_grade_cost_source = "estimate";
 double spray_delay_cusum_slack_base_rtts = 0.125;
 double spray_delay_cusum_threshold_base_rtts = 0.5;
 double spray_delay_thresholds_base_rtts[3] = {0.25, 0.5, 0.75};
@@ -185,7 +186,7 @@ const std::set<std::string> spray_policy_keys = {
     "SPRAY_GAMMA", "SPRAY_EPSILON", "SPRAY_CANDIDATES", "SPRAY_CANDIDATE_DRAW",
     "SPRAY_EDGE_WINDOW_PENALTY", "SPINE_REPORT_OUTPUT_FILE",
     "SPRAY_ABSENCE_FRACTION_OF_MEDIAN", "SPRAY_ABSENCE_MINIMUM_MEDIAN",
-    "SPRAY_GRADE_REFERENCE", "SPRAY_GRADE_SCOPE",
+    "SPRAY_GRADE_REFERENCE", "SPRAY_GRADE_SCOPE", "SPRAY_GRADE_COST_SOURCE",
     "SPRAY_ESTIMATOR_INTERVAL_SAMPLES"};
 const std::set<std::string> spray_one_way_delay_keys = {
     "SPRAY_DELAY_CUSUM_SLACK_BASE_RTTS",
@@ -715,6 +716,19 @@ uint32_t grade_scope_value(const std::string &scope) {
   return std::numeric_limits<uint32_t>::max();
 }
 
+uint32_t spray_grade_cost_source_value() {
+  if (spray_grade_cost_source == "estimate")
+    return static_cast<uint32_t>(GradeCostSource::Estimate);
+  if (spray_grade_cost_source == "switch_queue")
+    return static_cast<uint32_t>(GradeCostSource::SwitchQueue);
+  return std::numeric_limits<uint32_t>::max();
+}
+
+bool switch_queue_cost() {
+  return load_balancing == "spray_policy" &&
+         spray_grade_cost_source == "switch_queue";
+}
+
 // Under ack_redirect, whether the redirect is scored from the host's grader.
 bool host_redirect() {
   return path_selector == "ack_redirect" && ack_redirect_scope == "per_receiver";
@@ -947,8 +961,10 @@ void SetRoutingEntries() {
 // node id, so an index names the same spine in every run of a topology. Each
 // leaf learns its uplink to every spine in that order. Returns the number of
 // spines, or zero when there is none or a leaf lacks a link to one of them.
-uint32_t AssignSpinePorts(NodeContainer &n) {
-  vector<Ptr<Node>> leaves, spines;
+// The switches with a host attached, in node order, and the others, the
+// spines, in node-id order.
+void LeavesAndSpines(NodeContainer &n, vector<Ptr<Node>> &leaves,
+                     vector<Ptr<Node>> &spines) {
   for (uint32_t i = 0; i < n.GetN(); i++) {
     Ptr<Node> node = n.Get(i);
     if (node->GetNodeType() != 1)
@@ -960,6 +976,11 @@ uint32_t AssignSpinePorts(NodeContainer &n) {
   }
   std::sort(spines.begin(), spines.end(),
             [](Ptr<Node> a, Ptr<Node> b) { return a->GetId() < b->GetId(); });
+}
+
+uint32_t AssignSpinePorts(NodeContainer &n) {
+  vector<Ptr<Node>> leaves, spines;
+  LeavesAndSpines(n, leaves, spines);
   for (Ptr<Node> leaf : leaves) {
     vector<uint32_t> ports;
     for (Ptr<Node> spine : spines) {
@@ -971,6 +992,31 @@ uint32_t AssignSpinePorts(NodeContainer &n) {
     DynamicCast<SwitchNode>(leaf)->SetSpinePorts(ports);
   }
   return spines.size();
+}
+
+// Simulation only: every hop of every leaf-spine path, for a receiver that
+// grades the spines from the switches' own state, and every host's leaf.
+// Leaves are numbered in node order; every leaf links to every spine, as
+// AssignSpinePorts has checked.
+Ptr<SwitchQueueState> BuildSwitchQueueState(NodeContainer &n) {
+  vector<Ptr<Node>> leaves, spines;
+  LeavesAndSpines(n, leaves, spines);
+  Ptr<SwitchQueueState> state =
+      Create<SwitchQueueState>(leaves.size(), spines.size());
+  for (uint32_t s = 0; s < leaves.size(); s++) {
+    Ptr<SwitchNode> leaf = DynamicCast<SwitchNode>(leaves[s]);
+    for (uint32_t k = 0; k < spines.size(); k++) {
+      Ptr<SwitchNode> spine = DynamicCast<SwitchNode>(spines[k]);
+      const uint32_t up = nbr2if[leaf][spine].idx;
+      const uint32_t down = nbr2if[spine][leaf].idx;
+      state->SetUplink(s, k, SwitchQueueState::Hop{leaf, up, spine, down});
+      state->SetDownlink(k, s, SwitchQueueState::Hop{spine, down, leaf, up});
+    }
+    for (const auto &link : nbr2if[leaf])
+      if (link.first->GetNodeType() == 0)
+        state->SetLeafOf(node_id_to_ip(link.first->GetId()).Get(), s);
+  }
+  return state;
 }
 
 // The addresses of the hosts attached to the switch host is attached to,
@@ -1054,6 +1100,27 @@ void write_fabric_counters() {
   for (FILE *file : {port_counter_file, spine_arrival_file, spine_report_file})
     if (file != nullptr)
       fflush(file);
+}
+
+// A report graded from the switches' state for one source leaf: one row per
+// spine, with the counts of the grader's interval, the values read in place
+// of its averages, and the source leaf and loss fraction.
+void write_switch_queue_report(
+    uint32_t rank, uint64_t now_ns, const SpineGrader &grader,
+    uint32_t source_leaf, const std::vector<SpineGrader::SpineValues> &values,
+    const SpineReport &report) {
+  const std::vector<SpineGrader::SpineInterval> &spines = grader.LastInterval();
+  for (uint32_t spine = 0; spine < spines.size(); spine++) {
+    const SpineGrader::SpineInterval &closed = spines[spine];
+    fprintf(spine_report_file,
+            "%lu,%u,%u,%u,%u,%u,%u,%u,%.6f,%.6f,%.1f,%d,%u,%u,%d,%u,%.6f\n",
+            static_cast<unsigned long>(now_ns), rank, report.sequence, spine,
+            closed.arrivals, closed.marked, closed.trimmed, closed.moved,
+            values[spine].markFraction, values[spine].trimFraction,
+            values[spine].delayNs, closed.held ? 1 : 0, report.Grade(spine),
+            grader.LastIntervalLastHopTrims(), report.edgeCongested ? 1 : 0,
+            source_leaf, values[spine].lossFraction);
+  }
 }
 
 // A spine report as a receiver issued it: one row per spine, with the
@@ -1175,6 +1242,18 @@ bool valid_spray_policy() {
   }
   if (grade_scope_value(spray_grade_scope) == std::numeric_limits<uint32_t>::max()) {
     std::cerr << "SPRAY_GRADE_SCOPE must be per_receiver or per_connection\n";
+    return false;
+  }
+  if (spray_grade_cost_source_value() == std::numeric_limits<uint32_t>::max()) {
+    std::cerr << "SPRAY_GRADE_COST_SOURCE must be estimate or switch_queue\n";
+    return false;
+  }
+  // The switches' state is read per path into one receiving host, so it
+  // stands in for the host's grader only.
+  if (spray_grade_cost_source == "switch_queue" &&
+      spray_grade_scope != "per_receiver") {
+    std::cerr << "SPRAY_GRADE_COST_SOURCE switch_queue requires "
+                 "SPRAY_GRADE_SCOPE per_receiver\n";
     return false;
   }
   if (!(spray_gamma > 0 && spray_gamma <= 1)) {
@@ -1421,6 +1500,8 @@ bool ReadConf(string network_configuration) {
       conf >> spray_grade_reference;
     } else if (key.compare("SPRAY_GRADE_SCOPE") == 0) {
       conf >> spray_grade_scope;
+    } else if (key.compare("SPRAY_GRADE_COST_SOURCE") == 0) {
+      conf >> spray_grade_cost_source;
     } else if (key.compare("SPRAY_ESTIMATOR_INTERVAL_SAMPLES") == 0) {
       conf >> spray_estimator_interval_samples;
     } else if (key.compare("SPRAY_GAMMA") == 0) {
@@ -2164,6 +2245,8 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),
               << SpineReport::kMaxSpines << " spines\n";
     return false;
   }
+  const Ptr<SwitchQueueState> switch_queues =
+      switch_queue_cost() ? BuildSwitchQueueState(n) : nullptr;
   // One variable for every host, so the draw consumes a single fixed stream.
   Ptr<UniformRandomVariable> path_random;
   if (load_balancing_value() != static_cast<uint32_t>(LoadBalancingMode::Ecmp))
@@ -2282,6 +2365,13 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),
                            UintegerValue(spray_grade_reference_value()));
       rdmaHw->SetAttribute("SprayGradeScope",
                            UintegerValue(grade_scope_value(spray_grade_scope)));
+      rdmaHw->SetAttribute("SprayGradeCostSource",
+                           UintegerValue(spray_grade_cost_source_value()));
+      if (switch_queues) {
+        rdmaHw->m_switchQueues = switch_queues;
+        rdmaHw->m_leaf =
+            switch_queues->LeafOf(node_id_to_ip(n.Get(i)->GetId()).Get());
+      }
       rdmaHw->SetAttribute("SprayEstimatorIntervalSamples",
                            UintegerValue(spray_estimator_interval_samples));
       rdmaHw->SetAttribute("SprayGamma", DoubleValue(spray_gamma));
@@ -2466,11 +2556,20 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),
             "time_ns,rank,sequence,spine,arrivals,marked,trimmed,moved,"
             "mark_fraction,trim_fraction,delay_ns,held,grade,last_hop_trims,"
             "edge%s\n",
-            spray_grade_scope == "per_connection" ? ",sender,sender_port" : "");
+            spray_grade_scope == "per_connection" ? ",sender,sender_port"
+            : switch_queue_cost()                 ? ",source_leaf,loss_fraction"
+                                                  : "");
     for (uint32_t i = 0; i < node_num; i++)
-      if (n.Get(i)->GetNodeType() == 0)
-        n.Get(i)->GetObject<RdmaDriver>()->m_rdma->TraceConnectWithoutContext(
-            "SpineReport", MakeBoundCallback(&write_spine_report, i));
+      if (n.Get(i)->GetNodeType() == 0) {
+        Ptr<RdmaHw> hw = n.Get(i)->GetObject<RdmaDriver>()->m_rdma;
+        if (switch_queue_cost())
+          hw->TraceConnectWithoutContext(
+              "SwitchQueueReport",
+              MakeBoundCallback(&write_switch_queue_report, i));
+        else
+          hw->TraceConnectWithoutContext(
+              "SpineReport", MakeBoundCallback(&write_spine_report, i));
+      }
   }
   std::set<uint64_t> failure_times;
   for (const LinkFailure &failure : link_failures) {
