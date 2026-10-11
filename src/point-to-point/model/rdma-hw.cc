@@ -259,6 +259,19 @@ TypeId RdmaHw::GetTypeId (void)
 				MakeUintegerChecker<uint32_t>(
 					static_cast<uint32_t>(TrimScoring::Mark),
 					static_cast<uint32_t>(TrimScoring::Ignore)))
+		.AddAttribute("AckRedirectScope",
+				"Under PathSelector 5, what an arrival is scored against: 1=its "
+				"receive queue pair's own best spine, scored per arrival; 0=the "
+				"receiving host's best spine, scored at each close of the host's "
+				"spine grader's interval from its per-spine averages, which "
+				"takes the grader's Spray attributes and none of "
+				"AckRedirectValidityBaseRtts and AckRedirectTrimScoring. "
+				"Default 1.",
+				UintegerValue(static_cast<uint32_t>(GradeScope::PerConnection)),
+				MakeUintegerAccessor(&RdmaHw::m_ackRedirectScope),
+				MakeUintegerChecker<uint32_t>(
+					static_cast<uint32_t>(GradeScope::PerReceiver),
+					static_cast<uint32_t>(GradeScope::PerConnection)))
 		.AddAttribute("SprayBaseRttNs",
 				"Under LoadBalancing 3 and PathSelector 5, the base RTT the "
 				"attributes count time in. Zero, the default, is refused at the "
@@ -693,14 +706,14 @@ void RdmaHw::Setup(QpCompleteCallback cb, QpFailureCallback failure_cb){
 	NS_ABORT_MSG_IF(NamesSpine(static_cast<LoadBalancingMode>(m_loadBalancing)) &&
 			m_spineCount == 0,
 		"LoadBalancing 2 and 3 name a spine per packet and need SpineCount");
-	NS_ABORT_MSG_IF(IsSprayPolicy() && m_spineCount > SpineReport::kMaxSpines,
+	NS_ABORT_MSG_IF(IsGrading() && m_spineCount > SpineReport::kMaxSpines,
 		"a spine report grades at most SpineReport::kMaxSpines spines");
 	NS_ABORT_MSG_IF(CustomHeader::ackReportBytes != (IsSprayPolicy()
 			? 1 + SpineReport::GradeBytes(m_spineCount) : 0),
 		"LoadBalancing 3 and only it carries a report on the spines in every "
 		"acknowledgement, its sequence and the grades of SpineCount spines");
 	NS_ABORT_MSG_IF(m_sprayOneWayDelay &&
-			(!IsSprayPolicy() || IntHeader::mode != IntHeader::TS),
+			(!IsGrading() || IntHeader::mode != IntHeader::TS),
 		"SprayOneWayDelay grades the spines of LoadBalancing 3 by the send "
 		"timestamp of IntHeader::mode TS");
 	NS_ABORT_MSG_IF(m_pathSelectorKind !=
@@ -919,7 +932,7 @@ int RdmaHw::ReceiveUdp(Ptr<Packet> p, CustomHeader &ch){
 	}
 	rxQp->m_ecn_source.total++;
 	CountArrival(rxQp, ch.ipid, payload_size);
-	if (IsSprayPolicy())
+	if (IsGrading())
 		GradeArrival(rxQp, ch, ecnbits != 0);
 	rxQp->m_milestone_rx = m_ack_interval;
 
@@ -992,6 +1005,11 @@ uint8_t RdmaHw::ScoreForRedirect(Ptr<RdmaRxQueuePair> q,
 		const CustomHeader &ch, bool marked){
 	if (std::binary_search(m_ownLeafHosts.begin(), m_ownLeafHosts.end(), ch.sip))
 		return kNoRedirect;
+	// The host's grader has already counted this arrival and closed any
+	// interval that ended before it.
+	if (IsHostRedirect())
+		return m_hostRedirect.OnArrival(CarryingSpine(ch.ipid),
+			HostRedirectParameters());
 	NS_ABORT_MSG_IF(m_sprayBaseRttNs == 0,
 		"PathSelector 5 counts its validity cycle in SprayBaseRttNs");
 	const Time now = Simulator::Now();
@@ -1007,6 +1025,20 @@ uint8_t RdmaHw::ScoreForRedirect(Ptr<RdmaRxQueuePair> q,
 	NS_ASSERT_MSG(redirect == kNoRedirect || redirect < m_spineCount,
 		"a redirect names a spine by its index");
 	return redirect;
+}
+
+bool RdmaHw::IsHostRedirect() const{
+	return IsAckRedirect() &&
+		m_ackRedirectScope == static_cast<uint32_t>(GradeScope::PerReceiver);
+}
+
+bool RdmaHw::IsGrading() const{
+	return IsSprayPolicy() || IsHostRedirect();
+}
+
+HostSpineRedirect::Parameters RdmaHw::HostRedirectParameters() const{
+	return HostSpineRedirect::Parameters{m_ackRedirectOmega, m_ackRedirectFlag,
+		m_sprayBaseRttNs / 2, m_sprayOneWayDelay};
 }
 
 bool RdmaHw::IsPerConnectionGrading() const{
@@ -1073,9 +1105,12 @@ SpineGrader &RdmaHw::GraderOf(Ptr<RdmaRxQueuePair> q){
 SpineGrader &RdmaHw::GraderNow(Ptr<RdmaRxQueuePair> q){
 	const uint64_t now = Simulator::Now().GetNanoSeconds();
 	SpineGrader &grader = GraderOf(q);
-	if (grader.Advance(now))
+	if (grader.Advance(now)){
 		m_traceSpineReport(now, grader,
 			IsPerConnectionGrading() ? PeekPointer(q) : nullptr);
+		if (IsHostRedirect())
+			m_hostRedirect.OnClose(grader.LastInterval(), HostRedirectParameters());
+	}
 	return grader;
 }
 
@@ -1697,11 +1732,13 @@ int RdmaHw::ReceiveTrim(Ptr<Packet> p, CustomHeader &ch){
 		const Ptr<RdmaRxQueuePair> q = IsPerConnectionGrading() || IsAckRedirect()
 			? GetRxQp(ch.dip, ch.sip, ch.udp.dport, ch.udp.sport, ch.udp.pg, true)
 			: nullptr;
-		if (IsSprayPolicy())
+		if (IsGrading())
 			GradeTrim(q, ch, lastHop);
 		// A last-hop trim says nothing of the spine it crossed, and the repair
-		// request carries no redirect in any case.
-		if (IsAckRedirect() && !lastHop && m_ackRedirectTrimScoring ==
+		// request carries no redirect in any case. The host's redirect takes
+		// trims through its grader.
+		if (IsAckRedirect() && !IsHostRedirect() && !lastHop &&
+				m_ackRedirectTrimScoring ==
 				static_cast<uint32_t>(TrimScoring::Mark))
 			ScoreForRedirect(q, ch, true);
 		if (m_forgiveness && originalPayload > 0){

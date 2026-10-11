@@ -5500,6 +5500,206 @@ class AckRedirectTransportTest : public TestCase
     }
 };
 
+class HostSpineRedirectTest : public TestCase
+{
+  public:
+    HostSpineRedirectTest()
+        : TestCase("A host's redirect scores each spine from its grader's averages at each close "
+                   "and redirects every connection to the best")
+    {
+    }
+
+    void DoRun() override
+    {
+        Score();
+        Best();
+        Redirect();
+    }
+
+  private:
+    static constexpr uint64_t kBase = 6000;
+
+    static HostSpineRedirect::Parameters Defaults(double omega = 0.5,
+                                                  bool oneWayDelay = false,
+                                                  double flag = 0.1)
+    {
+        return HostSpineRedirect::Parameters{omega, flag, kBase, oneWayDelay};
+    }
+
+    // Four spines: clean, marked 0.2 with a delay average of the base delay,
+    // trimmed 0.2, and the second's averages held.
+    static std::vector<SpineGrader::SpineInterval> Averages()
+    {
+        std::vector<SpineGrader::SpineInterval> spines(4);
+        spines[1].markFraction = 0.2;
+        spines[1].delayNs = kBase;
+        spines[2].trimFraction = 0.2;
+        spines[2].markFraction = 0.1;
+        spines[3] = spines[1];
+        spines[3].held = true;
+        return spines;
+    }
+
+    // omega / (D / L0 + 0.001) + (1 - omega)(1 - C), worked by hand for
+    // C = 0.2 with D = L0, and D = 2 L0 under one-way delay.
+    void Score()
+    {
+        struct Case
+        {
+            double omega;
+            bool oneWayDelay;
+            double score;
+        };
+        const Case cases[] = {
+            {0.3, false, 0.8597002997002997},
+            {0.3, true, 0.7099250374812594},
+            {0.5, false, 0.8995004995004995},
+            {0.5, true, 0.6498750624687656},
+            {0.7, false, 0.9393006993006993},
+            {0.7, true, 0.5898250874562719},
+        };
+        for (const Case& c : cases)
+        {
+            HostSpineRedirect redirect;
+            redirect.OnClose(Averages(), Defaults(c.omega, c.oneWayDelay));
+            NS_TEST_EXPECT_MSG_EQ_TOL(redirect.SpineScore(1),
+                                      c.score,
+                                      1e-12,
+                                      "equation 1 on the averages at omega " << c.omega);
+            NS_TEST_EXPECT_MSG_EQ_TOL(redirect.SpineScore(2),
+                                      SpineRedirect::Score(c.omega, kBase, kBase, 0.2),
+                                      1e-12,
+                                      "the congestion average is the larger fraction");
+            NS_TEST_EXPECT_MSG_EQ(redirect.SpineScore(3), 0.0, "a held spine scores 0");
+            NS_TEST_EXPECT_MSG_EQ(uint32_t(redirect.Best()), 0u, "the clean spine is best");
+        }
+    }
+
+    void Best()
+    {
+        HostSpineRedirect redirect;
+        std::vector<SpineGrader::SpineInterval> spines(4);
+        spines[0].markFraction = 0.5;
+        redirect.OnClose(spines, Defaults());
+        NS_TEST_EXPECT_MSG_EQ(uint32_t(redirect.Best()),
+                              1u,
+                              "of tied highest, the lowest index at the first close");
+        spines[0].markFraction = 0;
+        redirect.OnClose(spines, Defaults());
+        NS_TEST_EXPECT_MSG_EQ(uint32_t(redirect.Best()), 1u, "a tie keeps the current best");
+        spines[1].markFraction = 0.3;
+        redirect.OnArrival(2, Defaults());
+        NS_TEST_EXPECT_MSG_EQ(uint32_t(redirect.Best()), 1u, "only a close moves the best");
+        redirect.OnClose(spines, Defaults());
+        NS_TEST_EXPECT_MSG_EQ(uint32_t(redirect.Best()), 0u, "a higher score wins at the close");
+    }
+
+    void Redirect()
+    {
+        HostSpineRedirect redirect;
+        NS_TEST_EXPECT_MSG_EQ(uint32_t(redirect.OnArrival(2, Defaults())),
+                              uint32_t(kNoRedirect),
+                              "nothing is redirected before the first close");
+        std::vector<SpineGrader::SpineInterval> spines(4);
+        spines[2].markFraction = 0.4;
+        const double best = SpineRedirect::Score(0.5, kBase, kBase, 0);
+        const double worse = SpineRedirect::Score(0.5, kBase, kBase, 0.4);
+        const double gap = (best - worse) / best;
+        redirect.OnClose(spines, Defaults());
+        NS_TEST_EXPECT_MSG_EQ(uint32_t(redirect.OnArrival(2, Defaults(0.5, false, gap - 1e-9))),
+                              0u,
+                              "a gap just over the flag redirects to the best");
+        NS_TEST_EXPECT_MSG_EQ(uint32_t(redirect.OnArrival(2, Defaults(0.5, false, gap + 1e-9))),
+                              uint32_t(kNoRedirect),
+                              "a gap just under it does not");
+        NS_TEST_EXPECT_MSG_EQ(uint32_t(redirect.OnArrival(0, Defaults(0.5, false, 0))),
+                              uint32_t(kNoRedirect),
+                              "an arrival on the best is not redirected");
+    }
+};
+
+class AckRedirectScopeTest : public TestCase
+{
+  public:
+    AckRedirectScopeTest()
+        : TestCase("Under ack_redirect's per_receiver scope every connection into a host is "
+                   "redirected by the host's averages, under per_connection by its own arrivals")
+    {
+    }
+
+    void DoRun() override
+    {
+        const IntHeader::Mode savedIntMode = IntHeader::mode;
+        const bool savedPacketSeq = CustomHeader::ackCarriesPacketSeq;
+        const uint32_t savedRedirectBytes = CustomHeader::ackRedirectBytes;
+        IntHeader::mode = IntHeader::TS;
+        CustomHeader::ackCarriesPacketSeq = true;
+        CustomHeader::ackRedirectBytes = 1;
+        const auto [hostMarked, hostClean] = Redirects(GradeScope::PerReceiver);
+        NS_TEST_EXPECT_MSG_EQ(hostMarked, 0u, "the marked connection is moved off spine 3");
+        NS_TEST_EXPECT_MSG_EQ(hostClean, 0u, "and so is the other, by the host's averages");
+        const auto [ownMarked, ownClean] = Redirects(GradeScope::PerConnection);
+        NS_TEST_EXPECT_MSG_EQ(ownMarked, 0u, "the marked connection is moved off spine 3");
+        NS_TEST_EXPECT_MSG_EQ(ownClean,
+                              uint32_t(kNoRedirect),
+                              "the other, whose arrivals over spine 3 are clean, is not");
+        CustomHeader::ackRedirectBytes = savedRedirectBytes;
+        CustomHeader::ackCarriesPacketSeq = savedPacketSeq;
+        IntHeader::mode = savedIntMode;
+    }
+
+  private:
+    static constexpr uint32_t kSpines = 8;
+    static constexpr uint64_t kBaseRtt = 10000;
+    static constexpr uint16_t kOtherPort = 10002;
+
+    // Two connections into node 0, whose grader's first interval ends at two
+    // base RTTs: within it 16 packets per spine on each, those of the first
+    // over spine 3 marked; after it one packet over spine 3 on each. The
+    // redirect fields the two last answers carry.
+    static std::pair<uint32_t, uint32_t> Redirects(GradeScope scope)
+    {
+        IsolatedHost receiver(LoadBalancingMode::SprayUniform, kTestSender, kSpines);
+        receiver.hw->SetNode(CreateObject<Node>());
+        receiver.hw->m_pathSelectorKind = static_cast<uint32_t>(PathSelectorKind::AckRedirect);
+        receiver.hw->m_ackRedirectScope = static_cast<uint32_t>(scope);
+        receiver.hw->m_sprayBaseRttNs = kBaseRtt;
+        const std::vector<uint16_t> ports{IsolatedHost::kSenderPort, kOtherPort};
+        std::map<uint16_t, uint32_t> seq;
+        std::map<uint16_t, uint32_t> last;
+        auto deliver = [&](uint16_t port, uint8_t spine, bool marked) {
+            receiver.ReceiveData(kTestSender,
+                                 kTestReceiver,
+                                 seq[port],
+                                 SpineIdentification(spine, spine),
+                                 marked,
+                                 port,
+                                 kBaseRtt / 2);
+            seq[port] += IsolatedHost::kMtu;
+            last[port] = receiver.emitted.back().ack.redirect;
+        };
+        Simulator::Schedule(NanoSeconds(kBaseRtt), [&]() {
+            for (uint16_t port : ports)
+            {
+                for (uint8_t spine = 0; spine < kSpines; ++spine)
+                {
+                    for (uint32_t j = 0; j < 16; ++j)
+                    {
+                        deliver(port, spine, spine == 3 && port == ports.front());
+                    }
+                }
+            }
+        });
+        Simulator::Schedule(NanoSeconds(2 * kBaseRtt + 1000), [&]() {
+            deliver(ports.front(), 3, true);
+            deliver(ports.back(), 3, false);
+        });
+        Simulator::Run();
+        Simulator::Destroy();
+        return {last[ports.front()], last[ports.back()]};
+    }
+};
+
 class GradeScopeTest : public TestCase
 {
   public:
@@ -5859,6 +6059,8 @@ PointToPointTestSuite::PointToPointTestSuite()
     AddTestCase(new SpineRedirectTest, TestCase::Duration::QUICK);
     AddTestCase(new AckRedirectSelectorTest, TestCase::Duration::QUICK);
     AddTestCase(new AckRedirectTransportTest, TestCase::Duration::QUICK);
+    AddTestCase(new HostSpineRedirectTest, TestCase::Duration::QUICK);
+    AddTestCase(new AckRedirectScopeTest, TestCase::Duration::QUICK);
 }
 
 static PointToPointTestSuite g_pointToPointTestSuite; //!< The testsuite
