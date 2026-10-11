@@ -45,6 +45,8 @@
 #include "ns3/simulator.h"
 #include "ns3/spine-grader.h"
 #include "ns3/spine-redirect.h"
+#include "ns3/switch-queue-state.h"
+#include "ns3/error-model.h"
 #include "ns3/string.h"
 #include "ns3/test.h"
 #include "ns3/udp-header.h"
@@ -5700,6 +5702,367 @@ class AckRedirectScopeTest : public TestCase
     }
 };
 
+/**
+ * Three leaves and four spines, every leaf linked to every spine at 400 Gbps
+ * with ECN from 100 KB to 400 KB at a pmax of 0.2, and the SwitchQueueState
+ * that reads their paths. Leaves 0 and 1 hold one host each, leaf 2 the
+ * receiver.
+ */
+class SwitchQueueFabric
+{
+  public:
+    static constexpr uint32_t kLeaves = 3;
+    static constexpr uint32_t kSpines = 4;
+    static constexpr uint32_t kPriorityGroup = 3;
+
+    SwitchQueueFabric()
+        : state(Create<SwitchQueueState>(kLeaves, kSpines))
+    {
+        for (uint32_t i = 0; i < kLeaves; ++i)
+        {
+            leaves.push_back(Switch());
+        }
+        for (uint32_t k = 0; k < kSpines; ++k)
+        {
+            spines.push_back(Switch());
+        }
+        for (uint32_t s = 0; s < kLeaves; ++s)
+        {
+            for (uint32_t k = 0; k < kSpines; ++k)
+            {
+                const uint32_t up = Port(leaves[s]);
+                const uint32_t down = Port(spines[k]);
+                Ptr<QbbChannel> channel = CreateObject<QbbChannel>();
+                Device(leaves[s], up)->Attach(channel);
+                Device(spines[k], down)->Attach(channel);
+                uplink[s][k] = up;
+                downlink[k][s] = down;
+                state->SetUplink(s, k, SwitchQueueState::Hop{leaves[s], up, spines[k], down});
+                state->SetDownlink(k, s, SwitchQueueState::Hop{spines[k], down, leaves[s], up});
+            }
+        }
+        state->SetLeafOf(kTestSender.Get(), 0);
+        state->SetLeafOf(kOtherSender.Get(), 1);
+        state->SetLeafOf(kTestReceiver.Get(), 2);
+    }
+
+    static Ptr<QbbNetDevice> Device(Ptr<SwitchNode> sw, uint32_t port)
+    {
+        return DynamicCast<QbbNetDevice>(sw->GetDevice(port));
+    }
+
+    // The data bytes queued on spine k's downlink to the receiver's leaf, or
+    // on leaf s's uplink to spine k.
+    void QueueDown(uint32_t k, uint32_t bytes)
+    {
+        spines[k]->m_mmu->egress_bytes[downlink[k][2]][kPriorityGroup] = bytes;
+    }
+
+    void QueueUp(uint32_t s, uint32_t k, uint32_t bytes)
+    {
+        leaves[s]->m_mmu->egress_bytes[uplink[s][k]][kPriorityGroup] = bytes;
+    }
+
+    static inline const Ipv4Address kOtherSender{"11.0.3.1"};
+    std::vector<Ptr<SwitchNode>> leaves;
+    std::vector<Ptr<SwitchNode>> spines;
+    uint32_t uplink[kLeaves][kSpines];
+    uint32_t downlink[kSpines][kLeaves];
+    Ptr<SwitchQueueState> state;
+
+  private:
+    static Ptr<SwitchNode> Switch()
+    {
+        Ptr<SwitchNode> sw = CreateObject<SwitchNode>();
+        sw->SetAttribute("EcnEnabled", BooleanValue(true));
+        // Port 0 is the loopback every node holds.
+        sw->AddDevice(CreateObject<QbbNetDevice>());
+        return sw;
+    }
+
+    static uint32_t Port(Ptr<SwitchNode> sw)
+    {
+        Ptr<QbbNetDevice> device = CreateObject<QbbNetDevice>();
+        device->SetQueue(CreateObject<BEgressQueue>());
+        device->SetDataRate(DataRate("400Gbps"));
+        const uint32_t port = sw->AddDevice(device);
+        sw->m_mmu->ConfigEcn(port, 100, 400, 0.2, port);
+        return port;
+    }
+};
+
+class SwitchQueueStateTest : public TestCase
+{
+  public:
+    SwitchQueueStateTest()
+        : TestCase("Simulator state read per path: the marking probability of each hop's queue, "
+                   "their queueing delay and their configured loss")
+    {
+    }
+
+    void DoRun() override
+    {
+        Marking();
+        TwoHops();
+        Loss();
+        Simulator::Destroy();
+    }
+
+  private:
+    // The probability ShouldSendCN marks with at each occupancy.
+    void Marking()
+    {
+        SwitchQueueFabric fabric;
+        Ptr<SwitchMmu> mmu = fabric.leaves[0]->m_mmu;
+        const uint32_t port = fabric.uplink[0][0];
+        NS_TEST_EXPECT_MSG_EQ(mmu->MarkingProbability(port, 100000), 0.0, "0 at kmin");
+        NS_TEST_EXPECT_MSG_EQ_TOL(mmu->MarkingProbability(port, 250000),
+                                  0.1,
+                                  1e-12,
+                                  "linear between kmin and kmax");
+        NS_TEST_EXPECT_MSG_EQ_TOL(mmu->MarkingProbability(port, 400000), 0.2, 1e-12, "pmax at kmax");
+        NS_TEST_EXPECT_MSG_EQ(mmu->MarkingProbability(port, 400001), 1.0, "1 above kmax");
+        mmu->egress_bytes[port][3] = 400001;
+        NS_TEST_EXPECT_MSG_EQ(mmu->ShouldSendCN(port, 3), true, "as ShouldSendCN marks above kmax");
+        mmu->egress_bytes[port][3] = 100000;
+        NS_TEST_EXPECT_MSG_EQ(mmu->ShouldSendCN(port, 3), false, "and not at kmin");
+    }
+
+    // Leaf 0's uplink to spine 1 halfway between the thresholds, spine 1's
+    // downlink at kmax and at half rate.
+    void TwoHops()
+    {
+        SwitchQueueFabric fabric;
+        fabric.QueueUp(0, 1, 250000);
+        fabric.QueueDown(1, 400000);
+        SwitchQueueFabric::Device(fabric.spines[1], fabric.downlink[1][2])
+            ->SetDataRate(DataRate("200Gbps"));
+        const auto fromZero = fabric.state->PathValues(0, 2, true);
+        NS_TEST_EXPECT_MSG_EQ_TOL(fromZero[1].markFraction,
+                                  1 - 0.9 * 0.8,
+                                  1e-12,
+                                  "a packet crossing both hops arrives marked");
+        NS_TEST_EXPECT_MSG_EQ_TOL(fromZero[1].delayNs,
+                                  8.0 * 250000 / 400 + 8.0 * 400000 / 200,
+                                  1e-6,
+                                  "each hop delays it by its queue over its rate");
+        NS_TEST_EXPECT_MSG_EQ(fromZero[1].trimFraction, 0.0, "no trimmed fraction is read");
+        NS_TEST_EXPECT_MSG_EQ(fromZero[0].markFraction, 0.0, "the other spines are clean");
+        NS_TEST_EXPECT_MSG_EQ(fabric.state->PathValues(0, 2, false)[1].delayNs,
+                              0.0,
+                              "no delay unless asked for");
+        const auto fromOne = fabric.state->PathValues(1, 2, true);
+        NS_TEST_EXPECT_MSG_EQ_TOL(fromOne[1].markFraction,
+                                  0.2,
+                                  1e-12,
+                                  "leaf 1 shares only the downlink");
+        NS_TEST_EXPECT_MSG_EQ(fabric.state->LeafOf(SwitchQueueFabric::kOtherSender.Get()),
+                              1u,
+                              "a host's leaf is found by its address");
+        NS_TEST_EXPECT_MSG_EQ(fabric.state->LeafOf(0),
+                              SwitchQueueState::kNoLeaf,
+                              "an unknown address has none");
+    }
+
+    void Loss()
+    {
+        SwitchQueueFabric fabric;
+        for (uint32_t s = 0; s < 2; ++s)
+        {
+            for (const auto& values : fabric.state->PathValues(s, 2, false))
+            {
+                NS_TEST_EXPECT_MSG_EQ(values.lossFraction, 0.0, "no loss configured, none read");
+            }
+        }
+        // One percent lost where leaf 0's uplink to spine 2 is received.
+        Ptr<RateErrorModel> gray = CreateObject<RateErrorModel>();
+        gray->SetAttribute("ErrorUnit", StringValue("ERROR_UNIT_PACKET"));
+        gray->SetRate(0.01);
+        SwitchQueueFabric::Device(fabric.spines[2], fabric.downlink[2][0])
+            ->SetAttribute("LinkErrorModel", PointerValue(gray));
+        // Spine 3's downlink to the receiver's leaf silent.
+        fabric.leaves[2]->SetBlackhole(fabric.uplink[2][3]);
+        const auto fromZero = fabric.state->PathValues(0, 2, false);
+        const auto fromOne = fabric.state->PathValues(1, 2, false);
+        NS_TEST_EXPECT_MSG_EQ_TOL(fromZero[2].lossFraction, 0.01, 1e-12, "the gray hop's path");
+        NS_TEST_EXPECT_MSG_EQ(fromOne[2].lossFraction, 0.0, "and no other path");
+        NS_TEST_EXPECT_MSG_EQ(fromZero[3].lossFraction, 1.0, "a silent port loses everything");
+        NS_TEST_EXPECT_MSG_EQ(fromOne[3].lossFraction, 1.0, "on every path through it");
+        NS_TEST_EXPECT_MSG_EQ(fromZero[0].lossFraction, 0.0, "the others lose nothing");
+    }
+};
+
+class SwitchQueueGradeTest : public TestCase
+{
+  public:
+    SwitchQueueGradeTest()
+        : TestCase("Under grade cost source switch_queue each source leaf's paths are graded "
+                   "from the switches' state at the grader's close, by the grade rule")
+    {
+    }
+
+    void DoRun() override
+    {
+        Substitution();
+        const bool savedPacketSeq = CustomHeader::ackCarriesPacketSeq;
+        const uint32_t savedReportBytes = CustomHeader::ackReportBytes;
+        CustomHeader::ackCarriesPacketSeq = true;
+        CustomHeader::ackReportBytes = 1 + SpineReport::GradeBytes(SwitchQueueFabric::kSpines);
+        Transport();
+        CustomHeader::ackReportBytes = savedReportBytes;
+        CustomHeader::ackCarriesPacketSeq = savedPacketSeq;
+    }
+
+  private:
+    static constexpr uint64_t kBaseRtt = 10000;
+
+    // The grade rule on the grader's own averages gives the grader's report;
+    // with zero loss graded it gives the same.
+    void Substitution()
+    {
+        SpineGrader::Parameters parameters = GraderFixture::Defaults();
+        SpineGrader grader(parameters);
+        for (uint32_t i = 0; i < 3; ++i)
+        {
+            for (uint8_t spine = 0; spine < 8; ++spine)
+            {
+                for (uint32_t j = 0; j < 40; ++j)
+                {
+                    grader.OnArrival(spine, spine, spine == 2 || (spine == 5 && j % 3 == 0), 0);
+                }
+            }
+            grader.Advance((i + 1) * parameters.intervalNs);
+        }
+        std::vector<SpineGrader::SpineValues> values(8);
+        std::vector<bool> held(8);
+        for (uint32_t k = 0; k < 8; ++k)
+        {
+            const SpineGrader::SpineInterval& closed = grader.LastInterval()[k];
+            values[k] = {closed.markFraction, closed.trimFraction, closed.delayNs, 0};
+            held[k] = closed.held;
+        }
+        const SpineReport& report = grader.Report();
+        NS_TEST_ASSERT_MSG_LT(uint32_t(report.Grade(2)), 3u, "the grader graded spine 2 down");
+        for (const std::optional<double> lossHold : {std::optional<double>(), std::optional(0.875)})
+        {
+            const SpineReport graded = grader.Graded(values, held, lossHold);
+            NS_TEST_EXPECT_MSG_EQ(graded.sequence, report.sequence, "the latest sequence");
+            for (uint32_t k = 0; k < 8; ++k)
+            {
+                NS_TEST_EXPECT_MSG_EQ(uint32_t(graded.Grade(k)),
+                                      uint32_t(report.Grade(k)),
+                                      "the grader's own averages earn its own grades");
+            }
+        }
+        values[6].lossFraction = 0.875;
+        NS_TEST_EXPECT_MSG_EQ(uint32_t(grader.Graded(values, held, 0.875).Grade(6)),
+                              0u,
+                              "a loss reaching the hold level holds the spine");
+        values[6].lossFraction = 0.6;
+        NS_TEST_EXPECT_MSG_EQ(uint32_t(grader.Graded(values, held, 0.875).Grade(6)),
+                              1u,
+                              "a smaller loss costs grades over the median's");
+        // Every spine losing alike costs none of them a grade against the
+        // median, but each is held all the same.
+        for (SpineGrader::SpineValues& spine : values)
+        {
+            spine.lossFraction = 0.9;
+        }
+        const SpineReport lossy = grader.Graded(values, held, 0.875);
+        for (uint32_t k = 0; k < 8; ++k)
+        {
+            NS_TEST_EXPECT_MSG_EQ(uint32_t(lossy.Grade(k)), 0u, "a loss at the hold level holds");
+        }
+    }
+
+    // The receiver on leaf 2; one data packet from each sender just after
+    // each of three interval closes. The grades of spine k in the answers to
+    // each sender after each close.
+    struct Answers
+    {
+        std::vector<SpineReport> fromZero;
+        std::vector<SpineReport> fromOne;
+    };
+
+    static SpineReport Carried(const CustomHeader& answer)
+    {
+        SpineReport report;
+        report.sequence = answer.ack.spine_report[0];
+        std::copy_n(answer.ack.spine_report + 1,
+                    SpineReport::GradeBytes(SwitchQueueFabric::kSpines),
+                    report.grades);
+        return report;
+    }
+
+    void Transport()
+    {
+        SwitchQueueFabric fabric;
+        IsolatedHost receiver(LoadBalancingMode::SprayPolicy,
+                              kTestSender,
+                              SwitchQueueFabric::kSpines);
+        receiver.hw->m_rtTable[SwitchQueueFabric::kOtherSender.Get()].push_back(0);
+        Ptr<Node> node = CreateObject<Node>();
+        receiver.hw->SetNode(node);
+        receiver.hw->m_sprayBaseRttNs = kBaseRtt;
+        receiver.hw->m_sprayGradeCostSource =
+            static_cast<uint32_t>(GradeCostSource::SwitchQueue);
+        receiver.hw->m_switchQueues = fabric.state;
+        receiver.hw->m_leaf = 2;
+        const uint64_t interval = receiver.hw->SprayReportIntervalNs();
+        // Where the receiver's intervals start.
+        const uint64_t phase = std::fmod(node->GetId() * 0.6180339887498949, 1.0) * interval;
+        Answers answers;
+        std::map<uint32_t, uint32_t> seq;
+        auto deliver = [&](Ipv4Address from) {
+            receiver.ReceiveData(from, kTestReceiver, seq[from.Get()], SpineIdentification(0, 0));
+            seq[from.Get()] += IsolatedHost::kMtu;
+            return Carried(receiver.emitted.back());
+        };
+        auto both = [&]() {
+            answers.fromZero.push_back(deliver(kTestSender));
+            answers.fromOne.push_back(deliver(SwitchQueueFabric::kOtherSender));
+        };
+        // Within the first interval spine 1's downlink fills and drains again;
+        // at its close only leaf 0's uplink to spine 3 is full.
+        Simulator::Schedule(NanoSeconds(phase + interval / 4), [&]() {
+            both();
+            fabric.QueueDown(1, 500000);
+        });
+        Simulator::Schedule(NanoSeconds(phase + interval / 2), [&]() {
+            fabric.QueueDown(1, 0);
+            fabric.QueueUp(0, 3, 500000);
+        });
+        Simulator::Schedule(NanoSeconds(phase + interval + 1), both);
+        // At the second close spine 1's downlink is silent.
+        Simulator::Schedule(NanoSeconds(phase + interval + 2), [&]() {
+            fabric.leaves[2]->SetBlackhole(fabric.uplink[2][1]);
+        });
+        Simulator::Schedule(NanoSeconds(phase + 2 * interval + 1), both);
+        Simulator::Run();
+        Simulator::Destroy();
+
+        NS_TEST_ASSERT_MSG_EQ(answers.fromZero.size(), 3u, "three answers to each sender");
+        for (uint32_t k = 0; k < SwitchQueueFabric::kSpines; ++k)
+        {
+            NS_TEST_EXPECT_MSG_EQ(uint32_t(answers.fromZero[0].Grade(k)),
+                                  3u,
+                                  "before the first close every spine is at the top");
+            NS_TEST_EXPECT_MSG_EQ(uint32_t(answers.fromZero[1].Grade(k)),
+                                  (k == 3 ? 0u : 3u),
+                                  "at the first close only what is queued then counts");
+            NS_TEST_EXPECT_MSG_EQ(uint32_t(answers.fromOne[1].Grade(k)),
+                                  3u,
+                                  "and leaf 0's uplink is not leaf 1's path");
+            NS_TEST_EXPECT_MSG_EQ(uint32_t(answers.fromOne[2].Grade(k)),
+                                  (k == 1 ? 0u : 3u),
+                                  "a silent downlink holds its spine at the next close");
+        }
+        NS_TEST_EXPECT_MSG_EQ(uint32_t(answers.fromZero[1].sequence),
+                              1u,
+                              "the reports keep the grader's sequence");
+    }
+};
+
 class GradeScopeTest : public TestCase
 {
   public:
@@ -6061,6 +6424,8 @@ PointToPointTestSuite::PointToPointTestSuite()
     AddTestCase(new AckRedirectTransportTest, TestCase::Duration::QUICK);
     AddTestCase(new HostSpineRedirectTest, TestCase::Duration::QUICK);
     AddTestCase(new AckRedirectScopeTest, TestCase::Duration::QUICK);
+    AddTestCase(new SwitchQueueStateTest, TestCase::Duration::QUICK);
+    AddTestCase(new SwitchQueueGradeTest, TestCase::Duration::QUICK);
 }
 
 static PointToPointTestSuite g_pointToPointTestSuite; //!< The testsuite

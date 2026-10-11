@@ -105,14 +105,22 @@ namespace ns3 {
 	bool SwitchMmu::ShouldSendCN(uint32_t ifindex, uint32_t qIndex){
 		if (qIndex == 0)
 			return false;
-		if (egress_bytes[ifindex][qIndex] > kmax[ifindex])
+		const uint32_t bytes = egress_bytes[ifindex][qIndex];
+		if (bytes > kmax[ifindex])
 			return true;
-		if (egress_bytes[ifindex][qIndex] > kmin[ifindex]){
-			double p = pmax[ifindex] * double(egress_bytes[ifindex][qIndex] - kmin[ifindex]) / (kmax[ifindex] - kmin[ifindex]);
-			if (markingRandom[ifindex]->GetValue() < p)
-				return true;
-		}
+		// Drawn whenever the queue is above kmin, whatever pmax is, so that
+		// the marking stream advances as it always has.
+		if (bytes > kmin[ifindex])
+			return markingRandom[ifindex]->GetValue() <
+				MarkingProbability(ifindex, bytes);
 		return false;
+	}
+	double SwitchMmu::MarkingProbability(uint32_t port, uint32_t bytes) const{
+		if (bytes > kmax[port])
+			return 1;
+		if (bytes > kmin[port])
+			return pmax[port] * double(bytes - kmin[port]) / (kmax[port] - kmin[port]);
+		return 0;
 	}
 	void SwitchMmu::ConfigEcn(uint32_t port, uint32_t _kmin, uint32_t _kmax, double _pmax,
 			int64_t markingStream){

@@ -41,6 +41,7 @@ build_lib(
     model/spine-redirect.cc
     model/switch-mmu.cc
     model/switch-node.cc
+    model/switch-queue-state.cc
   HEADER_FILES
     ${mpi_headers}
     helper/point-to-point-helper.h
@@ -68,6 +69,7 @@ build_lib(
     model/spine-report.h
     model/switch-mmu.h
     model/switch-node.h
+    model/switch-queue-state.h
     model/trace-format.h
   LIBRARIES_TO_LINK ${libnetwork}
                     ${mpi_libraries}

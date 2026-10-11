@@ -12,6 +12,7 @@
 #include "nscc-window.h"
 #include "spine-grader.h"
 #include "spine-redirect.h"
+#include "switch-queue-state.h"
 #include <memory>
 #include <unordered_map>
 #include "pint.h"
@@ -130,6 +131,29 @@ public:
 	bool m_sprayOneWayDelay;
 	uint32_t m_sprayGradeReference; // SpineGrader::GradeReference
 	uint32_t m_sprayGradeScope; // GradeScope
+	// GradeCostSource. Under SwitchQueue, at each close of the host's
+	// grader's interval the spines are graded once per source leaf from
+	// m_switchQueues, simulator state no host could read, and an answer to a
+	// sender on another leaf carries its leaf's report. m_leaf is this host's
+	// leaf.
+	uint32_t m_sprayGradeCostSource;
+	Ptr<SwitchQueueState> m_switchQueues;
+	uint32_t m_leaf;
+	std::vector<SpineReport> m_leafReports;
+	bool IsSwitchQueueCost() const;
+	// The report an answer to destinationIp from q carries.
+	const SpineReport &ReportFor(Ptr<RdmaRxQueuePair> q, uint32_t destinationIp);
+	// Grade every source leaf's paths from the switches' state, at a close.
+	void GradeFromSwitchQueues(uint64_t nowNs, const SpineGrader &grader);
+	// The SwitchQueueReport trace source: the time, the host's grader, the
+	// source leaf, the values read and the report they earned.
+	typedef void (*SwitchQueueReportTracedCallback)(uint64_t nowNs,
+		const SpineGrader &grader, uint32_t sourceLeaf,
+		const std::vector<SpineGrader::SpineValues> &values,
+		const SpineReport &report);
+	TracedCallback<uint64_t, const SpineGrader &, uint32_t,
+		const std::vector<SpineGrader::SpineValues> &, const SpineReport &>
+		m_traceSwitchQueueReport;
 	double m_sprayDelayCusumSlackBaseRtts;
 	double m_sprayDelayCusumThresholdBaseRtts;
 	double m_sprayDelayThreshold1BaseRtts, m_sprayDelayThreshold2BaseRtts,
