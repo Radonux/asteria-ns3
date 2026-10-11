@@ -131,6 +131,7 @@ double ack_redirect_omega = 0.5;
 double ack_redirect_flag = 0.1;
 double ack_redirect_validity_base_rtts = 2.0;
 std::string ack_redirect_trim_scoring = "mark";
+std::string ack_redirect_scope = "per_connection";
 // The selectors each parameter belongs to. A parameter given under another
 // selector would be read by nothing, so it is refused.
 const std::map<std::string, std::set<std::string>> path_selector_parameter_owners = {
@@ -145,7 +146,11 @@ const std::map<std::string, std::set<std::string>> path_selector_parameter_owner
     {"ACK_REDIRECT_FLAG", {"ack_redirect"}},
     {"ACK_REDIRECT_VALIDITY_BASE_RTTS", {"ack_redirect"}},
     {"ACK_REDIRECT_TRIM_SCORING", {"ack_redirect"}},
+    {"ACK_REDIRECT_SCOPE", {"ack_redirect"}},
 };
+// The keys of ack_redirect that only its per_connection scope reads.
+const std::set<std::string> ack_redirect_connection_keys = {
+    "ACK_REDIRECT_VALIDITY_BASE_RTTS", "ACK_REDIRECT_TRIM_SCORING"};
 std::set<std::string> path_selector_parameters_given;
 // Under LOAD_BALANCING spray_policy, the receiver's and the sender's
 // parameters, each RdmaHw's default; times in base RTTs.
@@ -186,6 +191,15 @@ const std::set<std::string> spray_one_way_delay_keys = {
     "SPRAY_DELAY_CUSUM_SLACK_BASE_RTTS",
     "SPRAY_DELAY_CUSUM_THRESHOLD_BASE_RTTS",
     "SPRAY_DELAY_THRESHOLDS_BASE_RTTS"};
+// The spray_policy keys the host's grader reads, which ack_redirect at its
+// per_receiver scope reads too.
+const std::set<std::string> spine_grader_keys = {
+    "SPRAY_REPORT_INTERVAL_BASE_RTTS", "SPRAY_ESTIMATOR_GAIN",
+    "SPRAY_ESTIMATOR_INTERVAL_SAMPLES", "SPRAY_FRACTION_CUSUM_SLACK",
+    "SPRAY_FRACTION_CUSUM_THRESHOLD", "SPRAY_ABSENCE_FRACTION_OF_MEDIAN",
+    "SPRAY_ABSENCE_MINIMUM_MEDIAN", "SPRAY_RELEASE_FRACTION_OF_FLOOR",
+    "SPRAY_ONE_WAY_DELAY", "SPRAY_DELAY_CUSUM_SLACK_BASE_RTTS",
+    "SPRAY_DELAY_CUSUM_THRESHOLD_BASE_RTTS"};
 std::set<std::string> spray_policy_keys_given;
 // UEC 1.0.3 section 4.1.4.1 RECOMMENDS three traffic classes: TC_low for data,
 // TC_med for trimmed packets, TC_high for control. Queue 0 is TC_high here, so
@@ -693,12 +707,17 @@ uint32_t spray_grade_reference_value() {
   return std::numeric_limits<uint32_t>::max();
 }
 
-uint32_t spray_grade_scope_value() {
-  if (spray_grade_scope == "per_receiver")
+uint32_t grade_scope_value(const std::string &scope) {
+  if (scope == "per_receiver")
     return static_cast<uint32_t>(GradeScope::PerReceiver);
-  if (spray_grade_scope == "per_connection")
+  if (scope == "per_connection")
     return static_cast<uint32_t>(GradeScope::PerConnection);
   return std::numeric_limits<uint32_t>::max();
+}
+
+// Under ack_redirect, whether the redirect is scored from the host's grader.
+bool host_redirect() {
+  return path_selector == "ack_redirect" && ack_redirect_scope == "per_receiver";
 }
 
 bool names_spine() {
@@ -1154,7 +1173,7 @@ bool valid_spray_policy() {
     std::cerr << "SPRAY_GRADE_REFERENCE must be absolute or median\n";
     return false;
   }
-  if (spray_grade_scope_value() == std::numeric_limits<uint32_t>::max()) {
+  if (grade_scope_value(spray_grade_scope) == std::numeric_limits<uint32_t>::max()) {
     std::cerr << "SPRAY_GRADE_SCOPE must be per_receiver or per_connection\n";
     return false;
   }
@@ -1200,6 +1219,13 @@ bool valid_ack_redirect() {
     std::cerr << "ACK_REDIRECT_TRIM_SCORING must be mark or ignore\n";
     return false;
   }
+  if (grade_scope_value(ack_redirect_scope) ==
+      std::numeric_limits<uint32_t>::max()) {
+    std::cerr << "ACK_REDIRECT_SCOPE must be per_connection or per_receiver\n";
+    return false;
+  }
+  if (host_redirect() && !valid_spray_policy())
+    return false;
   // The score reads the send timestamp IntHeader::mode TS carries, which
   // HPCC's modes would replace with their own.
   if (cc_mode == 3 || cc_mode == 10) {
@@ -1362,6 +1388,8 @@ bool ReadConf(string network_configuration) {
       conf >> ack_redirect_validity_base_rtts;
     } else if (key.compare("ACK_REDIRECT_TRIM_SCORING") == 0) {
       conf >> ack_redirect_trim_scoring;
+    } else if (key.compare("ACK_REDIRECT_SCOPE") == 0) {
+      conf >> ack_redirect_scope;
     } else if (key.compare("SPRAY_REPORT_INTERVAL_BASE_RTTS") == 0) {
       conf >> spray_report_interval_base_rtts;
     } else if (key.compare("SPRAY_ESTIMATOR_GAIN") == 0) {
@@ -1672,8 +1700,13 @@ bool ReadConf(string network_configuration) {
     return false;
   }
   for (const std::string &key : spray_policy_keys_given) {
-    if (load_balancing != "spray_policy") {
-      std::cerr << key << " is read only under LOAD_BALANCING spray_policy\n";
+    if (load_balancing != "spray_policy" &&
+        !(host_redirect() && spine_grader_keys.count(key) > 0)) {
+      std::cerr << key << " is read only under LOAD_BALANCING spray_policy"
+                << (spine_grader_keys.count(key) > 0
+                        ? " or PATH_SELECTOR ack_redirect with "
+                          "ACK_REDIRECT_SCOPE per_receiver\n"
+                        : "\n");
       return false;
     }
     if (spray_one_way_delay_keys.count(key) > 0 && spray_one_way_delay == 0) {
@@ -1707,6 +1740,10 @@ bool ReadConf(string network_configuration) {
     if (path_selector_parameter_owners.at(key).count(path_selector) == 0) {
       std::cerr << key << " is not a parameter of PATH_SELECTOR "
                 << path_selector << "\n";
+      return false;
+    }
+    if (host_redirect() && ack_redirect_connection_keys.count(key) > 0) {
+      std::cerr << key << " is not read under ACK_REDIRECT_SCOPE per_receiver\n";
       return false;
     }
   }
@@ -2122,6 +2159,11 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),
     }
     CustomHeader::ackReportBytes = 1 + SpineReport::GradeBytes(spine_count);
   }
+  if (host_redirect() && spine_count > SpineReport::kMaxSpines) {
+    std::cerr << "ACK_REDIRECT_SCOPE per_receiver grades at most "
+              << SpineReport::kMaxSpines << " spines\n";
+    return false;
+  }
   // One variable for every host, so the draw consumes a single fixed stream.
   Ptr<UniformRandomVariable> path_random;
   if (load_balancing_value() != static_cast<uint32_t>(LoadBalancingMode::Ecmp))
@@ -2200,6 +2242,8 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),
                            DoubleValue(ack_redirect_validity_base_rtts));
       rdmaHw->SetAttribute("AckRedirectTrimScoring",
                            UintegerValue(ack_redirect_trim_scoring_value()));
+      rdmaHw->SetAttribute("AckRedirectScope",
+                           UintegerValue(grade_scope_value(ack_redirect_scope)));
       if (path_selector == "ack_redirect")
         rdmaHw->m_ownLeafHosts = own_leaf_hosts(n.Get(i));
       rdmaHw->SetAttribute("SprayReportIntervalBaseRtts",
@@ -2237,7 +2281,7 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),
       rdmaHw->SetAttribute("SprayGradeReference",
                            UintegerValue(spray_grade_reference_value()));
       rdmaHw->SetAttribute("SprayGradeScope",
-                           UintegerValue(spray_grade_scope_value()));
+                           UintegerValue(grade_scope_value(spray_grade_scope)));
       rdmaHw->SetAttribute("SprayEstimatorIntervalSamples",
                            UintegerValue(spray_estimator_interval_samples));
       rdmaHw->SetAttribute("SprayGamma", DoubleValue(spray_gamma));
