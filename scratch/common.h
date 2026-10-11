@@ -150,6 +150,7 @@ uint32_t spray_absence_minimum_median = 16;
 double spray_release_fraction_of_floor = 0.5;
 uint32_t spray_one_way_delay = 0;
 std::string spray_grade_reference = "median";
+std::string spray_grade_scope = "per_receiver";
 double spray_delay_cusum_slack_base_rtts = 0.125;
 double spray_delay_cusum_threshold_base_rtts = 0.5;
 double spray_delay_thresholds_base_rtts[3] = {0.25, 0.5, 0.75};
@@ -169,7 +170,7 @@ const std::set<std::string> spray_policy_keys = {
     "SPRAY_GAMMA", "SPRAY_EPSILON", "SPRAY_CANDIDATES", "SPRAY_CANDIDATE_DRAW",
     "SPRAY_EDGE_WINDOW_PENALTY", "SPINE_REPORT_OUTPUT_FILE",
     "SPRAY_ABSENCE_FRACTION_OF_MEDIAN", "SPRAY_ABSENCE_MINIMUM_MEDIAN",
-    "SPRAY_GRADE_REFERENCE",
+    "SPRAY_GRADE_REFERENCE", "SPRAY_GRADE_SCOPE",
     "SPRAY_ESTIMATOR_INTERVAL_SAMPLES"};
 const std::set<std::string> spray_one_way_delay_keys = {
     "SPRAY_DELAY_CUSUM_SLACK_BASE_RTTS",
@@ -672,6 +673,14 @@ uint32_t spray_grade_reference_value() {
   return std::numeric_limits<uint32_t>::max();
 }
 
+uint32_t spray_grade_scope_value() {
+  if (spray_grade_scope == "per_receiver")
+    return static_cast<uint32_t>(GradeScope::PerReceiver);
+  if (spray_grade_scope == "per_connection")
+    return static_cast<uint32_t>(GradeScope::PerConnection);
+  return std::numeric_limits<uint32_t>::max();
+}
+
 bool names_spine() {
   return NamesSpine(static_cast<LoadBalancingMode>(load_balancing_value()));
 }
@@ -996,21 +1005,27 @@ void write_fabric_counters() {
 }
 
 // A spine report as a receiver issued it: one row per spine, with the
-// interval it closed.
+// interval it closed. A connection's report also names the connection by its
+// sender's rank and port.
 void write_spine_report(uint32_t rank, uint64_t now_ns,
-                        const SpineGrader &grader) {
+                        const SpineGrader &grader,
+                        const RdmaRxQueuePair *connection) {
   const SpineReport &report = grader.Report();
   const std::vector<SpineGrader::SpineInterval> &spines = grader.LastInterval();
   for (uint32_t spine = 0; spine < spines.size(); spine++) {
     const SpineGrader::SpineInterval &closed = spines[spine];
     fprintf(spine_report_file,
-            "%lu,%u,%u,%u,%u,%u,%u,%u,%.6f,%.6f,%.1f,%d,%u,%u,%d\n",
+            "%lu,%u,%u,%u,%u,%u,%u,%u,%.6f,%.6f,%.1f,%d,%u,%u,%d",
             static_cast<unsigned long>(now_ns), rank, report.sequence, spine,
             closed.arrivals, closed.marked, closed.trimmed, closed.moved,
             closed.markFraction, closed.trimFraction, closed.delayNs,
             closed.held ? 1 : 0,
             report.Grade(spine), grader.LastIntervalLastHopTrims(),
             report.edgeCongested ? 1 : 0);
+    if (connection != nullptr)
+      fprintf(spine_report_file, ",%u,%u",
+              ip_to_node_id(Ipv4Address(connection->dip)), connection->dport);
+    fputc('\n', spine_report_file);
   }
 }
 
@@ -1104,6 +1119,10 @@ bool valid_spray_policy() {
   }
   if (spray_grade_reference_value() == std::numeric_limits<uint32_t>::max()) {
     std::cerr << "SPRAY_GRADE_REFERENCE must be absolute or median\n";
+    return false;
+  }
+  if (spray_grade_scope_value() == std::numeric_limits<uint32_t>::max()) {
+    std::cerr << "SPRAY_GRADE_SCOPE must be per_receiver or per_connection\n";
     return false;
   }
   if (!(spray_gamma > 0 && spray_gamma <= 1)) {
@@ -1302,6 +1321,8 @@ bool ReadConf(string network_configuration) {
       conf >> spray_absence_minimum_median;
     } else if (key.compare("SPRAY_GRADE_REFERENCE") == 0) {
       conf >> spray_grade_reference;
+    } else if (key.compare("SPRAY_GRADE_SCOPE") == 0) {
+      conf >> spray_grade_scope;
     } else if (key.compare("SPRAY_ESTIMATOR_INTERVAL_SAMPLES") == 0) {
       conf >> spray_estimator_interval_samples;
     } else if (key.compare("SPRAY_GAMMA") == 0) {
@@ -2127,6 +2148,8 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),
                            UintegerValue(spray_absence_minimum_median));
       rdmaHw->SetAttribute("SprayGradeReference",
                            UintegerValue(spray_grade_reference_value()));
+      rdmaHw->SetAttribute("SprayGradeScope",
+                           UintegerValue(spray_grade_scope_value()));
       rdmaHw->SetAttribute("SprayEstimatorIntervalSamples",
                            UintegerValue(spray_estimator_interval_samples));
       rdmaHw->SetAttribute("SprayGamma", DoubleValue(spray_gamma));
@@ -2310,7 +2333,8 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),
     fprintf(spine_report_file,
             "time_ns,rank,sequence,spine,arrivals,marked,trimmed,moved,"
             "mark_fraction,trim_fraction,delay_ns,held,grade,last_hop_trims,"
-            "edge\n");
+            "edge%s\n",
+            spray_grade_scope == "per_connection" ? ",sender,sender_port" : "");
     for (uint32_t i = 0; i < node_num; i++)
       if (n.Get(i)->GetNodeType() == 0)
         n.Get(i)->GetObject<RdmaDriver>()->m_rdma->TraceConnectWithoutContext(
