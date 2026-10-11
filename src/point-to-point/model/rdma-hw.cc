@@ -547,6 +547,14 @@ TypeId RdmaHw::GetTypeId (void)
 				"values read from the switches and the report they earned.",
 				MakeTraceSourceAccessor(&RdmaHw::m_traceSwitchQueueReport),
 				"ns3::RdmaHw::SwitchQueueReportTracedCallback")
+		.AddTraceSource("SpineLossInterval",
+				"Under LoadBalancing 3 with SprayLossThreshold1 set and "
+				"SpraySenderPoolWeight above zero, the host's pooled scores "
+				"closed a loss interval: the time it ended at and, per spine, "
+				"the sends and losses counted in it and the grade its lost "
+				"fraction earns.",
+				MakeTraceSourceAccessor(&RdmaHw::m_traceSpineLossInterval),
+				"ns3::RdmaHw::SpineLossIntervalTracedCallback")
 		.AddAttribute("EwmaGain",
 				"Control gain parameter which determines the level of rate decrease",
 				DoubleValue(1.0 / 16),
@@ -2321,9 +2329,17 @@ void RdmaHw::StartPathSelection(Ptr<RdmaQueuePair> qp, uint64_t bdpBytes,
 			parameters.lossThresholds = SprayLossThresholds();
 			parameters.lossIntervalNs = m_sprayLossIntervalNs;
 		}
-		if (m_spraySenderPoolWeight > 0 && !m_senderSpineScores)
+		if (m_spraySenderPoolWeight > 0 && !m_senderSpineScores){
 			m_senderSpineScores =
 				std::make_unique<SpineScores>(m_spineCount, parameters);
+			if (parameters.lossThresholds)
+				m_senderSpineScores->SetLossIntervalCallback(
+					[this](uint64_t endNs, const std::vector<uint32_t> &sent,
+							const std::vector<uint32_t> &lost,
+							const std::vector<uint8_t> &grades){
+						m_traceSpineLossInterval(endNs, sent, lost, grades);
+					});
+		}
 		if (IsPerConnectionGrading()){
 			auto scores = std::make_unique<SpineScores>(m_spineCount, parameters);
 			if (m_senderSpineScores)

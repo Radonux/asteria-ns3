@@ -6,6 +6,7 @@
 #include "spine-report.h"
 #include <array>
 #include <deque>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <stdint.h>
@@ -147,6 +148,15 @@ public:
 	// score of each spine in place of this score. Several scores may share a
 	// pool.
 	void Pool(SpineScores &pool, double weight);
+	// As a pool with loss thresholds set: called as each loss interval is
+	// closed, with the time it ended at and, per spine, the sends and losses
+	// counted in it and the grade its lost fraction earns, the top grade for
+	// a spine not sent on. A later interval that ended before the next send,
+	// loss or report counted nothing and is not passed.
+	using LossIntervalCallback = std::function<void(uint64_t endNs,
+		const std::vector<uint32_t> &sent, const std::vector<uint32_t> &lost,
+		const std::vector<uint8_t> &grades)>;
+	void SetLossIntervalCallback(LossIntervalCallback callback);
 	// p for spine, as the scores stand.
 	double Share(uint32_t spine) const;
 	uint32_t Score(uint32_t spine) const;
@@ -193,6 +203,7 @@ private:
 	uint64_t m_lossIntervalNs;
 	uint64_t m_lossIntervalEndNs;
 	std::vector<uint8_t> m_lossGrades;
+	LossIntervalCallback m_onLossInterval;
 };
 
 // A spine drawn per packet from the scores towards the queue pair's

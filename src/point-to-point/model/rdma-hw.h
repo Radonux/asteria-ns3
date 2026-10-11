@@ -193,6 +193,16 @@ public:
 	// made at the first queue pair; null otherwise.
 	double m_spraySenderPoolWeight;
 	std::unique_ptr<SpineScores> m_senderSpineScores;
+	// The SpineLossInterval trace source: the host's pooled scores closed a
+	// loss interval (SpineScores::LossIntervalCallback): the time it ended
+	// at and, per spine, the sends and losses counted in it and the grade
+	// its lost fraction earns.
+	typedef void (*SpineLossIntervalTracedCallback)(uint64_t endNs,
+		const std::vector<uint32_t> &sent, const std::vector<uint32_t> &lost,
+		const std::vector<uint8_t> &grades);
+	TracedCallback<uint64_t, const std::vector<uint32_t> &,
+		const std::vector<uint32_t> &, const std::vector<uint8_t> &>
+		m_traceSpineLossInterval;
 	// The SpineReport trace source: the time, the grader that has just issued
 	// a report, and under PerConnection the receive queue pair that owns it,
 	// null under PerReceiver.

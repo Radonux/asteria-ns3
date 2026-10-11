@@ -75,8 +75,11 @@ std::string transport_event_summary_output_file = "transport_summary.csv";
 // writes neither.
 std::string port_counter_output_file, spine_arrival_output_file;
 std::string spine_report_output_file;
+// Each host's pooled loss intervals under SPRAY_LOSS_THRESHOLDS: one row per
+// host, closed interval and spine. Empty writes none.
+std::string spine_loss_output_file;
 FILE *port_counter_file = nullptr, *spine_arrival_file = nullptr;
-FILE *spine_report_file = nullptr;
+FILE *spine_report_file = nullptr, *spine_loss_file = nullptr;
 
 double alpha_resume_interval = 55, rp_timer, ewma_gain = 1 / 16;
 double rate_decrease_interval = 4;
@@ -200,6 +203,7 @@ const std::set<std::string> spray_policy_keys = {
     "SPRAY_GAMMA", "SPRAY_EPSILON", "SPRAY_CANDIDATES", "SPRAY_CANDIDATE_DRAW",
     "SPRAY_EDGE_WINDOW_PENALTY", "SPRAY_EDGE_FREEZE",
     "SPRAY_SENDER_POOL_WEIGHT", "SPINE_REPORT_OUTPUT_FILE",
+    "SPINE_LOSS_OUTPUT_FILE",
     "SPRAY_ABSENCE_FRACTION_OF_MEDIAN", "SPRAY_ABSENCE_MINIMUM_MEDIAN",
     "SPRAY_GRADE_REFERENCE", "SPRAY_GRADE_SCOPE", "SPRAY_GRADE_COST_SOURCE",
     "SPRAY_ESTIMATOR_INTERVAL_SAMPLES"};
@@ -1123,7 +1127,8 @@ void write_fabric_counters() {
       }
     }
   }
-  for (FILE *file : {port_counter_file, spine_arrival_file, spine_report_file})
+  for (FILE *file : {port_counter_file, spine_arrival_file, spine_report_file,
+                     spine_loss_file})
     if (file != nullptr)
       fflush(file);
 }
@@ -1172,6 +1177,19 @@ void write_spine_report(uint32_t rank, uint64_t now_ns,
               ip_to_node_id(Ipv4Address(connection->dip)), connection->dport);
     fputc('\n', spine_report_file);
   }
+}
+
+// A loss interval the host's pooled scores closed: one row per spine, under
+// the time the interval ended at, with the sends and losses counted in it and
+// the grade its lost fraction earns.
+void write_spine_loss_interval(uint32_t rank, uint64_t end_ns,
+                               const std::vector<uint32_t> &sent,
+                               const std::vector<uint32_t> &lost,
+                               const std::vector<uint8_t> &grades) {
+  for (uint32_t spine = 0; spine < sent.size(); spine++)
+    fprintf(spine_loss_file, "%lu,%u,%u,%u,%u,%u\n",
+            static_cast<unsigned long>(end_ns), rank, spine, sent[spine],
+            lost[spine], grades[spine]);
 }
 
 // The link events' applier, which keeps what a restore puts back.
@@ -1328,6 +1346,17 @@ bool valid_spray_policy() {
   }
   if (!(spray_sender_pool_weight >= 0 && spray_sender_pool_weight <= 1)) {
     std::cerr << "SPRAY_SENDER_POOL_WEIGHT must be in [0, 1]\n";
+    return false;
+  }
+  // Only the host's pool counts over loss intervals, and only the sender's
+  // own counting, outside switch_queue, feeds it.
+  if (!spine_loss_output_file.empty() &&
+      (spray_policy_keys_given.count("SPRAY_LOSS_THRESHOLDS") == 0 ||
+       spray_sender_pool_weight == 0 ||
+       spray_grade_cost_source == "switch_queue")) {
+    std::cerr << "SPINE_LOSS_OUTPUT_FILE requires SPRAY_LOSS_THRESHOLDS and "
+                 "SPRAY_SENDER_POOL_WEIGHT above zero, outside "
+                 "SPRAY_GRADE_COST_SOURCE switch_queue\n";
     return false;
   }
   return true;
@@ -1648,6 +1677,8 @@ bool ReadConf(string network_configuration) {
       conf >> spine_arrival_output_file;
     } else if (key.compare("SPINE_REPORT_OUTPUT_FILE") == 0) {
       conf >> spine_report_output_file;
+    } else if (key.compare("SPINE_LOSS_OUTPUT_FILE") == 0) {
+      conf >> spine_loss_output_file;
     } else if (key.compare("LINK_DOWN") == 0) {
       conf >> link_down_time >> link_down_A >> link_down_B;
     } else if (key.compare("LINK_FAILURE") == 0) {
@@ -2695,6 +2726,19 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),
           hw->TraceConnectWithoutContext(
               "SpineReport", MakeBoundCallback(&write_spine_report, i));
       }
+  }
+  if (!spine_loss_output_file.empty()) {
+    spine_loss_file = fopen(spine_loss_output_file.c_str(), "w");
+    if (spine_loss_file == nullptr) {
+      std::cerr << "Error: cannot open " << spine_loss_output_file << "\n";
+      return false;
+    }
+    fprintf(spine_loss_file, "time_ns,rank,spine,sent,lost,grade\n");
+    for (uint32_t i = 0; i < node_num; i++)
+      if (n.Get(i)->GetNodeType() == 0)
+        n.Get(i)->GetObject<RdmaDriver>()->m_rdma->TraceConnectWithoutContext(
+            "SpineLossInterval",
+            MakeBoundCallback(&write_spine_loss_interval, i));
   }
   std::set<uint64_t> event_times;
   for (const LinkEvent &event : link_events) {

@@ -156,13 +156,24 @@ void SpineScores::AdvanceLossInterval(uint64_t nowNs){
 	// The counts are those of the interval that ended at m_lossIntervalEndNs;
 	// any later interval that ended by now had nothing counted.
 	const bool lastCounted = nowNs - m_lossIntervalEndNs < m_lossIntervalNs;
+	std::vector<uint8_t> closed(m_scores.size());
 	for (uint32_t k = 0; k < m_scores.size(); k++)
-		m_lossGrades[k] = lastCounted
-			? LossGrade(m_sent[k], m_lost[k]) : SpineReport::kTopGrade;
+		closed[k] = LossGrade(m_sent[k], m_lost[k]);
+	if (m_onLossInterval)
+		m_onLossInterval(m_lossIntervalEndNs, m_sent, m_lost, closed);
+	if (lastCounted)
+		m_lossGrades = closed;
+	else
+		std::fill(m_lossGrades.begin(), m_lossGrades.end(),
+			SpineReport::kTopGrade);
 	std::fill(m_sent.begin(), m_sent.end(), 0);
 	std::fill(m_lost.begin(), m_lost.end(), 0);
 	m_lossIntervalEndNs += m_lossIntervalNs *
 		(1 + (nowNs - m_lossIntervalEndNs) / m_lossIntervalNs);
+}
+
+void SpineScores::SetLossIntervalCallback(LossIntervalCallback callback){
+	m_onLossInterval = std::move(callback);
 }
 
 void SpineScores::Take(const SpineReport &report, uint64_t nowNs){

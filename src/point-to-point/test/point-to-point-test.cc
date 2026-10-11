@@ -5744,8 +5744,9 @@ class SpineLossThresholdsTest : public TestCase
   public:
     SpineLossThresholdsTest()
         : TestCase("Loss thresholds grade the lost fraction of a spine at the sender, per "
-                   "destination between reports and host-wide per loss interval in the pool; "
-                   "under switch_queue they grade the loss of the paths instead")
+                   "destination between reports and host-wide per loss interval in the pool, "
+                   "which the host traces as each interval closes; under switch_queue they "
+                   "grade the loss of the paths instead")
     {
     }
 
@@ -5755,6 +5756,7 @@ class SpineLossThresholdsTest : public TestCase
         Unset();
         Local();
         Pool();
+        PoolTrace();
         const bool savedPacketSeq = CustomHeader::ackCarriesPacketSeq;
         const uint32_t savedReportBytes = CustomHeader::ackReportBytes;
         CustomHeader::ackCarriesPacketSeq = true;
@@ -5890,6 +5892,8 @@ class SpineLossThresholdsTest : public TestCase
         toSecond.Pool(pool, 0.5);
         SpineScores referencePool(kSpines, ScoresFixture::Defaults());
         const std::vector<uint8_t> top(kSpines, 3);
+        std::vector<Closed> closed;
+        pool.SetLossIntervalCallback(Recorder(closed));
 
         // First interval: spine 3 loses none of 10 towards the first and 6 of
         // 10 towards the second, 6 of 20 from the host; spine 5 loses a send
@@ -5934,6 +5938,118 @@ class SpineLossThresholdsTest : public TestCase
         toFirst.OnReport(ScoresFixture::Report(3, top), 4 * kInterval + 5000);
         referencePool.OnReport(ScoresFixture::Report(4, top), 4 * kInterval + 5000);
         ExpectScores(pool, referencePool, "an interval with nothing counted grades no spine down");
+
+        // One record per interval closed, with the counts above: the first
+        // interval's, the second's, and the third's, whose 2 of 2 lost on
+        // spine 6 grade it 0 although the fourth, which counted nothing and
+        // is not passed, is the one the pool grades by.
+        NS_TEST_ASSERT_MSG_EQ(closed.size(), 3u, "a record per interval closed");
+        std::vector<Closed> expectedClosed(3);
+        expectedClosed[0].endNs = kInterval;
+        expectedClosed[1].endNs = 2 * kInterval;
+        expectedClosed[2].endNs = 3 * kInterval;
+        for (Closed& interval : expectedClosed)
+        {
+            interval.sent.assign(kSpines, 0);
+            interval.lost.assign(kSpines, 0);
+            interval.grades = top;
+        }
+        expectedClosed[0].sent[3] = 20;
+        expectedClosed[0].lost[3] = 6;
+        expectedClosed[0].grades[3] = 1;
+        expectedClosed[0].lost[5] = 1;
+        expectedClosed[0].sent[0] = 10;
+        expectedClosed[1].sent[4] = 4;
+        expectedClosed[1].lost[4] = 4;
+        expectedClosed[1].grades[4] = 0;
+        expectedClosed[2].sent[6] = 2;
+        expectedClosed[2].lost[6] = 2;
+        expectedClosed[2].grades[6] = 0;
+        ExpectClosed(closed, expectedClosed);
+    }
+
+    // A loss interval the pool closed, as its callback passes it.
+    struct Closed
+    {
+        uint64_t endNs = 0;
+        std::vector<uint32_t> sent, lost;
+        std::vector<uint8_t> grades;
+    };
+
+    static SpineScores::LossIntervalCallback Recorder(std::vector<Closed>& closed)
+    {
+        return [&closed](uint64_t endNs,
+                         const std::vector<uint32_t>& sent,
+                         const std::vector<uint32_t>& lost,
+                         const std::vector<uint8_t>& grades) {
+            closed.push_back(Closed{endNs, sent, lost, grades});
+        };
+    }
+
+    void ExpectClosed(const std::vector<Closed>& closed, const std::vector<Closed>& expected)
+    {
+        NS_TEST_ASSERT_MSG_EQ(closed.size(), expected.size(), "a record per interval closed");
+        for (uint32_t i = 0; i < expected.size(); ++i)
+        {
+            NS_TEST_EXPECT_MSG_EQ(closed[i].endNs, expected[i].endNs, "the interval's end");
+            NS_TEST_ASSERT_MSG_EQ(closed[i].sent.size(), uint32_t(kSpines), "every spine");
+            for (uint32_t spine = 0; spine < kSpines; ++spine)
+            {
+                NS_TEST_EXPECT_MSG_EQ(closed[i].sent[spine], expected[i].sent[spine], "sent");
+                NS_TEST_EXPECT_MSG_EQ(closed[i].lost[spine], expected[i].lost[spine], "lost");
+                NS_TEST_EXPECT_MSG_EQ(uint32_t(closed[i].grades[spine]),
+                                      uint32_t(expected[i].grades[spine]),
+                                      "the grade the interval's lost fraction earns");
+            }
+        }
+    }
+
+    // A host whose queue pairs' scores are pooled traces each loss interval
+    // its pool closes through SpineLossInterval.
+    void PoolTrace()
+    {
+        IsolatedHost sender(LoadBalancingMode::SprayPolicy, kTestReceiver, kSpines);
+        sender.hw->m_sprayBaseRttNs = kInterval / 2;
+        sender.hw->m_sprayLossThreshold1 = kThresholds[0];
+        sender.hw->m_sprayLossThreshold2 = kThresholds[1];
+        sender.hw->m_sprayLossThreshold3 = kThresholds[2];
+        sender.hw->m_sprayLossIntervalNs = kInterval;
+        sender.hw->m_spraySenderPoolWeight = 0.5;
+        sender.AddSender(kTestSender, kTestReceiver, 16 * IsolatedHost::kMtu);
+        NS_TEST_ASSERT_MSG_NE(sender.hw->m_senderSpineScores, nullptr, "the host pools");
+        NS_TEST_ASSERT_MSG_EQ(sender.hw->m_spineScores.size(), 1u, "one host's scores");
+        SpineScores& scores = sender.hw->m_spineScores.begin()->second;
+        std::vector<Closed> closed;
+        const SpineScores::LossIntervalCallback record = Recorder(closed);
+        sender.hw->TraceConnectWithoutContext(
+            "SpineLossInterval",
+            Callback<void,
+                     uint64_t,
+                     const std::vector<uint32_t>&,
+                     const std::vector<uint32_t>&,
+                     const std::vector<uint8_t>&>(record));
+
+        Send(scores, 2, 8, 3, 1000);
+        Send(scores, 1, 4, 0, 2000);
+        Send(scores, 2, 1, 0, kInterval + 1000);
+        NS_TEST_EXPECT_MSG_EQ(closed.size(), 1u, "the first send after its end closes it");
+        Send(scores, 0, 1, 0, 3 * kInterval + 1000);
+        std::vector<Closed> expected(2);
+        expected[0].endNs = kInterval;
+        expected[1].endNs = 2 * kInterval;
+        for (Closed& interval : expected)
+        {
+            interval.sent.assign(kSpines, 0);
+            interval.lost.assign(kSpines, 0);
+            interval.grades.assign(kSpines, 3);
+        }
+        expected[0].sent[2] = 8;
+        expected[0].lost[2] = 3;
+        expected[0].grades[2] = 1;
+        expected[0].sent[1] = 4;
+        expected[1].sent[2] = 1;
+        ExpectClosed(closed, expected);
+        Simulator::Destroy();
     }
 
     // The acknowledgement of the send of seq along identification's spine,
