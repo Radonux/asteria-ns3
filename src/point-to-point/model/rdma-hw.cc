@@ -419,6 +419,18 @@ TypeId RdmaHw::GetTypeId (void)
 				MakeUintegerChecker<uint32_t>(
 					static_cast<uint32_t>(GradeScope::PerReceiver),
 					static_cast<uint32_t>(GradeScope::PerConnection)))
+		.AddAttribute("SprayGradeCostSource",
+				"Under LoadBalancing 3 and SprayGradeScope 0, where the values "
+				"the spines are graded on come from: 0=the receiver's estimate "
+				"from its arrivals; 1=simulation only, the switches' own state "
+				"at each close of the grader's interval, read through "
+				"SwitchQueueState once per source leaf, with the absence rule's "
+				"deficit replaced by the paths' configured loss. Default 0.",
+				UintegerValue(static_cast<uint32_t>(GradeCostSource::Estimate)),
+				MakeUintegerAccessor(&RdmaHw::m_sprayGradeCostSource),
+				MakeUintegerChecker<uint32_t>(
+					static_cast<uint32_t>(GradeCostSource::Estimate),
+					static_cast<uint32_t>(GradeCostSource::SwitchQueue)))
 		.AddAttribute("SprayGamma",
 				"Under LoadBalancing 3, the fraction of every spine score a "
 				"report decays. Default 0.25.",
@@ -461,6 +473,12 @@ TypeId RdmaHw::GetTypeId (void)
 				"grader belongs to, else null.",
 				MakeTraceSourceAccessor(&RdmaHw::m_traceSpineReport),
 				"ns3::RdmaHw::SpineReportTracedCallback")
+		.AddTraceSource("SwitchQueueReport",
+				"Under SprayGradeCostSource 1, a receiver graded one source "
+				"leaf's paths: the time, the grader, the source leaf, the "
+				"values read from the switches and the report they earned.",
+				MakeTraceSourceAccessor(&RdmaHw::m_traceSwitchQueueReport),
+				"ns3::RdmaHw::SwitchQueueReportTracedCallback")
 		.AddAttribute("EwmaGain",
 				"Control gain parameter which determines the level of rate decrease",
 				DoubleValue(1.0 / 16),
@@ -679,6 +697,7 @@ TypeId RdmaHw::GetTypeId (void)
 }
 
 RdmaHw::RdmaHw(){
+	m_leaf = SwitchQueueState::kNoLeaf;
 	enable_pcie_pause = true;
 	m_paused_times = 0;
 }
@@ -712,6 +731,10 @@ void RdmaHw::Setup(QpCompleteCallback cb, QpFailureCallback failure_cb){
 			? 1 + SpineReport::GradeBytes(m_spineCount) : 0),
 		"LoadBalancing 3 and only it carries a report on the spines in every "
 		"acknowledgement, its sequence and the grades of SpineCount spines");
+	NS_ABORT_MSG_IF(IsSwitchQueueCost() && (IsPerConnectionGrading() ||
+			!m_switchQueues),
+		"SprayGradeCostSource 1 grades the host's paths from SwitchQueueState "
+		"and needs SprayGradeScope 0");
 	NS_ABORT_MSG_IF(m_sprayOneWayDelay &&
 			(!IsGrading() || IntHeader::mode != IntHeader::TS),
 		"SprayOneWayDelay grades the spines of LoadBalancing 3 by the send "
@@ -1041,6 +1064,44 @@ HostSpineRedirect::Parameters RdmaHw::HostRedirectParameters() const{
 		m_sprayBaseRttNs / 2, m_sprayOneWayDelay};
 }
 
+bool RdmaHw::IsSwitchQueueCost() const{
+	return IsSprayPolicy() && m_sprayGradeCostSource ==
+		static_cast<uint32_t>(GradeCostSource::SwitchQueue);
+}
+
+const SpineReport &RdmaHw::ReportFor(Ptr<RdmaRxQueuePair> q,
+		uint32_t destinationIp){
+	if (IsSwitchQueueCost()){
+		// A sender on this leaf crosses no spine and has no path of its own;
+		// before the first close no leaf has been graded.
+		const uint32_t leaf = m_switchQueues->LeafOf(destinationIp);
+		if (leaf != m_leaf && leaf < m_leafReports.size())
+			return m_leafReports[leaf];
+	}
+	return GraderOf(q).Report();
+}
+
+void RdmaHw::GradeFromSwitchQueues(uint64_t nowNs, const SpineGrader &grader){
+	const std::vector<SpineGrader::SpineInterval> &closed = grader.LastInterval();
+	std::vector<bool> held(closed.size());
+	for (uint32_t k = 0; k < closed.size(); k++)
+		held[k] = closed[k].held;
+	// A path losing as large a share of its packets as an absent spine is
+	// short of the median's is held as that absence would hold it.
+	const double lossHold = 1 - m_sprayAbsenceFractionOfMedian;
+	m_leafReports.resize(m_switchQueues->Leaves());
+	for (uint32_t leaf = 0; leaf < m_leafReports.size(); leaf++){
+		if (leaf == m_leaf)
+			continue;
+		const std::vector<SpineGrader::SpineValues> values =
+			m_switchQueues->PathValues(leaf, m_leaf, m_sprayOneWayDelay);
+		SpineReport report = grader.Graded(values, held, lossHold);
+		report.edgeCongested |= grader.LastIntervalLastHopTrims() > 0;
+		m_leafReports[leaf] = report;
+		m_traceSwitchQueueReport(nowNs, grader, leaf, values, report);
+	}
+}
+
 bool RdmaHw::IsPerConnectionGrading() const{
 	return IsSprayPolicy() &&
 		m_sprayGradeScope == static_cast<uint32_t>(GradeScope::PerConnection);
@@ -1077,7 +1138,10 @@ SpineGrader::Parameters RdmaHw::GraderParameters() const{
 	parameters.delayThresholdsNs[2] = m_sprayDelayThreshold3BaseRtts * rtt;
 	parameters.reference =
 		static_cast<SpineGrader::GradeReference>(m_sprayGradeReference);
-	parameters.absenceFractionOfMedian = m_sprayAbsenceFractionOfMedian;
+	// Under the switches' state the paths' loss stands in for the deficit of
+	// arrivals, so arrivals hold no spine for their absence.
+	parameters.absenceFractionOfMedian =
+		IsSwitchQueueCost() ? 0 : m_sprayAbsenceFractionOfMedian;
 	parameters.absenceMinimumMedian = m_sprayAbsenceMinimumMedian;
 	parameters.releaseFractionOfFloor = m_sprayReleaseFractionOfFloor;
 	// A held spine is drawn at epsilon / N and a top-graded one at about 1 / N.
@@ -1110,6 +1174,8 @@ SpineGrader &RdmaHw::GraderNow(Ptr<RdmaRxQueuePair> q){
 			IsPerConnectionGrading() ? PeekPointer(q) : nullptr);
 		if (IsHostRedirect())
 			m_hostRedirect.OnClose(grader.LastInterval(), HostRedirectParameters());
+		if (IsSwitchQueueCost())
+			GradeFromSwitchQueues(now, grader);
 	}
 	return grader;
 }
@@ -1152,7 +1218,7 @@ void RdmaHw::SendAck(Ptr<RdmaRxQueuePair> q, uint32_t sourceIp,
 		seqh.SetProbeAnswer();
 	seqh.SetAllowanceExhausted(spent);
 	if (IsSprayPolicy())
-		seqh.SetSpineReport(GraderOf(q).Report());
+		seqh.SetSpineReport(ReportFor(q, destinationIp));
 	seqh.SetRedirect(redirect);
 	// The grant is this flag without the report above. A receiver that may not
 	// forgive this flow, or a step that is critical, never sets it, so those
@@ -1399,7 +1465,7 @@ void RdmaHw::SendTrimNack(Ptr<RdmaRxQueuePair> q, const CustomHeader &ch,
 	// with no budget at all also sends one.
 	repair.SetForgivenessEligible(eligible);
 	if (IsSprayPolicy())
-		repair.SetSpineReport(GraderOf(q).Report());
+		repair.SetSpineReport(ReportFor(q, destinationIp));
 	Ptr<Packet> packet = Create<Packet>(
 		std::max(60 - 14 - 20 - static_cast<int>(repair.GetSerializedSize()), 0));
 	packet->AddHeader(repair);

@@ -4,6 +4,7 @@
 #include "spine-report.h"
 #include <stdint.h>
 #include <array>
+#include <optional>
 #include <vector>
 
 namespace ns3 {
@@ -114,7 +115,25 @@ public:
 		bool held = false;
 	};
 
+	// What the grade rule takes of one spine: the marked and the trimmed
+	// fraction, the delay above the spine's least, and the fraction of its
+	// packets lost without a trim.
+	struct SpineValues {
+		double markFraction = 0;
+		double trimFraction = 0;
+		double delayNs = 0;
+		double lossFraction = 0;
+	};
+
 	explicit SpineGrader(const Parameters &parameters);
+	// The grades and edge bit the grade rule gives spines with these values,
+	// a spine graded 0 if held says so. With lossHold the loss fraction is
+	// graded too: its excess over the median spine's costs a grade as the
+	// marked and trimmed fractions' do, and a spine whose loss fraction
+	// reaches lossHold is graded 0. The edge bit here is set only when no
+	// spine earns the top grade; the report's sequence is the latest's.
+	SpineReport Graded(const std::vector<SpineValues> &values,
+		const std::vector<bool> &held, std::optional<double> lossHold) const;
 	// Close the interval in progress if it has ended by now and issue the
 	// report; true if one was issued. Called before each event is counted.
 	bool Advance(uint64_t nowNs);

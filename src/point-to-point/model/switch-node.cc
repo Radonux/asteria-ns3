@@ -535,6 +535,22 @@ const SwitchPortCounters &SwitchNode::GetPortCounters(uint32_t port) const{
 	return m_portCounters[port];
 }
 
+bool SwitchNode::IsBlackholed(uint32_t port) const{
+	return port < m_blackholed.size() && m_blackholed[port];
+}
+
+bool SwitchNode::IsEcnEnabled() const{
+	return m_ecnEnabled;
+}
+
+uint32_t SwitchNode::DataQueueBytes(uint32_t port) const{
+	uint32_t bytes = 0;
+	for (uint32_t q = 1; q < SwitchMmu::qCnt; q++)
+		if (q != m_trimmedQueueIndex)
+			bytes += m_mmu->egress_bytes[port][q];
+	return bytes;
+}
+
 void SwitchNode::SetBlackhole(uint32_t port){
 	if (m_blackholed.size() <= port)
 		m_blackholed.resize(port + 1, false);

@@ -126,38 +126,73 @@ void SpineGrader::Close(uint64_t nowNs){
 		delays[k] = spine.delayNs.Value();
 	}
 	JudgeWindow();
+	std::vector<SpineValues> values(spines);
+	std::vector<bool> held(spines);
+	for (uint32_t k = 0; k < spines; k++){
+		values[k].markFraction = marks[k];
+		values[k].trimFraction = trims[k];
+		values[k].delayNs = delays[k];
+		held[k] = m_spines[k].held;
+	}
+	// The receiver's arrivals measure no loss apart from absence, which holds
+	// a spine through JudgeWindow.
+	const SpineReport graded = Graded(values, held, std::nullopt);
+	for (uint32_t k = 0; k < spines; k++){
+		SpineInterval &counted = m_spines[k].counting;
+		counted.markFraction = marks[k];
+		counted.trimFraction = trims[k];
+		counted.delayNs = delays[k];
+		counted.held = held[k];
+		m_lastInterval[k] = counted;
+		counted = SpineInterval{};
+	}
+	std::copy_n(graded.grades, SpineReport::kMaxSpines / 4, m_report.grades);
+	// Every spine's packets cross the receiver's downlink, so congestion there
+	// shows on all of them at once and on none more than another.
+	m_report.edgeCongested = m_lastHopTrims > 0 || graded.edgeCongested;
+	m_report.sequence++;
+	m_lastIntervalLastHopTrims = m_lastHopTrims;
+	m_lastHopTrims = 0;
+}
+
+SpineReport SpineGrader::Graded(const std::vector<SpineValues> &values,
+		const std::vector<bool> &held, std::optional<double> lossHold) const{
+	const uint32_t spines = values.size();
+	std::array<double, SpineReport::kMaxSpines> marks{}, trims{}, delays{},
+		losses{};
+	for (uint32_t k = 0; k < spines; k++){
+		marks[k] = values[k].markFraction;
+		trims[k] = values[k].trimFraction;
+		delays[k] = values[k].delayNs;
+		losses[k] = values[k].lossFraction;
+	}
 	// Spines alike all earn the top grade against their median, so the
 	// median reference, unlike a rank, has no loser on a healthy fabric.
 	const bool median = m_parameters.reference == GradeReference::Median;
 	const double markReference = median ? Median(marks) : 0;
 	const double trimReference = median ? Median(trims) : 0;
 	const double delayReference = median ? Median(delays) : 0;
+	const double lossReference = median ? Median(losses) : 0;
+	SpineReport report = m_report;
 	bool everySpineBelowTop = true;
 	for (uint32_t k = 0; k < spines; k++){
-		Spine &spine = m_spines[k];
-		SpineInterval &counted = spine.counting;
 		// A trimmed packet and a marked one both met a queue past a threshold,
 		// so whichever kind stands out more is the spine's congestion; adding
-		// them would count one queue twice.
-		everySpineBelowTop &= Earned(std::max(marks[k], trims[k]), delays[k]) <
-			SpineReport::kTopGrade;
-		const uint8_t earned = Earned(
-			std::max(marks[k] - markReference, trims[k] - trimReference),
-			delays[k] - delayReference);
-		counted.markFraction = marks[k];
-		counted.trimFraction = trims[k];
-		counted.delayNs = delays[k];
-		counted.held = spine.held;
-		m_report.SetGrade(k, counted.held ? 0 : earned);
-		m_lastInterval[k] = counted;
-		counted = SpineInterval{};
+		// them would count one queue twice. A lost packet is a third such
+		// kind.
+		double absolute = std::max(marks[k], trims[k]);
+		double cost = std::max(marks[k] - markReference, trims[k] - trimReference);
+		if (lossHold){
+			absolute = std::max(absolute, losses[k]);
+			cost = std::max(cost, losses[k] - lossReference);
+		}
+		everySpineBelowTop &= Earned(absolute, delays[k]) < SpineReport::kTopGrade;
+		const bool lossHeld = lossHold && losses[k] >= *lossHold;
+		report.SetGrade(k, held[k] || lossHeld ? 0 : Earned(cost, delays[k] -
+			delayReference));
 	}
-	// Every spine's packets cross the receiver's downlink, so congestion there
-	// shows on all of them at once and on none more than another.
-	m_report.edgeCongested = m_lastHopTrims > 0 || everySpineBelowTop;
-	m_report.sequence++;
-	m_lastIntervalLastHopTrims = m_lastHopTrims;
-	m_lastHopTrims = 0;
+	report.edgeCongested = everySpineBelowTop;
+	return report;
 }
 
 void SpineGrader::JudgeWindow(){

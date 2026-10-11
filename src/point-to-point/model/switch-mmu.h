@@ -36,6 +36,9 @@ public:
 	uint32_t GetSharedUsed(uint32_t port, uint32_t qIndex);
 
 	bool ShouldSendCN(uint32_t ifindex, uint32_t qIndex);
+	// The probability ShouldSendCN marks a packet leaving port with bytes in
+	// its queue: 0 up to kmin, pmax at kmax, linear between, 1 above kmax.
+	double MarkingProbability(uint32_t port, uint32_t bytes) const;
 
 	// markingStream is the ns-3 stream the port's marking draws come from.
 	void ConfigEcn(uint32_t port, uint32_t _kmin, uint32_t _kmax, double _pmax,
