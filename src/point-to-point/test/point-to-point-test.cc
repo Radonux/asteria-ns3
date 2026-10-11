@@ -7223,6 +7223,7 @@ class SwitchQueueStateTest : public TestCase
         Marking();
         TwoHops();
         Loss();
+        ReverseLoss();
         Simulator::Destroy();
     }
 
@@ -7307,6 +7308,59 @@ class SwitchQueueStateTest : public TestCase
         NS_TEST_EXPECT_MSG_EQ(fromZero[3].lossFraction, 1.0, "a silent port loses everything");
         NS_TEST_EXPECT_MSG_EQ(fromOne[3].lossFraction, 1.0, "on every path through it");
         NS_TEST_EXPECT_MSG_EQ(fromZero[0].lossFraction, 0.0, "the others lose nothing");
+        // From the receiver's leaf both faults sit on the hops back.
+        const auto fromTwo = fabric.state->PathValues(2, 0, false);
+        NS_TEST_EXPECT_MSG_EQ_TOL(fromTwo[2].lossFraction,
+                                  0.01,
+                                  1e-12,
+                                  "the gray hop drops the ACK coming back");
+        NS_TEST_EXPECT_MSG_EQ(fromTwo[3].lossFraction, 1.0, "and the silent port does too");
+        NS_TEST_EXPECT_MSG_EQ(fromTwo[0].lossFraction, 0.0, "the others lose nothing back");
+    }
+
+    // The ACK returns through the spine that carried the packet, over the
+    // destination leaf's uplink and the spine's downlink to the source leaf.
+    void ReverseLoss()
+    {
+        {
+            SwitchQueueFabric fabric;
+            // The receiver's leaf's uplink to spine 1 silent.
+            fabric.spines[1]->SetBlackhole(fabric.downlink[1][2]);
+            // Its uplink to spine 1 queued above kmax.
+            fabric.QueueUp(2, 1, 400001);
+            const auto fromZero = fabric.state->PathValues(0, 2, false);
+            NS_TEST_EXPECT_MSG_EQ(fromZero[1].lossFraction,
+                                  1.0,
+                                  "a silent reverse hop loses every ACK");
+            NS_TEST_EXPECT_MSG_EQ(fromZero[1].markFraction,
+                                  0.0,
+                                  "the marked fraction is the forward hops' only");
+            for (uint32_t k : {0u, 2u, 3u})
+            {
+                NS_TEST_EXPECT_MSG_EQ(fromZero[k].lossFraction, 0.0, "the other spines lose nothing");
+            }
+        }
+        {
+            SwitchQueueFabric fabric;
+            // Five percent lost each way on the sender's leaf's link to spine 3.
+            const double e = 0.05;
+            for (const auto& [sw, port] :
+                 {std::make_pair(fabric.spines[3], fabric.downlink[3][0]),
+                  std::make_pair(fabric.leaves[0], fabric.uplink[0][3])})
+            {
+                Ptr<RateErrorModel> gray = CreateObject<RateErrorModel>();
+                gray->SetAttribute("ErrorUnit", StringValue("ERROR_UNIT_PACKET"));
+                gray->SetRate(e);
+                SwitchQueueFabric::Device(sw, port)->SetAttribute("LinkErrorModel",
+                                                                  PointerValue(gray));
+            }
+            const auto fromZero = fabric.state->PathValues(0, 2, false);
+            NS_TEST_EXPECT_MSG_EQ_TOL(fromZero[3].lossFraction,
+                                      1 - (1 - e) * (1 - e),
+                                      1e-12,
+                                      "the packet and its ACK each cross the lossy link");
+            NS_TEST_EXPECT_MSG_EQ(fromZero[0].lossFraction, 0.0, "the other spines lose nothing");
+        }
     }
 };
 
