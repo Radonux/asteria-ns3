@@ -161,6 +161,9 @@ uint32_t spray_estimator_interval_samples = 32;
 double spray_fraction_cusum_slack = 0.125;
 double spray_fraction_cusum_threshold = 0.5;
 double spray_congestion_thresholds[3] = {0.25, 0.5, 0.75};
+// Zero, unless SPRAY_TRIM_THRESHOLDS is given: the trimmed fraction is graded
+// through spray_congestion_thresholds.
+double spray_trim_thresholds[3] = {0, 0, 0};
 double spray_absence_fraction_of_median = 0.125;
 uint32_t spray_absence_minimum_median = 16;
 double spray_release_fraction_of_floor = 0.5;
@@ -183,7 +186,8 @@ double spray_sender_pool_weight = 0;
 const std::set<std::string> spray_policy_keys = {
     "SPRAY_REPORT_INTERVAL_BASE_RTTS", "SPRAY_ESTIMATOR_GAIN",
     "SPRAY_FRACTION_CUSUM_SLACK", "SPRAY_FRACTION_CUSUM_THRESHOLD",
-    "SPRAY_CONGESTION_THRESHOLDS", "SPRAY_RELEASE_FRACTION_OF_FLOOR",
+    "SPRAY_CONGESTION_THRESHOLDS", "SPRAY_TRIM_THRESHOLDS",
+    "SPRAY_RELEASE_FRACTION_OF_FLOOR",
     "SPRAY_ONE_WAY_DELAY", "SPRAY_DELAY_CUSUM_SLACK_BASE_RTTS",
     "SPRAY_DELAY_CUSUM_THRESHOLD_BASE_RTTS", "SPRAY_DELAY_THRESHOLDS_BASE_RTTS",
     "SPRAY_GAMMA", "SPRAY_EPSILON", "SPRAY_CANDIDATES", "SPRAY_CANDIDATE_DRAW",
@@ -1198,6 +1202,12 @@ bool valid_spray_policy() {
                  "fractions in (0, 1]\n";
     return false;
   }
+  if (spray_policy_keys_given.count("SPRAY_TRIM_THRESHOLDS") > 0 &&
+      (!increasing(spray_trim_thresholds) || spray_trim_thresholds[2] > 1)) {
+    std::cerr << "SPRAY_TRIM_THRESHOLDS must be three increasing "
+                 "fractions in (0, 1]\n";
+    return false;
+  }
   if (!increasing(spray_delay_thresholds_base_rtts)) {
     std::cerr << "SPRAY_DELAY_THRESHOLDS_BASE_RTTS must be three increasing "
                  "positive numbers\n";
@@ -1475,6 +1485,9 @@ bool ReadConf(string network_configuration) {
     } else if (key.compare("SPRAY_CONGESTION_THRESHOLDS") == 0) {
       conf >> spray_congestion_thresholds[0] >>
           spray_congestion_thresholds[1] >> spray_congestion_thresholds[2];
+    } else if (key.compare("SPRAY_TRIM_THRESHOLDS") == 0) {
+      conf >> spray_trim_thresholds[0] >> spray_trim_thresholds[1] >>
+          spray_trim_thresholds[2];
     } else if (key.compare("SPRAY_RELEASE_FRACTION_OF_FLOOR") == 0) {
       conf >> spray_release_fraction_of_floor;
     } else if (key.compare("SPRAY_ONE_WAY_DELAY") == 0) {
@@ -2353,6 +2366,12 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),
                            DoubleValue(spray_congestion_thresholds[1]));
       rdmaHw->SetAttribute("SprayCongestionThreshold3",
                            DoubleValue(spray_congestion_thresholds[2]));
+      rdmaHw->SetAttribute("SprayTrimThreshold1",
+                           DoubleValue(spray_trim_thresholds[0]));
+      rdmaHw->SetAttribute("SprayTrimThreshold2",
+                           DoubleValue(spray_trim_thresholds[1]));
+      rdmaHw->SetAttribute("SprayTrimThreshold3",
+                           DoubleValue(spray_trim_thresholds[2]));
       rdmaHw->SetAttribute("SprayReleaseFractionOfFloor",
                            DoubleValue(spray_release_fraction_of_floor));
       rdmaHw->SetAttribute("SprayOneWayDelay",

@@ -7,7 +7,8 @@ namespace ns3 {
 namespace {
 
 // 3 below the first threshold, 2 below the second, 1 below the third, else 0.
-uint8_t Quantize(double value, const double (&thresholds)[3]){
+template <typename Thresholds>
+uint8_t Quantize(double value, const Thresholds &thresholds){
 	for (uint8_t i = 0; i < 3; i++){
 		if (value < thresholds[i])
 			return SpineReport::kTopGrade - i;
@@ -180,16 +181,26 @@ SpineReport SpineGrader::Graded(const std::vector<SpineValues> &values,
 		// so whichever kind stands out more is the spine's congestion; adding
 		// them would count one queue twice. A lost packet is a third such
 		// kind.
+		// Each kind is graded through its own thresholds and the lowest grade
+		// stands; through the same thresholds that is the larger cost's grade.
+		const double (&thresholds)[3] = m_parameters.congestionThresholds;
 		double absolute = std::max(marks[k], trims[k]);
-		double cost = std::max(marks[k] - markReference, trims[k] - trimReference);
+		const double trimCost = trims[k] - trimReference;
+		uint8_t byCongestion = std::min(
+			Quantize(marks[k] - markReference, thresholds),
+			m_parameters.trimThresholds ?
+				Quantize(trimCost, *m_parameters.trimThresholds) :
+				Quantize(trimCost, thresholds));
 		if (lossHold){
 			absolute = std::max(absolute, losses[k]);
-			cost = std::max(cost, losses[k] - lossReference);
+			byCongestion = std::min(byCongestion,
+				Quantize(losses[k] - lossReference, thresholds));
 		}
-		everySpineBelowTop &= Earned(absolute, delays[k]) < SpineReport::kTopGrade;
+		everySpineBelowTop &= Earned(Quantize(absolute, thresholds), delays[k]) <
+			SpineReport::kTopGrade;
 		const bool lossHeld = lossHold && losses[k] >= *lossHold;
-		report.SetGrade(k, held[k] || lossHeld ? 0 : Earned(cost, delays[k] -
-			delayReference));
+		report.SetGrade(k, held[k] || lossHeld ? 0 : Earned(byCongestion,
+			delays[k] - delayReference));
 	}
 	report.edgeCongested = everySpineBelowTop;
 	return report;
@@ -221,9 +232,7 @@ void SpineGrader::JudgeWindow(){
 	}
 }
 
-uint8_t SpineGrader::Earned(double congestionCost, double delayCostNs) const{
-	const uint8_t byCongestion =
-		Quantize(congestionCost, m_parameters.congestionThresholds);
+uint8_t SpineGrader::Earned(uint8_t byCongestion, double delayCostNs) const{
 	if (byCongestion < SpineReport::kTopGrade || !m_parameters.oneWayDelay)
 		return byCongestion;
 	return Quantize(delayCostNs, m_parameters.delayThresholdsNs);

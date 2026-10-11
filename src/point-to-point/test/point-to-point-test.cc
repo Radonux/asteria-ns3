@@ -4221,6 +4221,185 @@ class SpineTrimCostTest : public TestCase
     }
 };
 
+class SpineTrimThresholdsTest : public TestCase
+{
+  public:
+    SpineTrimThresholdsTest()
+        : TestCase("Trim thresholds grade the trimmed fraction alone, unset they are the "
+                   "congestion thresholds, and the edge bit and absence keep theirs")
+    {
+    }
+
+    void DoRun() override
+    {
+        Unset();
+        Lower();
+        EdgeAndAbsence();
+    }
+
+  private:
+    // Trim thresholds below the default congestion thresholds.
+    static constexpr std::array<double, 3> kLow = {0.05, 0.1, 0.15};
+
+    static SpineGrader::SpineValues Values(double marked, double trimmed, double lost = 0)
+    {
+        return {marked, trimmed, 0, lost};
+    }
+
+    // Four intervals of 100 arrivals per spine, spine k marking and trimming
+    // its share of the pattern; the report after each interval.
+    static std::vector<SpineReport> Run(const SpineGrader::Parameters& parameters)
+    {
+        const uint32_t marked[GraderFixture::kSpines] = {0, 30, 0, 30, 60, 10, 80, 20};
+        const uint32_t trims[GraderFixture::kSpines] = {0, 0, 30, 60, 30, 80, 10, 20};
+        SpineGrader grader(parameters);
+        std::vector<SpineReport> reports;
+        for (uint32_t interval = 0; interval < 4; ++interval)
+        {
+            grader.Advance(interval * GraderFixture::kInterval);
+            for (uint32_t spine = 0; spine < GraderFixture::kSpines; ++spine)
+            {
+                for (uint32_t i = 0; i < 100; ++i)
+                {
+                    grader.OnArrival(spine, spine, i < marked[spine], 0);
+                }
+                for (uint32_t i = 0; i < trims[spine]; ++i)
+                {
+                    grader.OnTrim(spine, false);
+                }
+            }
+            grader.Advance((interval + 1) * GraderFixture::kInterval);
+            reports.push_back(grader.Report());
+        }
+        return reports;
+    }
+
+    // Unset, a spine grades by the larger of its marked and trimmed
+    // fractions through the congestion thresholds, as with trim thresholds
+    // equal to them.
+    void Unset()
+    {
+        SpineGrader grader(GraderFixture::Absolute());
+        const std::vector<SpineGrader::SpineValues> values = {Values(0, 0),
+                                                              Values(0.3, 0),
+                                                              Values(0, 0.3),
+                                                              Values(0.3, 0.6),
+                                                              Values(0.6, 0.3),
+                                                              Values(0.1, 0.8),
+                                                              Values(0.8, 0.1),
+                                                              Values(0.2, 0.2)};
+        const uint32_t expected[GraderFixture::kSpines] = {3, 2, 2, 1, 1, 0, 0, 3};
+        const std::vector<bool> held(GraderFixture::kSpines, false);
+        const SpineReport report = grader.Graded(values, held, std::nullopt);
+        for (uint32_t k = 0; k < GraderFixture::kSpines; ++k)
+        {
+            NS_TEST_EXPECT_MSG_EQ(uint32_t(report.Grade(k)),
+                                  expected[k],
+                                  "unset, the larger fraction grades through the congestion "
+                                  "thresholds");
+        }
+        for (auto reference :
+             {SpineGrader::GradeReference::Absolute, SpineGrader::GradeReference::Median})
+        {
+            SpineGrader::Parameters unset = GraderFixture::Defaults();
+            unset.reference = reference;
+            SpineGrader::Parameters same = unset;
+            same.trimThresholds = std::array<double, 3>{same.congestionThresholds[0],
+                                                        same.congestionThresholds[1],
+                                                        same.congestionThresholds[2]};
+            const std::vector<SpineReport> a = Run(unset);
+            const std::vector<SpineReport> b = Run(same);
+            for (uint32_t i = 0; i < a.size(); ++i)
+            {
+                NS_TEST_EXPECT_MSG_EQ(a[i].edgeCongested,
+                                      b[i].edgeCongested,
+                                      "the same edge bit");
+                for (uint32_t k = 0; k < GraderFixture::kSpines; ++k)
+                {
+                    NS_TEST_EXPECT_MSG_EQ(uint32_t(a[i].Grade(k)),
+                                          uint32_t(b[i].Grade(k)),
+                                          "trim thresholds equal to the congestion thresholds "
+                                          "are the unset rule");
+                }
+            }
+        }
+    }
+
+    // Lower trim thresholds grade a small trimmed fraction down, and leave
+    // the marked fraction, and a loss fraction, on the congestion thresholds.
+    void Lower()
+    {
+        const std::vector<SpineGrader::SpineValues> values = {Values(0, 0),
+                                                              Values(0, 0.08),
+                                                              Values(0, 0.12),
+                                                              Values(0, 0.2),
+                                                              Values(0.3, 0),
+                                                              Values(0.6, 0),
+                                                              Values(0.3, 0.12),
+                                                              Values(0, 0, 0.08)};
+        const uint32_t before[GraderFixture::kSpines] = {3, 3, 3, 3, 2, 1, 2, 3};
+        const uint32_t after[GraderFixture::kSpines] = {3, 2, 1, 0, 2, 1, 1, 3};
+        const std::vector<bool> held(GraderFixture::kSpines, false);
+        SpineGrader::Parameters parameters = GraderFixture::Absolute();
+        const SpineReport unset =
+            SpineGrader(parameters).Graded(values, held, std::optional(0.875));
+        parameters.trimThresholds = kLow;
+        const SpineReport low = SpineGrader(parameters).Graded(values, held, std::optional(0.875));
+        for (uint32_t k = 0; k < GraderFixture::kSpines; ++k)
+        {
+            NS_TEST_EXPECT_MSG_EQ(uint32_t(unset.Grade(k)), before[k], "the congestion thresholds");
+            NS_TEST_EXPECT_MSG_EQ(uint32_t(low.Grade(k)),
+                                  after[k],
+                                  "the trim thresholds grade the trimmed fraction alone");
+        }
+    }
+
+    // Lower trim thresholds leave the edge bit on the congestion thresholds
+    // and on last-hop trims, and a silent spine held.
+    void EdgeAndAbsence()
+    {
+        SpineGrader::Parameters parameters = GraderFixture::Absolute();
+        parameters.trimThresholds = kLow;
+        const std::vector<SpineGrader::SpineValues> values(GraderFixture::kSpines,
+                                                           Values(0, 0.08));
+        const std::vector<bool> held(GraderFixture::kSpines, false);
+        const SpineReport graded = SpineGrader(parameters).Graded(values, held, std::nullopt);
+        NS_TEST_EXPECT_MSG_EQ(uint32_t(graded.Grade(0)), 2u, "every spine grades down");
+        NS_TEST_EXPECT_MSG_EQ(graded.edgeCongested,
+                              false,
+                              "while the congestion thresholds give each the top grade");
+
+        SpineGrader grader(parameters);
+        GraderFixture::Interval(grader, 0, std::vector<double>(GraderFixture::kSpines, 0));
+        NS_TEST_EXPECT_MSG_EQ(grader.Report().edgeCongested, false, "a clean interval");
+        grader.OnArrival(0, 0, false, 0);
+        grader.OnTrim(0, true);
+        NS_TEST_ASSERT_MSG_EQ(grader.Advance(2 * GraderFixture::kInterval), true, "a report");
+        NS_TEST_EXPECT_MSG_EQ(grader.Report().edgeCongested, true, "a last-hop trim");
+
+        SpineGrader absent(parameters);
+        std::mt19937 random(11);
+        std::uniform_int_distribution<uint32_t> spine(0, GraderFixture::kSpines - 1);
+        for (uint32_t interval = 0; interval < 20; ++interval)
+        {
+            absent.Advance(interval * GraderFixture::kInterval);
+            for (uint32_t i = 0; i < 300; ++i)
+            {
+                const uint8_t k = spine(random);
+                if (k != 5 || interval < 10)
+                {
+                    absent.OnArrival(k, k, false, 0);
+                }
+            }
+            absent.Advance((interval + 1) * GraderFixture::kInterval);
+            NS_TEST_EXPECT_MSG_EQ(uint32_t(absent.Report().Grade(5)),
+                                  (interval < 10) ? 3u : 0u,
+                                  "a silent spine is held");
+            NS_TEST_EXPECT_MSG_EQ(uint32_t(absent.Report().Grade(4)), 3u, "and no other");
+        }
+    }
+};
+
 class SpineDelayReferenceTest : public TestCase
 {
   public:
@@ -6887,6 +7066,7 @@ PointToPointTestSuite::PointToPointTestSuite()
     AddTestCase(new SpineAttributionTest, TestCase::Duration::QUICK);
     AddTestCase(new SpineGradeTest, TestCase::Duration::QUICK);
     AddTestCase(new SpineTrimCostTest, TestCase::Duration::QUICK);
+    AddTestCase(new SpineTrimThresholdsTest, TestCase::Duration::QUICK);
     AddTestCase(new SpineGradeReferenceTest, TestCase::Duration::QUICK);
     AddTestCase(new SpineDelayReferenceTest, TestCase::Duration::QUICK);
     AddTestCase(new SpineAbsenceTest, TestCase::Duration::QUICK);

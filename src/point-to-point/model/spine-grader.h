@@ -59,8 +59,11 @@ private:
 // first threshold grades the spine by it alone, and otherwise the delay cost,
 // where delay is measured, grades it. Under the absolute reference a cost is
 // the average itself; under the median reference it is the average's excess
-// over the median of the spines' averages. The congestion cost is the larger
-// of the marked and the trimmed fraction's costs.
+// over the median of the spines' averages. The congestion grade is the lower
+// of the grades the marked fraction's cost earns through the congestion
+// thresholds and the trimmed fraction's cost earns through the trim
+// thresholds, which are the congestion thresholds unless set apart; with the
+// same thresholds for both it is the grade of the larger cost.
 //
 // A held spine grades 0 whatever its costs. A moved packet holds the spine it
 // was requested on at once. Arrivals are counted per spine over a window of
@@ -70,7 +73,7 @@ private:
 // exploration floor sends it, a share of the median's, is released.
 // The edge bit is set when the receiver's own downlink trimmed a packet in the
 // interval, or when no spine's averages earn it the top grade under the
-// absolute reference.
+// absolute reference, every average graded through the congestion thresholds.
 class SpineGrader {
 public:
 	enum class GradeReference : uint32_t {
@@ -86,6 +89,9 @@ public:
 		SupervisedEwma::Parameters fractions;
 		// The congestion costs from which a spine grades 2, 1 and 0.
 		double congestionThresholds[3];
+		// The trimmed fraction's costs from which a spine grades 2, 1 and 0;
+		// unset, the congestion thresholds.
+		std::optional<std::array<double, 3>> trimThresholds;
 		bool oneWayDelay;
 		SupervisedEwma::Parameters delayNs;
 		// The delays above a spine's least from which it grades 2, 1 and 0.
@@ -163,8 +169,8 @@ private:
 	// hold or release each spine by its count.
 	void JudgeWindow();
 	void Close(uint64_t nowNs);
-	// The grade a spine's congestion and delay costs earn it.
-	uint8_t Earned(double congestionCost, double delayCostNs) const;
+	// The grade a spine's congestion grade and delay cost earn it.
+	uint8_t Earned(uint8_t byCongestion, double delayCostNs) const;
 	// The median of the first spines values.
 	double Median(std::array<double, SpineReport::kMaxSpines> values) const;
 
