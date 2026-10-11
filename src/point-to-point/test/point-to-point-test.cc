@@ -1691,16 +1691,19 @@ class IsolatedHost
 
     // A sender queue pair as AddQueuePair registers it, without the NIC's
     // scheduler, which no test here drives.
-    Ptr<RdmaQueuePair> AddSender(Ipv4Address self, Ipv4Address peer, uint64_t size)
+    Ptr<RdmaQueuePair> AddSender(Ipv4Address self,
+                                 Ipv4Address peer,
+                                 uint64_t size,
+                                 uint16_t port = kSenderPort)
     {
         Ptr<RdmaQueuePair> qp =
-            CreateObject<RdmaQueuePair>(kPriorityGroup, self, peer, kSenderPort, kReceiverPort);
+            CreateObject<RdmaQueuePair>(kPriorityGroup, self, peer, port, kReceiverPort);
         qp->m_size = size;
         if (hw->IsPathPerPacket())
         {
             hw->StartPathSelection(qp, 0, 0);
         }
-        hw->m_qpMap[RdmaHw::GetQpKey(peer.Get(), kSenderPort, kPriorityGroup)] = qp;
+        hw->m_qpMap[RdmaHw::GetQpKey(peer.Get(), port, kPriorityGroup)] = qp;
         return qp;
     }
 
@@ -1710,7 +1713,8 @@ class IsolatedHost
                      Ipv4Address to,
                      uint32_t seq,
                      uint16_t identification,
-                     bool marked = false)
+                     bool marked = false,
+                     uint16_t senderPort = kSenderPort)
     {
         Ptr<Packet> packet = Create<Packet>(kMtu);
         SeqTsHeader seqTs;
@@ -1718,7 +1722,7 @@ class IsolatedHost
         seqTs.SetPG(kPriorityGroup);
         packet->AddHeader(seqTs);
         UdpHeader udp;
-        udp.SetSourcePort(kSenderPort);
+        udp.SetSourcePort(senderPort);
         udp.SetDestinationPort(kReceiverPort);
         udp.ForcePayloadSize(CustomHeader::GetUdpHeaderSize() + kMtu);
         packet->AddHeader(udp);
@@ -5025,6 +5029,256 @@ class SprayPolicyDefaultsTest : public TestCase
                               static_cast<uint32_t>(SpineScores::CandidateDraw::Proportional),
                               "drawn in proportion");
         NS_TEST_EXPECT_MSG_EQ(hw->m_sprayOneWayDelay, false, "no one-way delay");
+        NS_TEST_EXPECT_MSG_EQ(hw->m_sprayGradeScope,
+                              static_cast<uint32_t>(GradeScope::PerReceiver),
+                              "one grader per receiving host");
+    }
+};
+
+class GradeScopeTest : public TestCase
+{
+  public:
+    GradeScopeTest()
+        : TestCase("Under grade scope per_connection a receive queue pair grades the spines from "
+                   "its own arrivals and a sending queue pair keeps its own scores")
+    {
+    }
+
+    void DoRun() override
+    {
+        const bool savedPacketSeq = CustomHeader::ackCarriesPacketSeq;
+        const uint32_t savedReportBytes = CustomHeader::ackReportBytes;
+        CustomHeader::ackCarriesPacketSeq = true;
+        CustomHeader::ackReportBytes = 1 + SpineReport::GradeBytes(kSpines);
+        OneConnection();
+        TwoConnections();
+        SenderScores();
+        CustomHeader::ackReportBytes = savedReportBytes;
+        CustomHeader::ackCarriesPacketSeq = savedPacketSeq;
+    }
+
+  private:
+    static constexpr uint32_t kSpines = 8;
+    static constexpr uint64_t kBaseRtt = 10000;
+    static constexpr uint16_t kOtherPort = 10002;
+
+    // What a receiver under scope emits for four intervals of arrivals over
+    // every spine from each of ports, spine 2 marked on the first port's
+    // packets, spine 5 trimmed once per interval on each port's.
+    static std::vector<CustomHeader> Answers(GradeScope scope, std::vector<uint16_t> ports)
+    {
+        IsolatedHost receiver(LoadBalancingMode::SprayPolicy, kTestSender, kSpines);
+        // Node 1, whose intervals start at a phase of their own.
+        CreateObject<Node>();
+        Ptr<Node> node = CreateObject<Node>();
+        receiver.hw->SetNode(node);
+        receiver.hw->m_sprayBaseRttNs = kBaseRtt;
+        receiver.hw->m_sprayGradeScope = static_cast<uint32_t>(scope);
+        const uint64_t interval = receiver.hw->SprayReportIntervalNs();
+        const uint64_t phase = std::fmod(node->GetId() * 0.6180339887498949, 1.0) * interval;
+        std::map<uint16_t, uint32_t> seq;
+        // Spread over each interval, so that an interval closing at another
+        // phase would split them differently.
+        for (uint32_t i = 0; i < 4; ++i)
+        {
+            for (uint32_t j = 0; j < 8; ++j)
+            {
+                Simulator::Schedule(NanoSeconds(phase + i * interval + 1 + j * interval / 9),
+                                    [&, i, j]() {
+                                        for (uint16_t port : ports)
+                                        {
+                                            Deliver(receiver, seq[port], port, i, j, ports);
+                                        }
+                                    });
+            }
+        }
+        Simulator::Run();
+        Simulator::Destroy();
+        return receiver.emitted;
+    }
+
+    // The j-th of eight packets per spine in interval i on the connection from
+    // port, spine 2 marked on the first port's; in the first three intervals
+    // every spine and a trim on spine 5, in the fourth spine 0 only.
+    static void Deliver(IsolatedHost& receiver,
+                        uint32_t& seq,
+                        uint16_t port,
+                        uint32_t i,
+                        uint32_t j,
+                        const std::vector<uint16_t>& ports)
+    {
+        for (uint8_t spine = 0; spine < kSpines && (i < 3 || spine == 0); ++spine)
+        {
+            receiver.ReceiveData(kTestSender,
+                                 kTestReceiver,
+                                 seq,
+                                 SpineIdentification(spine, spine),
+                                 spine == 2 && port == ports.front(),
+                                 port);
+            seq += IsolatedHost::kMtu;
+        }
+        if (i < 3 && j == 0)
+        {
+            Trim(receiver, port, seq, 5);
+            seq += IsolatedHost::kMtu;
+        }
+    }
+
+    // A data packet of the connection from port trimmed on spine before the
+    // last hop, as its destination parses it.
+    static void Trim(IsolatedHost& receiver, uint16_t port, uint32_t seq, uint8_t spine)
+    {
+        CustomHeader trimmed;
+        trimmed.l3Prot = 0x11;
+        trimmed.m_tos = kUetDscpTrimmed << 2;
+        trimmed.sip = kTestSender.Get();
+        trimmed.dip = kTestReceiver.Get();
+        trimmed.ipid = SpineIdentification(spine, spine);
+        trimmed.udp.sport = port;
+        trimmed.udp.dport = IsolatedHost::kReceiverPort;
+        trimmed.udp.pg = IsolatedHost::kPriorityGroup;
+        trimmed.udp.seq = seq;
+        trimmed.udp.payload_size = CustomHeader::GetUdpHeaderSize() + IsolatedHost::kMtu;
+        receiver.hw->Receive(Create<Packet>(), trimmed);
+    }
+
+    static SpineReport LastReportTo(const std::vector<CustomHeader>& answers, uint16_t port)
+    {
+        SpineReport report;
+        for (const CustomHeader& answer : answers)
+        {
+            if (answer.ack.dport == port)
+            {
+                report.sequence = answer.ack.spine_report[0];
+                std::copy_n(answer.ack.spine_report + 1,
+                            SpineReport::GradeBytes(kSpines),
+                            report.grades);
+            }
+        }
+        return report;
+    }
+
+    // With one connection into the receiver its arrivals are all the host's,
+    // so the two scopes answer alike, report for report.
+    void OneConnection()
+    {
+        const std::vector<CustomHeader> host =
+            Answers(GradeScope::PerReceiver, {IsolatedHost::kSenderPort});
+        const std::vector<CustomHeader> own =
+            Answers(GradeScope::PerConnection, {IsolatedHost::kSenderPort});
+        NS_TEST_ASSERT_MSG_EQ(own.size(), host.size(), "every packet is answered in both");
+        bool alike = true;
+        for (size_t i = 0; i < host.size(); ++i)
+        {
+            alike &= own[i].l3Prot == host[i].l3Prot && own[i].ack.seq == host[i].ack.seq &&
+                     own[i].ack.flags == host[i].ack.flags &&
+                     std::equal(own[i].ack.spine_report,
+                                own[i].ack.spine_report + CustomHeader::ackReportBytes,
+                                host[i].ack.spine_report);
+        }
+        NS_TEST_EXPECT_MSG_EQ(alike, true, "one connection's grades are its host's");
+        const SpineReport last = LastReportTo(host, IsolatedHost::kSenderPort);
+        NS_TEST_EXPECT_MSG_EQ(uint32_t(last.sequence), 3u, "three intervals were reported");
+        NS_TEST_EXPECT_MSG_LT(uint32_t(last.Grade(2)), 3u, "and the marked spine graded down");
+    }
+
+    // Marks on one connection's arrivals over spine 2 lower that spine for
+    // both connections when the host grades, and for the marked one alone
+    // when each connection grades its own.
+    void TwoConnections()
+    {
+        const std::vector<uint16_t> ports{IsolatedHost::kSenderPort, kOtherPort};
+        const std::vector<CustomHeader> host = Answers(GradeScope::PerReceiver, ports);
+        const std::vector<CustomHeader> own = Answers(GradeScope::PerConnection, ports);
+        const SpineReport hostMarked = LastReportTo(host, IsolatedHost::kSenderPort);
+        const SpineReport hostClean = LastReportTo(host, kOtherPort);
+        NS_TEST_EXPECT_MSG_LT(uint32_t(hostMarked.Grade(2)), 3u, "the host grades spine 2 down");
+        NS_TEST_EXPECT_MSG_EQ(uint32_t(hostClean.Grade(2)),
+                              uint32_t(hostMarked.Grade(2)),
+                              "for both connections");
+        const SpineReport ownMarked = LastReportTo(own, IsolatedHost::kSenderPort);
+        const SpineReport ownClean = LastReportTo(own, kOtherPort);
+        NS_TEST_EXPECT_MSG_EQ(uint32_t(ownMarked.sequence), 3u, "each connection reports");
+        NS_TEST_EXPECT_MSG_EQ(uint32_t(ownClean.sequence), 3u, "on the host's intervals");
+        NS_TEST_EXPECT_MSG_LT(uint32_t(ownMarked.Grade(2)),
+                              uint32_t(hostMarked.Grade(2)),
+                              "the marked connection sees spine 2 alone and grades it lower");
+        NS_TEST_EXPECT_MSG_EQ(uint32_t(ownClean.Grade(2)),
+                              3u,
+                              "the other connection's spine 2 keeps the top grade");
+        for (uint32_t spine = 0; spine < kSpines; ++spine)
+        {
+            if (spine != 2)
+            {
+                NS_TEST_EXPECT_MSG_EQ(uint32_t(ownMarked.Grade(spine)),
+                                      uint32_t(ownClean.Grade(spine)),
+                                      "the connections agree on every other spine");
+            }
+        }
+    }
+
+    // The acknowledgement of a queue pair's first send, carrying a report
+    // that grades every spine 0 but spine 6.
+    static void Report(IsolatedHost& sender, uint16_t port, uint8_t sequence)
+    {
+        CustomHeader ack;
+        ack.l3Prot = 0xFC;
+        ack.sip = kTestReceiver.Get();
+        ack.ack.sport = IsolatedHost::kReceiverPort;
+        ack.ack.dport = port;
+        ack.ack.pg = IsolatedHost::kPriorityGroup;
+        ack.ack.flags = 0;
+        ack.ack.seq = 0;
+        ack.ack.packet_seq = 0;
+        SpineReport report;
+        report.sequence = sequence;
+        for (uint32_t spine = 0; spine < kSpines; ++spine)
+        {
+            report.SetGrade(spine, spine == 6 ? 3 : 0);
+        }
+        ack.ack.spine_report[0] = report.sequence;
+        std::copy_n(report.grades, SpineReport::GradeBytes(kSpines), ack.ack.spine_report + 1);
+        sender.hw->ReceiveAck(Create<Packet>(), ack);
+    }
+
+    // The sends on spine 6 out of a thousand each queue pair to one host draws
+    // after reports reach the first of them only, and the sets of scores
+    // shared per destination host.
+    static std::tuple<uint32_t, uint32_t, size_t> OnSix(GradeScope scope)
+    {
+        IsolatedHost sender(LoadBalancingMode::SprayPolicy, kTestReceiver, kSpines);
+        sender.hw->m_sprayBaseRttNs = kBaseRtt;
+        sender.hw->m_sprayGradeScope = static_cast<uint32_t>(scope);
+        Ptr<RdmaQueuePair> first =
+            sender.AddSender(kTestSender, kTestReceiver, 100 * IsolatedHost::kMtu);
+        Ptr<RdmaQueuePair> second =
+            sender.AddSender(kTestSender, kTestReceiver, 100 * IsolatedHost::kMtu, kOtherPort);
+        for (uint8_t sequence = 1; sequence < 40; ++sequence)
+        {
+            Report(sender, IsolatedHost::kSenderPort, sequence);
+        }
+        uint32_t firstOnSix = 0;
+        uint32_t secondOnSix = 0;
+        for (uint32_t i = 0; i < 1000; ++i)
+        {
+            firstOnSix += RequestedSpine(first->m_pathSelector->Choose(0)) == 6;
+            secondOnSix += RequestedSpine(second->m_pathSelector->Choose(0)) == 6;
+        }
+        const size_t shared = sender.hw->m_spineScores.size();
+        Simulator::Destroy();
+        return {firstOnSix, secondOnSix, shared};
+    }
+
+    void SenderScores()
+    {
+        const auto [hostFirst, hostSecond, hostShared] = OnSix(GradeScope::PerReceiver);
+        NS_TEST_EXPECT_MSG_EQ(hostShared, 1u, "one set of scores per destination host");
+        NS_TEST_EXPECT_MSG_GT(hostFirst, 950u, "the reported queue pair follows its reports");
+        NS_TEST_EXPECT_MSG_GT(hostSecond, 950u, "and so does the other, sharing its scores");
+        const auto [ownFirst, ownSecond, ownShared] = OnSix(GradeScope::PerConnection);
+        NS_TEST_EXPECT_MSG_EQ(ownShared, 0u, "no scores shared per destination host");
+        NS_TEST_EXPECT_MSG_GT(ownFirst, 950u, "the reported queue pair follows its reports");
+        NS_TEST_EXPECT_MSG_LT(ownSecond, 200u, "the other keeps scores of its own");
     }
 };
 
@@ -5136,6 +5390,7 @@ PointToPointTestSuite::PointToPointTestSuite()
     AddTestCase(new SprayPolicyTransportTest, TestCase::Duration::QUICK);
     AddTestCase(new NsccReceiverPenaltyTest, TestCase::Duration::QUICK);
     AddTestCase(new SprayPolicyDefaultsTest, TestCase::Duration::QUICK);
+    AddTestCase(new GradeScopeTest, TestCase::Duration::QUICK);
 }
 
 static PointToPointTestSuite g_pointToPointTestSuite; //!< The testsuite

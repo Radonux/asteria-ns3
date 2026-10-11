@@ -10,6 +10,7 @@
 #include <ns3/int-header.h>
 #include "nscc-window.h"
 #include "path-selector.h"
+#include "spine-grader.h"
 #include <map>
 #include <memory>
 #include <set>
@@ -312,6 +313,10 @@ public:
 	// pair emits carries it, and an acknowledgement carrying it without the
 	// allowance report is what grants the sender its exemption.
 	bool m_forgiveness_eligible;
+	// Under spray_policy with GradeScope::PerConnection, the grader this
+	// connection's arrivals feed and its answers report, made at its first
+	// event.
+	std::unique_ptr<SpineGrader> m_spineGrader;
 	static TypeId GetTypeId (void);
 	RdmaRxQueuePair();
 	uint32_t GetHash(void);
