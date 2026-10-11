@@ -95,6 +95,7 @@ private:
 // highest-scored of them, the candidates drawn from p or uniformly. While a
 // report's edge bit is set the scores stay as they are, and without reports
 // they decay once per report interval from two intervals after the last.
+// With edgeFreeze unset, a report with the edge bit set is taken as any other.
 //
 // A score is fixed-point, 1/256 of a grade, and a decay removes the rounded-up
 // fraction gamma of it, so that a score left without deposits reaches zero.
@@ -111,6 +112,7 @@ public:
 		uint32_t candidates;
 		CandidateDraw candidateDraw;
 		uint64_t reportIntervalNs;
+		bool edgeFreeze = true;
 	};
 	SpineScores(uint32_t spines, const Parameters &parameters);
 	void OnReport(const SpineReport &report, uint64_t nowNs);

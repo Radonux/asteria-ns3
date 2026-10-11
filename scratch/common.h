@@ -175,6 +175,7 @@ double spray_epsilon = 0.02;
 uint32_t spray_candidates = 1;
 std::string spray_candidate_draw = "proportional";
 uint32_t spray_edge_window_penalty = 64;
+uint32_t spray_edge_freeze = 1;
 // The keys that only spray_policy reads, and among them those that only its
 // one-way delay reads; a key nothing reads is refused.
 const std::set<std::string> spray_policy_keys = {
@@ -184,7 +185,8 @@ const std::set<std::string> spray_policy_keys = {
     "SPRAY_ONE_WAY_DELAY", "SPRAY_DELAY_CUSUM_SLACK_BASE_RTTS",
     "SPRAY_DELAY_CUSUM_THRESHOLD_BASE_RTTS", "SPRAY_DELAY_THRESHOLDS_BASE_RTTS",
     "SPRAY_GAMMA", "SPRAY_EPSILON", "SPRAY_CANDIDATES", "SPRAY_CANDIDATE_DRAW",
-    "SPRAY_EDGE_WINDOW_PENALTY", "SPINE_REPORT_OUTPUT_FILE",
+    "SPRAY_EDGE_WINDOW_PENALTY", "SPRAY_EDGE_FREEZE",
+    "SPINE_REPORT_OUTPUT_FILE",
     "SPRAY_ABSENCE_FRACTION_OF_MEDIAN", "SPRAY_ABSENCE_MINIMUM_MEDIAN",
     "SPRAY_GRADE_REFERENCE", "SPRAY_GRADE_SCOPE", "SPRAY_GRADE_COST_SOURCE",
     "SPRAY_ESTIMATOR_INTERVAL_SAMPLES"};
@@ -1276,6 +1278,10 @@ bool valid_spray_policy() {
     std::cerr << "SPRAY_EDGE_WINDOW_PENALTY must be in [0, 127]\n";
     return false;
   }
+  if (spray_edge_freeze > 1) {
+    std::cerr << "SPRAY_EDGE_FREEZE must be 0 or 1\n";
+    return false;
+  }
   return true;
 }
 
@@ -1514,6 +1520,8 @@ bool ReadConf(string network_configuration) {
       conf >> spray_candidate_draw;
     } else if (key.compare("SPRAY_EDGE_WINDOW_PENALTY") == 0) {
       conf >> spray_edge_window_penalty;
+    } else if (key.compare("SPRAY_EDGE_FREEZE") == 0) {
+      conf >> spray_edge_freeze;
 	} else if (key.compare("PACKET_TRIM_MODE") == 0) {
 	  conf >> packet_trim_mode;
 	} else if (key.compare("PACKET_TRIM_QUEUE") == 0) {
@@ -2381,6 +2389,8 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),
                            UintegerValue(spray_candidate_draw_value()));
       rdmaHw->SetAttribute("SprayEdgeWindowPenalty",
                            UintegerValue(spray_edge_window_penalty));
+      rdmaHw->SetAttribute("SprayEdgeFreeze",
+                           BooleanValue(spray_edge_freeze == 1));
       // A PointerValue cannot carry null, which is the ECMP default.
       if (path_random)
         rdmaHw->SetAttribute("PathRandomVariable", PointerValue(path_random));

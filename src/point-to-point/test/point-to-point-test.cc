@@ -4796,6 +4796,58 @@ class SpineScoresDrawTest : public TestCase
     }
 };
 
+class SpineScoresEdgeFreezeTest : public TestCase
+{
+  public:
+    SpineScoresEdgeFreezeTest()
+        : TestCase("Under edge freeze a report with the edge bit moves no score; without it "
+                   "the report moves the scores as one without the bit")
+    {
+    }
+
+    void DoRun() override
+    {
+        NS_TEST_EXPECT_MSG_EQ(ScoresFixture::Defaults().edgeFreeze,
+                              true,
+                              "the scores freeze under the edge bit by default");
+        BooleanValue attribute;
+        CreateObject<RdmaHw>()->GetAttribute("SprayEdgeFreeze", attribute);
+        NS_TEST_EXPECT_MSG_EQ(attribute.Get(), true, "SprayEdgeFreeze is true by default");
+
+        std::vector<uint8_t> grades(ScoresFixture::kSpines, 3);
+        grades[2] = 0;
+        grades[5] = 1;
+        SpineReport edge = ScoresFixture::Report(1, grades);
+        edge.edgeCongested = true;
+        const SpineReport plain = ScoresFixture::Report(1, grades);
+
+        SpineScores::Parameters frozen = ScoresFixture::Defaults();
+        frozen.edgeFreeze = true;
+        SpineScores::Parameters moving = ScoresFixture::Defaults();
+        moving.edgeFreeze = false;
+        SpineScores held(ScoresFixture::kSpines, frozen);
+        SpineScores taken(ScoresFixture::kSpines, moving);
+        SpineScores reference(ScoresFixture::kSpines, moving);
+        const uint32_t start = held.Score(2);
+        held.OnReport(edge, 10000);
+        taken.OnReport(edge, 10000);
+        reference.OnReport(plain, 10000);
+        for (uint32_t spine = 0; spine < ScoresFixture::kSpines; ++spine)
+        {
+            NS_TEST_EXPECT_MSG_EQ(held.Score(spine), start, "edge freeze holds every score");
+            NS_TEST_EXPECT_MSG_EQ(taken.Score(spine),
+                                  reference.Score(spine),
+                                  "without edge freeze the edge bit changes nothing");
+        }
+        NS_TEST_EXPECT_MSG_LT(taken.Score(2), start, "a spine graded 0 loses score");
+        NS_TEST_EXPECT_MSG_LT(taken.Share(2), held.Share(2), "and share");
+        // The bit still dates the report: the same sequence is not taken again.
+        const uint32_t once = taken.Score(2);
+        taken.OnReport(edge, 10100);
+        NS_TEST_EXPECT_MSG_EQ(taken.Score(2), once, "a report is taken once");
+    }
+};
+
 class SprayPolicyTransportTest : public TestCase
 {
   public:
@@ -6415,6 +6467,7 @@ PointToPointTestSuite::PointToPointTestSuite()
     AddTestCase(new SpineScoresFloorTest, TestCase::Duration::QUICK);
     AddTestCase(new SpineScoresFlapTest, TestCase::Duration::QUICK);
     AddTestCase(new SpineScoresDrawTest, TestCase::Duration::QUICK);
+    AddTestCase(new SpineScoresEdgeFreezeTest, TestCase::Duration::QUICK);
     AddTestCase(new SprayPolicyTransportTest, TestCase::Duration::QUICK);
     AddTestCase(new NsccReceiverPenaltyTest, TestCase::Duration::QUICK);
     AddTestCase(new SprayPolicyDefaultsTest, TestCase::Duration::QUICK);

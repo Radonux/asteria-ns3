@@ -92,7 +92,7 @@ void SpineScores::OnReport(const SpineReport &report, uint64_t nowNs){
 	// A report is due every interval, and the acknowledgements carrying one
 	// arrive with an interval of jitter.
 	m_nextDecayNs = nowNs + 2 * m_parameters.reportIntervalNs;
-	if (report.edgeCongested)
+	if (report.edgeCongested && m_parameters.edgeFreeze)
 		return;
 	Decay();
 	for (uint32_t k = 0; k < m_scores.size(); k++)

@@ -458,6 +458,13 @@ TypeId RdmaHw::GetTypeId (void)
 				MakeUintegerChecker<uint32_t>(
 					static_cast<uint32_t>(SpineScores::CandidateDraw::Proportional),
 					static_cast<uint32_t>(SpineScores::CandidateDraw::Uniform)))
+		.AddAttribute("SprayEdgeFreeze",
+				"Under LoadBalancing 3, whether a report whose edge bit is set "
+				"leaves the sender's spine scores as they are; when false it "
+				"moves them as any other report. Default true.",
+				BooleanValue(true),
+				MakeBooleanAccessor(&RdmaHw::m_sprayEdgeFreeze),
+				MakeBooleanChecker())
 		.AddAttribute("SprayEdgeWindowPenalty",
 				"Under LoadBalancing 3 and CC mode 11, the Rcv_Cwnd_Pend (UEC "
 				"1.0.3 section 3.6.13.2) of an acknowledgement whose report says "
@@ -2224,7 +2231,7 @@ void RdmaHw::StartPathSelection(Ptr<RdmaQueuePair> qp, uint64_t bdpBytes,
 		const SpineScores::Parameters parameters{m_sprayGamma, m_sprayEpsilon,
 			m_sprayCandidates,
 			static_cast<SpineScores::CandidateDraw>(m_sprayCandidateDraw),
-			SprayReportIntervalNs()};
+			SprayReportIntervalNs(), m_sprayEdgeFreeze};
 		if (IsPerConnectionGrading()){
 			qp->m_pathSelector = std::make_unique<PolicySpineSelector>(
 				m_pathRandom, std::make_unique<SpineScores>(m_spineCount, parameters));

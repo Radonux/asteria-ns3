@@ -162,6 +162,8 @@ public:
 	double m_sprayEpsilon;
 	uint32_t m_sprayCandidates;
 	uint32_t m_sprayCandidateDraw; // SpineScores::CandidateDraw
+	// SpineScores::Parameters::edgeFreeze.
+	bool m_sprayEdgeFreeze;
 	// The Rcv_Cwnd_Pend NSCC is handed for an acknowledgement whose report has
 	// the edge bit set.
 	uint32_t m_sprayEdgeWindowPenalty;
