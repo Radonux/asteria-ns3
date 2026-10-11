@@ -57,6 +57,9 @@ inline uint16_t PathOf(LoadBalancingMode mode, uint16_t identification){
 	return NamesSpine(mode) ? RequestedSpine(identification) : identification;
 }
 
+// The value of an acknowledgement's redirect field that names no spine.
+constexpr uint8_t kNoRedirect = 255;
+
 } /* namespace ns3 */
 
 #endif /* LOAD_BALANCING_H */
