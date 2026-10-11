@@ -4,20 +4,6 @@
 
 namespace ns3 {
 
-namespace {
-
-// 3 below the first threshold, 2 below the second, 1 below the third, else 0.
-template <typename Thresholds>
-uint8_t Quantize(double value, const Thresholds &thresholds){
-	for (uint8_t i = 0; i < 3; i++){
-		if (value < thresholds[i])
-			return SpineReport::kTopGrade - i;
-	}
-	return 0;
-}
-
-} // namespace
-
 void SupervisedEwma::Add(double sample, uint32_t packets,
 		const Parameters &parameters){
 	if (parameters.intervalSamples > 0 && packets >= parameters.intervalSamples){
@@ -187,17 +173,21 @@ SpineReport SpineGrader::Graded(const std::vector<SpineValues> &values,
 		double absolute = std::max(marks[k], trims[k]);
 		const double trimCost = trims[k] - trimReference;
 		uint8_t byCongestion = std::min(
-			Quantize(marks[k] - markReference, thresholds),
+			QuantizeGrade(marks[k] - markReference, thresholds),
 			m_parameters.trimThresholds ?
-				Quantize(trimCost, *m_parameters.trimThresholds) :
-				Quantize(trimCost, thresholds));
+				QuantizeGrade(trimCost, *m_parameters.trimThresholds) :
+				QuantizeGrade(trimCost, thresholds));
 		if (lossHold){
 			absolute = std::max(absolute, losses[k]);
+			const double lossCost = losses[k] - lossReference;
 			byCongestion = std::min(byCongestion,
-				Quantize(losses[k] - lossReference, thresholds));
+				m_parameters.lossThresholds ?
+					QuantizeGrade(lossCost, *m_parameters.lossThresholds) :
+					QuantizeGrade(lossCost, thresholds));
 		}
-		everySpineBelowTop &= Earned(Quantize(absolute, thresholds), delays[k]) <
-			SpineReport::kTopGrade;
+		everySpineBelowTop &=
+			Earned(QuantizeGrade(absolute, thresholds), delays[k]) <
+				SpineReport::kTopGrade;
 		const bool lossHeld = lossHold && losses[k] >= *lossHold;
 		report.SetGrade(k, held[k] || lossHeld ? 0 : Earned(byCongestion,
 			delays[k] - delayReference));
@@ -235,7 +225,7 @@ void SpineGrader::JudgeWindow(){
 uint8_t SpineGrader::Earned(uint8_t byCongestion, double delayCostNs) const{
 	if (byCongestion < SpineReport::kTopGrade || !m_parameters.oneWayDelay)
 		return byCongestion;
-	return Quantize(delayCostNs, m_parameters.delayThresholdsNs);
+	return QuantizeGrade(delayCostNs, m_parameters.delayThresholdsNs);
 }
 
 double SpineGrader::Median(

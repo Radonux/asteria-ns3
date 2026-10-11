@@ -127,6 +127,18 @@ public:
 	double m_sprayCongestionThreshold1, m_sprayCongestionThreshold2, m_sprayCongestionThreshold3;
 	// Zero leaves the trimmed fraction on the congestion thresholds.
 	double m_sprayTrimThreshold1, m_sprayTrimThreshold2, m_sprayTrimThreshold3;
+	// Zero counts no loss at the sender and leaves the loss fraction the
+	// grader grades under SwitchQueue on the congestion thresholds.
+	double m_sprayLossThreshold1, m_sprayLossThreshold2, m_sprayLossThreshold3;
+	// SpineScores::Parameters::lossIntervalNs.
+	uint64_t m_sprayLossIntervalNs;
+	// The loss thresholds, unset while SprayLossThreshold1 is zero.
+	std::optional<std::array<double, 3>> SprayLossThresholds() const;
+	// Whether the sender's scores count sends and losses: under SprayPolicy
+	// with the loss thresholds set, outside SwitchQueue.
+	bool CountsSprayLoss() const;
+	// Whether the loss counting has the send records it needs.
+	bool ValidSprayLoss() const;
 	double m_sprayAbsenceFractionOfMedian;
 	uint32_t m_sprayAbsenceMinimumMedian;
 	double m_sprayReleaseFractionOfFloor;

@@ -4,8 +4,10 @@
 #include <ns3/ptr.h>
 #include <ns3/random-variable-stream.h>
 #include "spine-report.h"
+#include <array>
 #include <deque>
 #include <memory>
+#include <optional>
 #include <stdint.h>
 #include <utility>
 #include <vector>
@@ -100,6 +102,18 @@ private:
 // A score is fixed-point, 1/256 of a grade, and a decay removes the rounded-up
 // fraction gamma of it, so that a score left without deposits reaches zero.
 // Every score starts where the top grade holds it.
+//
+// With loss thresholds set, the scores also count per spine the sends drawn
+// from them and the sends declared lost, and a report taken grades each spine
+// sent on since the last report taken at the lower of its report grade and
+// the grade its lost fraction, lost over sent and at most 1, earns through
+// the loss thresholds; a spine not sent on keeps its report grade. The counts
+// restart at every report taken. Scores used as a pool count the sends and
+// losses of every set of scores pooled with them over fixed loss intervals,
+// and at each interval's end grade each spine by the lost fraction of the
+// interval that ended, a spine not sent on in it at the top grade; a report a
+// pooled set of scores takes is taken by the pool at the lower of the grade
+// it took and the pool's loss grade.
 class SpineScores {
 public:
 	enum class CandidateDraw : uint32_t {
@@ -113,10 +127,20 @@ public:
 		CandidateDraw candidateDraw;
 		uint64_t reportIntervalNs;
 		bool edgeFreeze = true;
+		// The lost fractions from which a spine grades 2, 1 and 0; unset,
+		// sends and losses are not counted.
+		std::optional<std::array<double, 3>> lossThresholds;
+		// The loss interval of scores used as a pool; zero, the report
+		// interval.
+		uint64_t lossIntervalNs = 0;
 	};
 	SpineScores(uint32_t spines, const Parameters &parameters);
 	void OnReport(const SpineReport &report, uint64_t nowNs);
 	uint8_t Choose(UniformRandomVariable &random, uint64_t nowNs);
+	// A send drawn from these scores on spine, and a send on spine declared
+	// lost; each is counted by the pool too.
+	void OnSend(uint32_t spine, uint64_t nowNs);
+	void OnLoss(uint32_t spine, uint64_t nowNs);
 	// Mix these scores with pool's, which outlive them. Every report these
 	// scores take, pool takes too, by the same rule; and with weight w above
 	// zero, every draw and every p use w * pool's score + (1 - w) * this
@@ -142,6 +166,11 @@ private:
 	void Age(uint64_t nowNs);
 	void Accumulate();
 	uint8_t DrawFromShares(UniformRandomVariable &random) const;
+	// The grade the lost fraction of sent sends earns.
+	uint8_t LossGrade(uint32_t sent, uint32_t lost) const;
+	// As a pool: close the loss intervals ended by now, grading the spines by
+	// the last of them, before a send or loss is counted or a grade read.
+	void AdvanceLossInterval(uint64_t nowNs);
 
 	Parameters m_parameters;
 	// gamma in 1/65536.
@@ -156,6 +185,14 @@ private:
 	// Null, or the scores mixed with these, and the weight of theirs.
 	SpineScores *m_pool;
 	double m_poolWeight;
+	// Per spine, the sends and the losses counted since the counts restarted.
+	std::vector<uint32_t> m_sent;
+	std::vector<uint32_t> m_lost;
+	// As a pool: the loss interval, the end of the one in progress, and the
+	// grades the last one that ended earned.
+	uint64_t m_lossIntervalNs;
+	uint64_t m_lossIntervalEndNs;
+	std::vector<uint8_t> m_lossGrades;
 };
 
 // A spine drawn per packet from the scores towards the queue pair's
@@ -167,7 +204,10 @@ public:
 	PolicySpineSelector(Ptr<UniformRandomVariable> random, SpineScores &scores);
 	PolicySpineSelector(Ptr<UniformRandomVariable> random,
 		std::unique_ptr<SpineScores> scores);
+	// The spine drawn is counted as a send in the scores.
 	uint16_t Choose(uint64_t nowNs) override;
+	// A loss on the requested spine path names is counted in the scores.
+	void OnLoss(uint16_t path, uint64_t nowNs) override;
 	void OnReport(const SpineReport &report, uint64_t nowNs) override;
 
 private:

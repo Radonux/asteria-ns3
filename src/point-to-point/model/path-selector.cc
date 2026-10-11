@@ -1,5 +1,6 @@
 #include "path-selector.h"
 #include "load-balancing.h"
+#include "spine-grader.h"
 #include <ns3/assert.h>
 #include <algorithm>
 #include <cmath>
@@ -65,12 +66,23 @@ SpineScores::SpineScores(uint32_t spines, const Parameters &parameters)
 	  m_decay(std::llround(parameters.gamma * 65536)),
 	  m_accumulated(spines), m_reported(false), m_sequence(0),
 	  m_reportedNs(0), m_nextDecayNs(UINT64_MAX), m_pool(nullptr),
-	  m_poolWeight(0)
+	  m_poolWeight(0), m_sent(spines), m_lost(spines),
+	  m_lossIntervalNs(parameters.lossIntervalNs > 0
+		? parameters.lossIntervalNs : parameters.reportIntervalNs),
+	  m_lossIntervalEndNs(m_lossIntervalNs),
+	  m_lossGrades(spines, SpineReport::kTopGrade)
 {
 	NS_ASSERT_MSG(spines > 0 && spines <= SpineReport::kMaxSpines,
 		"a report grades at most SpineReport::kMaxSpines spines");
 	NS_ASSERT_MSG(m_decay > 0 && m_decay <= 65536, "gamma is in (0, 1]");
 	NS_ASSERT_MSG(parameters.candidates > 0, "a spine is drawn from candidates");
+	NS_ASSERT_MSG(!parameters.lossThresholds ||
+			((*parameters.lossThresholds)[0] > 0 &&
+				(*parameters.lossThresholds)[0] < (*parameters.lossThresholds)[1] &&
+				(*parameters.lossThresholds)[1] < (*parameters.lossThresholds)[2]),
+		"the loss thresholds are three increasing positive fractions");
+	NS_ASSERT_MSG(!parameters.lossThresholds || m_lossIntervalNs > 0,
+		"a pool grades loss per interval");
 	// The largest score a decay takes exactly the top grade from.
 	m_scores.assign(spines,
 		SpineReport::kTopGrade * kGradeScale * uint64_t{65536} / m_decay);
@@ -88,9 +100,69 @@ void SpineScores::OnReport(const SpineReport &report, uint64_t nowNs){
 		return;
 	m_reported = true;
 	m_sequence = report.sequence;
-	Take(report, nowNs);
-	if (m_pool != nullptr)
-		m_pool->Take(report, nowNs);
+	SpineReport combined = report;
+	if (m_parameters.lossThresholds){
+		for (uint32_t k = 0; k < m_scores.size(); k++){
+			if (m_sent[k] > 0)
+				combined.SetGrade(k, std::min(report.Grade(k),
+					LossGrade(m_sent[k], m_lost[k])));
+		}
+		std::fill(m_sent.begin(), m_sent.end(), 0);
+		std::fill(m_lost.begin(), m_lost.end(), 0);
+	}
+	Take(combined, nowNs);
+	if (m_pool == nullptr)
+		return;
+	SpineReport pooled = combined;
+	if (m_pool->m_parameters.lossThresholds){
+		m_pool->AdvanceLossInterval(nowNs);
+		for (uint32_t k = 0; k < m_scores.size(); k++)
+			pooled.SetGrade(k,
+				std::min(combined.Grade(k), m_pool->m_lossGrades[k]));
+	}
+	m_pool->Take(pooled, nowNs);
+}
+
+void SpineScores::OnSend(uint32_t spine, uint64_t nowNs){
+	NS_ASSERT_MSG(spine < m_scores.size(), "a send is on a scored spine");
+	if (m_parameters.lossThresholds)
+		m_sent[spine]++;
+	if (m_pool != nullptr && m_pool->m_parameters.lossThresholds){
+		m_pool->AdvanceLossInterval(nowNs);
+		m_pool->m_sent[spine]++;
+	}
+}
+
+void SpineScores::OnLoss(uint32_t spine, uint64_t nowNs){
+	NS_ASSERT_MSG(spine < m_scores.size(), "a loss is on a scored spine");
+	if (m_parameters.lossThresholds)
+		m_lost[spine]++;
+	if (m_pool != nullptr && m_pool->m_parameters.lossThresholds){
+		m_pool->AdvanceLossInterval(nowNs);
+		m_pool->m_lost[spine]++;
+	}
+}
+
+uint8_t SpineScores::LossGrade(uint32_t sent, uint32_t lost) const{
+	if (sent == 0)
+		return SpineReport::kTopGrade;
+	return QuantizeGrade(std::min(1.0, static_cast<double>(lost) / sent),
+		*m_parameters.lossThresholds);
+}
+
+void SpineScores::AdvanceLossInterval(uint64_t nowNs){
+	if (nowNs < m_lossIntervalEndNs)
+		return;
+	// The counts are those of the interval that ended at m_lossIntervalEndNs;
+	// any later interval that ended by now had nothing counted.
+	const bool lastCounted = nowNs - m_lossIntervalEndNs < m_lossIntervalNs;
+	for (uint32_t k = 0; k < m_scores.size(); k++)
+		m_lossGrades[k] = lastCounted
+			? LossGrade(m_sent[k], m_lost[k]) : SpineReport::kTopGrade;
+	std::fill(m_sent.begin(), m_sent.end(), 0);
+	std::fill(m_lost.begin(), m_lost.end(), 0);
+	m_lossIntervalEndNs += m_lossIntervalNs *
+		(1 + (nowNs - m_lossIntervalEndNs) / m_lossIntervalNs);
 }
 
 void SpineScores::Take(const SpineReport &report, uint64_t nowNs){
@@ -258,7 +330,12 @@ PolicySpineSelector::PolicySpineSelector(Ptr<UniformRandomVariable> random,
 
 uint16_t PolicySpineSelector::Choose(uint64_t nowNs){
 	const uint8_t spine = m_scores.Choose(*m_random, nowNs);
+	m_scores.OnSend(spine, nowNs);
 	return SpineIdentification(spine, spine);
+}
+
+void PolicySpineSelector::OnLoss(uint16_t path, uint64_t nowNs){
+	m_scores.OnLoss(path, nowNs);
 }
 
 void PolicySpineSelector::OnReport(const SpineReport &report, uint64_t nowNs){

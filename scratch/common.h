@@ -164,6 +164,12 @@ double spray_congestion_thresholds[3] = {0.25, 0.5, 0.75};
 // Zero, unless SPRAY_TRIM_THRESHOLDS is given: the trimmed fraction is graded
 // through spray_congestion_thresholds.
 double spray_trim_thresholds[3] = {0, 0, 0};
+// Zero, unless SPRAY_LOSS_THRESHOLDS is given: the sender counts no loss, and
+// the switch_queue grader grades the loss fraction through
+// spray_congestion_thresholds. Zero spray_loss_interval_ns is the report
+// interval.
+double spray_loss_thresholds[3] = {0, 0, 0};
+uint64_t spray_loss_interval_ns = 0;
 double spray_absence_fraction_of_median = 0.125;
 uint32_t spray_absence_minimum_median = 16;
 double spray_release_fraction_of_floor = 0.5;
@@ -187,6 +193,7 @@ const std::set<std::string> spray_policy_keys = {
     "SPRAY_REPORT_INTERVAL_BASE_RTTS", "SPRAY_ESTIMATOR_GAIN",
     "SPRAY_FRACTION_CUSUM_SLACK", "SPRAY_FRACTION_CUSUM_THRESHOLD",
     "SPRAY_CONGESTION_THRESHOLDS", "SPRAY_TRIM_THRESHOLDS",
+    "SPRAY_LOSS_THRESHOLDS", "SPRAY_LOSS_INTERVAL_NS",
     "SPRAY_RELEASE_FRACTION_OF_FLOOR",
     "SPRAY_ONE_WAY_DELAY", "SPRAY_DELAY_CUSUM_SLACK_BASE_RTTS",
     "SPRAY_DELAY_CUSUM_THRESHOLD_BASE_RTTS", "SPRAY_DELAY_THRESHOLDS_BASE_RTTS",
@@ -1208,6 +1215,27 @@ bool valid_spray_policy() {
                  "fractions in (0, 1]\n";
     return false;
   }
+  if (spray_policy_keys_given.count("SPRAY_LOSS_THRESHOLDS") > 0 &&
+      (!increasing(spray_loss_thresholds) || spray_loss_thresholds[2] > 1)) {
+    std::cerr << "SPRAY_LOSS_THRESHOLDS must be three increasing "
+                 "fractions in (0, 1]\n";
+    return false;
+  }
+  if (spray_policy_keys_given.count("SPRAY_LOSS_INTERVAL_NS") > 0 &&
+      spray_policy_keys_given.count("SPRAY_LOSS_THRESHOLDS") == 0) {
+    std::cerr << "SPRAY_LOSS_INTERVAL_NS is read only with "
+                 "SPRAY_LOSS_THRESHOLDS\n";
+    return false;
+  }
+  // The sender declares a send lost only from the send records selective
+  // retransmission keeps; under switch_queue the thresholds grade the paths'
+  // loss read from the switches instead.
+  if (spray_policy_keys_given.count("SPRAY_LOSS_THRESHOLDS") > 0 &&
+      spray_grade_cost_source != "switch_queue" &&
+      selective_retransmission == 0) {
+    std::cerr << "SPRAY_LOSS_THRESHOLDS requires SELECTIVE_RETRANSMISSION 1\n";
+    return false;
+  }
   if (!increasing(spray_delay_thresholds_base_rtts)) {
     std::cerr << "SPRAY_DELAY_THRESHOLDS_BASE_RTTS must be three increasing "
                  "positive numbers\n";
@@ -1488,6 +1516,11 @@ bool ReadConf(string network_configuration) {
     } else if (key.compare("SPRAY_TRIM_THRESHOLDS") == 0) {
       conf >> spray_trim_thresholds[0] >> spray_trim_thresholds[1] >>
           spray_trim_thresholds[2];
+    } else if (key.compare("SPRAY_LOSS_THRESHOLDS") == 0) {
+      conf >> spray_loss_thresholds[0] >> spray_loss_thresholds[1] >>
+          spray_loss_thresholds[2];
+    } else if (key.compare("SPRAY_LOSS_INTERVAL_NS") == 0) {
+      conf >> spray_loss_interval_ns;
     } else if (key.compare("SPRAY_RELEASE_FRACTION_OF_FLOOR") == 0) {
       conf >> spray_release_fraction_of_floor;
     } else if (key.compare("SPRAY_ONE_WAY_DELAY") == 0) {
@@ -2372,6 +2405,14 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),
                            DoubleValue(spray_trim_thresholds[1]));
       rdmaHw->SetAttribute("SprayTrimThreshold3",
                            DoubleValue(spray_trim_thresholds[2]));
+      rdmaHw->SetAttribute("SprayLossThreshold1",
+                           DoubleValue(spray_loss_thresholds[0]));
+      rdmaHw->SetAttribute("SprayLossThreshold2",
+                           DoubleValue(spray_loss_thresholds[1]));
+      rdmaHw->SetAttribute("SprayLossThreshold3",
+                           DoubleValue(spray_loss_thresholds[2]));
+      rdmaHw->SetAttribute("SprayLossIntervalNs",
+                           UintegerValue(spray_loss_interval_ns));
       rdmaHw->SetAttribute("SprayReleaseFractionOfFloor",
                            DoubleValue(spray_release_fraction_of_floor));
       rdmaHw->SetAttribute("SprayOneWayDelay",

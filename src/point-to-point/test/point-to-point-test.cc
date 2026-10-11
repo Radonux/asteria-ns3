@@ -53,9 +53,11 @@
 #include "ns3/udp-header.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <map>
 #include <memory>
+#include <optional>
 #include <random>
 #include <set>
 #include <string>
@@ -5453,6 +5455,365 @@ class SpineScoresPoolTest : public TestCase
     }
 };
 
+class SpineLossThresholdsTest : public TestCase
+{
+  public:
+    SpineLossThresholdsTest()
+        : TestCase("Loss thresholds grade the lost fraction of a spine at the sender, per "
+                   "destination between reports and host-wide per loss interval in the pool; "
+                   "under switch_queue they grade the loss of the paths instead")
+    {
+    }
+
+    void DoRun() override
+    {
+        Defaults();
+        Unset();
+        Local();
+        Pool();
+        const bool savedPacketSeq = CustomHeader::ackCarriesPacketSeq;
+        const uint32_t savedReportBytes = CustomHeader::ackReportBytes;
+        CustomHeader::ackCarriesPacketSeq = true;
+        CustomHeader::ackReportBytes = 1 + SpineReport::GradeBytes(kSpines);
+        Transport(GradeCostSource::Estimate);
+        Transport(GradeCostSource::SwitchQueue);
+        CustomHeader::ackReportBytes = savedReportBytes;
+        CustomHeader::ackCarriesPacketSeq = savedPacketSeq;
+        Oracle();
+        Validation();
+        Simulator::Destroy();
+    }
+
+  private:
+    static constexpr uint32_t kSpines = ScoresFixture::kSpines;
+    static constexpr uint64_t kInterval = ScoresFixture::kInterval;
+    static constexpr std::array<double, 3> kThresholds = {0.1, 0.25, 0.5};
+    static constexpr uint16_t kOtherPort = 10002;
+
+    static SpineScores::Parameters WithThresholds()
+    {
+        SpineScores::Parameters parameters = ScoresFixture::Defaults();
+        parameters.lossThresholds = kThresholds;
+        return parameters;
+    }
+
+    static void Send(SpineScores& scores,
+                     uint32_t spine,
+                     uint32_t sent,
+                     uint32_t lost,
+                     uint64_t now)
+    {
+        for (uint32_t i = 0; i < sent; ++i)
+        {
+            scores.OnSend(spine, now);
+        }
+        for (uint32_t i = 0; i < lost; ++i)
+        {
+            scores.OnLoss(spine, now);
+        }
+    }
+
+    void ExpectScores(const SpineScores& scores,
+                      const SpineScores& reference,
+                      const std::string& message)
+    {
+        for (uint32_t spine = 0; spine < kSpines; ++spine)
+        {
+            NS_TEST_EXPECT_MSG_EQ(scores.Score(spine), reference.Score(spine), message);
+        }
+    }
+
+    void Defaults()
+    {
+        Ptr<RdmaHw> hw = CreateObject<RdmaHw>();
+        NS_TEST_EXPECT_MSG_EQ(hw->m_sprayLossThreshold1, 0.0, "the loss thresholds are unset");
+        NS_TEST_EXPECT_MSG_EQ(hw->m_sprayLossIntervalNs, 0u, "the loss interval is the report's");
+        NS_TEST_EXPECT_MSG_EQ(hw->SprayLossThresholds().has_value(), false, "unset");
+    }
+
+    // Unset, sends and losses leave every deposit as the report has it.
+    void Unset()
+    {
+        const SpineScores::Parameters parameters = ScoresFixture::Defaults();
+        SpineScores pool(kSpines, parameters);
+        SpineScores counted(kSpines, parameters);
+        SpineScores reference(kSpines, parameters);
+        SpineScores referencePool(kSpines, parameters);
+        counted.Pool(pool, 0.5);
+        reference.Pool(referencePool, 0.5);
+        std::vector<uint8_t> grades(kSpines, 3);
+        grades[5] = 2;
+        for (uint8_t sequence = 1; sequence <= 3; ++sequence)
+        {
+            Send(counted, 3, 10, 7, sequence * kInterval - 1);
+            counted.OnReport(ScoresFixture::Report(sequence, grades), sequence * kInterval);
+            reference.OnReport(ScoresFixture::Report(sequence, grades), sequence * kInterval);
+        }
+        ExpectScores(counted, reference, "unset, the scores deposit the report's grades");
+        ExpectScores(pool, referencePool, "and so does the pool");
+    }
+
+    // gamma 0.25 from 3072: a decay leaves 2304, and grade g deposits 256 g.
+    void Local()
+    {
+        SpineScores scores(kSpines, WithThresholds());
+        SpineScores reference(kSpines, ScoresFixture::Defaults());
+        std::vector<uint8_t> grades(kSpines, 3);
+        grades[4] = 0;
+        grades[6] = 2;
+        Send(scores, 0, 10, 0, 100);
+        Send(scores, 3, 10, 3, 100);
+        Send(scores, 4, 10, 3, 100);
+        // Lost sends counted on a spine nothing was sent on since the last
+        // report.
+        Send(scores, 6, 0, 2, 100);
+        scores.OnReport(ScoresFixture::Report(1, grades), kInterval);
+        NS_TEST_EXPECT_MSG_EQ(scores.Score(0), 3072u, "no loss keeps the top grade");
+        NS_TEST_EXPECT_MSG_EQ(scores.Score(3), 2304u + 256u, "3 of 10 lost grades the spine 1");
+        NS_TEST_EXPECT_MSG_EQ(scores.Score(4), 2304u, "the receiver's lower grade wins");
+        NS_TEST_EXPECT_MSG_EQ(scores.Score(6), 2304u + 512u, "a spine not sent on keeps its grade");
+        std::vector<uint8_t> combined = grades;
+        combined[3] = 1;
+        reference.OnReport(ScoresFixture::Report(1, combined), kInterval);
+        ExpectScores(scores, reference, "the first report, combined");
+
+        // The counts restarted at the report: the next one stands alone.
+        std::vector<uint8_t> top(kSpines, 3);
+        scores.OnReport(ScoresFixture::Report(2, top), 2 * kInterval);
+        reference.OnReport(ScoresFixture::Report(2, top), 2 * kInterval);
+        ExpectScores(scores, reference, "the counts restart at every report taken");
+
+        // A stale report is not taken and leaves the counts to the next.
+        Send(scores, 2, 4, 4, 2 * kInterval + 100);
+        scores.OnReport(ScoresFixture::Report(1, top), 2 * kInterval + 200);
+        ExpectScores(scores, reference, "a stale report deposits nothing");
+        scores.OnReport(ScoresFixture::Report(3, top), 3 * kInterval);
+        std::vector<uint8_t> lost = top;
+        lost[2] = 0;
+        reference.OnReport(ScoresFixture::Report(3, lost), 3 * kInterval);
+        ExpectScores(scores, reference, "the counts reach the next report taken");
+    }
+
+    // Two destinations pooled; the pool's loss interval is the report
+    // interval, kInterval.
+    void Pool()
+    {
+        const SpineScores::Parameters parameters = WithThresholds();
+        SpineScores pool(kSpines, parameters);
+        SpineScores toFirst(kSpines, parameters);
+        SpineScores toSecond(kSpines, parameters);
+        toFirst.Pool(pool, 0.5);
+        toSecond.Pool(pool, 0.5);
+        SpineScores referencePool(kSpines, ScoresFixture::Defaults());
+        const std::vector<uint8_t> top(kSpines, 3);
+
+        // First interval: spine 3 loses none of 10 towards the first and 6 of
+        // 10 towards the second, 6 of 20 from the host; spine 5 loses a send
+        // but carries none.
+        Send(toFirst, 3, 10, 0, 1000);
+        Send(toSecond, 3, 10, 6, 2000);
+        Send(toFirst, 5, 0, 1, 3000);
+        Send(toSecond, 0, 10, 0, 4000);
+        toFirst.OnReport(ScoresFixture::Report(1, top), kInterval + 5000);
+        NS_TEST_EXPECT_MSG_EQ(toFirst.Score(3), 3072u, "the first lost nothing on spine 3");
+        NS_TEST_EXPECT_MSG_EQ(pool.Score(3),
+                              2304u + 256u,
+                              "the pool grades spine 3 by the host's 6 of 20, grade 1");
+        std::vector<uint8_t> expected = top;
+        expected[3] = 1;
+        referencePool.OnReport(ScoresFixture::Report(1, expected), kInterval + 5000);
+        ExpectScores(pool, referencePool, "spine 5, not sent on, is not graded down");
+
+        // The second destination's own loss, 6 of 10, grades spine 3 0, below
+        // the pool's grade.
+        toSecond.OnReport(ScoresFixture::Report(1, top), kInterval + 6000);
+        NS_TEST_EXPECT_MSG_EQ(toSecond.Score(3), 2304u, "6 of 10 lost grades the spine 0");
+        expected[3] = 0;
+        referencePool.OnReport(ScoresFixture::Report(2, expected), kInterval + 6000);
+        ExpectScores(pool, referencePool, "the pool takes the lower of the two grades");
+
+        // Second interval: the second destination loses all 4 sends on spine
+        // 4. The first destination's next report, after the interval ends,
+        // grades spine 4 by the host's counts, and spine 3, whose counts
+        // restarted, at the top.
+        Send(toSecond, 4, 4, 4, kInterval + 7000);
+        toFirst.OnReport(ScoresFixture::Report(2, top), 2 * kInterval + 5000);
+        NS_TEST_EXPECT_MSG_EQ(toFirst.Score(4), 3072u, "the first sent nothing on spine 4");
+        expected = top;
+        expected[4] = 0;
+        referencePool.OnReport(ScoresFixture::Report(3, expected), 2 * kInterval + 5000);
+        ExpectScores(pool, referencePool, "the pool's counts restart at each interval's end");
+
+        // Two intervals later with nothing counted in between: every spine at
+        // the top.
+        Send(toSecond, 6, 2, 2, 2 * kInterval + 6000);
+        toFirst.OnReport(ScoresFixture::Report(3, top), 4 * kInterval + 5000);
+        referencePool.OnReport(ScoresFixture::Report(4, top), 4 * kInterval + 5000);
+        ExpectScores(pool, referencePool, "an interval with nothing counted grades no spine down");
+    }
+
+    // The acknowledgement of the send of seq along identification's spine,
+    // carrying a report that grades every spine 3.
+    static void Acknowledge(IsolatedHost& sender,
+                            uint32_t seq,
+                            uint16_t identification,
+                            uint8_t sequence)
+    {
+        CustomHeader ack;
+        ack.l3Prot = 0xFC;
+        ack.sip = kTestReceiver.Get();
+        ack.ipid = identification;
+        ack.ack.sport = IsolatedHost::kReceiverPort;
+        ack.ack.dport = IsolatedHost::kSenderPort;
+        ack.ack.pg = IsolatedHost::kPriorityGroup;
+        ack.ack.flags = 0;
+        ack.ack.seq = 0;
+        ack.ack.packet_seq = seq;
+        SpineReport report;
+        report.sequence = sequence;
+        ack.ack.spine_report[0] = report.sequence;
+        std::copy_n(report.grades, SpineReport::GradeBytes(kSpines), ack.ack.spine_report + 1);
+        sender.hw->ReceiveAck(Create<Packet>(), ack);
+    }
+
+    // Two queue pairs to one host send; an acknowledgement declares two of
+    // the first's sends lost on one spine, and the next report is graded by
+    // the sends and losses of both. Under switch_queue the sender counts
+    // nothing and deposits the report as it stands.
+    void Transport(GradeCostSource source)
+    {
+        constexpr uint32_t kMtu = IsolatedHost::kMtu;
+        constexpr uint32_t kPackets = 16;
+        IsolatedHost sender(LoadBalancingMode::SprayPolicy, kTestReceiver, kSpines);
+        sender.hw->m_sprayBaseRttNs = kInterval / 2;
+        sender.hw->m_sprayGradeCostSource = static_cast<uint32_t>(source);
+        sender.hw->m_sprayLossThreshold1 = kThresholds[0];
+        sender.hw->m_sprayLossThreshold2 = kThresholds[1];
+        sender.hw->m_sprayLossThreshold3 = kThresholds[2];
+        const bool counting = source == GradeCostSource::Estimate;
+        NS_TEST_EXPECT_MSG_EQ(sender.hw->CountsSprayLoss(),
+                              counting,
+                              "the sender counts loss outside switch_queue only");
+        Ptr<RdmaQueuePair> first = sender.AddSender(kTestSender, kTestReceiver, kPackets * kMtu);
+        Ptr<RdmaQueuePair> second =
+            sender.AddSender(kTestSender, kTestReceiver, kPackets * kMtu, kOtherPort);
+        NS_TEST_ASSERT_MSG_EQ(sender.hw->m_spineScores.size(), 1u, "one host's scores");
+        SpineScores& scores = sender.hw->m_spineScores.begin()->second;
+        SpineScores reference(kSpines, ScoresFixture::Defaults());
+        const std::vector<uint8_t> top(kSpines, 3);
+        scores.OnReport(ScoresFixture::Report(1, top), 0);
+        reference.OnReport(ScoresFixture::Report(1, top), 0);
+
+        std::vector<uint32_t> sent(kSpines, 0);
+        std::vector<uint16_t> identifications;
+        for (uint32_t i = 0; i < kPackets; ++i)
+        {
+            for (Ptr<RdmaQueuePair> qp : {first, second})
+            {
+                CustomHeader parsed(CustomHeader::L2_Header | CustomHeader::L3_Header);
+                sender.hw->GetNxtPacket(qp)->PeekHeader(parsed);
+                sent[RequestedSpine(parsed.ipid)]++;
+                if (qp == first)
+                {
+                    identifications.push_back(parsed.ipid);
+                }
+            }
+        }
+        // The first queue pair's sends on the spine it sent most on.
+        std::vector<std::vector<uint32_t>> bySpine(kSpines);
+        for (uint32_t i = 0; i < kPackets; ++i)
+        {
+            bySpine[RequestedSpine(identifications[i])].push_back(i);
+        }
+        const uint8_t spine =
+            std::max_element(bySpine.begin(),
+                             bySpine.end(),
+                             [](const auto& a, const auto& b) { return a.size() < b.size(); }) -
+            bySpine.begin();
+        const std::vector<uint32_t>& onSpine = bySpine[spine];
+        NS_TEST_ASSERT_MSG_GT(onSpine.size(), 2, "the draw puts three sends on one spine");
+        // The report it carries is the one already taken.
+        Acknowledge(sender, onSpine[2] * kMtu, identifications[onSpine[2]], 1);
+        NS_TEST_EXPECT_MSG_EQ(first->m_recovery_events, 2, "two sends declared lost");
+        Acknowledge(sender, onSpine[2] * kMtu, identifications[onSpine[2]], 2);
+
+        std::vector<uint8_t> expected = top;
+        if (counting)
+        {
+            expected[spine] = QuantizeGrade(std::min(1.0, 2.0 / sent[spine]), kThresholds);
+            NS_TEST_EXPECT_MSG_LT(uint32_t(expected[spine]), 3u, "the loss costs a grade");
+        }
+        reference.OnReport(ScoresFixture::Report(2, expected), 0);
+        ExpectScores(scores,
+                     reference,
+                     counting ? "both queue pairs' sends and the losses grade the host's scores"
+                              : "under switch_queue the sender's losses are not counted");
+        Simulator::Destroy();
+    }
+
+    // Under switch_queue the grader grades the paths' loss through the loss
+    // thresholds, and through the congestion thresholds while they are unset.
+    void Oracle()
+    {
+        std::vector<SpineGrader::SpineValues> values(GraderFixture::kSpines);
+        values[6].lossFraction = 0.3;
+        const std::vector<bool> held(GraderFixture::kSpines, false);
+        SpineGrader::Parameters parameters = GraderFixture::Absolute();
+        NS_TEST_EXPECT_MSG_EQ(
+            uint32_t(SpineGrader(parameters).Graded(values, held, 0.875).Grade(6)),
+            2u,
+            "unset, a loss of 0.3 grades 2 through the congestion thresholds");
+        parameters.lossThresholds = kThresholds;
+        const SpineReport report = SpineGrader(parameters).Graded(values, held, 0.875);
+        NS_TEST_EXPECT_MSG_EQ(uint32_t(report.Grade(6)), 1u, "and 1 through the loss thresholds");
+        NS_TEST_EXPECT_MSG_EQ(uint32_t(report.Grade(0)), 3u, "a spine without loss keeps 3");
+        values[6].lossFraction = 0;
+        values[6].markFraction = 0.3;
+        NS_TEST_EXPECT_MSG_EQ(
+            uint32_t(SpineGrader(parameters).Graded(values, held, 0.875).Grade(6)),
+            2u,
+            "the marked fraction keeps the congestion thresholds");
+
+        Ptr<RdmaHw> hw = CreateObject<RdmaHw>();
+        hw->SetNode(CreateObject<Node>());
+        hw->m_sprayBaseRttNs = 10000;
+        hw->m_loadBalancing = static_cast<uint32_t>(LoadBalancingMode::SprayPolicy);
+        hw->m_sprayGradeCostSource = static_cast<uint32_t>(GradeCostSource::SwitchQueue);
+        NS_TEST_EXPECT_MSG_EQ(hw->GraderParameters().lossThresholds.has_value(),
+                              false,
+                              "unset, the grader has no loss thresholds");
+        hw->m_sprayLossThreshold1 = kThresholds[0];
+        hw->m_sprayLossThreshold2 = kThresholds[1];
+        hw->m_sprayLossThreshold3 = kThresholds[2];
+        const std::optional<std::array<double, 3>> filled = hw->GraderParameters().lossThresholds;
+        NS_TEST_ASSERT_MSG_EQ(filled.has_value(), true, "the grader takes the loss thresholds");
+        NS_TEST_EXPECT_MSG_EQ((*filled == kThresholds), true, "as set");
+    }
+
+    // The sender's counting needs the send records selective retransmission
+    // keeps; under switch_queue it counts nothing.
+    void Validation()
+    {
+        Ptr<RdmaHw> hw = CreateObject<RdmaHw>();
+        hw->m_loadBalancing = static_cast<uint32_t>(LoadBalancingMode::SprayPolicy);
+        hw->m_selective_retransmission = false;
+        NS_TEST_EXPECT_MSG_EQ(hw->ValidSprayLoss(), true, "unset thresholds need nothing");
+        hw->m_sprayLossThreshold1 = kThresholds[0];
+        hw->m_sprayLossThreshold2 = kThresholds[1];
+        hw->m_sprayLossThreshold3 = kThresholds[2];
+        NS_TEST_EXPECT_MSG_EQ(hw->ValidSprayLoss(),
+                              false,
+                              "thresholds without selective retransmission are refused");
+        hw->m_selective_retransmission = true;
+        NS_TEST_EXPECT_MSG_EQ(hw->ValidSprayLoss(), true, "with it they are accepted");
+        hw->m_selective_retransmission = false;
+        hw->m_sprayGradeCostSource = static_cast<uint32_t>(GradeCostSource::SwitchQueue);
+        NS_TEST_EXPECT_MSG_EQ(hw->ValidSprayLoss(),
+                              true,
+                              "under switch_queue the sender counts nothing to need them for");
+    }
+};
+
 class SprayPolicyTransportTest : public TestCase
 {
   public:
@@ -7076,6 +7437,7 @@ PointToPointTestSuite::PointToPointTestSuite()
     AddTestCase(new SpineScoresDrawTest, TestCase::Duration::QUICK);
     AddTestCase(new SpineScoresEdgeFreezeTest, TestCase::Duration::QUICK);
     AddTestCase(new SpineScoresPoolTest, TestCase::Duration::QUICK);
+    AddTestCase(new SpineLossThresholdsTest, TestCase::Duration::QUICK);
     AddTestCase(new SprayPolicyTransportTest, TestCase::Duration::QUICK);
     AddTestCase(new NsccReceiverPenaltyTest, TestCase::Duration::QUICK);
     AddTestCase(new SprayPolicyDefaultsTest, TestCase::Duration::QUICK);

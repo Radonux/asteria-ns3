@@ -9,6 +9,17 @@
 
 namespace ns3 {
 
+// A cost graded through three increasing thresholds: 3 below the first, 2
+// below the second, 1 below the third, else 0.
+template <typename Thresholds>
+uint8_t QuantizeGrade(double value, const Thresholds &thresholds){
+	for (uint8_t i = 0; i < 3; i++){
+		if (value < thresholds[i])
+			return SpineReport::kTopGrade - i;
+	}
+	return 0;
+}
+
 // Whose arrivals one grader counts and whose acknowledgements carry its
 // report, and so which senders share one set of scores: every connection into
 // a receiving host, or each connection alone.
@@ -92,6 +103,9 @@ public:
 		// The trimmed fraction's costs from which a spine grades 2, 1 and 0;
 		// unset, the congestion thresholds.
 		std::optional<std::array<double, 3>> trimThresholds;
+		// The loss fraction's costs from which a spine grades 2, 1 and 0
+		// when Graded grades loss; unset, the congestion thresholds.
+		std::optional<std::array<double, 3>> lossThresholds;
 		bool oneWayDelay;
 		SupervisedEwma::Parameters delayNs;
 		// The delays above a spine's least from which it grades 2, 1 and 0.
@@ -136,7 +150,8 @@ public:
 	// a spine graded 0 if held says so. With lossHold the loss fraction is
 	// graded too: its excess over the median spine's costs a grade as the
 	// marked and trimmed fractions' do, and a spine whose loss fraction
-	// reaches lossHold is graded 0. The edge bit here is set only when no
+	// reaches lossHold is graded 0; the loss fraction's cost is graded
+	// through the loss thresholds where they are set. The edge bit here is set only when no
 	// spine earns the top grade; the report's sequence is the latest's.
 	SpineReport Graded(const std::vector<SpineValues> &values,
 		const std::vector<bool> &held, std::optional<double> lossHold) const;
