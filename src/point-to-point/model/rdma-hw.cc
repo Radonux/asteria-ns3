@@ -387,6 +387,15 @@ TypeId RdmaHw::GetTypeId (void)
 				UintegerValue(0),
 				MakeUintegerAccessor(&RdmaHw::m_sprayLossIntervalNs),
 				MakeUintegerChecker<uint64_t>())
+		.AddAttribute("SprayLossHoldCleanSentinels",
+				"Under LoadBalancing 3 with SprayLossThreshold1 set, the clean "
+				"sends a spine whose lost fraction graded it 0 needs, counted "
+				"across report periods and loss intervals and restarted by any "
+				"loss, before its loss grade leaves 0; per destination and in "
+				"the host's pooled scores alike. Default 0: no loss hold.",
+				UintegerValue(0),
+				MakeUintegerAccessor(&RdmaHw::m_sprayLossHoldCleanSentinels),
+				MakeUintegerChecker<uint32_t>())
 		.AddAttribute("SprayAbsenceFractionOfMedian",
 				"Under LoadBalancing 3, a spine whose arrivals over a window are "
 				"below this fraction of the median spine's is held at grade 0, "
@@ -2385,6 +2394,7 @@ void RdmaHw::StartPathSelection(Ptr<RdmaQueuePair> qp, uint64_t bdpBytes,
 		if (CountsSprayLoss()){
 			parameters.lossThresholds = SprayLossThresholds();
 			parameters.lossIntervalNs = m_sprayLossIntervalNs;
+			parameters.lossHoldCleanSentinels = m_sprayLossHoldCleanSentinels;
 		}
 		if (m_spraySenderPoolWeight > 0 && !m_senderSpineScores){
 			SpineScores::Parameters poolParameters = parameters;

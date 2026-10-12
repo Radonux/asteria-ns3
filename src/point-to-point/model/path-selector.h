@@ -116,6 +116,23 @@ private:
 // pooled set of scores takes is taken by the pool at the lower of the grade
 // it took and the pool's loss grade.
 //
+// With loss hold clean sentinels n above zero, the loss grading also holds:
+// per spine, in the counts each report takes and in the pool's loss
+// intervals alike, a report period or interval whose lost fraction grades a
+// spine 0 puts it in loss hold with its clean count at zero. While in loss
+// hold a spine's loss grade is 0: a period with a loss restarts its clean
+// count, and a period without one adds its sends to the count until it
+// reaches n, when the loss hold ends and that period's loss grade is the top
+// grade, the report's grade then applying through the lower of the two as
+// before. A period with nothing sent leaves a spine's loss hold as it is: in
+// loss hold its loss grade stays 0, and outside it the period grades as
+// above, the report's grade standing and the pool's loss grade the top; so
+// the pool's loss grade of a spine in loss hold stays 0 across intervals with
+// nothing sent. The loss hold outlives the counts, which still restart at
+// every report taken. Under the sentinel held
+// exploration a held spine's sends are its sentinels, so n clean sentinels in
+// a row are the evidence that releases it.
+//
 // A spine is held while the last report taken graded it 0; drawn through a
 // pool, while the last report the pool took did. Under the epsilon held
 // exploration a held spine keeps its epsilon / N of the draws. Under the
@@ -165,6 +182,9 @@ public:
 		// The loss interval of scores used as a pool; zero, the report
 		// interval.
 		uint64_t lossIntervalNs = 0;
+		// With loss thresholds set, the clean sends that end a loss hold;
+		// zero holds nothing.
+		uint32_t lossHoldCleanSentinels = 0;
 		HeldExploration heldExploration = HeldExploration::Epsilon;
 		// Under the sentinel held exploration, the interval between two
 		// sentinels on one held spine; zero, the report interval.
@@ -195,9 +215,10 @@ public:
 	void Pool(SpineScores &pool, double weight);
 	// As a pool with loss thresholds set: called as each loss interval is
 	// closed, with the time it ended at and, per spine, the sends and losses
-	// counted in it and the grade its lost fraction earns, the top grade for
-	// a spine not sent on. A later interval that ended before the next send,
-	// loss or report counted nothing and is not passed.
+	// counted in it and the grade its lost fraction earns through the loss
+	// hold, the top grade for a spine not sent on and not in loss hold. A
+	// later interval that ended before the next send, loss or report counted
+	// nothing and is not passed.
 	using LossIntervalCallback = std::function<void(uint64_t endNs,
 		const std::vector<uint32_t> &sent, const std::vector<uint32_t> &lost,
 		const std::vector<uint8_t> &grades)>;
@@ -234,6 +255,10 @@ private:
 	double EpsilonShare(uint32_t spine) const;
 	// The grade the lost fraction of sent sends earns.
 	uint8_t LossGrade(uint32_t sent, uint32_t lost) const;
+	// The loss grade of a period in which spine had sent sends and lost
+	// declared lost, through the loss hold; the top grade for a spine not
+	// sent on and not in loss hold.
+	uint8_t HeldLossGrade(uint32_t spine, uint32_t sent, uint32_t lost);
 	// As a pool: close the loss intervals ended by now, grading the spines by
 	// the last of them, before a send or loss is counted or a grade read.
 	void AdvanceLossInterval(uint64_t nowNs);
@@ -260,6 +285,10 @@ private:
 	uint64_t m_lossIntervalEndNs;
 	std::vector<uint8_t> m_lossGrades;
 	LossIntervalCallback m_onLossInterval;
+	// Per spine, whether it is in loss hold, and its clean sends since the
+	// loss hold started or last saw a loss.
+	std::vector<bool> m_lossHeld;
+	std::vector<uint32_t> m_lossClean;
 	// Per spine, whether the last report taken graded it 0, and when its
 	// last sentinel was sent.
 	std::vector<bool> m_held;

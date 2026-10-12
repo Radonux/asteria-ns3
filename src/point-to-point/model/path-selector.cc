@@ -70,7 +70,8 @@ SpineScores::SpineScores(uint32_t spines, const Parameters &parameters)
 	  m_lossIntervalNs(parameters.lossIntervalNs > 0
 		? parameters.lossIntervalNs : parameters.reportIntervalNs),
 	  m_lossIntervalEndNs(m_lossIntervalNs),
-	  m_lossGrades(spines, SpineReport::kTopGrade), m_held(spines),
+	  m_lossGrades(spines, SpineReport::kTopGrade), m_lossHeld(spines),
+	  m_lossClean(spines), m_held(spines),
 	  m_sentinelNs(spines),
 	  m_sentinelIntervalNs(parameters.sentinelIntervalNs > 0
 		? parameters.sentinelIntervalNs : parameters.reportIntervalNs),
@@ -114,11 +115,11 @@ void SpineScores::OnReport(const SpineReport &report, uint64_t nowNs){
 	m_sequence = report.sequence;
 	SpineReport combined = report;
 	if (m_parameters.lossThresholds){
-		for (uint32_t k = 0; k < m_scores.size(); k++){
-			if (m_sent[k] > 0)
-				combined.SetGrade(k, std::min(report.Grade(k),
-					LossGrade(m_sent[k], m_lost[k])));
-		}
+		// A spine not sent on and not in loss hold earns the top grade, and
+		// keeps the report's.
+		for (uint32_t k = 0; k < m_scores.size(); k++)
+			combined.SetGrade(k, std::min(report.Grade(k),
+				HeldLossGrade(k, m_sent[k], m_lost[k])));
 		std::fill(m_sent.begin(), m_sent.end(), 0);
 		std::fill(m_lost.begin(), m_lost.end(), 0);
 	}
@@ -165,6 +166,31 @@ uint8_t SpineScores::LossGrade(uint32_t sent, uint32_t lost) const{
 		*m_parameters.lossThresholds);
 }
 
+uint8_t SpineScores::HeldLossGrade(uint32_t spine, uint32_t sent,
+		uint32_t lost){
+	const uint8_t grade = LossGrade(sent, lost);
+	const uint32_t clean = m_parameters.lossHoldCleanSentinels;
+	if (clean == 0)
+		return grade;
+	if (!m_lossHeld[spine]){
+		if (grade == 0){
+			m_lossHeld[spine] = true;
+			m_lossClean[spine] = 0;
+		}
+		return grade;
+	}
+	if (lost > 0){
+		m_lossClean[spine] = 0;
+		return 0;
+	}
+	m_lossClean[spine] += sent;
+	if (m_lossClean[spine] < clean)
+		return 0;
+	m_lossHeld[spine] = false;
+	m_lossClean[spine] = 0;
+	return SpineReport::kTopGrade;
+}
+
 void SpineScores::AdvanceLossInterval(uint64_t nowNs){
 	if (nowNs < m_lossIntervalEndNs)
 		return;
@@ -173,14 +199,16 @@ void SpineScores::AdvanceLossInterval(uint64_t nowNs){
 	const bool lastCounted = nowNs - m_lossIntervalEndNs < m_lossIntervalNs;
 	std::vector<uint8_t> closed(m_scores.size());
 	for (uint32_t k = 0; k < m_scores.size(); k++)
-		closed[k] = LossGrade(m_sent[k], m_lost[k]);
+		closed[k] = HeldLossGrade(k, m_sent[k], m_lost[k]);
 	if (m_onLossInterval)
 		m_onLossInterval(m_lossIntervalEndNs, m_sent, m_lost, closed);
+	// The intervals after it counted nothing, which leaves a spine in loss
+	// hold at 0.
 	if (lastCounted)
 		m_lossGrades = closed;
 	else
-		std::fill(m_lossGrades.begin(), m_lossGrades.end(),
-			SpineReport::kTopGrade);
+		for (uint32_t k = 0; k < m_scores.size(); k++)
+			m_lossGrades[k] = m_lossHeld[k] ? 0 : SpineReport::kTopGrade;
 	std::fill(m_sent.begin(), m_sent.end(), 0);
 	std::fill(m_lost.begin(), m_lost.end(), 0);
 	m_lossIntervalEndNs += m_lossIntervalNs *

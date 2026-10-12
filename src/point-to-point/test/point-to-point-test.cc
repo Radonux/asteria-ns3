@@ -5956,7 +5956,8 @@ class SpineLossThresholdsTest : public TestCase
         : TestCase("Loss thresholds grade the lost fraction of a spine at the sender, per "
                    "destination between reports and host-wide per loss interval in the pool, "
                    "which the host traces as each interval closes; under switch_queue they "
-                   "grade the loss of the paths instead")
+                   "grade the loss of the paths instead; with loss hold clean sentinels a "
+                   "spine they grade 0 stays at 0 until that many clean sends")
     {
     }
 
@@ -5967,6 +5968,11 @@ class SpineLossThresholdsTest : public TestCase
         Local();
         Pool();
         PoolTrace();
+        LossHoldLocal(0);
+        LossHoldLocal(4);
+        LossHoldPool(0);
+        LossHoldPool(4);
+        LossHoldUnset();
         const bool savedPacketSeq = CustomHeader::ackCarriesPacketSeq;
         const uint32_t savedReportBytes = CustomHeader::ackReportBytes;
         CustomHeader::ackCarriesPacketSeq = true;
@@ -6025,6 +6031,166 @@ class SpineLossThresholdsTest : public TestCase
         NS_TEST_EXPECT_MSG_EQ(hw->m_sprayLossThreshold1, 0.0, "the loss thresholds are unset");
         NS_TEST_EXPECT_MSG_EQ(hw->m_sprayLossIntervalNs, 0u, "the loss interval is the report's");
         NS_TEST_EXPECT_MSG_EQ(hw->SprayLossThresholds().has_value(), false, "unset");
+        NS_TEST_EXPECT_MSG_EQ(hw->m_sprayLossHoldCleanSentinels, 0u, "no loss hold");
+        NS_TEST_EXPECT_MSG_EQ(ScoresFixture::Defaults().lossHoldCleanSentinels,
+                              0u,
+                              "the scores hold nothing by default");
+    }
+
+    // One report period or loss interval of the loss hold sequence: the
+    // sends and losses on spine 2, and its loss grade without and with a
+    // loss hold of 4 clean sends.
+    struct HoldStep
+    {
+        uint32_t sent, lost;
+        uint8_t unheld, held;
+    };
+
+    static std::vector<HoldStep> HoldSteps()
+    {
+        return {
+            {10, 6, 0, 0}, // 6 of 10 lost grades 0: the loss hold starts
+            {0, 0, 3, 0},  // nothing sent: held at 0
+            {1, 1, 0, 0},  // a lost sentinel
+            {2, 0, 3, 0},  // 2 clean
+            {0, 0, 3, 0},  // nothing sent: the clean count is kept
+            {1, 0, 3, 0},  // 3 clean
+            {1, 1, 0, 0},  // a loss restarts the count
+            {3, 0, 3, 0},  // 3 clean
+            {1, 0, 3, 3},  // 4 clean: the loss hold ends
+            {0, 0, 3, 3},  // nothing sent and not held: the top grade
+            {10, 6, 0, 0}, // the next loss holds it again
+            {4, 0, 3, 3},  // and 4 clean in one period end it
+        };
+    }
+
+    static SpineScores::Parameters WithHold(uint32_t clean)
+    {
+        SpineScores::Parameters parameters = WithThresholds();
+        parameters.lossHoldCleanSentinels = clean;
+        return parameters;
+    }
+
+    // Per destination: the report's grade of spine 2 is 3, except 2 at the
+    // ninth report, where the loss hold ends and the lower of the two holds;
+    // spine 5 loses 3 of 10 in the first period, graded 1 and not held.
+    void LossHoldLocal(uint32_t clean)
+    {
+        SpineScores scores(kSpines, WithHold(clean));
+        SpineScores reference(kSpines, ScoresFixture::Defaults());
+        const std::vector<HoldStep> steps = HoldSteps();
+        const std::string label = clean > 0 ? "held: " : "unheld: ";
+        for (uint32_t i = 0; i < steps.size(); ++i)
+        {
+            const uint8_t sequence = i + 1;
+            const uint64_t now = sequence * kInterval;
+            Send(scores, 2, steps[i].sent, steps[i].lost, now - 100);
+            if (i == 0)
+            {
+                Send(scores, 5, 10, 3, now - 100);
+            }
+            std::vector<uint8_t> grades(kSpines, 3);
+            if (i == 8)
+            {
+                grades[2] = 2;
+            }
+            scores.OnReport(ScoresFixture::Report(sequence, grades), now);
+            std::vector<uint8_t> expected = grades;
+            const uint8_t loss = clean > 0 ? steps[i].held : steps[i].unheld;
+            expected[2] = std::min(grades[2], loss);
+            if (i == 0)
+            {
+                expected[5] = 1;
+            }
+            reference.OnReport(ScoresFixture::Report(sequence, expected), now);
+            ExpectScores(scores, reference, label + "report " + std::to_string(sequence));
+            NS_TEST_EXPECT_MSG_EQ(scores.Held(2),
+                                  (expected[2] == 0),
+                                  label + "held while graded 0, report " +
+                                      std::to_string(sequence));
+        }
+    }
+
+    // In the pool, whose loss interval is the report interval: the first
+    // destination sends, and the second, which sends nothing, reports every
+    // spine 3 once per interval, so the pool takes its own loss grade. The
+    // destinations hold nothing themselves.
+    void LossHoldPool(uint32_t clean)
+    {
+        SpineScores pool(kSpines, WithHold(clean));
+        SpineScores toFirst(kSpines, WithThresholds());
+        SpineScores toSecond(kSpines, WithThresholds());
+        toFirst.Pool(pool, 0.5);
+        toSecond.Pool(pool, 0.5);
+        SpineScores referencePool(kSpines, ScoresFixture::Defaults());
+        std::vector<Closed> closed;
+        pool.SetLossIntervalCallback(Recorder(closed));
+        const std::vector<uint8_t> top(kSpines, 3);
+        const std::vector<HoldStep> steps = HoldSteps();
+        const std::string label = clean > 0 ? "held: " : "unheld: ";
+        std::vector<Closed> expectedClosed;
+        for (uint32_t i = 0; i < steps.size(); ++i)
+        {
+            const uint8_t sequence = i + 1;
+            // The sends fall in interval i, and the report early in the next.
+            Send(toFirst, 2, steps[i].sent, steps[i].lost, i * kInterval + 6000);
+            const uint64_t now = sequence * kInterval + 5000;
+            toSecond.OnReport(ScoresFixture::Report(sequence, top), now);
+            std::vector<uint8_t> expected = top;
+            expected[2] = clean > 0 ? steps[i].held : steps[i].unheld;
+            referencePool.OnReport(ScoresFixture::Report(sequence, expected), now);
+            ExpectScores(pool, referencePool, label + "interval " + std::to_string(i));
+            Closed interval;
+            interval.endNs = sequence * kInterval;
+            interval.sent.assign(kSpines, 0);
+            interval.lost.assign(kSpines, 0);
+            interval.sent[2] = steps[i].sent;
+            interval.lost[2] = steps[i].lost;
+            interval.grades = expected;
+            expectedClosed.push_back(interval);
+        }
+        ExpectClosed(closed, expectedClosed);
+
+        // Held again, then three intervals with nothing counted: the one
+        // closed and the two not passed leave it at 0, where it was the top
+        // grade before.
+        const uint32_t next = steps.size();
+        Send(toFirst, 2, 10, 6, next * kInterval + 6000);
+        toSecond.OnReport(ScoresFixture::Report(next + 1, top), (next + 1) * kInterval + 5000);
+        std::vector<uint8_t> expected = top;
+        expected[2] = 0;
+        referencePool.OnReport(ScoresFixture::Report(next + 1, expected),
+                               (next + 1) * kInterval + 5000);
+        toSecond.OnReport(ScoresFixture::Report(next + 2, top), (next + 4) * kInterval + 5000);
+        expected[2] = clean > 0 ? 0 : 3;
+        referencePool.OnReport(ScoresFixture::Report(next + 2, expected),
+                               (next + 4) * kInterval + 5000);
+        ExpectScores(pool, referencePool, label + "intervals with nothing counted");
+        NS_TEST_EXPECT_MSG_EQ(pool.Held(2), (clean > 0), label + "the pool holds the spine");
+    }
+
+    // Without loss thresholds nothing is counted, so a loss hold set holds
+    // nothing: the scores deposit the report's grades.
+    void LossHoldUnset()
+    {
+        SpineScores::Parameters parameters = ScoresFixture::Defaults();
+        parameters.lossHoldCleanSentinels = 4;
+        SpineScores pool(kSpines, parameters);
+        SpineScores scores(kSpines, parameters);
+        scores.Pool(pool, 0.5);
+        SpineScores reference(kSpines, ScoresFixture::Defaults());
+        SpineScores referencePool(kSpines, ScoresFixture::Defaults());
+        reference.Pool(referencePool, 0.5);
+        const std::vector<uint8_t> top(kSpines, 3);
+        for (uint8_t sequence = 1; sequence <= 3; ++sequence)
+        {
+            const uint32_t lost = sequence == 1 ? 10 : 0;
+            Send(scores, 2, lost, lost, sequence * kInterval - 100);
+            scores.OnReport(ScoresFixture::Report(sequence, top), sequence * kInterval);
+            reference.OnReport(ScoresFixture::Report(sequence, top), sequence * kInterval);
+        }
+        ExpectScores(scores, reference, "without thresholds nothing is held");
+        ExpectScores(pool, referencePool, "nor in the pool");
     }
 
     // Unset, sends and losses leave every deposit as the report has it.

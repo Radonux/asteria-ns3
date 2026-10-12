@@ -130,8 +130,9 @@ public:
 	// Zero counts no loss at the sender and leaves the loss fraction the
 	// grader grades under SwitchQueue on the congestion thresholds.
 	double m_sprayLossThreshold1, m_sprayLossThreshold2, m_sprayLossThreshold3;
-	// SpineScores::Parameters::lossIntervalNs.
+	// SpineScores::Parameters::lossIntervalNs and lossHoldCleanSentinels.
 	uint64_t m_sprayLossIntervalNs;
+	uint32_t m_sprayLossHoldCleanSentinels;
 	// The loss thresholds, unset while SprayLossThreshold1 is zero.
 	std::optional<std::array<double, 3>> SprayLossThresholds() const;
 	// Whether the sender's scores count sends and losses: under SprayPolicy
