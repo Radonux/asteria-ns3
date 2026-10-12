@@ -176,13 +176,15 @@ TypeId RdmaHw::GetTypeId (void)
 				"value: 0=OPS, a fresh value drawn per packet; 1=REPS; 2=UEC "
 				"oblivious spraying; 3=UEC path-aware spraying with the "
 				"congestion bitmap; 4=MRC. Under LoadBalancing 2, 0 draws each "
-				"spine uniformly and 5 sends on the spine the latest "
-				"acknowledgement redirects to, which needs IntHeader::mode TS.",
+				"spine uniformly, 5 sends on the spine the latest "
+				"acknowledgement redirects to, which needs IntHeader::mode TS, "
+				"and 6 is REPS over spines leaving out the spines the host's "
+				"loss hold holds.",
 				UintegerValue(static_cast<uint32_t>(PathSelectorKind::Ops)),
 				MakeUintegerAccessor(&RdmaHw::m_pathSelectorKind),
 				MakeUintegerChecker<uint32_t>(
 					static_cast<uint32_t>(PathSelectorKind::Ops),
-					static_cast<uint32_t>(PathSelectorKind::AckRedirect)))
+					static_cast<uint32_t>(PathSelectorKind::RepsHold)))
 		.AddAttribute("RepsBufferSize",
 				"REPS: the entries of the circular buffer of entropy values to "
 				"reuse. Default 8, REPS section 3.1.",
@@ -861,6 +863,11 @@ void RdmaHw::Setup(QpCompleteCallback cb, QpFailureCallback failure_cb){
 		"SprayHeldExploration none needs SprayGradeCostSource 1: a held spine "
 		"is sent nothing, and the receiver's estimate releases a hold only "
 		"for arrivals");
+	NS_ABORT_MSG_IF(!ValidRepsHold(),
+		"PathSelector 6 holds spines by their loss and needs LoadBalancing 2, "
+		"SprayLossThreshold1-3, SprayLossIntervalNs and "
+		"SprayLossHoldCleanSentinels above zero and SprayHeldExploration "
+		"sentinel");
 	NS_ABORT_MSG_IF(!ValidPoolHoldPropagates(),
 		"SprayPoolHoldPropagates needs SpraySenderPoolWeight above zero: "
 		"without a pool there is no pool's hold to propagate");
@@ -889,6 +896,7 @@ void RdmaHw::Setup(QpCompleteCallback cb, QpFailureCallback failure_cb){
 				static_cast<uint32_t>(PathSelectorKind::Ops) &&
 			m_pathSelectorKind !=
 				static_cast<uint32_t>(PathSelectorKind::AckRedirect) &&
+			!IsRepsHold() &&
 			m_loadBalancing !=
 				static_cast<uint32_t>(LoadBalancingMode::EntropyHash),
 		"PathSelector 1 to 4 choose entropy values and need LoadBalancing 1");
@@ -1256,7 +1264,50 @@ void RdmaHw::GradeFromSwitchQueues(uint64_t nowNs, const SpineGrader &grader){
 bool RdmaHw::CountsSprayLoss() const{
 	// Under the switches' state the paths' loss is read into the reports, so
 	// the sender counts none of its own.
-	return IsSprayPolicy() && m_sprayLossThreshold1 > 0 && !IsSwitchQueueCost();
+	return m_sprayLossThreshold1 > 0 &&
+		((IsSprayPolicy() && !IsSwitchQueueCost()) || IsRepsHold());
+}
+
+bool RdmaHw::IsRepsHold() const{
+	return m_pathSelectorKind ==
+		static_cast<uint32_t>(PathSelectorKind::RepsHold);
+}
+
+bool RdmaHw::ValidRepsHold() const{
+	return !IsRepsHold() ||
+		(m_loadBalancing ==
+				static_cast<uint32_t>(LoadBalancingMode::SprayUniform) &&
+			m_sprayLossThreshold1 > 0 && m_sprayLossIntervalNs > 0 &&
+			m_sprayLossHoldCleanSentinels > 0 &&
+			m_sprayHeldExploration == SpineScores::HeldExploration::Sentinel);
+}
+
+SpineScores::Parameters RdmaHw::LossHoldParameters() const{
+	// The scores are never drawn from: only their loss counting, loss hold
+	// and sentinels are read. A sentinel interval of zero is the loss
+	// interval, which stands in for the report interval.
+	SpineScores::Parameters parameters{1, 0, 1,
+		SpineScores::CandidateDraw::Proportional, m_sprayLossIntervalNs};
+	parameters.lossThresholds = SprayLossThresholds();
+	parameters.lossIntervalNs = m_sprayLossIntervalNs;
+	parameters.lossHoldCleanSentinels = m_sprayLossHoldCleanSentinels;
+	parameters.heldExploration = m_sprayHeldExploration;
+	parameters.sentinelIntervalNs = m_sprayHeldSentinelIntervalNs;
+	return parameters;
+}
+
+SpineScores &RdmaHw::HostScores(const SpineScores::Parameters &parameters){
+	if (m_senderSpineScores)
+		return *m_senderSpineScores;
+	m_senderSpineScores = std::make_unique<SpineScores>(m_spineCount, parameters);
+	if (parameters.lossThresholds)
+		m_senderSpineScores->SetLossIntervalCallback(
+			[this](uint64_t endNs, const std::vector<uint32_t> &sent,
+					const std::vector<uint32_t> &lost,
+					const std::vector<uint8_t> &grades){
+				m_traceSpineLossInterval(endNs, sent, lost, grades);
+			});
+	return *m_senderSpineScores;
 }
 
 bool RdmaHw::ValidSprayLoss() const{
@@ -2408,6 +2459,12 @@ void RdmaHw::StartPathSelection(Ptr<RdmaQueuePair> qp, uint64_t bdpBytes,
 			std::make_unique<AckRedirectSelector>(m_pathRandom, m_spineCount);
 		return;
 	}
+	if (IsRepsHold()){
+		qp->m_pathSelector = std::make_unique<RepsHoldSelector>(m_pathRandom,
+			m_repsBufferSize, m_repsFreezingTimeoutNs, bdpBytes / m_mtu,
+			m_spineCount, HostScores(LossHoldParameters()));
+		return;
+	}
 	if (m_loadBalancing == static_cast<uint32_t>(LoadBalancingMode::SprayUniform)){
 		qp->m_pathSelector =
 			std::make_unique<UniformSpineSelector>(m_pathRandom, m_spineCount);
@@ -2426,18 +2483,10 @@ void RdmaHw::StartPathSelection(Ptr<RdmaQueuePair> qp, uint64_t bdpBytes,
 			parameters.lossIntervalNs = m_sprayLossIntervalNs;
 			parameters.lossHoldCleanSentinels = m_sprayLossHoldCleanSentinels;
 		}
-		if (m_spraySenderPoolWeight > 0 && !m_senderSpineScores){
+		if (m_spraySenderPoolWeight > 0){
 			SpineScores::Parameters poolParameters = parameters;
 			poolParameters.poolDecayIntervalNs = m_sprayPoolDecayIntervalNs;
-			m_senderSpineScores =
-				std::make_unique<SpineScores>(m_spineCount, poolParameters);
-			if (parameters.lossThresholds)
-				m_senderSpineScores->SetLossIntervalCallback(
-					[this](uint64_t endNs, const std::vector<uint32_t> &sent,
-							const std::vector<uint32_t> &lost,
-							const std::vector<uint8_t> &grades){
-						m_traceSpineLossInterval(endNs, sent, lost, grades);
-					});
+			HostScores(poolParameters);
 		}
 		if (IsPerConnectionGrading()){
 			auto scores = std::make_unique<SpineScores>(m_spineCount, parameters);

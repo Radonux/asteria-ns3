@@ -24,6 +24,9 @@ enum class PathSelectorKind : uint32_t {
 	Mrc,
 	// Under SprayUniform: the spine the latest acknowledgement redirects to.
 	AckRedirect,
+	// Under SprayUniform: REPS over spines, leaving out the spines the host's
+	// loss hold holds.
+	RepsHold,
 };
 
 // A queue pair's choice of the path each of its data packets takes, and what
@@ -222,6 +225,21 @@ public:
 	bool TakeSentinel(uint64_t nowNs, uint8_t &spine);
 	// Whether spine is held for the draws from these scores.
 	bool Held(uint32_t spine) const;
+	// Whether these scores hold spine themselves, by their held flag or their
+	// loss hold, and whether they hold every spine.
+	bool Holds(uint32_t spine) const;
+	bool HoldsEvery() const;
+	// With loss thresholds set, scores used as a loss hold without reports,
+	// as a pool is: a send on spine and a send on spine declared lost,
+	// counted in the loss interval in progress once those ended by now are
+	// closed.
+	void CountIntervalSend(uint32_t spine, uint64_t nowNs);
+	void CountIntervalLoss(uint32_t spine, uint64_t nowNs);
+	// Scores used as a loss hold: close the loss intervals ended by now and,
+	// under the sentinel held exploration, whether a sentinel on a spine
+	// these scores hold is due, and which; the lowest such spine is taken
+	// and its sentinel interval restarts now.
+	bool TakeHoldSentinel(uint64_t nowNs, uint8_t &spine);
 	// A send drawn from these scores on spine, and a send on spine declared
 	// lost; each is counted by the pool too.
 	void OnSend(uint32_t spine, uint64_t nowNs);
@@ -259,6 +277,9 @@ private:
 	bool Propagates() const;
 	// Whether the pool holds spine: its held flag or its loss hold.
 	bool PoolHolds(uint32_t spine) const;
+	// Whether spine's sentinel is due by now, its last one a sentinel
+	// interval or more ago; if so its sentinel interval restarts now.
+	bool SentinelDue(uint32_t spine, uint64_t nowNs);
 	// Under propagation: whether a spine the pool holds is excluded from the
 	// mixed draw, which it is unless the pool holds every spine.
 	bool ExcludesPoolHeld() const;
@@ -385,6 +406,15 @@ public:
 	// times out untrimmed is taken for a failure (REPS appendix A).
 	void OnTimeout(uint64_t nowNs) override;
 
+protected:
+	// Over the paths 0 to paths - 1. A path Excluded names is never chosen:
+	// a cached one is passed over, used up as if it had been sent on, and a
+	// fresh one is drawn again. While the buffer holds only such values,
+	// freezing mode draws fresh ones too. Excluded must leave some path in.
+	RepsSelector(Ptr<UniformRandomVariable> random, uint32_t bufferSize,
+		uint64_t freezingTimeoutNs, uint32_t explorePackets, uint32_t paths);
+	virtual bool Excluded(uint16_t path) const;
+
 private:
 	struct Entry {
 		uint16_t ev;
@@ -395,6 +425,7 @@ private:
 	uint16_t Cached();
 
 	Ptr<UniformRandomVariable> m_random;
+	uint32_t m_paths;
 	std::vector<Entry> m_buffer;
 	uint32_t m_head; // the slot the next acknowledgement writes
 	uint32_t m_valid; // numberOfValidEVs
@@ -406,6 +437,31 @@ private:
 	uint64_t m_exitFreezingNs;
 	uint32_t m_explorePackets;
 	uint32_t m_exploreCounter;
+};
+
+// REPS (RepsSelector) over spines under SprayUniform, with a loss hold: the
+// spines that scores used as a loss hold (SpineScores) hold are left out of
+// REPS's choices unless they hold every spine, and each held spine is sent
+// the hold's sentinels, one per sentinel interval for every selector that
+// shares the hold, in place of REPS's choice. Every send, sentinel or chosen,
+// and every send declared lost is counted in the hold, which grades its
+// spines per loss interval as the host's pooled scores do and holds a spine
+// by the same loss hold. The hold is shared by every queue pair of a host.
+class RepsHoldSelector : public RepsSelector {
+public:
+	RepsHoldSelector(Ptr<UniformRandomVariable> random, uint32_t bufferSize,
+		uint64_t freezingTimeoutNs, uint32_t explorePackets, uint32_t spines,
+		SpineScores &hold);
+	uint16_t Choose(uint64_t nowNs) override;
+	void OnLoss(uint16_t path, uint64_t nowNs) override;
+
+protected:
+	bool Excluded(uint16_t path) const override;
+
+private:
+	SpineScores &m_hold;
+	// Whether the hold leaves a spine out, set before each choice.
+	bool m_excluding;
 };
 
 // The entropy values 0 to size - 1, visited in a pseudo-random order that

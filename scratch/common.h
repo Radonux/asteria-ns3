@@ -120,9 +120,10 @@ uint32_t selective_retransmission = 0;
 std::string packet_trim_mode = "disabled";
 std::string load_balancing = "ecmp";
 // Under LOAD_BALANCING ev_hash, what chooses each data packet's entropy value,
-// and under spray_uniform whether ack_redirect chooses its spine instead of a
-// uniform draw; and the parameters of the selectors, each the default of its
-// source.
+// and under spray_uniform whether ack_redirect or reps_hold chooses its spine
+// instead of a uniform draw; and the parameters of the selectors, each the
+// default of its source. reps_hold is REPS over spines, leaving out the
+// spines the host's loss hold holds.
 std::string path_selector = "ops";
 uint32_t reps_buffer_size = 8;
 uint64_t reps_freezing_timeout_ns = 10000000;
@@ -139,8 +140,8 @@ std::string ack_redirect_scope = "per_connection";
 // The selectors each parameter belongs to. A parameter given under another
 // selector would be read by nothing, so it is refused.
 const std::map<std::string, std::set<std::string>> path_selector_parameter_owners = {
-    {"REPS_BUFFER_SIZE", {"reps"}},
-    {"REPS_FREEZING_TIMEOUT_NS", {"reps"}},
+    {"REPS_BUFFER_SIZE", {"reps", "reps_hold"}},
+    {"REPS_FREEZING_TIMEOUT_NS", {"reps", "reps_hold"}},
     {"UE_EV_SET_SIZE", {"ue_oblivious", "ue_aware"}},
     {"UE_SATURATION_FRACTION", {"ue_aware"}},
     {"MRC_EV_SET_SIZE", {"mrc"}},
@@ -241,6 +242,15 @@ const std::set<std::string> spine_grader_keys = {
     "SPRAY_ABSENCE_MINIMUM_MEDIAN", "SPRAY_RELEASE_FRACTION_OF_FLOOR",
     "SPRAY_ONE_WAY_DELAY", "SPRAY_DELAY_CUSUM_SLACK_BASE_RTTS",
     "SPRAY_DELAY_CUSUM_THRESHOLD_BASE_RTTS"};
+// The spray_policy keys the host's loss hold reads, which reps_hold reads
+// too, and those of them it requires.
+const std::set<std::string> loss_hold_keys = {
+    "SPRAY_LOSS_THRESHOLDS", "SPRAY_LOSS_INTERVAL_NS",
+    "SPRAY_LOSS_HOLD_CLEAN_SENTINELS", "SPRAY_HELD_EXPLORATION",
+    "SPRAY_HELD_SENTINEL_INTERVAL_NS", "SPINE_LOSS_OUTPUT_FILE"};
+const std::vector<std::string> loss_hold_required_keys = {
+    "SPRAY_LOSS_THRESHOLDS", "SPRAY_LOSS_INTERVAL_NS",
+    "SPRAY_LOSS_HOLD_CLEAN_SENTINELS", "SPRAY_HELD_EXPLORATION"};
 std::set<std::string> spray_policy_keys_given;
 // UEC 1.0.3 section 4.1.4.1 RECOMMENDS three traffic classes: TC_low for data,
 // TC_med for trimmed packets, TC_high for control. Queue 0 is TC_high here, so
@@ -720,6 +730,8 @@ uint32_t path_selector_value() {
     return static_cast<uint32_t>(PathSelectorKind::Mrc);
   if (path_selector == "ack_redirect")
     return static_cast<uint32_t>(PathSelectorKind::AckRedirect);
+  if (path_selector == "reps_hold")
+    return static_cast<uint32_t>(PathSelectorKind::RepsHold);
   return std::numeric_limits<uint32_t>::max();
 }
 
@@ -1250,13 +1262,14 @@ uint64_t get_nic_rate(NodeContainer &n) {
   return 0;
 }
 
+bool increasing(const double (&thresholds)[3]) {
+  return thresholds[0] > 0 && thresholds[0] < thresholds[1] &&
+         thresholds[1] < thresholds[2];
+}
+
 // The spray_policy parameters within the ranges their RdmaHw attributes and
 // the grades they set take.
 bool valid_spray_policy() {
-  auto increasing = [](const double (&thresholds)[3]) {
-    return thresholds[0] > 0 && thresholds[0] < thresholds[1] &&
-           thresholds[1] < thresholds[2];
-  };
   if (!(spray_report_interval_base_rtts > 0)) {
     std::cerr << "SPRAY_REPORT_INTERVAL_BASE_RTTS must be positive\n";
     return false;
@@ -1468,6 +1481,45 @@ bool valid_ack_redirect() {
   if (cc_mode == 3 || cc_mode == 10) {
     std::cerr << "PATH_SELECTOR ack_redirect needs the timestamp CC_MODE "
               << cc_mode << " replaces\n";
+    return false;
+  }
+  return true;
+}
+
+// The loss hold of PATH_SELECTOR reps_hold: every key it requires given,
+// within the ranges its RdmaHw attributes take, and the sentinels that end
+// a hold sent.
+bool valid_loss_hold() {
+  for (const std::string &key : loss_hold_required_keys) {
+    if (spray_policy_keys_given.count(key) == 0) {
+      std::cerr << "PATH_SELECTOR " << path_selector
+                << " requires SPRAY_LOSS_THRESHOLDS, SPRAY_LOSS_INTERVAL_NS, "
+                   "SPRAY_LOSS_HOLD_CLEAN_SENTINELS and "
+                   "SPRAY_HELD_EXPLORATION\n";
+      return false;
+    }
+  }
+  if (!increasing(spray_loss_thresholds) || spray_loss_thresholds[2] > 1) {
+    std::cerr << "SPRAY_LOSS_THRESHOLDS must be three increasing "
+                 "fractions in (0, 1]\n";
+    return false;
+  }
+  if (spray_loss_interval_ns == 0) {
+    std::cerr << "SPRAY_LOSS_INTERVAL_NS must be positive under PATH_SELECTOR "
+              << path_selector << "\n";
+    return false;
+  }
+  if (spray_loss_hold_clean_sentinels == 0) {
+    std::cerr << "SPRAY_LOSS_HOLD_CLEAN_SENTINELS must be positive under "
+                 "PATH_SELECTOR "
+              << path_selector << "\n";
+    return false;
+  }
+  // A held spine is left out of every choice, so only its sentinels' clean
+  // sends can end the hold.
+  if (spray_held_exploration != "sentinel") {
+    std::cerr << "PATH_SELECTOR " << path_selector
+              << " requires SPRAY_HELD_EXPLORATION sentinel\n";
     return false;
   }
   return true;
@@ -2007,11 +2059,14 @@ bool ReadConf(string network_configuration) {
   }
   for (const std::string &key : spray_policy_keys_given) {
     if (load_balancing != "spray_policy" &&
-        !(host_redirect() && spine_grader_keys.count(key) > 0)) {
+        !(host_redirect() && spine_grader_keys.count(key) > 0) &&
+        !(path_selector == "reps_hold" && loss_hold_keys.count(key) > 0)) {
       std::cerr << key << " is read only under LOAD_BALANCING spray_policy"
                 << (spine_grader_keys.count(key) > 0
                         ? " or PATH_SELECTOR ack_redirect with "
                           "ACK_REDIRECT_SCOPE per_receiver\n"
+                    : loss_hold_keys.count(key) > 0
+                        ? " or PATH_SELECTOR reps_hold\n"
                         : "\n");
       return false;
     }
@@ -2023,9 +2078,18 @@ bool ReadConf(string network_configuration) {
   if (load_balancing == "spray_policy" && !valid_spray_policy())
     return false;
   if (path_selector_value() == std::numeric_limits<uint32_t>::max()) {
-    std::cerr << "PATH_SELECTOR must be ops, reps, ue_oblivious, ue_aware, mrc "
-                 "or ack_redirect\n";
+    std::cerr << "PATH_SELECTOR must be ops, reps, ue_oblivious, ue_aware, mrc, "
+                 "ack_redirect or reps_hold\n";
     return false;
+  }
+  if (path_selector == "reps_hold") {
+    if (load_balancing != "spray_uniform") {
+      std::cerr << "PATH_SELECTOR " << path_selector
+                << " names spines and requires LOAD_BALANCING spray_uniform\n";
+      return false;
+    }
+    if (!valid_loss_hold())
+      return false;
   }
   if (path_selector == "ack_redirect") {
     if (load_balancing != "spray_uniform") {
@@ -2035,7 +2099,7 @@ bool ReadConf(string network_configuration) {
     }
     if (!valid_ack_redirect())
       return false;
-  } else if (path_selector != "ops" &&
+  } else if (path_selector != "ops" && path_selector != "reps_hold" &&
              load_balancing_value() !=
                  static_cast<uint32_t>(LoadBalancingMode::EntropyHash)) {
     std::cerr << "PATH_SELECTOR " << path_selector
@@ -2467,6 +2531,11 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),
   }
   if (host_redirect() && spine_count > SpineReport::kMaxSpines) {
     std::cerr << "ACK_REDIRECT_SCOPE per_receiver grades at most "
+              << SpineReport::kMaxSpines << " spines\n";
+    return false;
+  }
+  if (path_selector == "reps_hold" && spine_count > SpineReport::kMaxSpines) {
+    std::cerr << "PATH_SELECTOR " << path_selector << " holds at most "
               << SpineReport::kMaxSpines << " spines\n";
     return false;
   }

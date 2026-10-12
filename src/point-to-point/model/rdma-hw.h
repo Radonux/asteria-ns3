@@ -138,7 +138,8 @@ public:
 	// The loss thresholds, unset while SprayLossThreshold1 is zero.
 	std::optional<std::array<double, 3>> SprayLossThresholds() const;
 	// Whether the sender's scores count sends and losses: under SprayPolicy
-	// with the loss thresholds set, outside SwitchQueue.
+	// with the loss thresholds set, outside SwitchQueue, and under
+	// PathSelector RepsHold.
 	bool CountsSprayLoss() const;
 	// Whether the loss counting has the send records it needs.
 	bool ValidSprayLoss() const;
@@ -208,7 +209,19 @@ public:
 	// whether it is set only with a pool to propagate from.
 	bool m_sprayPoolHoldPropagates;
 	bool ValidPoolHoldPropagates() const;
+	// The host's pooled scores, or under PathSelector RepsHold its loss hold;
+	// null until the first queue pair that uses them.
 	std::unique_ptr<SpineScores> m_senderSpineScores;
+	// m_senderSpineScores, made with parameters if it is null, its loss
+	// intervals traced to SpineLossInterval when they are graded.
+	SpineScores &HostScores(const SpineScores::Parameters &parameters);
+	// PathSelector RepsHold, and whether its loss hold has what it needs:
+	// spines named per packet, the loss thresholds, a loss interval, a loss
+	// hold and the sentinels that release it.
+	bool IsRepsHold() const;
+	bool ValidRepsHold() const;
+	// The parameters of scores used as a loss hold alone.
+	SpineScores::Parameters LossHoldParameters() const;
 	// The SpineLossInterval trace source: the host's pooled scores closed a
 	// loss interval (SpineScores::LossIntervalCallback): the time it ended
 	// at and, per spine, the sends and losses counted in it and the grade

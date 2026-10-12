@@ -55,6 +55,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <functional>
 #include <map>
 #include <memory>
 #include <optional>
@@ -7085,6 +7086,152 @@ class SpinePoolHoldPropagationTest : public TestCase
     }
 };
 
+/**
+ * Scores used as a loss hold alone, as RdmaHw makes them under PathSelector
+ * RepsHold: eight spines, a loss interval and sentinel interval of 10 us, the
+ * loss thresholds 0.1, 0.25 and 0.5, and a hold of three clean sentinels.
+ */
+class LossHoldFixture
+{
+  public:
+    static constexpr uint32_t kSpines = 8;
+    static constexpr uint64_t kInterval = 10000;
+    static constexpr uint32_t kClean = 3;
+
+    static Ptr<RdmaHw> Hw()
+    {
+        Ptr<RdmaHw> hw = CreateObject<RdmaHw>();
+        hw->m_spineCount = kSpines;
+        hw->m_loadBalancing = static_cast<uint32_t>(LoadBalancingMode::SprayUniform);
+        hw->m_pathSelectorKind = static_cast<uint32_t>(PathSelectorKind::RepsHold);
+        hw->m_sprayLossThreshold1 = 0.1;
+        hw->m_sprayLossThreshold2 = 0.25;
+        hw->m_sprayLossThreshold3 = 0.5;
+        hw->m_sprayLossIntervalNs = kInterval;
+        hw->m_sprayLossHoldCleanSentinels = kClean;
+        hw->m_sprayHeldExploration = SpineScores::HeldExploration::Sentinel;
+        return hw;
+    }
+
+    static std::unique_ptr<RepsHoldSelector> Selector(SpineScores& hold)
+    {
+        return std::make_unique<RepsHoldSelector>(SelectorStream(), 8, 1000000, 20, kSpines, hold);
+    }
+
+    // One send of selector at nowNs, as the transport answers it: a send on a
+    // spine in lossy is declared lost, and of the others every second one is
+    // acknowledged unmarked and the rest marked, so that the buffer drains
+    // and fresh spines are drawn too. The spine sent on.
+    static uint8_t Send(PathSelector& selector,
+                        uint64_t nowNs,
+                        uint32_t step,
+                        const std::set<uint8_t>& lossy)
+    {
+        const uint8_t spine = RequestedSpine(selector.Choose(nowNs));
+        if (lossy.count(spine) > 0)
+        {
+            selector.OnLoss(spine, nowNs);
+        }
+        else
+        {
+            selector.OnAck(spine, step % 2 == 1, nowNs);
+        }
+        return spine;
+    }
+};
+
+class RepsHoldTest : public TestCase
+{
+  public:
+    RepsHoldTest()
+        : TestCase("Under reps_hold a spine whose losses grade it 0 leaves every flow's REPS "
+                   "choices, is sent one sentinel per interval for the host, and returns after "
+                   "the clean sentinels; the policy is refused without its loss hold")
+    {
+    }
+
+    void DoRun() override
+    {
+        Validation();
+        Hold();
+        Simulator::Destroy();
+    }
+
+  private:
+    static constexpr uint32_t kSpines = LossHoldFixture::kSpines;
+    static constexpr uint64_t kInterval = LossHoldFixture::kInterval;
+
+    void Validation()
+    {
+        NS_TEST_EXPECT_MSG_EQ(LossHoldFixture::Hw()->ValidRepsHold(), true, "a full loss hold");
+        NS_TEST_EXPECT_MSG_EQ(CreateObject<RdmaHw>()->ValidRepsHold(), true, "not reps_hold");
+        const std::vector<std::pair<std::function<void(RdmaHw&)>, std::string>> missing = {
+            {[](RdmaHw& hw) {
+                 hw.m_loadBalancing = static_cast<uint32_t>(LoadBalancingMode::EntropyHash);
+             },
+             "entropy values name no spine"},
+            {[](RdmaHw& hw) { hw.m_sprayLossThreshold1 = 0; }, "no loss thresholds"},
+            {[](RdmaHw& hw) { hw.m_sprayLossIntervalNs = 0; }, "no loss interval"},
+            {[](RdmaHw& hw) { hw.m_sprayLossHoldCleanSentinels = 0; }, "no loss hold"},
+            {[](RdmaHw& hw) { hw.m_sprayHeldExploration = SpineScores::HeldExploration::Epsilon; },
+             "no sentinels"},
+        };
+        for (const auto& [unset, message] : missing)
+        {
+            Ptr<RdmaHw> hw = LossHoldFixture::Hw();
+            unset(*hw);
+            NS_TEST_EXPECT_MSG_EQ(hw->ValidRepsHold(), false, "refused: " + message);
+        }
+        Ptr<RdmaHw> hw = LossHoldFixture::Hw();
+        NS_TEST_EXPECT_MSG_EQ(hw->CountsSprayLoss(), true, "the hold counts the sender's losses");
+        hw->m_selective_retransmission = false;
+        NS_TEST_EXPECT_MSG_EQ(hw->ValidSprayLoss(), false, "from selective retransmission's records");
+        const SpineScores::Parameters parameters = hw->LossHoldParameters();
+        NS_TEST_EXPECT_MSG_EQ(parameters.lossIntervalNs, kInterval, "the loss interval");
+        NS_TEST_EXPECT_MSG_EQ(parameters.lossHoldCleanSentinels, 3u, "the clean sentinels");
+    }
+
+    // Two flows of one host share the hold. Over the first interval every
+    // send on spine 3 is lost; over the next three each is sent its
+    // sentinel, which arrives; after the third the spine is chosen again.
+    void Hold()
+    {
+        Ptr<RdmaHw> hw = LossHoldFixture::Hw();
+        SpineScores hold(kSpines, hw->LossHoldParameters());
+        std::unique_ptr<RepsHoldSelector> flows[2] = {LossHoldFixture::Selector(hold),
+                                                      LossHoldFixture::Selector(hold)};
+        uint32_t step = 0;
+        std::vector<uint32_t> onSpine3(5);
+        std::vector<uint32_t> sentinelsByFlow(2);
+        for (uint32_t interval = 0; interval < 5; ++interval)
+        {
+            for (uint32_t i = 0; i < 100; ++i, ++step)
+            {
+                const uint64_t now = interval * kInterval + 100 * i;
+                const std::set<uint8_t> lossy =
+                    interval == 0 ? std::set<uint8_t>{3} : std::set<uint8_t>{};
+                const uint8_t spine =
+                    LossHoldFixture::Send(*flows[step % 2], now, step, lossy);
+                onSpine3[interval] += spine == 3;
+                if (interval >= 1 && interval <= 3 && spine == 3)
+                {
+                    sentinelsByFlow[step % 2]++;
+                }
+            }
+            if (interval == 0)
+            {
+                NS_TEST_EXPECT_MSG_GT(onSpine3[0], 0u, "spine 3 is sent on, and loses");
+            }
+        }
+        NS_TEST_EXPECT_MSG_EQ(onSpine3[1], 1u, "held: one sentinel in the first interval");
+        NS_TEST_EXPECT_MSG_EQ(onSpine3[2], 1u, "and in the second");
+        NS_TEST_EXPECT_MSG_EQ(onSpine3[3], 1u, "and in the third, for the whole host");
+        NS_TEST_EXPECT_MSG_EQ(sentinelsByFlow[0] + sentinelsByFlow[1], 3u, "taken by either flow");
+        NS_TEST_EXPECT_MSG_EQ(hold.Holds(3), false, "three clean sentinels release the spine");
+        NS_TEST_EXPECT_MSG_GT(onSpine3[4], 1u, "and REPS chooses it again");
+    }
+};
+
 class SprayPolicyTransportTest : public TestCase
 {
   public:
@@ -8767,6 +8914,7 @@ PointToPointTestSuite::PointToPointTestSuite()
     AddTestCase(new SpineLossThresholdsTest, TestCase::Duration::QUICK);
     AddTestCase(new SpineHeldExplorationTest, TestCase::Duration::QUICK);
     AddTestCase(new SpinePoolHoldPropagationTest, TestCase::Duration::QUICK);
+    AddTestCase(new RepsHoldTest, TestCase::Duration::QUICK);
     AddTestCase(new SprayPolicyTransportTest, TestCase::Duration::QUICK);
     AddTestCase(new NsccReceiverPenaltyTest, TestCase::Duration::QUICK);
     AddTestCase(new SprayPolicyDefaultsTest, TestCase::Duration::QUICK);

@@ -143,20 +143,30 @@ void SpineScores::OnSend(uint32_t spine, uint64_t nowNs){
 	NS_ASSERT_MSG(spine < m_scores.size(), "a send is on a scored spine");
 	if (m_parameters.lossThresholds)
 		m_sent[spine]++;
-	if (m_pool != nullptr && m_pool->m_parameters.lossThresholds){
-		m_pool->AdvanceLossInterval(nowNs);
-		m_pool->m_sent[spine]++;
-	}
+	if (m_pool != nullptr)
+		m_pool->CountIntervalSend(spine, nowNs);
 }
 
 void SpineScores::OnLoss(uint32_t spine, uint64_t nowNs){
 	NS_ASSERT_MSG(spine < m_scores.size(), "a loss is on a scored spine");
 	if (m_parameters.lossThresholds)
 		m_lost[spine]++;
-	if (m_pool != nullptr && m_pool->m_parameters.lossThresholds){
-		m_pool->AdvanceLossInterval(nowNs);
-		m_pool->m_lost[spine]++;
-	}
+	if (m_pool != nullptr)
+		m_pool->CountIntervalLoss(spine, nowNs);
+}
+
+void SpineScores::CountIntervalSend(uint32_t spine, uint64_t nowNs){
+	if (!m_parameters.lossThresholds)
+		return;
+	AdvanceLossInterval(nowNs);
+	m_sent[spine]++;
+}
+
+void SpineScores::CountIntervalLoss(uint32_t spine, uint64_t nowNs){
+	if (!m_parameters.lossThresholds)
+		return;
+	AdvanceLossInterval(nowNs);
+	m_lost[spine]++;
 }
 
 uint8_t SpineScores::LossGrade(uint32_t sent, uint32_t lost) const{
@@ -286,18 +296,24 @@ bool SpineScores::Propagates() const{
 	return IsPooled() && m_parameters.poolHoldPropagates;
 }
 
+bool SpineScores::Holds(uint32_t spine) const{
+	return m_held[spine] || m_lossHeld[spine];
+}
+
+bool SpineScores::HoldsEvery() const{
+	for (uint32_t k = 0; k < m_scores.size(); k++){
+		if (!Holds(k))
+			return false;
+	}
+	return true;
+}
+
 bool SpineScores::PoolHolds(uint32_t spine) const{
-	return m_pool->m_held[spine] || m_pool->m_lossHeld[spine];
+	return m_pool->Holds(spine);
 }
 
 bool SpineScores::ExcludesPoolHeld() const{
-	if (!Propagates())
-		return false;
-	for (uint32_t k = 0; k < m_scores.size(); k++){
-		if (!PoolHolds(k))
-			return true;
-	}
-	return false;
+	return Propagates() && !m_pool->HoldsEvery();
 }
 
 bool SpineScores::Held(uint32_t spine) const{
@@ -318,20 +334,39 @@ bool SpineScores::TakeSentinel(uint64_t nowNs, uint8_t &spine){
 		// A spine the pool holds is sent the pool's sentinels, one per
 		// interval for every set of scores pooled with it.
 		if (propagates && PoolHolds(k)){
-			if (nowNs >= m_pool->m_sentinelNs[k] + m_pool->m_sentinelIntervalNs){
-				m_pool->m_sentinelNs[k] = nowNs;
+			if (m_pool->SentinelDue(k, nowNs)){
 				spine = k;
 				return true;
 			}
 			continue;
 		}
-		if (Held(k) && nowNs >= m_sentinelNs[k] + m_sentinelIntervalNs){
-			m_sentinelNs[k] = nowNs;
+		if (Held(k) && SentinelDue(k, nowNs)){
 			spine = k;
 			return true;
 		}
 	}
 	return false;
+}
+
+bool SpineScores::TakeHoldSentinel(uint64_t nowNs, uint8_t &spine){
+	if (m_parameters.lossThresholds)
+		AdvanceLossInterval(nowNs);
+	if (m_parameters.heldExploration != HeldExploration::Sentinel)
+		return false;
+	for (uint32_t k = 0; k < m_scores.size(); k++){
+		if (Holds(k) && SentinelDue(k, nowNs)){
+			spine = k;
+			return true;
+		}
+	}
+	return false;
+}
+
+bool SpineScores::SentinelDue(uint32_t spine, uint64_t nowNs){
+	if (nowNs < m_sentinelNs[spine] + m_sentinelIntervalNs)
+		return false;
+	m_sentinelNs[spine] = nowNs;
+	return true;
 }
 
 uint32_t SpineScores::Unheld() const{
@@ -592,7 +627,16 @@ uint16_t ObliviousSelector::Choose(uint64_t){
 
 RepsSelector::RepsSelector(Ptr<UniformRandomVariable> random,
 		uint32_t bufferSize, uint64_t freezingTimeoutNs, uint32_t explorePackets)
-	: m_random(random), m_buffer(bufferSize, Entry{0, false}), m_head(0),
+	: RepsSelector(random, bufferSize, freezingTimeoutNs, explorePackets,
+		UINT16_MAX + 1)
+{
+}
+
+RepsSelector::RepsSelector(Ptr<UniformRandomVariable> random,
+		uint32_t bufferSize, uint64_t freezingTimeoutNs, uint32_t explorePackets,
+		uint32_t paths)
+	: m_random(random), m_paths(paths), m_buffer(bufferSize, Entry{0, false}),
+	  m_head(0),
 	  m_valid(0), m_written(0), m_frozenNext(0), m_frozen(false),
 	  m_freezingTimeoutNs(freezingTimeoutNs), m_exitFreezingNs(0),
 	  m_explorePackets(explorePackets), m_exploreCounter(0)
@@ -615,24 +659,39 @@ uint16_t RepsSelector::Choose(uint64_t){
 }
 
 uint16_t RepsSelector::Fresh(){
-	return m_random->GetInteger(0, UINT16_MAX);
+	uint16_t path;
+	do
+		path = m_random->GetInteger(0, m_paths - 1);
+	while (Excluded(path));
+	return path;
+}
+
+bool RepsSelector::Excluded(uint16_t) const{
+	return false;
 }
 
 uint16_t RepsSelector::Cached(){
-	if (m_valid > 0){
-		const uint32_t size = m_buffer.size();
+	const uint32_t size = m_buffer.size();
+	while (m_valid > 0){
 		Entry &oldest = m_buffer[(m_head + size - m_valid) % size];
 		oldest.valid = false;
 		m_valid--;
-		return oldest.ev;
+		if (!Excluded(oldest.ev))
+			return oldest.ev;
 	}
+	if (!m_frozen)
+		return Fresh();
 	// Frozen with nothing valid: the next held value in turn. The pseudocode
 	// cycles the write position over the whole buffer; cycling over the slots
 	// written so far, as the artifact does, never reads a slot that holds no
 	// value.
-	const uint16_t ev = m_buffer[m_frozenNext].ev;
-	m_frozenNext = (m_frozenNext + 1) % m_written;
-	return ev;
+	for (uint32_t i = 0; i < m_written; i++){
+		const uint16_t ev = m_buffer[m_frozenNext].ev;
+		m_frozenNext = (m_frozenNext + 1) % m_written;
+		if (!Excluded(ev))
+			return ev;
+	}
+	return Fresh();
 }
 
 // Algorithm 1's onAck.
@@ -658,6 +717,33 @@ void RepsSelector::OnTimeout(uint64_t nowNs){
 		return;
 	m_frozen = true;
 	m_exitFreezingNs = nowNs + m_freezingTimeoutNs;
+}
+
+RepsHoldSelector::RepsHoldSelector(Ptr<UniformRandomVariable> random,
+		uint32_t bufferSize, uint64_t freezingTimeoutNs, uint32_t explorePackets,
+		uint32_t spines, SpineScores &hold)
+	: RepsSelector(random, bufferSize, freezingTimeoutNs, explorePackets,
+		spines),
+	  m_hold(hold), m_excluding(false)
+{
+}
+
+uint16_t RepsHoldSelector::Choose(uint64_t nowNs){
+	uint8_t spine;
+	if (!m_hold.TakeHoldSentinel(nowNs, spine)){
+		m_excluding = !m_hold.HoldsEvery();
+		spine = RepsSelector::Choose(nowNs);
+	}
+	m_hold.CountIntervalSend(spine, nowNs);
+	return SpineIdentification(spine, spine);
+}
+
+void RepsHoldSelector::OnLoss(uint16_t path, uint64_t nowNs){
+	m_hold.CountIntervalLoss(path, nowNs);
+}
+
+bool RepsHoldSelector::Excluded(uint16_t path) const{
+	return m_excluding && m_hold.Holds(path);
 }
 
 EntropyRotation::EntropyRotation(Ptr<UniformRandomVariable> random,
