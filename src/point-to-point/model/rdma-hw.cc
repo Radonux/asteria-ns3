@@ -6,6 +6,7 @@
 #include "ns3/boolean.h"
 #include "ns3/uinteger.h"
 #include "ns3/double.h"
+#include "ns3/enum.h"
 #include "ns3/data-rate.h"
 #include "ns3/pointer.h"
 #include "ns3/abort.h"
@@ -496,6 +497,27 @@ TypeId RdmaHw::GetTypeId (void)
 				DoubleValue(0.02),
 				MakeDoubleAccessor(&RdmaHw::m_sprayEpsilon),
 				MakeDoubleChecker<double>(0, 1))
+		.AddAttribute("SprayHeldExploration",
+				"Under LoadBalancing 3, what a spine the last report graded 0 "
+				"is sent: epsilon=its SprayEpsilon / N share of the draws; "
+				"sentinel=no share of the epsilon term, which the other spines "
+				"split, and one packet per SprayHeldSentinelIntervalNs; "
+				"none=no share and no packet, which needs SprayGradeCostSource "
+				"1, whose hold releases from the switches' state. Default "
+				"epsilon.",
+				EnumValue(SpineScores::HeldExploration::Epsilon),
+				MakeEnumAccessor<SpineScores::HeldExploration>(
+					&RdmaHw::m_sprayHeldExploration),
+				MakeEnumChecker(SpineScores::HeldExploration::Epsilon, "epsilon",
+					SpineScores::HeldExploration::Sentinel, "sentinel",
+					SpineScores::HeldExploration::None, "none"))
+		.AddAttribute("SprayHeldSentinelIntervalNs",
+				"Under SprayHeldExploration sentinel, the interval between two "
+				"packets sent on one held spine by one set of scores. Default "
+				"0, the report interval.",
+				UintegerValue(0),
+				MakeUintegerAccessor(&RdmaHw::m_sprayHeldSentinelIntervalNs),
+				MakeUintegerChecker<uint64_t>())
 		.AddAttribute("SprayCandidates",
 				"Under LoadBalancing 3, the candidates drawn per packet, of which "
 				"the highest-scored is sent on. Default 1.",
@@ -797,6 +819,10 @@ void RdmaHw::Setup(QpCompleteCallback cb, QpFailureCallback failure_cb){
 	NS_ABORT_MSG_IF(!ValidSprayLoss(),
 		"SprayLossThreshold1-3 need SelectiveRetransmission: a send is declared "
 		"lost only from the send records it keeps");
+	NS_ABORT_MSG_IF(!ValidHeldExploration(),
+		"SprayHeldExploration none needs SprayGradeCostSource 1: a held spine "
+		"is sent nothing, and the receiver's estimate releases a hold only "
+		"for arrivals");
 	NS_ABORT_MSG_IF(m_loadBalancing !=
 				static_cast<uint32_t>(LoadBalancingMode::Ecmp) && !m_pathRandom,
 		"A LoadBalancing mode other than ECMP draws the identification of every "
@@ -1163,8 +1189,13 @@ const SpineReport &RdmaHw::ReportFor(Ptr<RdmaRxQueuePair> q,
 void RdmaHw::GradeFromSwitchQueues(uint64_t nowNs, const SpineGrader &grader){
 	const std::vector<SpineGrader::SpineInterval> &closed = grader.LastInterval();
 	std::vector<bool> held(closed.size());
+	// Under the none held exploration a held spine is sent nothing and so
+	// never arrives to release the hold a moved packet set; the spine is held
+	// only over an interval in which a packet requested on it was moved.
+	const bool none =
+		m_sprayHeldExploration == SpineScores::HeldExploration::None;
 	for (uint32_t k = 0; k < closed.size(); k++)
-		held[k] = closed[k].held;
+		held[k] = none ? closed[k].moved > 0 : closed[k].held;
 	// A path losing as large a share of its packets as an absent spine is
 	// short of the median's is held as that absence would hold it.
 	const double lossHold = 1 - m_sprayAbsenceFractionOfMedian;
@@ -1189,6 +1220,12 @@ bool RdmaHw::CountsSprayLoss() const{
 
 bool RdmaHw::ValidSprayLoss() const{
 	return !CountsSprayLoss() || m_selective_retransmission;
+}
+
+bool RdmaHw::ValidHeldExploration() const{
+	return !IsSprayPolicy() ||
+		m_sprayHeldExploration != SpineScores::HeldExploration::None ||
+		IsSwitchQueueCost();
 }
 
 std::optional<std::array<double, 3>> RdmaHw::SprayLossThresholds() const{
@@ -1245,7 +1282,16 @@ SpineGrader::Parameters RdmaHw::GraderParameters() const{
 	parameters.absenceMinimumMedian = m_sprayAbsenceMinimumMedian;
 	parameters.releaseFractionOfFloor = m_sprayReleaseFractionOfFloor;
 	// A held spine is drawn at epsilon / N and a top-graded one at about 1 / N.
+	// Under the sentinel and the none held exploration a held spine has no
+	// share of the epsilon term: it is sent the sentinel rate, one packet per
+	// sentinel interval per set of scores, or nothing. Sentinels arrive once
+	// per interval however many the median spine does, so under sentinel a
+	// held spine is released by one arrival over a window whenever the floor
+	// share asks more; under none the switch_queue cost source's hold does
+	// not wait for arrivals.
 	parameters.floorShareOfMedian = m_sprayEpsilon;
+	parameters.releaseOnOneArrival =
+		m_sprayHeldExploration == SpineScores::HeldExploration::Sentinel;
 	return parameters;
 }
 
@@ -2325,6 +2371,8 @@ void RdmaHw::StartPathSelection(Ptr<RdmaQueuePair> qp, uint64_t bdpBytes,
 			m_sprayCandidates,
 			static_cast<SpineScores::CandidateDraw>(m_sprayCandidateDraw),
 			SprayReportIntervalNs(), m_sprayEdgeFreeze};
+		parameters.heldExploration = m_sprayHeldExploration;
+		parameters.sentinelIntervalNs = m_sprayHeldSentinelIntervalNs;
 		if (CountsSprayLoss()){
 			parameters.lossThresholds = SprayLossThresholds();
 			parameters.lossIntervalNs = m_sprayLossIntervalNs;

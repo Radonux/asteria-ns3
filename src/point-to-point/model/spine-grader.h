@@ -81,7 +81,9 @@ private:
 // intervals that closes once the median spine's count reaches a minimum, and
 // at its close a spine whose count is below a fraction of the median's is
 // held, while a held spine whose count reaches a fraction of what the
-// exploration floor sends it, a share of the median's, is released.
+// exploration floor sends it, a share of the median's, is released; with
+// releaseOnOneArrival, a held spine that arrives once over a window is
+// released whatever the median.
 // The edge bit is set when the receiver's own downlink trimmed a packet in the
 // interval, or when no spine's averages earn it the top grade under the
 // absolute reference, every average graded through the congestion thresholds.
@@ -119,6 +121,11 @@ public:
 		// its floor's share of the median spine's arrivals over a window.
 		double releaseFractionOfFloor;
 		double floorShareOfMedian;
+		// Release a held spine for one arrival over a window whenever that
+		// fraction of the floor's share asks more: a held spine sent one
+		// sentinel per interval arrives once per interval while its path
+		// works, however many the median spine does.
+		bool releaseOnOneArrival = false;
 	};
 	// What one spine showed over the last interval that ended, and what it
 	// was graded on that.

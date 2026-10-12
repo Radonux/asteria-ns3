@@ -176,6 +176,13 @@ public:
 	double m_sprayEpsilon;
 	uint32_t m_sprayCandidates;
 	uint32_t m_sprayCandidateDraw; // SpineScores::CandidateDraw
+	// SpineScores::Parameters::heldExploration and sentinelIntervalNs.
+	SpineScores::HeldExploration m_sprayHeldExploration;
+	uint64_t m_sprayHeldSentinelIntervalNs;
+	// Whether the held exploration suits the cost source: none sends a held
+	// spine nothing, and only the switch_queue cost source releases one
+	// without its arrivals.
+	bool ValidHeldExploration() const;
 	// SpineScores::Parameters::edgeFreeze.
 	bool m_sprayEdgeFreeze;
 	// The Rcv_Cwnd_Pend NSCC is handed for an acknowledgement whose report has

@@ -115,11 +115,29 @@ private:
 // interval that ended, a spine not sent on in it at the top grade; a report a
 // pooled set of scores takes is taken by the pool at the lower of the grade
 // it took and the pool's loss grade.
+//
+// A spine is held while the last report taken graded it 0; drawn through a
+// pool, while the last report the pool took did. Under the epsilon held
+// exploration a held spine keeps its epsilon / N of the draws. Under the
+// sentinel and the none held exploration the epsilon term is spread over the
+// spines not held, and a held spine is drawn only by its score, which grade 0
+// decays to zero; while every spine is held the term stays spread over all.
+// Under the sentinel held exploration a held spine is sent one packet per
+// sentinel interval in place of a draw, the sentinel, which is a send as any
+// other: it is counted, may be declared lost and, arriving, is counted by the
+// receiver. Under none a held spine is sent nothing, so only a receiver whose
+// hold does not wait for arrivals, the switch_queue cost source's, can
+// release it.
 class SpineScores {
 public:
 	enum class CandidateDraw : uint32_t {
 		Proportional = 0,
 		Uniform,
+	};
+	enum class HeldExploration : uint32_t {
+		Epsilon = 0,
+		Sentinel,
+		None,
 	};
 	struct Parameters {
 		double gamma;
@@ -134,10 +152,21 @@ public:
 		// The loss interval of scores used as a pool; zero, the report
 		// interval.
 		uint64_t lossIntervalNs = 0;
+		HeldExploration heldExploration = HeldExploration::Epsilon;
+		// Under the sentinel held exploration, the interval between two
+		// sentinels on one held spine; zero, the report interval.
+		uint64_t sentinelIntervalNs = 0;
 	};
 	SpineScores(uint32_t spines, const Parameters &parameters);
 	void OnReport(const SpineReport &report, uint64_t nowNs);
 	uint8_t Choose(UniformRandomVariable &random, uint64_t nowNs);
+	// Under the sentinel held exploration: whether a held spine's sentinel is
+	// due by now, its last sentinel a sentinel interval or more ago, and which
+	// spine; the lowest such spine is taken and its sentinel interval restarts
+	// now.
+	bool TakeSentinel(uint64_t nowNs, uint8_t &spine);
+	// Whether spine is held for the draws from these scores.
+	bool Held(uint32_t spine) const;
 	// A send drawn from these scores on spine, and a send on spine declared
 	// lost; each is counted by the pool too.
 	void OnSend(uint32_t spine, uint64_t nowNs);
@@ -176,6 +205,13 @@ private:
 	void Age(uint64_t nowNs);
 	void Accumulate();
 	uint8_t DrawFromShares(UniformRandomVariable &random) const;
+	// The spines not held, under a held exploration that spreads the
+	// epsilon term over them; the epsilon draw u / epsilon in [0, 1) mapped
+	// onto the spines it is spread over.
+	uint32_t Unheld() const;
+	uint8_t DrawEpsilon(double fraction) const;
+	// The epsilon term of spine's share.
+	double EpsilonShare(uint32_t spine) const;
 	// The grade the lost fraction of sent sends earns.
 	uint8_t LossGrade(uint32_t sent, uint32_t lost) const;
 	// As a pool: close the loss intervals ended by now, grading the spines by
@@ -204,6 +240,11 @@ private:
 	uint64_t m_lossIntervalEndNs;
 	std::vector<uint8_t> m_lossGrades;
 	LossIntervalCallback m_onLossInterval;
+	// Per spine, whether the last report taken graded it 0, and when its
+	// last sentinel was sent.
+	std::vector<bool> m_held;
+	std::vector<uint64_t> m_sentinelNs;
+	uint64_t m_sentinelIntervalNs;
 };
 
 // A spine drawn per packet from the scores towards the queue pair's
@@ -215,7 +256,8 @@ public:
 	PolicySpineSelector(Ptr<UniformRandomVariable> random, SpineScores &scores);
 	PolicySpineSelector(Ptr<UniformRandomVariable> random,
 		std::unique_ptr<SpineScores> scores);
-	// The spine drawn is counted as a send in the scores.
+	// A held spine's sentinel when one is due, else the spine drawn; either
+	// is counted as a send in the scores.
 	uint16_t Choose(uint64_t nowNs) override;
 	// A loss on the requested spine path names is counted in the scores.
 	void OnLoss(uint16_t path, uint64_t nowNs) override;

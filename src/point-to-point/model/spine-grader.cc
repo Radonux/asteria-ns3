@@ -207,8 +207,11 @@ void SpineGrader::JudgeWindow(){
 	// A held spine is sent only the exploration floor, a small share of what
 	// the median spine is sent; that share, and not the median's, is what its
 	// arrivals return to while its path works.
-	const double release = m_parameters.releaseFractionOfFloor *
+	double release = m_parameters.releaseFractionOfFloor *
 		m_parameters.floorShareOfMedian * median;
+	// Sentinels arrive once per interval whatever the median's arrivals.
+	if (m_parameters.releaseOnOneArrival)
+		release = std::min(release, 1.0);
 	for (uint32_t k = 0; k < spines; k++){
 		Spine &spine = m_spines[k];
 		if (spine.held){

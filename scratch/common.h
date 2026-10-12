@@ -190,6 +190,10 @@ std::string spray_candidate_draw = "proportional";
 uint32_t spray_edge_window_penalty = 64;
 uint32_t spray_edge_freeze = 1;
 double spray_sender_pool_weight = 0;
+// What a spine graded 0 is sent: epsilon, sentinel or none. Zero
+// spray_held_sentinel_interval_ns is the report interval.
+std::string spray_held_exploration = "epsilon";
+uint64_t spray_held_sentinel_interval_ns = 0;
 // The keys that only spray_policy reads, and among them those that only its
 // one-way delay reads; a key nothing reads is refused.
 const std::set<std::string> spray_policy_keys = {
@@ -203,7 +207,8 @@ const std::set<std::string> spray_policy_keys = {
     "SPRAY_GAMMA", "SPRAY_EPSILON", "SPRAY_CANDIDATES", "SPRAY_CANDIDATE_DRAW",
     "SPRAY_EDGE_WINDOW_PENALTY", "SPRAY_EDGE_FREEZE",
     "SPRAY_SENDER_POOL_WEIGHT", "SPINE_REPORT_OUTPUT_FILE",
-    "SPINE_LOSS_OUTPUT_FILE",
+    "SPINE_LOSS_OUTPUT_FILE", "SPRAY_HELD_EXPLORATION",
+    "SPRAY_HELD_SENTINEL_INTERVAL_NS",
     "SPRAY_ABSENCE_FRACTION_OF_MEDIAN", "SPRAY_ABSENCE_MINIMUM_MEDIAN",
     "SPRAY_GRADE_REFERENCE", "SPRAY_GRADE_SCOPE", "SPRAY_GRADE_COST_SOURCE",
     "SPRAY_ESTIMATOR_INTERVAL_SAMPLES"};
@@ -751,6 +756,16 @@ uint32_t spray_grade_cost_source_value() {
     return static_cast<uint32_t>(GradeCostSource::Estimate);
   if (spray_grade_cost_source == "switch_queue")
     return static_cast<uint32_t>(GradeCostSource::SwitchQueue);
+  return std::numeric_limits<uint32_t>::max();
+}
+
+uint32_t spray_held_exploration_value() {
+  if (spray_held_exploration == "epsilon")
+    return static_cast<uint32_t>(SpineScores::HeldExploration::Epsilon);
+  if (spray_held_exploration == "sentinel")
+    return static_cast<uint32_t>(SpineScores::HeldExploration::Sentinel);
+  if (spray_held_exploration == "none")
+    return static_cast<uint32_t>(SpineScores::HeldExploration::None);
   return std::numeric_limits<uint32_t>::max();
 }
 
@@ -1348,6 +1363,24 @@ bool valid_spray_policy() {
     std::cerr << "SPRAY_SENDER_POOL_WEIGHT must be in [0, 1]\n";
     return false;
   }
+  if (spray_held_exploration_value() == std::numeric_limits<uint32_t>::max()) {
+    std::cerr << "SPRAY_HELD_EXPLORATION must be epsilon, sentinel or none\n";
+    return false;
+  }
+  // Under none a held spine is sent nothing, and the receiver's estimate
+  // releases a hold only for arrivals.
+  if (spray_held_exploration == "none" &&
+      spray_grade_cost_source != "switch_queue") {
+    std::cerr << "SPRAY_HELD_EXPLORATION none requires "
+                 "SPRAY_GRADE_COST_SOURCE switch_queue\n";
+    return false;
+  }
+  if (spray_policy_keys_given.count("SPRAY_HELD_SENTINEL_INTERVAL_NS") > 0 &&
+      spray_held_exploration != "sentinel") {
+    std::cerr << "SPRAY_HELD_SENTINEL_INTERVAL_NS is read only with "
+                 "SPRAY_HELD_EXPLORATION sentinel\n";
+    return false;
+  }
   // Only the host's pool counts over loss intervals, and only the sender's
   // own counting, outside switch_queue, feeds it.
   if (!spine_loss_output_file.empty() &&
@@ -1609,6 +1642,10 @@ bool ReadConf(string network_configuration) {
       conf >> spray_edge_freeze;
     } else if (key.compare("SPRAY_SENDER_POOL_WEIGHT") == 0) {
       conf >> spray_sender_pool_weight;
+    } else if (key.compare("SPRAY_HELD_EXPLORATION") == 0) {
+      conf >> spray_held_exploration;
+    } else if (key.compare("SPRAY_HELD_SENTINEL_INTERVAL_NS") == 0) {
+      conf >> spray_held_sentinel_interval_ns;
 	} else if (key.compare("PACKET_TRIM_MODE") == 0) {
 	  conf >> packet_trim_mode;
 	} else if (key.compare("PACKET_TRIM_QUEUE") == 0) {
@@ -2537,6 +2574,12 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),
                            BooleanValue(spray_edge_freeze == 1));
       rdmaHw->SetAttribute("SpraySenderPoolWeight",
                            DoubleValue(spray_sender_pool_weight));
+      rdmaHw->SetAttribute(
+          "SprayHeldExploration",
+          EnumValue(static_cast<SpineScores::HeldExploration>(
+              spray_held_exploration_value())));
+      rdmaHw->SetAttribute("SprayHeldSentinelIntervalNs",
+                           UintegerValue(spray_held_sentinel_interval_ns));
       // A PointerValue cannot carry null, which is the ECMP default.
       if (path_random)
         rdmaHw->SetAttribute("PathRandomVariable", PointerValue(path_random));
