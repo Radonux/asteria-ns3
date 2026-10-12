@@ -35,6 +35,9 @@ enum class PathSelectorKind : uint32_t {
 	// loss hold holds, or the queue pair's own.
 	RepsHold,
 	RepsFlowHold,
+	// Under SprayUniform: REPS over spines, leaving out the spines the
+	// switches' state shows a fault on toward the destination's leaf.
+	RepsOracle,
 };
 
 // A queue pair's choice of the path each of its data packets takes, and what
@@ -476,6 +479,44 @@ private:
 	SpineScores &m_hold;
 	// Whether the hold leaves a spine out, set before each choice.
 	bool m_excluding;
+};
+
+// Simulation only: the spines toward one destination leaf that a reader of
+// the switches' state names faulted, read at most once per read interval. A
+// spine once named stays faulted for the run. While every spine is faulted
+// none is excluded.
+class FaultedSpines {
+public:
+	using Reader = std::function<std::vector<bool>()>;
+	FaultedSpines(uint32_t spines, uint64_t readIntervalNs, Reader reader);
+	// Read the switches' state if a read interval has passed since the last
+	// read, or none was made.
+	void Read(uint64_t nowNs);
+	bool Excludes(uint32_t spine) const;
+
+private:
+	Reader m_reader;
+	uint64_t m_readIntervalNs;
+	uint64_t m_nextReadNs;
+	std::vector<bool> m_faulted;
+	bool m_excluding;
+};
+
+// REPS (RepsSelector) over spines under SprayUniform, leaving out the spines
+// FaultedSpines excludes toward the queue pair's destination leaf. No
+// sentinel is sent and nothing is released.
+class RepsOracleSelector : public RepsSelector {
+public:
+	RepsOracleSelector(Ptr<UniformRandomVariable> random, uint32_t bufferSize,
+		uint64_t freezingTimeoutNs, uint32_t explorePackets, uint32_t spines,
+		FaultedSpines &faulted);
+	uint16_t Choose(uint64_t nowNs) override;
+
+protected:
+	bool Excluded(uint16_t path) const override;
+
+private:
+	FaultedSpines &m_faulted;
 };
 
 // The entropy values 0 to size - 1, visited in a pseudo-random order that

@@ -755,6 +755,50 @@ bool RepsHoldSelector::Excluded(uint16_t path) const{
 	return m_excluding && m_hold.Holds(path);
 }
 
+FaultedSpines::FaultedSpines(uint32_t spines, uint64_t readIntervalNs,
+		Reader reader)
+	: m_reader(std::move(reader)), m_readIntervalNs(readIntervalNs),
+	  m_nextReadNs(0), m_faulted(spines), m_excluding(false)
+{
+	NS_ASSERT_MSG(readIntervalNs > 0, "the switches are read per interval");
+}
+
+void FaultedSpines::Read(uint64_t nowNs){
+	if (nowNs < m_nextReadNs)
+		return;
+	m_nextReadNs = nowNs + m_readIntervalNs;
+	const std::vector<bool> faulted = m_reader();
+	NS_ASSERT_MSG(faulted.size() == m_faulted.size(), "a fault per spine");
+	m_excluding = false;
+	for (uint32_t k = 0; k < m_faulted.size(); k++){
+		m_faulted[k] = m_faulted[k] || faulted[k];
+		m_excluding = m_excluding || !m_faulted[k];
+	}
+}
+
+bool FaultedSpines::Excludes(uint32_t spine) const{
+	return m_excluding && m_faulted[spine];
+}
+
+RepsOracleSelector::RepsOracleSelector(Ptr<UniformRandomVariable> random,
+		uint32_t bufferSize, uint64_t freezingTimeoutNs, uint32_t explorePackets,
+		uint32_t spines, FaultedSpines &faulted)
+	: RepsSelector(random, bufferSize, freezingTimeoutNs, explorePackets,
+		spines),
+	  m_faulted(faulted)
+{
+}
+
+uint16_t RepsOracleSelector::Choose(uint64_t nowNs){
+	m_faulted.Read(nowNs);
+	const uint8_t spine = RepsSelector::Choose(nowNs);
+	return SpineIdentification(spine, spine);
+}
+
+bool RepsOracleSelector::Excluded(uint16_t path) const{
+	return m_faulted.Excludes(path);
+}
+
 EntropyRotation::EntropyRotation(Ptr<UniformRandomVariable> random,
 		uint32_t size)
 	: m_random(random), m_order(size), m_next(0)

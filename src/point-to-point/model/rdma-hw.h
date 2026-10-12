@@ -230,6 +230,13 @@ public:
 	uint32_t m_sprayHoldScope;
 	std::unordered_map<uint32_t, SpineScores> m_leafHolds;
 	bool IsLeafHold() const;
+	// PathSelector RepsOracle, whether it has the switches' state to read,
+	// and per destination leaf the spines it excludes, made at the first
+	// queue pair to that leaf and read once per base RTT.
+	bool IsRepsOracle() const;
+	bool ValidRepsOracle() const;
+	std::unordered_map<uint32_t, FaultedSpines> m_faultedSpines;
+	FaultedSpines &FaultedSpinesTo(uint32_t leaf);
 	SpineScores &LeafHold(uint32_t leaf);
 	// The LeafSpineLossInterval trace source: a destination leaf's loss hold
 	// closed a loss interval, as SpineLossInterval passes it.

@@ -124,7 +124,9 @@ std::string load_balancing = "ecmp";
 // instead of a uniform draw; and the parameters of the selectors, each the
 // default of its source. reps_hold is REPS over spines, leaving out the
 // spines the host's loss hold holds; reps_flow_hold keeps a loss hold per
-// queue pair instead.
+// queue pair instead. reps_oracle is REPS over spines leaving out for good
+// the spines the switches' state shows a fault on toward the destination's
+// leaf, read under SPRAY_GRADE_COST_SOURCE switch_queue.
 std::string path_selector = "ops";
 bool reps_hold() {
   return path_selector == "reps_hold" || path_selector == "reps_flow_hold";
@@ -148,8 +150,9 @@ std::string ack_redirect_scope = "per_connection";
 // The selectors each parameter belongs to. A parameter given under another
 // selector would be read by nothing, so it is refused.
 const std::map<std::string, std::set<std::string>> path_selector_parameter_owners = {
-    {"REPS_BUFFER_SIZE", {"reps", "reps_hold", "reps_flow_hold"}},
-    {"REPS_FREEZING_TIMEOUT_NS", {"reps", "reps_hold", "reps_flow_hold"}},
+    {"REPS_BUFFER_SIZE", {"reps", "reps_hold", "reps_flow_hold", "reps_oracle"}},
+    {"REPS_FREEZING_TIMEOUT_NS",
+     {"reps", "reps_hold", "reps_flow_hold", "reps_oracle"}},
     {"UE_EV_SET_SIZE", {"ue_oblivious", "ue_aware"}},
     {"UE_SATURATION_FRACTION", {"ue_aware"}},
     {"MRC_EV_SET_SIZE", {"mrc"}},
@@ -743,6 +746,8 @@ uint32_t path_selector_value() {
     return static_cast<uint32_t>(PathSelectorKind::RepsHold);
   if (path_selector == "reps_flow_hold")
     return static_cast<uint32_t>(PathSelectorKind::RepsFlowHold);
+  if (path_selector == "reps_oracle")
+    return static_cast<uint32_t>(PathSelectorKind::RepsOracle);
   return std::numeric_limits<uint32_t>::max();
 }
 
@@ -824,6 +829,13 @@ uint32_t spray_held_exploration_value() {
 
 bool switch_queue_cost() {
   return load_balancing == "spray_policy" &&
+         spray_grade_cost_source == "switch_queue";
+}
+
+// Under reps_oracle, whether the switches' state is read for the spines'
+// faults.
+bool reps_oracle() {
+  return path_selector == "reps_oracle" &&
          spray_grade_cost_source == "switch_queue";
 }
 
@@ -2101,6 +2113,8 @@ bool ReadConf(string network_configuration) {
   for (const std::string &key : spray_policy_keys_given) {
     if (load_balancing != "spray_policy" &&
         !(host_redirect() && spine_grader_keys.count(key) > 0) &&
+        !(path_selector == "reps_oracle" &&
+          key == "SPRAY_GRADE_COST_SOURCE") &&
         !(reps_hold() && loss_hold_keys.count(key) > 0 &&
           !(path_selector == "reps_flow_hold" &&
             key == "SPINE_LOSS_OUTPUT_FILE"))) {
@@ -2108,6 +2122,8 @@ bool ReadConf(string network_configuration) {
                 << (spine_grader_keys.count(key) > 0
                         ? " or PATH_SELECTOR ack_redirect with "
                           "ACK_REDIRECT_SCOPE per_receiver\n"
+                    : key == "SPRAY_GRADE_COST_SOURCE"
+                        ? " or PATH_SELECTOR reps_oracle\n"
                     : key == "SPINE_LOSS_OUTPUT_FILE"
                         ? " or PATH_SELECTOR reps_hold\n"
                     : loss_hold_keys.count(key) > 0
@@ -2124,7 +2140,7 @@ bool ReadConf(string network_configuration) {
     return false;
   if (path_selector_value() == std::numeric_limits<uint32_t>::max()) {
     std::cerr << "PATH_SELECTOR must be ops, reps, ue_oblivious, ue_aware, mrc, "
-                 "ack_redirect, reps_hold or reps_flow_hold\n";
+                 "ack_redirect, reps_hold, reps_flow_hold or reps_oracle\n";
     return false;
   }
   if (reps_hold()) {
@@ -2135,6 +2151,18 @@ bool ReadConf(string network_configuration) {
     }
     if (!valid_loss_hold())
       return false;
+  }
+  if (path_selector == "reps_oracle") {
+    if (load_balancing != "spray_uniform") {
+      std::cerr << "PATH_SELECTOR " << path_selector
+                << " names spines and requires LOAD_BALANCING spray_uniform\n";
+      return false;
+    }
+    if (!reps_oracle()) {
+      std::cerr << "PATH_SELECTOR reps_oracle requires "
+                   "SPRAY_GRADE_COST_SOURCE switch_queue\n";
+      return false;
+    }
   }
   if (spray_hold_scope_given && path_selector != "reps_hold") {
     std::cerr << "SPRAY_HOLD_SCOPE is read only under PATH_SELECTOR "
@@ -2154,6 +2182,7 @@ bool ReadConf(string network_configuration) {
     if (!valid_ack_redirect())
       return false;
   } else if (path_selector != "ops" && !reps_hold() &&
+             path_selector != "reps_oracle" &&
              load_balancing_value() !=
                  static_cast<uint32_t>(LoadBalancingMode::EntropyHash)) {
     std::cerr << "PATH_SELECTOR " << path_selector
@@ -2595,7 +2624,9 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),
   }
   // The switches' state, which leaf_hold reads only for the hosts' leaves.
   const Ptr<SwitchQueueState> switch_queues =
-      switch_queue_cost() || leaf_hold() ? BuildSwitchQueueState(n) : nullptr;
+      switch_queue_cost() || leaf_hold() || reps_oracle()
+          ? BuildSwitchQueueState(n)
+          : nullptr;
   // One variable for every host, so the draw consumes a single fixed stream.
   Ptr<UniformRandomVariable> path_random;
   if (load_balancing_value() != static_cast<uint32_t>(LoadBalancingMode::Ecmp))
@@ -2833,7 +2864,8 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),
   }
   printf("maxRtt=%lu maxBdp=%lu\n", maxRtt, maxBdp);
   // Known only now that every route is, and read from the first packet on.
-  if (load_balancing == "spray_policy" || path_selector == "ack_redirect") {
+  if (load_balancing == "spray_policy" || path_selector == "ack_redirect" ||
+      reps_oracle()) {
     for (uint32_t i = 0; i < node_num; i++)
       if (n.Get(i)->GetNodeType() == 0)
         n.Get(i)->GetObject<RdmaDriver>()->m_rdma->SetAttribute(

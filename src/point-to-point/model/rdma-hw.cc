@@ -179,12 +179,15 @@ TypeId RdmaHw::GetTypeId (void)
 				"spine uniformly, 5 sends on the spine the latest "
 				"acknowledgement redirects to, which needs IntHeader::mode TS, "
 				"6 is REPS over spines leaving out the spines the host's "
-				"loss hold holds, and 7 as 6 with a loss hold per queue pair.",
+				"loss hold holds, 7 as 6 with a loss hold per queue pair, and 8 "
+				"is REPS over spines leaving out for good the spines "
+				"SwitchQueueState shows a fault on toward the destination's "
+				"leaf, which needs SprayGradeCostSource 1.",
 				UintegerValue(static_cast<uint32_t>(PathSelectorKind::Ops)),
 				MakeUintegerAccessor(&RdmaHw::m_pathSelectorKind),
 				MakeUintegerChecker<uint32_t>(
 					static_cast<uint32_t>(PathSelectorKind::Ops),
-					static_cast<uint32_t>(PathSelectorKind::RepsFlowHold)))
+					static_cast<uint32_t>(PathSelectorKind::RepsOracle)))
 		.AddAttribute("RepsBufferSize",
 				"REPS: the entries of the circular buffer of entropy values to "
 				"reuse. Default 8, REPS section 3.1.",
@@ -887,6 +890,9 @@ void RdmaHw::Setup(QpCompleteCallback cb, QpFailureCallback failure_cb){
 		"SprayLossHoldCleanSentinels above zero and SprayHeldExploration "
 		"sentinel, and PathSelector 6 under SprayHoldScope 1 needs "
 		"SwitchQueueState for the hosts' leaves");
+	NS_ABORT_MSG_IF(!ValidRepsOracle(),
+		"PathSelector 8 reads the spines' faults from SwitchQueueState and "
+		"needs LoadBalancing 2 and SprayGradeCostSource 1");
 	NS_ABORT_MSG_IF(!ValidPoolHoldPropagates(),
 		"SprayPoolHoldPropagates needs SpraySenderPoolWeight above zero: "
 		"without a pool there is no pool's hold to propagate");
@@ -915,7 +921,7 @@ void RdmaHw::Setup(QpCompleteCallback cb, QpFailureCallback failure_cb){
 				static_cast<uint32_t>(PathSelectorKind::Ops) &&
 			m_pathSelectorKind !=
 				static_cast<uint32_t>(PathSelectorKind::AckRedirect) &&
-			!IsRepsHold() &&
+			!IsRepsHold() && !IsRepsOracle() &&
 			m_loadBalancing !=
 				static_cast<uint32_t>(LoadBalancingMode::EntropyHash),
 		"PathSelector 1 to 4 choose entropy values and need LoadBalancing 1");
@@ -1302,6 +1308,32 @@ bool RdmaHw::ValidRepsHold() const{
 			m_sprayLossHoldCleanSentinels > 0 &&
 			m_sprayHeldExploration == SpineScores::HeldExploration::Sentinel &&
 			(!IsLeafHold() || m_switchQueues));
+}
+
+bool RdmaHw::IsRepsOracle() const{
+	return m_pathSelectorKind ==
+		static_cast<uint32_t>(PathSelectorKind::RepsOracle);
+}
+
+bool RdmaHw::ValidRepsOracle() const{
+	return !IsRepsOracle() ||
+		(m_loadBalancing ==
+				static_cast<uint32_t>(LoadBalancingMode::SprayUniform) &&
+			m_sprayGradeCostSource ==
+				static_cast<uint32_t>(GradeCostSource::SwitchQueue) &&
+			m_switchQueues);
+}
+
+FaultedSpines &RdmaHw::FaultedSpinesTo(uint32_t leaf){
+	NS_ABORT_MSG_IF(m_sprayBaseRttNs == 0,
+		"PathSelector 8 reads the switches once per SprayBaseRttNs");
+	NS_ABORT_MSG_IF(m_leaf == SwitchQueueState::kNoLeaf ||
+			leaf == SwitchQueueState::kNoLeaf,
+		"PathSelector 8 reads the paths between the source's and the "
+		"destination's leaves");
+	return m_faultedSpines.try_emplace(leaf, m_spineCount, m_sprayBaseRttNs,
+		[this, leaf](){ return m_switchQueues->Faulted(m_leaf, leaf); })
+		.first->second;
 }
 
 bool RdmaHw::IsLeafHold() const{
@@ -2507,6 +2539,13 @@ void RdmaHw::StartPathSelection(Ptr<RdmaQueuePair> qp, uint64_t bdpBytes,
 			m_repsBufferSize, m_repsFreezingTimeoutNs, bdpBytes / m_mtu,
 			m_spineCount,
 			std::make_unique<SpineScores>(m_spineCount, LossHoldParameters()));
+		return;
+	}
+	if (IsRepsOracle()){
+		qp->m_pathSelector = std::make_unique<RepsOracleSelector>(m_pathRandom,
+			m_repsBufferSize, m_repsFreezingTimeoutNs, bdpBytes / m_mtu,
+			m_spineCount,
+			FaultedSpinesTo(m_switchQueues->LeafOf(qp->dip.Get())));
 		return;
 	}
 	if (IsRepsHold()){

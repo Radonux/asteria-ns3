@@ -8540,6 +8540,84 @@ class SwitchQueueStateTest : public TestCase
     }
 };
 
+class RepsOracleTest : public TestCase
+{
+  public:
+    RepsOracleTest()
+        : TestCase("Under reps_oracle a spine the switches' state shows a loss or a slow port on "
+                   "toward a destination leaf leaves the REPS choices of the flows to that leaf "
+                   "for the run; the policy needs the switch_queue cost source")
+    {
+    }
+
+    void DoRun() override
+    {
+        SwitchQueueFabric fabric;
+        Ptr<RdmaHw> hw = CreateObject<RdmaHw>();
+        hw->SetAttribute("Mtu", UintegerValue(1000));
+        hw->SetAttribute("PathRandomVariable", PointerValue(SelectorStream()));
+        hw->m_spineCount = SwitchQueueFabric::kSpines;
+        hw->m_loadBalancing = static_cast<uint32_t>(LoadBalancingMode::SprayUniform);
+        hw->m_pathSelectorKind = static_cast<uint32_t>(PathSelectorKind::RepsOracle);
+        NS_TEST_EXPECT_MSG_EQ(hw->ValidRepsOracle(), false, "refused without the cost source");
+        hw->m_sprayGradeCostSource = static_cast<uint32_t>(GradeCostSource::SwitchQueue);
+        NS_TEST_EXPECT_MSG_EQ(hw->ValidRepsOracle(), false, "and without the switches' state");
+        hw->m_switchQueues = fabric.state;
+        NS_TEST_EXPECT_MSG_EQ(hw->ValidRepsOracle(), true, "accepted with both");
+        hw->m_loadBalancing = static_cast<uint32_t>(LoadBalancingMode::EntropyHash);
+        NS_TEST_EXPECT_MSG_EQ(hw->ValidRepsOracle(), false, "refused without named spines");
+        hw->m_loadBalancing = static_cast<uint32_t>(LoadBalancingMode::SprayUniform);
+        hw->m_sprayBaseRttNs = 1000;
+        // The sending host is on leaf 1.
+        hw->m_leaf = fabric.state->LeafOf(SwitchQueueFabric::kOtherSender.Get());
+
+        // One percent lost where spine 3's downlink to leaf 0 is received,
+        // and spine 2's downlink to leaf 2 at half rate.
+        Ptr<RateErrorModel> gray = CreateObject<RateErrorModel>();
+        gray->SetAttribute("ErrorUnit", StringValue("ERROR_UNIT_PACKET"));
+        gray->SetRate(0.01);
+        SwitchQueueFabric::Device(fabric.leaves[0], fabric.uplink[0][3])
+            ->SetAttribute("LinkErrorModel", PointerValue(gray));
+        Ptr<QbbNetDevice> slow = SwitchQueueFabric::Device(fabric.spines[2], fabric.downlink[2][2]);
+        slow->SetDataRate(DataRate(slow->GetDataRate().GetBitRate() / 2));
+        NS_TEST_EXPECT_MSG_EQ((fabric.state->Faulted(1, 0) ==
+                               std::vector<bool>{false, false, false, true}),
+                              true,
+                              "toward leaf 0 the lossy spine is faulted");
+        NS_TEST_EXPECT_MSG_EQ((fabric.state->Faulted(1, 2) ==
+                               std::vector<bool>{false, false, true, false}),
+                              true,
+                              "toward leaf 2 the slow spine is");
+
+        Ptr<RdmaQueuePair> toZero = CreateObject<RdmaQueuePair>(
+            3, SwitchQueueFabric::kOtherSender, kTestSender, 10000, 100);
+        Ptr<RdmaQueuePair> toTwo = CreateObject<RdmaQueuePair>(
+            3, SwitchQueueFabric::kOtherSender, kTestReceiver, 10001, 100);
+        hw->StartPathSelection(toZero, 0, 0);
+        hw->StartPathSelection(toTwo, 0, 0);
+        std::vector<uint32_t> zeroOn(SwitchQueueFabric::kSpines);
+        std::vector<uint32_t> twoOn(SwitchQueueFabric::kSpines);
+        for (uint32_t step = 0; step < 800; ++step)
+        {
+            // Halfway the faults are cleared; the spines stay out.
+            if (step == 400)
+            {
+                gray->Disable();
+                slow->SetDataRate(DataRate(slow->GetDataRate().GetBitRate() * 2));
+            }
+            const bool zero = step % 2 == 0;
+            const uint8_t spine = LossHoldFixture::Send(
+                *(zero ? toZero : toTwo)->m_pathSelector, 100 * step, step / 2, {});
+            (zero ? zeroOn : twoOn)[spine]++;
+        }
+        NS_TEST_EXPECT_MSG_EQ(zeroOn[3], 0u, "the flow to leaf 0 never sends on spine 3");
+        NS_TEST_EXPECT_MSG_GT(twoOn[3], 0u, "the flow to leaf 2 does");
+        NS_TEST_EXPECT_MSG_EQ(twoOn[2], 0u, "the flow to leaf 2 never sends on spine 2");
+        NS_TEST_EXPECT_MSG_GT(zeroOn[2], 0u, "the flow to leaf 0 does");
+        Simulator::Destroy();
+    }
+};
+
 class SwitchQueueGradeTest : public TestCase
 {
   public:
@@ -9086,6 +9164,7 @@ PointToPointTestSuite::PointToPointTestSuite()
     AddTestCase(new AckRedirectScopeTest, TestCase::Duration::QUICK);
     AddTestCase(new SwitchQueueStateTest, TestCase::Duration::QUICK);
     AddTestCase(new SwitchQueueGradeTest, TestCase::Duration::QUICK);
+    AddTestCase(new RepsOracleTest, TestCase::Duration::QUICK);
 }
 
 static PointToPointTestSuite g_pointToPointTestSuite; //!< The testsuite
