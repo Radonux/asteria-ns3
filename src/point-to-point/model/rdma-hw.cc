@@ -355,6 +355,15 @@ TypeId RdmaHw::GetTypeId (void)
 				DoubleValue(0),
 				MakeDoubleAccessor(&RdmaHw::m_sprayTrimThreshold3),
 				MakeDoubleChecker<double>(0, 1))
+		.AddAttribute("SprayCongestionGradeFloor",
+				"Under LoadBalancing 3, the least grade the receiver gives a "
+				"spine for its marked and trimmed fractions and its one-way "
+				"delay, before the report is sent. Default 0, which leaves them "
+				"their grade; above zero only the loss grade and a held spine "
+				"grade a spine below it.",
+				UintegerValue(0),
+				MakeUintegerAccessor(&RdmaHw::m_sprayCongestionGradeFloor),
+				MakeUintegerChecker<uint8_t>(0, SpineReport::kTopGrade))
 		.AddAttribute("SprayLossThreshold1",
 				"Under LoadBalancing 3, the fraction of a spine's sends declared "
 				"lost from which the sender grades it 2, depositing the lower of "
@@ -1303,6 +1312,7 @@ SpineGrader::Parameters RdmaHw::GraderParameters() const{
 		parameters.trimThresholds = std::array<double, 3>{m_sprayTrimThreshold1,
 			m_sprayTrimThreshold2, m_sprayTrimThreshold3};
 	parameters.lossThresholds = SprayLossThresholds();
+	parameters.congestionGradeFloor = m_sprayCongestionGradeFloor;
 	parameters.oneWayDelay = m_sprayOneWayDelay;
 	parameters.delayNs = {m_sprayEstimatorGain,
 		m_sprayDelayCusumSlackBaseRtts * rtt,

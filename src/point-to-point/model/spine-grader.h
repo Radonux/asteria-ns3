@@ -74,7 +74,8 @@ private:
 // of the grades the marked fraction's cost earns through the congestion
 // thresholds and the trimmed fraction's cost earns through the trim
 // thresholds, which are the congestion thresholds unless set apart; with the
-// same thresholds for both it is the grade of the larger cost.
+// same thresholds for both it is the grade of the larger cost. The congestion
+// grade and the delay grade are raised to the congestion grade floor.
 //
 // A held spine grades 0 whatever its costs. A moved packet holds the spine it
 // was requested on at once. Arrivals are counted per spine over a window of
@@ -108,6 +109,11 @@ public:
 		// The loss fraction's costs from which a spine grades 2, 1 and 0
 		// when Graded grades loss; unset, the congestion thresholds.
 		std::optional<std::array<double, 3>> lossThresholds;
+		// The least grade the marked and trimmed fractions' costs and the
+		// delay cost earn a spine; zero leaves them their grade. Above zero,
+		// only the loss fraction's cost, the loss hold and a held spine grade
+		// a spine below it.
+		uint8_t congestionGradeFloor = 0;
 		bool oneWayDelay;
 		SupervisedEwma::Parameters delayNs;
 		// The delays above a spine's least from which it grades 2, 1 and 0.

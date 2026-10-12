@@ -5067,6 +5067,116 @@ class ScoresFixture
     }
 };
 
+class SpineCongestionGradeFloorTest : public TestCase
+{
+  public:
+    SpineCongestionGradeFloorTest()
+        : TestCase("A congestion grade floor raises the grades the marked and trimmed fractions "
+                   "and the delay earn, and leaves the loss grade and a held spine at 0")
+    {
+    }
+
+    void DoRun() override
+    {
+        Ptr<RdmaHw> hw = CreateObject<RdmaHw>();
+        UintegerValue attribute;
+        hw->GetAttribute("SprayCongestionGradeFloor", attribute);
+        NS_TEST_EXPECT_MSG_EQ(attribute.Get(), 0u, "SprayCongestionGradeFloor is 0 by default");
+        hw->SetNode(CreateObject<Node>());
+        hw->m_sprayBaseRttNs = 10000;
+        hw->m_loadBalancing = static_cast<uint32_t>(LoadBalancingMode::SprayPolicy);
+        NS_TEST_EXPECT_MSG_EQ(uint32_t(hw->GraderParameters().congestionGradeFloor),
+                              0u,
+                              "the grader takes the default");
+        hw->SetAttribute("SprayCongestionGradeFloor", UintegerValue(1));
+        NS_TEST_EXPECT_MSG_EQ(uint32_t(hw->GraderParameters().congestionGradeFloor),
+                              1u,
+                              "and the floor set");
+
+        Arrivals();
+        PathValues();
+        SenderLoss();
+    }
+
+  private:
+    static constexpr uint32_t kSpines = GraderFixture::kSpines;
+
+    // Spine 2 marks nine in ten of its arrivals, above the top threshold.
+    void Arrivals()
+    {
+        std::vector<double> marks(kSpines, 0);
+        marks[2] = 0.9;
+        for (const uint8_t floor : {0, 1, 2})
+        {
+            SpineGrader::Parameters parameters = GraderFixture::Absolute();
+            parameters.congestionGradeFloor = floor;
+            SpineGrader grader(parameters);
+            GraderFixture::Interval(grader, 0, marks);
+            NS_TEST_EXPECT_MSG_EQ(uint32_t(grader.Report().Grade(2)),
+                                  uint32_t(floor),
+                                  "the marked spine grades the floor");
+            NS_TEST_EXPECT_MSG_EQ(uint32_t(grader.Report().Grade(0)),
+                                  3u,
+                                  "an unmarked spine keeps the top grade");
+        }
+    }
+
+    // The switch_queue path's values: the marked fraction and the delay are
+    // floored, the loss fraction's grade and the loss hold are not.
+    void PathValues()
+    {
+        std::vector<SpineGrader::SpineValues> values(kSpines);
+        values[1].markFraction = 0.9;
+        values[2].lossFraction = 0.8;
+        values[3].lossFraction = 0.9;
+        values[4].delayNs = 9000;
+        std::vector<bool> held(kSpines, false);
+        held[5] = true;
+        for (const uint8_t floor : {0, 1})
+        {
+            SpineGrader::Parameters parameters = GraderFixture::Absolute(true);
+            parameters.congestionGradeFloor = floor;
+            const SpineReport report = SpineGrader(parameters).Graded(values, held, 0.875);
+            NS_TEST_EXPECT_MSG_EQ(uint32_t(report.Grade(1)),
+                                  uint32_t(floor),
+                                  "the marked fraction's grade is floored");
+            NS_TEST_EXPECT_MSG_EQ(uint32_t(report.Grade(2)),
+                                  0u,
+                                  "the loss fraction's grade is not");
+            NS_TEST_EXPECT_MSG_EQ(uint32_t(report.Grade(3)), 0u, "nor the loss hold");
+            NS_TEST_EXPECT_MSG_EQ(uint32_t(report.Grade(4)),
+                                  uint32_t(floor),
+                                  "the delay's grade is floored");
+            NS_TEST_EXPECT_MSG_EQ(uint32_t(report.Grade(5)), 0u, "a held spine grades 0");
+            NS_TEST_EXPECT_MSG_EQ(uint32_t(report.Grade(0)), 3u, "a clean spine grades 3");
+        }
+    }
+
+    // A report floored at 1 meets the sender's loss grade of 0, and the
+    // lower stands.
+    void SenderLoss()
+    {
+        SpineScores::Parameters parameters = ScoresFixture::Defaults();
+        parameters.lossThresholds = std::array<double, 3>{0.1, 0.25, 0.5};
+        SpineScores scores(kSpines, parameters);
+        for (uint32_t i = 0; i < 10; ++i)
+        {
+            scores.OnSend(3, 1000);
+            scores.OnSend(4, 1000);
+            if (i < 6)
+            {
+                scores.OnLoss(3, 1000);
+            }
+        }
+        std::vector<uint8_t> grades(kSpines, 3);
+        grades[3] = 1;
+        grades[4] = 1;
+        scores.OnReport(ScoresFixture::Report(1, grades), ScoresFixture::kInterval);
+        NS_TEST_EXPECT_MSG_EQ(scores.Held(3), true, "the loss grade of 0 holds the spine");
+        NS_TEST_EXPECT_MSG_EQ(scores.Held(4), false, "the floored grade alone does not");
+    }
+};
+
 class SpineScoresDrainTest : public TestCase
 {
   public:
@@ -8647,6 +8757,7 @@ PointToPointTestSuite::PointToPointTestSuite()
     AddTestCase(new SpineGradeReferenceTest, TestCase::Duration::QUICK);
     AddTestCase(new SpineDelayReferenceTest, TestCase::Duration::QUICK);
     AddTestCase(new SpineAbsenceTest, TestCase::Duration::QUICK);
+    AddTestCase(new SpineCongestionGradeFloorTest, TestCase::Duration::QUICK);
     AddTestCase(new SpineScoresDrainTest, TestCase::Duration::QUICK);
     AddTestCase(new SpineScoresFloorTest, TestCase::Duration::QUICK);
     AddTestCase(new SpineScoresFlapTest, TestCase::Duration::QUICK);

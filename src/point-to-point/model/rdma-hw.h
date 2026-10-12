@@ -127,6 +127,8 @@ public:
 	double m_sprayCongestionThreshold1, m_sprayCongestionThreshold2, m_sprayCongestionThreshold3;
 	// Zero leaves the trimmed fraction on the congestion thresholds.
 	double m_sprayTrimThreshold1, m_sprayTrimThreshold2, m_sprayTrimThreshold3;
+	// SpineGrader::Parameters::congestionGradeFloor.
+	uint8_t m_sprayCongestionGradeFloor;
 	// Zero counts no loss at the sender and leaves the loss fraction the
 	// grader grades under SwitchQueue on the congestion thresholds.
 	double m_sprayLossThreshold1, m_sprayLossThreshold2, m_sprayLossThreshold3;

@@ -167,6 +167,10 @@ double spray_congestion_thresholds[3] = {0.25, 0.5, 0.75};
 // Zero, unless SPRAY_TRIM_THRESHOLDS is given: the trimmed fraction is graded
 // through spray_congestion_thresholds.
 double spray_trim_thresholds[3] = {0, 0, 0};
+// The least grade a receiver gives a spine for its marked and trimmed
+// fractions and its one-way delay; zero leaves them their grade. Above zero
+// only the loss grade and a held spine grade a spine below it.
+uint32_t spray_congestion_grade_floor = 0;
 // Zero, unless SPRAY_LOSS_THRESHOLDS is given: the sender counts no loss, and
 // the switch_queue grader grades the loss fraction through
 // spray_congestion_thresholds. Zero spray_loss_interval_ns is the report
@@ -208,6 +212,7 @@ const std::set<std::string> spray_policy_keys = {
     "SPRAY_REPORT_INTERVAL_BASE_RTTS", "SPRAY_ESTIMATOR_GAIN",
     "SPRAY_FRACTION_CUSUM_SLACK", "SPRAY_FRACTION_CUSUM_THRESHOLD",
     "SPRAY_CONGESTION_THRESHOLDS", "SPRAY_TRIM_THRESHOLDS",
+    "SPRAY_CONGESTION_GRADE_FLOOR",
     "SPRAY_LOSS_THRESHOLDS", "SPRAY_LOSS_INTERVAL_NS",
     "SPRAY_LOSS_HOLD_CLEAN_SENTINELS",
     "SPRAY_RELEASE_FRACTION_OF_FLOOR",
@@ -1280,6 +1285,10 @@ bool valid_spray_policy() {
                  "fractions in (0, 1]\n";
     return false;
   }
+  if (spray_congestion_grade_floor > SpineReport::kTopGrade) {
+    std::cerr << "SPRAY_CONGESTION_GRADE_FLOOR must be in [0, 3]\n";
+    return false;
+  }
   if (spray_policy_keys_given.count("SPRAY_LOSS_THRESHOLDS") > 0 &&
       (!increasing(spray_loss_thresholds) || spray_loss_thresholds[2] > 1)) {
     std::cerr << "SPRAY_LOSS_THRESHOLDS must be three increasing "
@@ -1632,6 +1641,8 @@ bool ReadConf(string network_configuration) {
     } else if (key.compare("SPRAY_TRIM_THRESHOLDS") == 0) {
       conf >> spray_trim_thresholds[0] >> spray_trim_thresholds[1] >>
           spray_trim_thresholds[2];
+    } else if (key.compare("SPRAY_CONGESTION_GRADE_FLOOR") == 0) {
+      conf >> spray_congestion_grade_floor;
     } else if (key.compare("SPRAY_LOSS_THRESHOLDS") == 0) {
       conf >> spray_loss_thresholds[0] >> spray_loss_thresholds[1] >>
           spray_loss_thresholds[2];
@@ -2563,6 +2574,8 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),
                            DoubleValue(spray_trim_thresholds[1]));
       rdmaHw->SetAttribute("SprayTrimThreshold3",
                            DoubleValue(spray_trim_thresholds[2]));
+      rdmaHw->SetAttribute("SprayCongestionGradeFloor",
+                           UintegerValue(spray_congestion_grade_floor));
       rdmaHw->SetAttribute("SprayLossThreshold1",
                            DoubleValue(spray_loss_thresholds[0]));
       rdmaHw->SetAttribute("SprayLossThreshold2",
