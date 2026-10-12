@@ -196,6 +196,8 @@ double spray_sender_pool_weight = 0;
 // Zero, unless SPRAY_POOL_DECAY_INTERVAL_NS is given: the host's pooled
 // scores decay once per report taken.
 uint64_t spray_pool_decay_interval_ns = 0;
+// 1 holds a spine the host's pooled scores hold in every destination's draw.
+uint32_t spray_pool_hold_propagates = 0;
 // What a spine graded 0 is sent: epsilon, sentinel or none. Zero
 // spray_held_sentinel_interval_ns is the report interval.
 std::string spray_held_exploration = "epsilon";
@@ -214,6 +216,7 @@ const std::set<std::string> spray_policy_keys = {
     "SPRAY_GAMMA", "SPRAY_EPSILON", "SPRAY_CANDIDATES", "SPRAY_CANDIDATE_DRAW",
     "SPRAY_EDGE_WINDOW_PENALTY", "SPRAY_EDGE_FREEZE",
     "SPRAY_SENDER_POOL_WEIGHT", "SPRAY_POOL_DECAY_INTERVAL_NS",
+    "SPRAY_POOL_HOLD_PROPAGATES",
     "SPINE_REPORT_OUTPUT_FILE",
     "SPINE_LOSS_OUTPUT_FILE", "SPRAY_HELD_EXPLORATION",
     "SPRAY_HELD_SENTINEL_INTERVAL_NS",
@@ -1383,6 +1386,16 @@ bool valid_spray_policy() {
                  "SPRAY_SENDER_POOL_WEIGHT above zero\n";
     return false;
   }
+  if (spray_pool_hold_propagates > 1) {
+    std::cerr << "SPRAY_POOL_HOLD_PROPAGATES must be 0 or 1\n";
+    return false;
+  }
+  if (spray_policy_keys_given.count("SPRAY_POOL_HOLD_PROPAGATES") > 0 &&
+      spray_sender_pool_weight == 0) {
+    std::cerr << "SPRAY_POOL_HOLD_PROPAGATES is read only with "
+                 "SPRAY_SENDER_POOL_WEIGHT above zero\n";
+    return false;
+  }
   if (spray_held_exploration_value() == std::numeric_limits<uint32_t>::max()) {
     std::cerr << "SPRAY_HELD_EXPLORATION must be epsilon, sentinel or none\n";
     return false;
@@ -1666,6 +1679,8 @@ bool ReadConf(string network_configuration) {
       conf >> spray_sender_pool_weight;
     } else if (key.compare("SPRAY_POOL_DECAY_INTERVAL_NS") == 0) {
       conf >> spray_pool_decay_interval_ns;
+    } else if (key.compare("SPRAY_POOL_HOLD_PROPAGATES") == 0) {
+      conf >> spray_pool_hold_propagates;
     } else if (key.compare("SPRAY_HELD_EXPLORATION") == 0) {
       conf >> spray_held_exploration;
     } else if (key.compare("SPRAY_HELD_SENTINEL_INTERVAL_NS") == 0) {
@@ -2602,6 +2617,8 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),
                            DoubleValue(spray_sender_pool_weight));
       rdmaHw->SetAttribute("SprayPoolDecayIntervalNs",
                            UintegerValue(spray_pool_decay_interval_ns));
+      rdmaHw->SetAttribute("SprayPoolHoldPropagates",
+                           BooleanValue(spray_pool_hold_propagates == 1));
       rdmaHw->SetAttribute(
           "SprayHeldExploration",
           EnumValue(static_cast<SpineScores::HeldExploration>(

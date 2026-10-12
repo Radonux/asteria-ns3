@@ -282,14 +282,49 @@ bool SpineScores::IsPooled() const{
 	return m_pool != nullptr && m_poolWeight > 0;
 }
 
+bool SpineScores::Propagates() const{
+	return IsPooled() && m_parameters.poolHoldPropagates;
+}
+
+bool SpineScores::PoolHolds(uint32_t spine) const{
+	return m_pool->m_held[spine] || m_pool->m_lossHeld[spine];
+}
+
+bool SpineScores::ExcludesPoolHeld() const{
+	if (!Propagates())
+		return false;
+	for (uint32_t k = 0; k < m_scores.size(); k++){
+		if (!PoolHolds(k))
+			return true;
+	}
+	return false;
+}
+
 bool SpineScores::Held(uint32_t spine) const{
-	return IsPooled() ? m_pool->m_held[spine] : m_held[spine];
+	if (!IsPooled())
+		return m_held[spine];
+	if (!m_parameters.poolHoldPropagates)
+		return m_pool->m_held[spine];
+	return m_held[spine] || PoolHolds(spine);
 }
 
 bool SpineScores::TakeSentinel(uint64_t nowNs, uint8_t &spine){
 	if (m_parameters.heldExploration != HeldExploration::Sentinel)
 		return false;
+	const bool propagates = Propagates();
+	if (propagates && m_pool->m_parameters.lossThresholds)
+		m_pool->AdvanceLossInterval(nowNs);
 	for (uint32_t k = 0; k < m_scores.size(); k++){
+		// A spine the pool holds is sent the pool's sentinels, one per
+		// interval for every set of scores pooled with it.
+		if (propagates && PoolHolds(k)){
+			if (nowNs >= m_pool->m_sentinelNs[k] + m_pool->m_sentinelIntervalNs){
+				m_pool->m_sentinelNs[k] = nowNs;
+				spine = k;
+				return true;
+			}
+			continue;
+		}
 		if (Held(k) && nowNs >= m_sentinelNs[k] + m_sentinelIntervalNs){
 			m_sentinelNs[k] = nowNs;
 			spine = k;
@@ -337,6 +372,9 @@ uint8_t SpineScores::Choose(UniformRandomVariable &random, uint64_t nowNs){
 	if (IsPooled()){
 		if (nowNs >= m_pool->m_nextDecayNs)
 			m_pool->Age(nowNs);
+		if (Propagates() && m_pool->m_parameters.lossThresholds)
+			m_pool->AdvanceLossInterval(nowNs);
+		const bool excluding = ExcludesPoolHeld();
 		auto candidate = [&]() -> uint8_t {
 			return m_parameters.candidateDraw == CandidateDraw::Proportional
 				? DrawFromMixed(random)
@@ -345,7 +383,7 @@ uint8_t SpineScores::Choose(UniformRandomVariable &random, uint64_t nowNs){
 		uint8_t chosen = candidate();
 		for (uint32_t i = 1; i < m_parameters.candidates; i++){
 			const uint8_t next = candidate();
-			if (Mixed(next) > Mixed(chosen))
+			if (Weight(next, excluding) > Weight(chosen, excluding))
 				chosen = next;
 		}
 		return chosen;
@@ -367,6 +405,23 @@ uint8_t SpineScores::Choose(UniformRandomVariable &random, uint64_t nowNs){
 double SpineScores::Share(uint32_t spine) const{
 	const double spines = m_scores.size();
 	if (IsPooled()){
+		const bool excluding = ExcludesPoolHeld();
+		if (excluding){
+			if (PoolHolds(spine))
+				return EpsilonShare(spine);
+			const double sum = WeightSum(true);
+			double part;
+			if (sum > 0)
+				part = Mixed(spine) / sum;
+			else {
+				// Spread uniformly over the spines the pool does not hold.
+				uint32_t unexcluded = 0;
+				for (uint32_t k = 0; k < m_scores.size(); k++)
+					unexcluded += !PoolHolds(k);
+				part = 1.0 / unexcluded;
+			}
+			return (1 - m_parameters.epsilon) * part + EpsilonShare(spine);
+		}
 		const double sum = MixedSum();
 		if (sum == 0)
 			return 1 / spines;
@@ -437,6 +492,17 @@ double SpineScores::MixedSum() const{
 	return sum;
 }
 
+double SpineScores::Weight(uint32_t spine, bool excluding) const{
+	return excluding && PoolHolds(spine) ? 0 : Mixed(spine);
+}
+
+double SpineScores::WeightSum(bool excluding) const{
+	double sum = 0;
+	for (uint32_t k = 0; k < m_scores.size(); k++)
+		sum += Weight(k, excluding);
+	return sum;
+}
+
 uint8_t SpineScores::DrawFromMixed(UniformRandomVariable &random) const{
 	const uint32_t spines = m_scores.size();
 	const double epsilon = m_parameters.epsilon;
@@ -444,19 +510,47 @@ uint8_t SpineScores::DrawFromMixed(UniformRandomVariable &random) const{
 	if (u < epsilon)
 		return DrawEpsilon(u / epsilon);
 	const double v = (u - epsilon) / (1 - epsilon);
-	const double sum = MixedSum();
-	if (sum == 0)
+	const bool excluding = ExcludesPoolHeld();
+	const double sum = WeightSum(excluding);
+	if (sum == 0 && !excluding)
 		return std::min(static_cast<uint32_t>(v * spines), spines - 1);
+	if (sum == 0){
+		// Uniformly over the spines the pool does not hold.
+		uint32_t unexcluded = 0;
+		for (uint32_t k = 0; k < spines; k++)
+			unexcluded += !PoolHolds(k);
+		uint32_t index = std::min(static_cast<uint32_t>(v * unexcluded),
+			unexcluded - 1);
+		for (uint32_t k = 0; k < spines; k++){
+			if (!PoolHolds(k) && index-- == 0)
+				return k;
+		}
+		return spines - 1;
+	}
 	// The first spine whose running sum exceeds the target, as DrawFromShares
 	// finds it.
 	const double target = v * sum;
 	double accumulated = 0;
-	for (uint32_t k = 0; k + 1 < spines; k++){
-		accumulated += Mixed(k);
+	if (!excluding){
+		for (uint32_t k = 0; k + 1 < spines; k++){
+			accumulated += Mixed(k);
+			if (accumulated > target)
+				return k;
+		}
+		return spines - 1;
+	}
+	// Excluding, the last spine with a weight takes what rounding leaves.
+	uint32_t last = spines - 1;
+	for (uint32_t k = 0; k < spines; k++){
+		const double weight = Weight(k, excluding);
+		if (weight == 0)
+			continue;
+		last = k;
+		accumulated += weight;
 		if (accumulated > target)
 			return k;
 	}
-	return spines - 1;
+	return last;
 }
 
 PolicySpineSelector::PolicySpineSelector(Ptr<UniformRandomVariable> random,

@@ -566,6 +566,17 @@ TypeId RdmaHw::GetTypeId (void)
 				UintegerValue(0),
 				MakeUintegerAccessor(&RdmaHw::m_sprayPoolDecayIntervalNs),
 				MakeUintegerChecker<uint64_t>())
+		.AddAttribute("SprayPoolHoldPropagates",
+				"Under LoadBalancing 3 with SpraySenderPoolWeight above zero, "
+				"whether a spine the host's pooled scores hold, by their held "
+				"flag or their loss hold, is held in every destination's draw: "
+				"it weighs nothing in the mixed draw, keeping epsilon / N only "
+				"under SprayHeldExploration epsilon, and under sentinel is sent "
+				"the pool's sentinels, one per sentinel interval for the host. "
+				"Default false.",
+				BooleanValue(false),
+				MakeBooleanAccessor(&RdmaHw::m_sprayPoolHoldPropagates),
+				MakeBooleanChecker())
 		.AddAttribute("SprayEdgeWindowPenalty",
 				"Under LoadBalancing 3 and CC mode 11, the Rcv_Cwnd_Pend (UEC "
 				"1.0.3 section 3.6.13.2) of an acknowledgement whose report says "
@@ -841,6 +852,9 @@ void RdmaHw::Setup(QpCompleteCallback cb, QpFailureCallback failure_cb){
 		"SprayHeldExploration none needs SprayGradeCostSource 1: a held spine "
 		"is sent nothing, and the receiver's estimate releases a hold only "
 		"for arrivals");
+	NS_ABORT_MSG_IF(!ValidPoolHoldPropagates(),
+		"SprayPoolHoldPropagates needs SpraySenderPoolWeight above zero: "
+		"without a pool there is no pool's hold to propagate");
 	NS_ABORT_MSG_IF(m_loadBalancing !=
 				static_cast<uint32_t>(LoadBalancingMode::Ecmp) && !m_pathRandom,
 		"A LoadBalancing mode other than ECMP draws the identification of every "
@@ -1244,6 +1258,11 @@ bool RdmaHw::ValidHeldExploration() const{
 	return !IsSprayPolicy() ||
 		m_sprayHeldExploration != SpineScores::HeldExploration::None ||
 		IsSwitchQueueCost();
+}
+
+bool RdmaHw::ValidPoolHoldPropagates() const{
+	return !IsSprayPolicy() || !m_sprayPoolHoldPropagates ||
+		m_spraySenderPoolWeight > 0;
 }
 
 std::optional<std::array<double, 3>> RdmaHw::SprayLossThresholds() const{
@@ -2391,6 +2410,7 @@ void RdmaHw::StartPathSelection(Ptr<RdmaQueuePair> qp, uint64_t bdpBytes,
 			SprayReportIntervalNs(), m_sprayEdgeFreeze};
 		parameters.heldExploration = m_sprayHeldExploration;
 		parameters.sentinelIntervalNs = m_sprayHeldSentinelIntervalNs;
+		parameters.poolHoldPropagates = m_sprayPoolHoldPropagates;
 		if (CountsSprayLoss()){
 			parameters.lossThresholds = SprayLossThresholds();
 			parameters.lossIntervalNs = m_sprayLossIntervalNs;

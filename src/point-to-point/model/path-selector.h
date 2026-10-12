@@ -158,6 +158,22 @@ private:
 // held while the interval's mean grade rounds to 0, under 1/2; one with
 // nothing counted in the interval keeps its held flag. Without reports the
 // scores still age as above.
+//
+// Drawn through a pool with pool hold propagation set, a spine is held while
+// these scores hold it, the last report they took grading it 0, or the pool
+// does, by its held flag or its loss hold. A spine the pool holds weighs
+// nothing in the draws and in p, under every held exploration, the others
+// sharing 1 - epsilon in proportion to their mixed scores; under the epsilon
+// held exploration it keeps its epsilon / N, and under sentinel and none it
+// has no share of the epsilon term, as a spine held only by these scores has
+// none, while the latter keeps its mixed score's part. While the pool holds
+// every spine, nothing is excluded for the pool's hold. Under the sentinel
+// held exploration the sentinels of a spine the pool holds follow the pool's
+// sentinel schedule, one per sentinel interval for every set of scores
+// pooled with it, taken by whichever draws first once one is due; a spine
+// held only by these scores follows their own schedule. The pool's hold ends
+// by the pool's rule, a report it takes grading the spine above 0 and its
+// loss hold's clean sends, and these scores' hold by theirs.
 class SpineScores {
 public:
 	enum class CandidateDraw : uint32_t {
@@ -192,6 +208,9 @@ public:
 		// As a pool: the pool decay interval; zero decays once per report
 		// taken.
 		uint64_t poolDecayIntervalNs = 0;
+		// Drawn through a pool: whether a spine the pool holds is held for
+		// these scores' draws and sentinels too.
+		bool poolHoldPropagates = false;
 	};
 	SpineScores(uint32_t spines, const Parameters &parameters);
 	void OnReport(const SpineReport &report, uint64_t nowNs);
@@ -236,6 +255,17 @@ private:
 	// mean grades, decaying the base once per interval.
 	void PoolTake(const SpineReport &report, uint64_t nowNs);
 	bool IsPooled() const;
+	// Drawn through a pool with pool hold propagation set.
+	bool Propagates() const;
+	// Whether the pool holds spine: its held flag or its loss hold.
+	bool PoolHolds(uint32_t spine) const;
+	// Under propagation: whether a spine the pool holds is excluded from the
+	// mixed draw, which it is unless the pool holds every spine.
+	bool ExcludesPoolHeld() const;
+	// The mixed score of spine, or 0 when it is excluded; excluding is
+	// ExcludesPoolHeld() as computed by the caller.
+	double Weight(uint32_t spine, bool excluding) const;
+	double WeightSum(bool excluding) const;
 	// The score a pooled draw weighs spine by, and the sum over the spines.
 	double Mixed(uint32_t spine) const;
 	double MixedSum() const;

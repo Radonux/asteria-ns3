@@ -202,6 +202,10 @@ public:
 	double m_spraySenderPoolWeight;
 	// The pooled scores' SpineScores::Parameters::poolDecayIntervalNs.
 	uint64_t m_sprayPoolDecayIntervalNs;
+	// Every queue pair's SpineScores::Parameters::poolHoldPropagates, and
+	// whether it is set only with a pool to propagate from.
+	bool m_sprayPoolHoldPropagates;
+	bool ValidPoolHoldPropagates() const;
 	std::unique_ptr<SpineScores> m_senderSpineScores;
 	// The SpineLossInterval trace source: the host's pooled scores closed a
 	// loss interval (SpineScores::LossIntervalCallback): the time it ended
