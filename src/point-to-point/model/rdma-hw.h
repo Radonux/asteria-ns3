@@ -215,7 +215,8 @@ public:
 	// m_senderSpineScores, made with parameters if it is null, its loss
 	// intervals traced to SpineLossInterval when they are graded.
 	SpineScores &HostScores(const SpineScores::Parameters &parameters);
-	// PathSelector RepsHold, and whether its loss hold has what it needs:
+	// PathSelector RepsHold or RepsFlowHold, and whether its loss hold has
+	// what it needs:
 	// spines named per packet, the loss thresholds, a loss interval, a loss
 	// hold and the sentinels that release it.
 	bool IsRepsHold() const;

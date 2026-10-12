@@ -25,8 +25,9 @@ enum class PathSelectorKind : uint32_t {
 	// Under SprayUniform: the spine the latest acknowledgement redirects to.
 	AckRedirect,
 	// Under SprayUniform: REPS over spines, leaving out the spines the host's
-	// loss hold holds.
+	// loss hold holds, or the queue pair's own.
 	RepsHold,
+	RepsFlowHold,
 };
 
 // A queue pair's choice of the path each of its data packets takes, and what
@@ -446,12 +447,16 @@ private:
 // shares the hold, in place of REPS's choice. Every send, sentinel or chosen,
 // and every send declared lost is counted in the hold, which grades its
 // spines per loss interval as the host's pooled scores do and holds a spine
-// by the same loss hold. The hold is shared by every queue pair of a host.
+// by the same loss hold. The hold is shared by every queue pair of a host,
+// or owned by this queue pair alone, whose sentinels it then sends alone.
 class RepsHoldSelector : public RepsSelector {
 public:
 	RepsHoldSelector(Ptr<UniformRandomVariable> random, uint32_t bufferSize,
 		uint64_t freezingTimeoutNs, uint32_t explorePackets, uint32_t spines,
 		SpineScores &hold);
+	RepsHoldSelector(Ptr<UniformRandomVariable> random, uint32_t bufferSize,
+		uint64_t freezingTimeoutNs, uint32_t explorePackets, uint32_t spines,
+		std::unique_ptr<SpineScores> hold);
 	uint16_t Choose(uint64_t nowNs) override;
 	void OnLoss(uint16_t path, uint64_t nowNs) override;
 
@@ -459,6 +464,8 @@ protected:
 	bool Excluded(uint16_t path) const override;
 
 private:
+	// Declared before m_hold, which refers to it when it is set.
+	std::unique_ptr<SpineScores> m_ownHold;
 	SpineScores &m_hold;
 	// Whether the hold leaves a spine out, set before each choice.
 	bool m_excluding;

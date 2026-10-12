@@ -728,6 +728,15 @@ RepsHoldSelector::RepsHoldSelector(Ptr<UniformRandomVariable> random,
 {
 }
 
+RepsHoldSelector::RepsHoldSelector(Ptr<UniformRandomVariable> random,
+		uint32_t bufferSize, uint64_t freezingTimeoutNs, uint32_t explorePackets,
+		uint32_t spines, std::unique_ptr<SpineScores> hold)
+	: RepsSelector(random, bufferSize, freezingTimeoutNs, explorePackets,
+		spines),
+	  m_ownHold(std::move(hold)), m_hold(*m_ownHold), m_excluding(false)
+{
+}
+
 uint16_t RepsHoldSelector::Choose(uint64_t nowNs){
 	uint8_t spine;
 	if (!m_hold.TakeHoldSentinel(nowNs, spine)){

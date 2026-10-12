@@ -7232,6 +7232,90 @@ class RepsHoldTest : public TestCase
     }
 };
 
+class RepsFlowHoldTest : public TestCase
+{
+  public:
+    RepsFlowHoldTest()
+        : TestCase("Under reps_flow_hold each queue pair keeps its own loss hold: a spine one "
+                   "flow loses on leaves that flow's choices alone, and is sent that flow's "
+                   "sentinels; under reps_hold the queue pairs share the host's")
+    {
+    }
+
+    void DoRun() override
+    {
+        Ptr<RdmaHw> shared = Hw(PathSelectorKind::RepsHold);
+        Ptr<RdmaQueuePair> first = Qp(shared, 10000);
+        Ptr<RdmaQueuePair> second = Qp(shared, 10001);
+        NS_TEST_EXPECT_MSG_NE(shared->m_senderSpineScores.get(),
+                              nullptr,
+                              "reps_hold makes the host's loss hold");
+
+        Ptr<RdmaHw> hw = Hw(PathSelectorKind::RepsFlowHold);
+        NS_TEST_EXPECT_MSG_EQ(hw->ValidRepsHold(), true, "the loss hold is set");
+        hw->m_sprayLossHoldCleanSentinels = 0;
+        NS_TEST_EXPECT_MSG_EQ(hw->ValidRepsHold(), false, "refused without the loss hold");
+        hw->m_sprayLossHoldCleanSentinels = LossHoldFixture::kClean;
+        hw->m_sprayHeldExploration = SpineScores::HeldExploration::None;
+        NS_TEST_EXPECT_MSG_EQ(hw->ValidRepsHold(), false, "refused without sentinels");
+        hw->m_sprayHeldExploration = SpineScores::HeldExploration::Sentinel;
+        Ptr<RdmaQueuePair> lossy = Qp(hw, 10000);
+        Ptr<RdmaQueuePair> clean = Qp(hw, 10001);
+        NS_TEST_EXPECT_MSG_EQ(hw->m_senderSpineScores.get(),
+                              nullptr,
+                              "reps_flow_hold makes no host-wide hold");
+
+        // Over the first interval every send of the first flow on spine 3 is
+        // lost; the second flow loses nothing.
+        uint32_t step = 0;
+        std::vector<uint32_t> lossyOn3(4);
+        std::vector<uint32_t> cleanOn3(4);
+        for (uint32_t interval = 0; interval < 4; ++interval)
+        {
+            for (uint32_t i = 0; i < 200; ++i, ++step)
+            {
+                const uint64_t now = interval * kInterval + 50 * i;
+                const bool firstFlow = step % 2 == 0;
+                PathSelector& selector =
+                    *(firstFlow ? lossy : clean)->m_pathSelector;
+                const std::set<uint8_t> lost =
+                    firstFlow && interval == 0 ? std::set<uint8_t>{3} : std::set<uint8_t>{};
+                const uint8_t spine = LossHoldFixture::Send(selector, now, step / 2, lost);
+                (firstFlow ? lossyOn3 : cleanOn3)[interval] += spine == 3;
+            }
+        }
+        NS_TEST_EXPECT_MSG_GT(lossyOn3[0], 0u, "the first flow loses on spine 3");
+        for (uint32_t interval = 1; interval < 4; ++interval)
+        {
+            NS_TEST_EXPECT_MSG_EQ(lossyOn3[interval],
+                                  1u,
+                                  "the first flow sends spine 3 its sentinel alone");
+            NS_TEST_EXPECT_MSG_GT(cleanOn3[interval], 1u, "the second flow keeps spine 3");
+        }
+        Simulator::Destroy();
+    }
+
+  private:
+    static constexpr uint64_t kInterval = LossHoldFixture::kInterval;
+
+    static Ptr<RdmaHw> Hw(PathSelectorKind kind)
+    {
+        Ptr<RdmaHw> hw = LossHoldFixture::Hw();
+        hw->m_pathSelectorKind = static_cast<uint32_t>(kind);
+        hw->SetAttribute("Mtu", UintegerValue(1000));
+        hw->SetAttribute("PathRandomVariable", PointerValue(SelectorStream()));
+        return hw;
+    }
+
+    static Ptr<RdmaQueuePair> Qp(Ptr<RdmaHw> hw, uint16_t sport)
+    {
+        Ptr<RdmaQueuePair> qp = CreateObject<RdmaQueuePair>(
+            3, Ipv4Address("11.0.1.1"), Ipv4Address("11.0.2.1"), sport, 100);
+        hw->StartPathSelection(qp, 0, 0);
+        return qp;
+    }
+};
+
 class SprayPolicyTransportTest : public TestCase
 {
   public:
@@ -8915,6 +8999,7 @@ PointToPointTestSuite::PointToPointTestSuite()
     AddTestCase(new SpineHeldExplorationTest, TestCase::Duration::QUICK);
     AddTestCase(new SpinePoolHoldPropagationTest, TestCase::Duration::QUICK);
     AddTestCase(new RepsHoldTest, TestCase::Duration::QUICK);
+    AddTestCase(new RepsFlowHoldTest, TestCase::Duration::QUICK);
     AddTestCase(new SprayPolicyTransportTest, TestCase::Duration::QUICK);
     AddTestCase(new NsccReceiverPenaltyTest, TestCase::Duration::QUICK);
     AddTestCase(new SprayPolicyDefaultsTest, TestCase::Duration::QUICK);

@@ -123,8 +123,12 @@ std::string load_balancing = "ecmp";
 // and under spray_uniform whether ack_redirect or reps_hold chooses its spine
 // instead of a uniform draw; and the parameters of the selectors, each the
 // default of its source. reps_hold is REPS over spines, leaving out the
-// spines the host's loss hold holds.
+// spines the host's loss hold holds; reps_flow_hold keeps a loss hold per
+// queue pair instead.
 std::string path_selector = "ops";
+bool reps_hold() {
+  return path_selector == "reps_hold" || path_selector == "reps_flow_hold";
+}
 uint32_t reps_buffer_size = 8;
 uint64_t reps_freezing_timeout_ns = 10000000;
 uint32_t ue_ev_set_size = 256;
@@ -140,8 +144,8 @@ std::string ack_redirect_scope = "per_connection";
 // The selectors each parameter belongs to. A parameter given under another
 // selector would be read by nothing, so it is refused.
 const std::map<std::string, std::set<std::string>> path_selector_parameter_owners = {
-    {"REPS_BUFFER_SIZE", {"reps", "reps_hold"}},
-    {"REPS_FREEZING_TIMEOUT_NS", {"reps", "reps_hold"}},
+    {"REPS_BUFFER_SIZE", {"reps", "reps_hold", "reps_flow_hold"}},
+    {"REPS_FREEZING_TIMEOUT_NS", {"reps", "reps_hold", "reps_flow_hold"}},
     {"UE_EV_SET_SIZE", {"ue_oblivious", "ue_aware"}},
     {"UE_SATURATION_FRACTION", {"ue_aware"}},
     {"MRC_EV_SET_SIZE", {"mrc"}},
@@ -243,7 +247,8 @@ const std::set<std::string> spine_grader_keys = {
     "SPRAY_ONE_WAY_DELAY", "SPRAY_DELAY_CUSUM_SLACK_BASE_RTTS",
     "SPRAY_DELAY_CUSUM_THRESHOLD_BASE_RTTS"};
 // The spray_policy keys the host's loss hold reads, which reps_hold reads
-// too, and those of them it requires.
+// too, and those of them it requires; reps_flow_hold reads them but
+// SPINE_LOSS_OUTPUT_FILE, whose rows are the host's.
 const std::set<std::string> loss_hold_keys = {
     "SPRAY_LOSS_THRESHOLDS", "SPRAY_LOSS_INTERVAL_NS",
     "SPRAY_LOSS_HOLD_CLEAN_SENTINELS", "SPRAY_HELD_EXPLORATION",
@@ -732,6 +737,8 @@ uint32_t path_selector_value() {
     return static_cast<uint32_t>(PathSelectorKind::AckRedirect);
   if (path_selector == "reps_hold")
     return static_cast<uint32_t>(PathSelectorKind::RepsHold);
+  if (path_selector == "reps_flow_hold")
+    return static_cast<uint32_t>(PathSelectorKind::RepsFlowHold);
   return std::numeric_limits<uint32_t>::max();
 }
 
@@ -2060,13 +2067,17 @@ bool ReadConf(string network_configuration) {
   for (const std::string &key : spray_policy_keys_given) {
     if (load_balancing != "spray_policy" &&
         !(host_redirect() && spine_grader_keys.count(key) > 0) &&
-        !(path_selector == "reps_hold" && loss_hold_keys.count(key) > 0)) {
+        !(reps_hold() && loss_hold_keys.count(key) > 0 &&
+          !(path_selector == "reps_flow_hold" &&
+            key == "SPINE_LOSS_OUTPUT_FILE"))) {
       std::cerr << key << " is read only under LOAD_BALANCING spray_policy"
                 << (spine_grader_keys.count(key) > 0
                         ? " or PATH_SELECTOR ack_redirect with "
                           "ACK_REDIRECT_SCOPE per_receiver\n"
-                    : loss_hold_keys.count(key) > 0
+                    : key == "SPINE_LOSS_OUTPUT_FILE"
                         ? " or PATH_SELECTOR reps_hold\n"
+                    : loss_hold_keys.count(key) > 0
+                        ? " or PATH_SELECTOR reps_hold or reps_flow_hold\n"
                         : "\n");
       return false;
     }
@@ -2079,10 +2090,10 @@ bool ReadConf(string network_configuration) {
     return false;
   if (path_selector_value() == std::numeric_limits<uint32_t>::max()) {
     std::cerr << "PATH_SELECTOR must be ops, reps, ue_oblivious, ue_aware, mrc, "
-                 "ack_redirect or reps_hold\n";
+                 "ack_redirect, reps_hold or reps_flow_hold\n";
     return false;
   }
-  if (path_selector == "reps_hold") {
+  if (reps_hold()) {
     if (load_balancing != "spray_uniform") {
       std::cerr << "PATH_SELECTOR " << path_selector
                 << " names spines and requires LOAD_BALANCING spray_uniform\n";
@@ -2099,7 +2110,7 @@ bool ReadConf(string network_configuration) {
     }
     if (!valid_ack_redirect())
       return false;
-  } else if (path_selector != "ops" && path_selector != "reps_hold" &&
+  } else if (path_selector != "ops" && !reps_hold() &&
              load_balancing_value() !=
                  static_cast<uint32_t>(LoadBalancingMode::EntropyHash)) {
     std::cerr << "PATH_SELECTOR " << path_selector
@@ -2534,7 +2545,7 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),
               << SpineReport::kMaxSpines << " spines\n";
     return false;
   }
-  if (path_selector == "reps_hold" && spine_count > SpineReport::kMaxSpines) {
+  if (reps_hold() && spine_count > SpineReport::kMaxSpines) {
     std::cerr << "PATH_SELECTOR " << path_selector << " holds at most "
               << SpineReport::kMaxSpines << " spines\n";
     return false;

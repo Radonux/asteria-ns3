@@ -178,13 +178,13 @@ TypeId RdmaHw::GetTypeId (void)
 				"congestion bitmap; 4=MRC. Under LoadBalancing 2, 0 draws each "
 				"spine uniformly, 5 sends on the spine the latest "
 				"acknowledgement redirects to, which needs IntHeader::mode TS, "
-				"and 6 is REPS over spines leaving out the spines the host's "
-				"loss hold holds.",
+				"6 is REPS over spines leaving out the spines the host's "
+				"loss hold holds, and 7 as 6 with a loss hold per queue pair.",
 				UintegerValue(static_cast<uint32_t>(PathSelectorKind::Ops)),
 				MakeUintegerAccessor(&RdmaHw::m_pathSelectorKind),
 				MakeUintegerChecker<uint32_t>(
 					static_cast<uint32_t>(PathSelectorKind::Ops),
-					static_cast<uint32_t>(PathSelectorKind::RepsHold)))
+					static_cast<uint32_t>(PathSelectorKind::RepsFlowHold)))
 		.AddAttribute("RepsBufferSize",
 				"REPS: the entries of the circular buffer of entropy values to "
 				"reuse. Default 8, REPS section 3.1.",
@@ -864,7 +864,7 @@ void RdmaHw::Setup(QpCompleteCallback cb, QpFailureCallback failure_cb){
 		"is sent nothing, and the receiver's estimate releases a hold only "
 		"for arrivals");
 	NS_ABORT_MSG_IF(!ValidRepsHold(),
-		"PathSelector 6 holds spines by their loss and needs LoadBalancing 2, "
+		"PathSelector 6 and 7 hold spines by their loss and need LoadBalancing 2, "
 		"SprayLossThreshold1-3, SprayLossIntervalNs and "
 		"SprayLossHoldCleanSentinels above zero and SprayHeldExploration "
 		"sentinel");
@@ -1270,7 +1270,9 @@ bool RdmaHw::CountsSprayLoss() const{
 
 bool RdmaHw::IsRepsHold() const{
 	return m_pathSelectorKind ==
-		static_cast<uint32_t>(PathSelectorKind::RepsHold);
+			static_cast<uint32_t>(PathSelectorKind::RepsHold) ||
+		m_pathSelectorKind ==
+			static_cast<uint32_t>(PathSelectorKind::RepsFlowHold);
 }
 
 bool RdmaHw::ValidRepsHold() const{
@@ -2457,6 +2459,14 @@ void RdmaHw::StartPathSelection(Ptr<RdmaQueuePair> qp, uint64_t bdpBytes,
 	if (IsAckRedirect()){
 		qp->m_pathSelector =
 			std::make_unique<AckRedirectSelector>(m_pathRandom, m_spineCount);
+		return;
+	}
+	if (m_pathSelectorKind ==
+			static_cast<uint32_t>(PathSelectorKind::RepsFlowHold)){
+		qp->m_pathSelector = std::make_unique<RepsHoldSelector>(m_pathRandom,
+			m_repsBufferSize, m_repsFreezingTimeoutNs, bdpBytes / m_mtu,
+			m_spineCount,
+			std::make_unique<SpineScores>(m_spineCount, LossHoldParameters()));
 		return;
 	}
 	if (IsRepsHold()){
