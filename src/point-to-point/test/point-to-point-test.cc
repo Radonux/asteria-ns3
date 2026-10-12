@@ -7110,6 +7110,7 @@ class LossHoldFixture
         hw->m_sprayLossIntervalNs = kInterval;
         hw->m_sprayLossHoldCleanSentinels = kClean;
         hw->m_sprayHeldExploration = SpineScores::HeldExploration::Sentinel;
+        hw->m_sprayHoldScope = static_cast<uint32_t>(HoldScope::Host);
         return hw;
     }
 
@@ -7314,6 +7315,79 @@ class RepsFlowHoldTest : public TestCase
         hw->StartPathSelection(qp, 0, 0);
         return qp;
     }
+};
+
+class RepsHoldScopeTest : public TestCase
+{
+  public:
+    RepsHoldScopeTest()
+        : TestCase("Under reps_hold with SprayHoldScope leaf a spine lost on toward one leaf is "
+                   "held for that leaf's destinations alone, with one sentinel per interval for "
+                   "the leaf; the scope needs the hosts' leaves")
+    {
+    }
+
+    void DoRun() override
+    {
+        Ptr<RdmaHw> unset = CreateObject<RdmaHw>();
+        UintegerValue scope;
+        unset->GetAttribute("SprayHoldScope", scope);
+        NS_TEST_EXPECT_MSG_EQ(scope.Get(),
+                              static_cast<uint32_t>(HoldScope::Leaf),
+                              "SprayHoldScope is leaf by default");
+
+        Ptr<RdmaHw> hw = LossHoldFixture::Hw();
+        hw->m_sprayHoldScope = static_cast<uint32_t>(HoldScope::Leaf);
+        hw->SetAttribute("Mtu", UintegerValue(1000));
+        hw->SetAttribute("PathRandomVariable", PointerValue(SelectorStream()));
+        NS_TEST_EXPECT_MSG_EQ(hw->ValidRepsHold(), false, "refused without the hosts' leaves");
+        hw->m_switchQueues = Create<SwitchQueueState>(2, LossHoldFixture::kSpines);
+        hw->m_switchQueues->SetLeafOf(Ipv4Address("11.0.2.1").Get(), 0);
+        hw->m_switchQueues->SetLeafOf(Ipv4Address("11.0.3.1").Get(), 0);
+        hw->m_switchQueues->SetLeafOf(Ipv4Address("11.0.4.1").Get(), 1);
+        NS_TEST_EXPECT_MSG_EQ(hw->ValidRepsHold(), true, "accepted with them");
+        // Two destinations on leaf 0, the first lossy on spine 3 over the
+        // first interval, and one on leaf 1.
+        std::vector<Ptr<RdmaQueuePair>> qps;
+        for (const char* destination : {"11.0.2.1", "11.0.3.1", "11.0.4.1"})
+        {
+            qps.push_back(CreateObject<RdmaQueuePair>(
+                3, Ipv4Address("11.0.1.1"), Ipv4Address(destination), 10000, 100));
+            hw->StartPathSelection(qps.back(), 0, 0);
+        }
+        NS_TEST_EXPECT_MSG_EQ(hw->m_leafHolds.size(), 2u, "one hold per destination leaf");
+        NS_TEST_EXPECT_MSG_EQ(hw->m_senderSpineScores.get(), nullptr, "and none for the host");
+
+        uint32_t step = 0;
+        std::vector<std::vector<uint32_t>> on3(3, std::vector<uint32_t>(4));
+        for (uint32_t interval = 0; interval < 4; ++interval)
+        {
+            for (uint32_t i = 0; i < 300; ++i, ++step)
+            {
+                const uint32_t flow = step % 3;
+                const uint64_t now = interval * kInterval + 30 * i;
+                const std::set<uint8_t> lost =
+                    flow == 0 && interval == 0 ? std::set<uint8_t>{3} : std::set<uint8_t>{};
+                const uint8_t spine =
+                    LossHoldFixture::Send(*qps[flow]->m_pathSelector, now, step / 3, lost);
+                on3[flow][interval] += spine == 3;
+            }
+        }
+        NS_TEST_EXPECT_MSG_GT(on3[0][0], 0u, "the flow to leaf 0 loses on spine 3");
+        NS_TEST_EXPECT_MSG_EQ(hw->m_leafHolds.at(0).Holds(3), true, "leaf 0's hold holds it");
+        NS_TEST_EXPECT_MSG_EQ(hw->m_leafHolds.at(1).Holds(3), false, "leaf 1's does not");
+        for (uint32_t interval = 1; interval < 4; ++interval)
+        {
+            NS_TEST_EXPECT_MSG_EQ(on3[0][interval] + on3[1][interval],
+                                  1u,
+                                  "leaf 0's destinations send spine 3 one sentinel");
+            NS_TEST_EXPECT_MSG_GT(on3[2][interval], 1u, "leaf 1's destination keeps spine 3");
+        }
+        Simulator::Destroy();
+    }
+
+  private:
+    static constexpr uint64_t kInterval = LossHoldFixture::kInterval;
 };
 
 class SprayPolicyTransportTest : public TestCase
@@ -9000,6 +9074,7 @@ PointToPointTestSuite::PointToPointTestSuite()
     AddTestCase(new SpinePoolHoldPropagationTest, TestCase::Duration::QUICK);
     AddTestCase(new RepsHoldTest, TestCase::Duration::QUICK);
     AddTestCase(new RepsFlowHoldTest, TestCase::Duration::QUICK);
+    AddTestCase(new RepsHoldScopeTest, TestCase::Duration::QUICK);
     AddTestCase(new SprayPolicyTransportTest, TestCase::Duration::QUICK);
     AddTestCase(new NsccReceiverPenaltyTest, TestCase::Duration::QUICK);
     AddTestCase(new SprayPolicyDefaultsTest, TestCase::Duration::QUICK);

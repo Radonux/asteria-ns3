@@ -15,6 +15,13 @@
 
 namespace ns3 {
 
+// What the host-wide loss hold of RepsHold is kept for: the host's every
+// destination, or each destination leaf apart.
+enum class HoldScope : uint32_t {
+	Host = 0,
+	Leaf,
+};
+
 // Which design chooses a data packet's entropy value under EntropyHash.
 enum class PathSelectorKind : uint32_t {
 	Ops = 0,

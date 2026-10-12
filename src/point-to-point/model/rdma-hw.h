@@ -223,6 +223,22 @@ public:
 	bool ValidRepsHold() const;
 	// The parameters of scores used as a loss hold alone.
 	SpineScores::Parameters LossHoldParameters() const;
+	// HoldScope of PathSelector RepsHold. Under Leaf the queue pairs to the
+	// hosts of one leaf, which m_switchQueues names, share that leaf's loss
+	// hold in m_leafHolds, made at the first of them; under Host every queue
+	// pair shares m_senderSpineScores.
+	uint32_t m_sprayHoldScope;
+	std::unordered_map<uint32_t, SpineScores> m_leafHolds;
+	bool IsLeafHold() const;
+	SpineScores &LeafHold(uint32_t leaf);
+	// The LeafSpineLossInterval trace source: a destination leaf's loss hold
+	// closed a loss interval, as SpineLossInterval passes it.
+	typedef void (*LeafSpineLossIntervalTracedCallback)(uint32_t leaf,
+		uint64_t endNs, const std::vector<uint32_t> &sent,
+		const std::vector<uint32_t> &lost, const std::vector<uint8_t> &grades);
+	TracedCallback<uint32_t, uint64_t, const std::vector<uint32_t> &,
+		const std::vector<uint32_t> &, const std::vector<uint8_t> &>
+		m_traceLeafSpineLossInterval;
 	// The SpineLossInterval trace source: the host's pooled scores closed a
 	// loss interval (SpineScores::LossIntervalCallback): the time it ended
 	// at and, per spine, the sends and losses counted in it and the grade

@@ -129,6 +129,10 @@ std::string path_selector = "ops";
 bool reps_hold() {
   return path_selector == "reps_hold" || path_selector == "reps_flow_hold";
 }
+// Under reps_hold, what one loss hold is kept for: host, every destination of
+// the host, or leaf, the destinations on one leaf.
+std::string spray_hold_scope = "leaf";
+bool spray_hold_scope_given = false;
 uint32_t reps_buffer_size = 8;
 uint64_t reps_freezing_timeout_ns = 10000000;
 uint32_t ue_ev_set_size = 256;
@@ -762,6 +766,20 @@ uint32_t load_balancing_value() {
   return std::numeric_limits<uint32_t>::max();
 }
 
+uint32_t spray_hold_scope_value() {
+  if (spray_hold_scope == "host")
+    return static_cast<uint32_t>(HoldScope::Host);
+  if (spray_hold_scope == "leaf")
+    return static_cast<uint32_t>(HoldScope::Leaf);
+  return std::numeric_limits<uint32_t>::max();
+}
+
+// Under reps_hold, whether a loss hold is kept per destination leaf, which
+// needs the hosts' leaves.
+bool leaf_hold() {
+  return path_selector == "reps_hold" && spray_hold_scope == "leaf";
+}
+
 uint32_t spray_candidate_draw_value() {
   if (spray_candidate_draw == "proportional")
     return static_cast<uint32_t>(SpineScores::CandidateDraw::Proportional);
@@ -1239,6 +1257,19 @@ void write_spine_loss_interval(uint32_t rank, uint64_t end_ns,
   for (uint32_t spine = 0; spine < sent.size(); spine++)
     fprintf(spine_loss_file, "%lu,%u,%u,%u,%u,%u\n",
             static_cast<unsigned long>(end_ns), rank, spine, sent[spine],
+            lost[spine], grades[spine]);
+}
+
+// A loss interval a destination leaf's loss hold closed under reps_hold, as
+// write_spine_loss_interval writes it with the leaf.
+void write_leaf_spine_loss_interval(uint32_t rank, uint32_t leaf,
+                                    uint64_t end_ns,
+                                    const std::vector<uint32_t> &sent,
+                                    const std::vector<uint32_t> &lost,
+                                    const std::vector<uint8_t> &grades) {
+  for (uint32_t spine = 0; spine < sent.size(); spine++)
+    fprintf(spine_loss_file, "%lu,%u,%u,%u,%u,%u,%u\n",
+            static_cast<unsigned long>(end_ns), rank, leaf, spine, sent[spine],
             lost[spine], grades[spine]);
 }
 
@@ -1751,6 +1782,9 @@ bool ReadConf(string network_configuration) {
       conf >> spray_pool_decay_interval_ns;
     } else if (key.compare("SPRAY_POOL_HOLD_PROPAGATES") == 0) {
       conf >> spray_pool_hold_propagates;
+    } else if (key.compare("SPRAY_HOLD_SCOPE") == 0) {
+      conf >> spray_hold_scope;
+      spray_hold_scope_given = true;
     } else if (key.compare("SPRAY_HELD_EXPLORATION") == 0) {
       conf >> spray_held_exploration;
     } else if (key.compare("SPRAY_HELD_SENTINEL_INTERVAL_NS") == 0) {
@@ -2101,6 +2135,15 @@ bool ReadConf(string network_configuration) {
     }
     if (!valid_loss_hold())
       return false;
+  }
+  if (spray_hold_scope_given && path_selector != "reps_hold") {
+    std::cerr << "SPRAY_HOLD_SCOPE is read only under PATH_SELECTOR "
+                 "reps_hold\n";
+    return false;
+  }
+  if (spray_hold_scope_value() == std::numeric_limits<uint32_t>::max()) {
+    std::cerr << "SPRAY_HOLD_SCOPE must be host or leaf\n";
+    return false;
   }
   if (path_selector == "ack_redirect") {
     if (load_balancing != "spray_uniform") {
@@ -2550,8 +2593,9 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),
               << SpineReport::kMaxSpines << " spines\n";
     return false;
   }
+  // The switches' state, which leaf_hold reads only for the hosts' leaves.
   const Ptr<SwitchQueueState> switch_queues =
-      switch_queue_cost() ? BuildSwitchQueueState(n) : nullptr;
+      switch_queue_cost() || leaf_hold() ? BuildSwitchQueueState(n) : nullptr;
   // One variable for every host, so the draw consumes a single fixed stream.
   Ptr<UniformRandomVariable> path_random;
   if (load_balancing_value() != static_cast<uint32_t>(LoadBalancingMode::Ecmp))
@@ -2618,6 +2662,8 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),
       rdmaHw->SetAttribute("RepsBufferSize", UintegerValue(reps_buffer_size));
       rdmaHw->SetAttribute("RepsFreezingTimeoutNs",
                            UintegerValue(reps_freezing_timeout_ns));
+      rdmaHw->SetAttribute("SprayHoldScope",
+                           UintegerValue(spray_hold_scope_value()));
       rdmaHw->SetAttribute("UeEvSetSize", UintegerValue(ue_ev_set_size));
       rdmaHw->SetAttribute("UeSaturationFraction",
                            DoubleValue(ue_saturation_fraction));
@@ -2914,12 +2960,20 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),
       std::cerr << "Error: cannot open " << spine_loss_output_file << "\n";
       return false;
     }
-    fprintf(spine_loss_file, "time_ns,rank,spine,sent,lost,grade\n");
+    fprintf(spine_loss_file, "time_ns,rank,%sspine,sent,lost,grade\n",
+            leaf_hold() ? "destination_leaf," : "");
     for (uint32_t i = 0; i < node_num; i++)
-      if (n.Get(i)->GetNodeType() == 0)
-        n.Get(i)->GetObject<RdmaDriver>()->m_rdma->TraceConnectWithoutContext(
-            "SpineLossInterval",
-            MakeBoundCallback(&write_spine_loss_interval, i));
+      if (n.Get(i)->GetNodeType() == 0) {
+        Ptr<RdmaHw> hw = n.Get(i)->GetObject<RdmaDriver>()->m_rdma;
+        if (leaf_hold())
+          hw->TraceConnectWithoutContext(
+              "LeafSpineLossInterval",
+              MakeBoundCallback(&write_leaf_spine_loss_interval, i));
+        else
+          hw->TraceConnectWithoutContext(
+              "SpineLossInterval",
+              MakeBoundCallback(&write_spine_loss_interval, i));
+      }
   }
   std::set<uint64_t> event_times;
   for (const LinkEvent &event : link_events) {
