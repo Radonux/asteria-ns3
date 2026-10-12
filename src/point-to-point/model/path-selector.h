@@ -115,11 +115,75 @@ private:
 // interval that ended, a spine not sent on in it at the top grade; a report a
 // pooled set of scores takes is taken by the pool at the lower of the grade
 // it took and the pool's loss grade.
+//
+// With loss hold clean sentinels n above zero, the loss grading also holds:
+// per spine, in the counts each report takes and in the pool's loss
+// intervals alike, a report period or interval whose lost fraction grades a
+// spine 0 puts it in loss hold with its clean count at zero. While in loss
+// hold a spine's loss grade is 0: a period with a loss restarts its clean
+// count, and a period without one adds its sends to the count until it
+// reaches n, when the loss hold ends and that period's loss grade is the top
+// grade, the report's grade then applying through the lower of the two as
+// before. A period with nothing sent leaves a spine's loss hold as it is: in
+// loss hold its loss grade stays 0, and outside it the period grades as
+// above, the report's grade standing and the pool's loss grade the top; so
+// the pool's loss grade of a spine in loss hold stays 0 across intervals with
+// nothing sent. The loss hold outlives the counts, which still restart at
+// every report taken. Under the sentinel held
+// exploration a held spine's sends are its sentinels, so n clean sentinels in
+// a row are the evidence that releases it.
+//
+// A spine is held while the last report taken graded it 0; drawn through a
+// pool, while the last report the pool took did. Under the epsilon held
+// exploration a held spine keeps its epsilon / N of the draws. Under the
+// sentinel and the none held exploration the epsilon term is spread over the
+// spines not held, and a held spine is drawn only by its score, which grade 0
+// decays to zero; while every spine is held the term stays spread over all.
+// Under the sentinel held exploration a held spine is sent one packet per
+// sentinel interval in place of a draw, the sentinel, which is a send as any
+// other: it is counted, may be declared lost and, arriving, is counted by the
+// receiver. Under none a held spine is sent nothing, so only a receiver whose
+// hold does not wait for arrivals, the switch_queue cost source's, can
+// release it.
+//
+// Scores used as a pool with a pool decay interval set decay once per fixed
+// pool decay interval, at the multiples of it, in place of once per report
+// taken: at the first report taken in an interval its base becomes the
+// scores decayed once, and each report taken in the interval, unless its
+// edge bit holds the scores, adds its grade to the interval's per-spine grade
+// sum and count. A spine's score is its base plus the interval's mean grade,
+// in 1/256 and rounded; a spine with nothing counted in the interval keeps its
+// base. The mean, not the sum, keeps the fixed point at grade / gamma
+// whatever the number of pooled sets of scores reporting. A spine is then
+// held while the interval's mean grade rounds to 0, under 1/2; one with
+// nothing counted in the interval keeps its held flag. Without reports the
+// scores still age as above.
+//
+// Drawn through a pool with pool hold propagation set, a spine is held while
+// these scores hold it, the last report they took grading it 0, or the pool
+// does, by its held flag or its loss hold. A spine the pool holds weighs
+// nothing in the draws and in p, under every held exploration, the others
+// sharing 1 - epsilon in proportion to their mixed scores; under the epsilon
+// held exploration it keeps its epsilon / N, and under sentinel and none it
+// has no share of the epsilon term, as a spine held only by these scores has
+// none, while the latter keeps its mixed score's part. While the pool holds
+// every spine, nothing is excluded for the pool's hold. Under the sentinel
+// held exploration the sentinels of a spine the pool holds follow the pool's
+// sentinel schedule, one per sentinel interval for every set of scores
+// pooled with it, taken by whichever draws first once one is due; a spine
+// held only by these scores follows their own schedule. The pool's hold ends
+// by the pool's rule, a report it takes grading the spine above 0 and its
+// loss hold's clean sends, and these scores' hold by theirs.
 class SpineScores {
 public:
 	enum class CandidateDraw : uint32_t {
 		Proportional = 0,
 		Uniform,
+	};
+	enum class HeldExploration : uint32_t {
+		Epsilon = 0,
+		Sentinel,
+		None,
 	};
 	struct Parameters {
 		double gamma;
@@ -134,10 +198,30 @@ public:
 		// The loss interval of scores used as a pool; zero, the report
 		// interval.
 		uint64_t lossIntervalNs = 0;
+		// With loss thresholds set, the clean sends that end a loss hold;
+		// zero holds nothing.
+		uint32_t lossHoldCleanSentinels = 0;
+		HeldExploration heldExploration = HeldExploration::Epsilon;
+		// Under the sentinel held exploration, the interval between two
+		// sentinels on one held spine; zero, the report interval.
+		uint64_t sentinelIntervalNs = 0;
+		// As a pool: the pool decay interval; zero decays once per report
+		// taken.
+		uint64_t poolDecayIntervalNs = 0;
+		// Drawn through a pool: whether a spine the pool holds is held for
+		// these scores' draws and sentinels too.
+		bool poolHoldPropagates = false;
 	};
 	SpineScores(uint32_t spines, const Parameters &parameters);
 	void OnReport(const SpineReport &report, uint64_t nowNs);
 	uint8_t Choose(UniformRandomVariable &random, uint64_t nowNs);
+	// Under the sentinel held exploration: whether a held spine's sentinel is
+	// due by now, its last sentinel a sentinel interval or more ago, and which
+	// spine; the lowest such spine is taken and its sentinel interval restarts
+	// now.
+	bool TakeSentinel(uint64_t nowNs, uint8_t &spine);
+	// Whether spine is held for the draws from these scores.
+	bool Held(uint32_t spine) const;
 	// A send drawn from these scores on spine, and a send on spine declared
 	// lost; each is counted by the pool too.
 	void OnSend(uint32_t spine, uint64_t nowNs);
@@ -150,9 +234,10 @@ public:
 	void Pool(SpineScores &pool, double weight);
 	// As a pool with loss thresholds set: called as each loss interval is
 	// closed, with the time it ended at and, per spine, the sends and losses
-	// counted in it and the grade its lost fraction earns, the top grade for
-	// a spine not sent on. A later interval that ended before the next send,
-	// loss or report counted nothing and is not passed.
+	// counted in it and the grade its lost fraction earns through the loss
+	// hold, the top grade for a spine not sent on and not in loss hold. A
+	// later interval that ended before the next send, loss or report counted
+	// nothing and is not passed.
 	using LossIntervalCallback = std::function<void(uint64_t endNs,
 		const std::vector<uint32_t> &sent, const std::vector<uint32_t> &lost,
 		const std::vector<uint8_t> &grades)>;
@@ -166,18 +251,44 @@ private:
 	// Decay the scores and add report's grades, unless its edge bit holds
 	// them; whether report is newer than the last is the caller's test.
 	void Take(const SpineReport &report, uint64_t nowNs);
+	// As a pool with a pool decay interval: take report into the interval's
+	// mean grades, decaying the base once per interval.
+	void PoolTake(const SpineReport &report, uint64_t nowNs);
 	bool IsPooled() const;
+	// Drawn through a pool with pool hold propagation set.
+	bool Propagates() const;
+	// Whether the pool holds spine: its held flag or its loss hold.
+	bool PoolHolds(uint32_t spine) const;
+	// Under propagation: whether a spine the pool holds is excluded from the
+	// mixed draw, which it is unless the pool holds every spine.
+	bool ExcludesPoolHeld() const;
+	// The mixed score of spine, or 0 when it is excluded; excluding is
+	// ExcludesPoolHeld() as computed by the caller.
+	double Weight(uint32_t spine, bool excluding) const;
+	double WeightSum(bool excluding) const;
 	// The score a pooled draw weighs spine by, and the sum over the spines.
 	double Mixed(uint32_t spine) const;
 	double MixedSum() const;
 	uint8_t DrawFromMixed(UniformRandomVariable &random) const;
 	void Decay();
+	void Decay(std::vector<uint32_t> &scores) const;
 	// Decay the scores for every report interval missed by now.
 	void Age(uint64_t nowNs);
 	void Accumulate();
 	uint8_t DrawFromShares(UniformRandomVariable &random) const;
+	// The spines not held, under a held exploration that spreads the
+	// epsilon term over them; the epsilon draw u / epsilon in [0, 1) mapped
+	// onto the spines it is spread over.
+	uint32_t Unheld() const;
+	uint8_t DrawEpsilon(double fraction) const;
+	// The epsilon term of spine's share.
+	double EpsilonShare(uint32_t spine) const;
 	// The grade the lost fraction of sent sends earns.
 	uint8_t LossGrade(uint32_t sent, uint32_t lost) const;
+	// The loss grade of a period in which spine had sent sends and lost
+	// declared lost, through the loss hold; the top grade for a spine not
+	// sent on and not in loss hold.
+	uint8_t HeldLossGrade(uint32_t spine, uint32_t sent, uint32_t lost);
 	// As a pool: close the loss intervals ended by now, grading the spines by
 	// the last of them, before a send or loss is counted or a grade read.
 	void AdvanceLossInterval(uint64_t nowNs);
@@ -204,6 +315,22 @@ private:
 	uint64_t m_lossIntervalEndNs;
 	std::vector<uint8_t> m_lossGrades;
 	LossIntervalCallback m_onLossInterval;
+	// Per spine, whether it is in loss hold, and its clean sends since the
+	// loss hold started or last saw a loss.
+	std::vector<bool> m_lossHeld;
+	std::vector<uint32_t> m_lossClean;
+	// Per spine, whether the last report taken graded it 0, and when its
+	// last sentinel was sent.
+	std::vector<bool> m_held;
+	std::vector<uint64_t> m_sentinelNs;
+	uint64_t m_sentinelIntervalNs;
+	// As a pool with a pool decay interval: the end of the interval in
+	// progress, the scores decayed once at its start, and per spine the sum
+	// and count of the grades taken in it.
+	uint64_t m_poolDecayEndNs;
+	std::vector<uint32_t> m_base;
+	std::vector<uint32_t> m_gradeSum;
+	std::vector<uint32_t> m_gradeCount;
 };
 
 // A spine drawn per packet from the scores towards the queue pair's
@@ -215,7 +342,8 @@ public:
 	PolicySpineSelector(Ptr<UniformRandomVariable> random, SpineScores &scores);
 	PolicySpineSelector(Ptr<UniformRandomVariable> random,
 		std::unique_ptr<SpineScores> scores);
-	// The spine drawn is counted as a send in the scores.
+	// A held spine's sentinel when one is due, else the spine drawn; either
+	// is counted as a send in the scores.
 	uint16_t Choose(uint64_t nowNs) override;
 	// A loss on the requested spine path names is counted in the scores.
 	void OnLoss(uint16_t path, uint64_t nowNs) override;

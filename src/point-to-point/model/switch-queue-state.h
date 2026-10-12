@@ -46,8 +46,16 @@ public:
 	// as the switches stand now: the marked fraction 1 - (1 - p_up)(1 - p_down)
 	// from the marking probability of each hop's data queue occupancy, no
 	// trimmed fraction, with delay the queueing delay 8 q / r summed over the
-	// hops, and the loss fraction 1 - (1 - l_up)(1 - l_down) from each
-	// receiving port's link error rate, 1 where the port is black-holed.
+	// forward hops, and the loss fraction
+	// 1 - (1 - l_up)(1 - l_down)(1 - l_rup)(1 - l_rdown) from each receiving
+	// port's link error rate, 1 where the port is black-holed, over the
+	// forward hops and the reverse hops, leaf destination's uplink to the
+	// spine and the spine's downlink to leaf source. The loss fraction is
+	// that of a packet delivered and acknowledged: the ACK echoes the spine
+	// that carried the packet and returns through the same spine, so a loss
+	// on a reverse hop drops the ACK and the sender's loss rule declares the
+	// delivered packet lost. The marked fraction and the delay are the
+	// forward hops' only, as the ACK echoes the packet's marking.
 	std::vector<SpineGrader::SpineValues> PathValues(uint32_t source,
 		uint32_t destination, bool delay) const;
 

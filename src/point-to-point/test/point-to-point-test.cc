@@ -5536,7 +5536,8 @@ class SpineScoresPoolTest : public TestCase
   public:
     SpineScoresPoolTest()
         : TestCase("Pooled scores: at weight 0 the draws and shares are unchanged, at 1 every "
-                   "destination follows the pool, at 0.5 their arithmetic mixture")
+                   "destination follows the pool, at 0.5 their arithmetic mixture; with a pool "
+                   "decay interval the pool decays once per interval by the mean grade")
     {
     }
 
@@ -5545,10 +5546,21 @@ class SpineScoresPoolTest : public TestCase
         DoubleValue attribute;
         CreateObject<RdmaHw>()->GetAttribute("SpraySenderPoolWeight", attribute);
         NS_TEST_EXPECT_MSG_EQ(attribute.Get(), 0.0, "SpraySenderPoolWeight is 0 by default");
+        UintegerValue interval;
+        CreateObject<RdmaHw>()->GetAttribute("SprayPoolDecayIntervalNs", interval);
+        NS_TEST_EXPECT_MSG_EQ(interval.Get(), 0u, "SprayPoolDecayIntervalNs is 0 by default");
+        NS_TEST_EXPECT_MSG_EQ(ScoresFixture::Defaults().poolDecayIntervalNs,
+                              0u,
+                              "and so is the pool decay interval");
         WeightZero();
         WeightOne();
         WeightHalf();
         EdgeBit();
+        DecayIntervalIndependentOfDestinations();
+        PerReportDecayDependsOnDestinations();
+        DecayIntervalMean();
+        DecayIntervalEdgeBit();
+        DecayIntervalIdle();
         Simulator::Destroy();
     }
 
@@ -5737,6 +5749,204 @@ class SpineScoresPoolTest : public TestCase
             NS_TEST_EXPECT_MSG_EQ(local.Score(4), pool.Score(4), "as the scores are");
         }
     }
+
+    static SpineScores::Parameters PoolParameters(uint64_t decayIntervalNs)
+    {
+        SpineScores::Parameters parameters = ScoresFixture::Defaults();
+        parameters.poolDecayIntervalNs = decayIntervalNs;
+        return parameters;
+    }
+
+    // Pool A takes one destination's reports and pool B 63 destinations',
+    // every destination sending one report per interval, A's late in it and
+    // B's spread over it, all spines graded 3 but spine 3, graded 0 from
+    // interval 4. The pools' scores after each interval, A's then B's.
+    static std::vector<std::pair<std::vector<uint32_t>, std::vector<uint32_t>>> RunPools(
+        uint64_t decayIntervalNs)
+    {
+        constexpr uint32_t kDestinations = 63;
+        const SpineScores::Parameters parameters = ScoresFixture::Defaults();
+        SpineScores poolA(ScoresFixture::kSpines, PoolParameters(decayIntervalNs));
+        SpineScores poolB(ScoresFixture::kSpines, PoolParameters(decayIntervalNs));
+        SpineScores toA(ScoresFixture::kSpines, parameters);
+        toA.Pool(poolA, 0.5);
+        std::deque<SpineScores> toB;
+        for (uint32_t d = 0; d < kDestinations; ++d)
+        {
+            toB.emplace_back(ScoresFixture::kSpines, parameters);
+            toB.back().Pool(poolB, 0.5);
+        }
+        std::vector<std::pair<std::vector<uint32_t>, std::vector<uint32_t>>> scores;
+        for (uint32_t n = 0; n < 10; ++n)
+        {
+            std::vector<uint8_t> grades(ScoresFixture::kSpines, 3);
+            grades[3] = n >= 4 ? 0 : 3;
+            const SpineReport report = ScoresFixture::Report(n + 1, grades);
+            const uint64_t start = n * ScoresFixture::kInterval;
+            for (uint32_t d = 0; d < kDestinations; ++d)
+            {
+                toB[d].OnReport(report, start + 100 + 140 * d);
+            }
+            toA.OnReport(report, start + 9000);
+            std::vector<uint32_t> a;
+            std::vector<uint32_t> b;
+            for (uint32_t spine = 0; spine < ScoresFixture::kSpines; ++spine)
+            {
+                a.push_back(poolA.Score(spine));
+                b.push_back(poolB.Score(spine));
+            }
+            scores.emplace_back(a, b);
+        }
+        return scores;
+    }
+
+    // With a pool decay interval, the pool's scores depend on the grades
+    // within each interval and not on how many destinations report them.
+    void DecayIntervalIndependentOfDestinations()
+    {
+        const auto scores = RunPools(ScoresFixture::kInterval);
+        // Spine 3: 3072 through interval 3, then decayed once per interval.
+        const std::vector<uint32_t> spine3 = {3072, 3072, 3072, 3072, 2304,
+                                              1728, 1296, 972,  729,  546};
+        for (uint32_t n = 0; n < scores.size(); ++n)
+        {
+            for (uint32_t spine = 0; spine < ScoresFixture::kSpines; ++spine)
+            {
+                NS_TEST_EXPECT_MSG_EQ(scores[n].first[spine],
+                                      scores[n].second[spine],
+                                      "1 and 63 destinations give the same pooled score");
+                NS_TEST_EXPECT_MSG_EQ(scores[n].first[spine],
+                                      (spine == 3 ? spine3[n] : 3072u),
+                                      "the pool decays once per interval");
+            }
+        }
+    }
+
+    // Without one, the pool decays once per report taken, so 63 destinations
+    // take spine 3 to zero within the interval in which one takes it to 2304.
+    void PerReportDecayDependsOnDestinations()
+    {
+        const auto scores = RunPools(0);
+        for (uint32_t n = 0; n < 4; ++n)
+        {
+            NS_TEST_EXPECT_MSG_EQ((scores[n].first == scores[n].second),
+                                  true,
+                                  "the top grade holds both pools at 3072");
+        }
+        NS_TEST_EXPECT_MSG_EQ(scores[4].first[3], 2304u, "one report decays spine 3 once");
+        NS_TEST_EXPECT_MSG_EQ(scores[4].second[3], 0u, "63 reports decay it to zero");
+        NS_TEST_EXPECT_MSG_EQ(scores[9].first[3], 546u, "one report per interval: 546");
+        NS_TEST_EXPECT_MSG_EQ(scores[9].second[3], 0u, "63 per interval: zero");
+    }
+
+    // Two destinations grading differently in one interval: the decayed
+    // base, 2304 from 3072, plus 256 times the mean of their grades.
+    void DecayIntervalMean()
+    {
+        const SpineScores::Parameters parameters = ScoresFixture::Defaults();
+        SpineScores pool(ScoresFixture::kSpines, PoolParameters(ScoresFixture::kInterval));
+        SpineScores toFirst(ScoresFixture::kSpines, parameters);
+        SpineScores toSecond(ScoresFixture::kSpines, parameters);
+        toFirst.Pool(pool, 0.5);
+        toSecond.Pool(pool, 0.5);
+        std::vector<uint8_t> first(ScoresFixture::kSpines, 3);
+        std::vector<uint8_t> second(ScoresFixture::kSpines, 3);
+        first[0] = 0;
+        second[0] = 1;
+        first[1] = 0;
+        second[1] = 0;
+        first[2] = 2;
+        second[2] = 3;
+        second[4] = 0;
+        toFirst.OnReport(ScoresFixture::Report(1, first), 2000);
+        NS_TEST_EXPECT_MSG_EQ(pool.Score(0), 2304u, "one report: the base plus its grade");
+        NS_TEST_EXPECT_MSG_EQ(toFirst.Held(0), true, "and spine 0 is held at its grade 0");
+        toSecond.OnReport(ScoresFixture::Report(1, second), 6000);
+        const std::vector<uint32_t> expected = {2432, 2304, 2944, 3072, 2688, 3072, 3072, 3072};
+        for (uint32_t spine = 0; spine < ScoresFixture::kSpines; ++spine)
+        {
+            NS_TEST_EXPECT_MSG_EQ(pool.Score(spine), expected[spine], "2304 plus 256 x the mean");
+        }
+        NS_TEST_EXPECT_MSG_EQ(toFirst.Held(0), false, "a mean of 1/2 rounds to 1 and releases");
+        NS_TEST_EXPECT_MSG_EQ(toFirst.Held(1), true, "a mean of 0 holds");
+        NS_TEST_EXPECT_MSG_EQ(toFirst.Held(4), false, "a mean of 3/2 does not");
+        // The next interval decays the scores once: 2432 - 608 = 1824, and
+        // the one report's grade 3 adds 768.
+        std::vector<uint8_t> top(ScoresFixture::kSpines, 3);
+        toFirst.OnReport(ScoresFixture::Report(2, top), 12000);
+        NS_TEST_EXPECT_MSG_EQ(pool.Score(0), 2592u, "the next interval's base is decayed once");
+        NS_TEST_EXPECT_MSG_EQ(pool.Score(1), 2496u, "1728 plus 768 on spine 1");
+        NS_TEST_EXPECT_MSG_EQ(toFirst.Held(1), false, "and grade 3 releases it");
+    }
+
+    // A report the edge bit holds the scores under adds no grade to the
+    // interval's mean.
+    void DecayIntervalEdgeBit()
+    {
+        for (bool freeze : {true, false})
+        {
+            SpineScores::Parameters parameters = ScoresFixture::Defaults();
+            parameters.edgeFreeze = freeze;
+            SpineScores::Parameters poolParameters = parameters;
+            poolParameters.poolDecayIntervalNs = ScoresFixture::kInterval;
+            SpineScores pool(ScoresFixture::kSpines, poolParameters);
+            SpineScores toFirst(ScoresFixture::kSpines, parameters);
+            SpineScores toSecond(ScoresFixture::kSpines, parameters);
+            toFirst.Pool(pool, 0.5);
+            toSecond.Pool(pool, 0.5);
+            std::vector<uint8_t> grades(ScoresFixture::kSpines, 3);
+            grades[5] = 0;
+            SpineReport edge = ScoresFixture::Report(1, grades);
+            edge.edgeCongested = true;
+            toFirst.OnReport(edge, 2000);
+            NS_TEST_EXPECT_MSG_EQ(pool.Score(5),
+                                  2304u,
+                                  "frozen, nothing counted: the base; else grade 0");
+            NS_TEST_EXPECT_MSG_EQ(pool.Score(0),
+                                  (freeze ? 2304u : 3072u),
+                                  "frozen, nothing counted: the base; else grade 3");
+            NS_TEST_EXPECT_MSG_EQ(toFirst.Held(5), !freeze, "only a counted grade 0 holds");
+            grades[5] = 3;
+            toSecond.OnReport(ScoresFixture::Report(1, grades), 6000);
+            NS_TEST_EXPECT_MSG_EQ(pool.Score(5),
+                                  (freeze ? 3072u : 2688u),
+                                  "the frozen report is not in the mean");
+            NS_TEST_EXPECT_MSG_EQ(toFirst.Held(5), false, "and the mean releases");
+        }
+    }
+
+    // Without reports a pool with a decay interval ages as one without.
+    void DecayIntervalIdle()
+    {
+        const SpineScores::Parameters parameters = ScoresFixture::Defaults();
+        SpineScores interval(ScoresFixture::kSpines, PoolParameters(ScoresFixture::kInterval));
+        SpineScores perReport(ScoresFixture::kSpines, PoolParameters(0));
+        SpineScores toInterval(ScoresFixture::kSpines, parameters);
+        SpineScores toPerReport(ScoresFixture::kSpines, parameters);
+        toInterval.Pool(interval, 0.5);
+        toPerReport.Pool(perReport, 0.5);
+        std::vector<uint8_t> grades(ScoresFixture::kSpines, 3);
+        grades[2] = 1;
+        grades[6] = 0;
+        const SpineReport report = ScoresFixture::Report(1, grades);
+        toInterval.OnReport(report, 3000);
+        toPerReport.OnReport(report, 3000);
+        Ptr<UniformRandomVariable> first = Stream();
+        Ptr<UniformRandomVariable> second = Stream();
+        for (uint64_t now = 3000; now < 30 * ScoresFixture::kInterval; now += 7000)
+        {
+            NS_TEST_EXPECT_MSG_EQ(uint32_t(toInterval.Choose(*first, now)),
+                                  uint32_t(toPerReport.Choose(*second, now)),
+                                  "the same draws");
+            for (uint32_t spine = 0; spine < ScoresFixture::kSpines; ++spine)
+            {
+                NS_TEST_EXPECT_MSG_EQ(interval.Score(spine),
+                                      perReport.Score(spine),
+                                      "idle, both pools age alike");
+            }
+        }
+        NS_TEST_EXPECT_MSG_LT(interval.Score(0), 3072u, "and they did age");
+    }
 };
 
 class SpineLossThresholdsTest : public TestCase
@@ -5746,7 +5956,8 @@ class SpineLossThresholdsTest : public TestCase
         : TestCase("Loss thresholds grade the lost fraction of a spine at the sender, per "
                    "destination between reports and host-wide per loss interval in the pool, "
                    "which the host traces as each interval closes; under switch_queue they "
-                   "grade the loss of the paths instead")
+                   "grade the loss of the paths instead; with loss hold clean sentinels a "
+                   "spine they grade 0 stays at 0 until that many clean sends")
     {
     }
 
@@ -5757,6 +5968,11 @@ class SpineLossThresholdsTest : public TestCase
         Local();
         Pool();
         PoolTrace();
+        LossHoldLocal(0);
+        LossHoldLocal(4);
+        LossHoldPool(0);
+        LossHoldPool(4);
+        LossHoldUnset();
         const bool savedPacketSeq = CustomHeader::ackCarriesPacketSeq;
         const uint32_t savedReportBytes = CustomHeader::ackReportBytes;
         CustomHeader::ackCarriesPacketSeq = true;
@@ -5815,6 +6031,166 @@ class SpineLossThresholdsTest : public TestCase
         NS_TEST_EXPECT_MSG_EQ(hw->m_sprayLossThreshold1, 0.0, "the loss thresholds are unset");
         NS_TEST_EXPECT_MSG_EQ(hw->m_sprayLossIntervalNs, 0u, "the loss interval is the report's");
         NS_TEST_EXPECT_MSG_EQ(hw->SprayLossThresholds().has_value(), false, "unset");
+        NS_TEST_EXPECT_MSG_EQ(hw->m_sprayLossHoldCleanSentinels, 0u, "no loss hold");
+        NS_TEST_EXPECT_MSG_EQ(ScoresFixture::Defaults().lossHoldCleanSentinels,
+                              0u,
+                              "the scores hold nothing by default");
+    }
+
+    // One report period or loss interval of the loss hold sequence: the
+    // sends and losses on spine 2, and its loss grade without and with a
+    // loss hold of 4 clean sends.
+    struct HoldStep
+    {
+        uint32_t sent, lost;
+        uint8_t unheld, held;
+    };
+
+    static std::vector<HoldStep> HoldSteps()
+    {
+        return {
+            {10, 6, 0, 0}, // 6 of 10 lost grades 0: the loss hold starts
+            {0, 0, 3, 0},  // nothing sent: held at 0
+            {1, 1, 0, 0},  // a lost sentinel
+            {2, 0, 3, 0},  // 2 clean
+            {0, 0, 3, 0},  // nothing sent: the clean count is kept
+            {1, 0, 3, 0},  // 3 clean
+            {1, 1, 0, 0},  // a loss restarts the count
+            {3, 0, 3, 0},  // 3 clean
+            {1, 0, 3, 3},  // 4 clean: the loss hold ends
+            {0, 0, 3, 3},  // nothing sent and not held: the top grade
+            {10, 6, 0, 0}, // the next loss holds it again
+            {4, 0, 3, 3},  // and 4 clean in one period end it
+        };
+    }
+
+    static SpineScores::Parameters WithHold(uint32_t clean)
+    {
+        SpineScores::Parameters parameters = WithThresholds();
+        parameters.lossHoldCleanSentinels = clean;
+        return parameters;
+    }
+
+    // Per destination: the report's grade of spine 2 is 3, except 2 at the
+    // ninth report, where the loss hold ends and the lower of the two holds;
+    // spine 5 loses 3 of 10 in the first period, graded 1 and not held.
+    void LossHoldLocal(uint32_t clean)
+    {
+        SpineScores scores(kSpines, WithHold(clean));
+        SpineScores reference(kSpines, ScoresFixture::Defaults());
+        const std::vector<HoldStep> steps = HoldSteps();
+        const std::string label = clean > 0 ? "held: " : "unheld: ";
+        for (uint32_t i = 0; i < steps.size(); ++i)
+        {
+            const uint8_t sequence = i + 1;
+            const uint64_t now = sequence * kInterval;
+            Send(scores, 2, steps[i].sent, steps[i].lost, now - 100);
+            if (i == 0)
+            {
+                Send(scores, 5, 10, 3, now - 100);
+            }
+            std::vector<uint8_t> grades(kSpines, 3);
+            if (i == 8)
+            {
+                grades[2] = 2;
+            }
+            scores.OnReport(ScoresFixture::Report(sequence, grades), now);
+            std::vector<uint8_t> expected = grades;
+            const uint8_t loss = clean > 0 ? steps[i].held : steps[i].unheld;
+            expected[2] = std::min(grades[2], loss);
+            if (i == 0)
+            {
+                expected[5] = 1;
+            }
+            reference.OnReport(ScoresFixture::Report(sequence, expected), now);
+            ExpectScores(scores, reference, label + "report " + std::to_string(sequence));
+            NS_TEST_EXPECT_MSG_EQ(scores.Held(2),
+                                  (expected[2] == 0),
+                                  label + "held while graded 0, report " +
+                                      std::to_string(sequence));
+        }
+    }
+
+    // In the pool, whose loss interval is the report interval: the first
+    // destination sends, and the second, which sends nothing, reports every
+    // spine 3 once per interval, so the pool takes its own loss grade. The
+    // destinations hold nothing themselves.
+    void LossHoldPool(uint32_t clean)
+    {
+        SpineScores pool(kSpines, WithHold(clean));
+        SpineScores toFirst(kSpines, WithThresholds());
+        SpineScores toSecond(kSpines, WithThresholds());
+        toFirst.Pool(pool, 0.5);
+        toSecond.Pool(pool, 0.5);
+        SpineScores referencePool(kSpines, ScoresFixture::Defaults());
+        std::vector<Closed> closed;
+        pool.SetLossIntervalCallback(Recorder(closed));
+        const std::vector<uint8_t> top(kSpines, 3);
+        const std::vector<HoldStep> steps = HoldSteps();
+        const std::string label = clean > 0 ? "held: " : "unheld: ";
+        std::vector<Closed> expectedClosed;
+        for (uint32_t i = 0; i < steps.size(); ++i)
+        {
+            const uint8_t sequence = i + 1;
+            // The sends fall in interval i, and the report early in the next.
+            Send(toFirst, 2, steps[i].sent, steps[i].lost, i * kInterval + 6000);
+            const uint64_t now = sequence * kInterval + 5000;
+            toSecond.OnReport(ScoresFixture::Report(sequence, top), now);
+            std::vector<uint8_t> expected = top;
+            expected[2] = clean > 0 ? steps[i].held : steps[i].unheld;
+            referencePool.OnReport(ScoresFixture::Report(sequence, expected), now);
+            ExpectScores(pool, referencePool, label + "interval " + std::to_string(i));
+            Closed interval;
+            interval.endNs = sequence * kInterval;
+            interval.sent.assign(kSpines, 0);
+            interval.lost.assign(kSpines, 0);
+            interval.sent[2] = steps[i].sent;
+            interval.lost[2] = steps[i].lost;
+            interval.grades = expected;
+            expectedClosed.push_back(interval);
+        }
+        ExpectClosed(closed, expectedClosed);
+
+        // Held again, then three intervals with nothing counted: the one
+        // closed and the two not passed leave it at 0, where it was the top
+        // grade before.
+        const uint32_t next = steps.size();
+        Send(toFirst, 2, 10, 6, next * kInterval + 6000);
+        toSecond.OnReport(ScoresFixture::Report(next + 1, top), (next + 1) * kInterval + 5000);
+        std::vector<uint8_t> expected = top;
+        expected[2] = 0;
+        referencePool.OnReport(ScoresFixture::Report(next + 1, expected),
+                               (next + 1) * kInterval + 5000);
+        toSecond.OnReport(ScoresFixture::Report(next + 2, top), (next + 4) * kInterval + 5000);
+        expected[2] = clean > 0 ? 0 : 3;
+        referencePool.OnReport(ScoresFixture::Report(next + 2, expected),
+                               (next + 4) * kInterval + 5000);
+        ExpectScores(pool, referencePool, label + "intervals with nothing counted");
+        NS_TEST_EXPECT_MSG_EQ(pool.Held(2), (clean > 0), label + "the pool holds the spine");
+    }
+
+    // Without loss thresholds nothing is counted, so a loss hold set holds
+    // nothing: the scores deposit the report's grades.
+    void LossHoldUnset()
+    {
+        SpineScores::Parameters parameters = ScoresFixture::Defaults();
+        parameters.lossHoldCleanSentinels = 4;
+        SpineScores pool(kSpines, parameters);
+        SpineScores scores(kSpines, parameters);
+        scores.Pool(pool, 0.5);
+        SpineScores reference(kSpines, ScoresFixture::Defaults());
+        SpineScores referencePool(kSpines, ScoresFixture::Defaults());
+        reference.Pool(referencePool, 0.5);
+        const std::vector<uint8_t> top(kSpines, 3);
+        for (uint8_t sequence = 1; sequence <= 3; ++sequence)
+        {
+            const uint32_t lost = sequence == 1 ? 10 : 0;
+            Send(scores, 2, lost, lost, sequence * kInterval - 100);
+            scores.OnReport(ScoresFixture::Report(sequence, top), sequence * kInterval);
+            reference.OnReport(ScoresFixture::Report(sequence, top), sequence * kInterval);
+        }
+        ExpectScores(scores, reference, "without thresholds nothing is held");
+        ExpectScores(pool, referencePool, "nor in the pool");
     }
 
     // Unset, sends and losses leave every deposit as the report has it.
@@ -6211,6 +6587,391 @@ class SpineLossThresholdsTest : public TestCase
         NS_TEST_EXPECT_MSG_EQ(hw->ValidSprayLoss(),
                               true,
                               "under switch_queue the sender counts nothing to need them for");
+    }
+};
+
+class SpineHeldExplorationTest : public TestCase
+{
+  public:
+    SpineHeldExplorationTest()
+        : TestCase("Under the sentinel held exploration a spine graded 0 has no share of the "
+                   "epsilon term and is sent one sentinel per interval, alone or pooled; none "
+                   "is refused outside switch_queue")
+    {
+    }
+
+    void DoRun() override
+    {
+        Ptr<RdmaHw> hw = CreateObject<RdmaHw>();
+        NS_TEST_EXPECT_MSG_EQ(static_cast<uint32_t>(hw->m_sprayHeldExploration),
+                              static_cast<uint32_t>(SpineScores::HeldExploration::Epsilon),
+                              "the default keeps epsilon / N for a held spine");
+        hw->m_loadBalancing = static_cast<uint32_t>(LoadBalancingMode::SprayPolicy);
+        hw->m_sprayHeldExploration = SpineScores::HeldExploration::None;
+        NS_TEST_EXPECT_MSG_EQ(hw->ValidHeldExploration(), false, "none under the estimate");
+        hw->m_sprayGradeCostSource = static_cast<uint32_t>(GradeCostSource::SwitchQueue);
+        NS_TEST_EXPECT_MSG_EQ(hw->ValidHeldExploration(), true, "none under switch_queue");
+
+        SpineScores::Parameters parameters = ScoresFixture::Defaults();
+        parameters.heldExploration = SpineScores::HeldExploration::Sentinel;
+        const double epsilon = parameters.epsilon;
+        SpineScores scores(kSpines, parameters);
+        ScoresFixture::Feed(scores, std::vector<uint8_t>(40, 0));
+        NS_TEST_EXPECT_MSG_EQ(scores.Score(3), 0u, "grade 0 drains the score");
+        NS_TEST_EXPECT_MSG_EQ(scores.Share(3), 0.0, "a held spine has no epsilon term");
+        ExpectShares(scores, epsilon / 7, "held");
+        Ptr<UniformRandomVariable> random =
+            CreateObjectWithAttributes<UniformRandomVariable>("Stream", IntegerValue(0));
+        PolicySpineSelector selector(random, scores);
+        uint32_t sentinels = 0;
+        for (uint64_t now = 41 * kInterval; now < 51 * kInterval; now += 100)
+        {
+            sentinels += RequestedSpine(selector.Choose(now)) == 3;
+        }
+        NS_TEST_EXPECT_MSG_EQ(sentinels, 10u, "one draw per sentinel interval on the held spine");
+        ScoresFixture::Feed(scores, {3}, 52);
+        NS_TEST_EXPECT_MSG_EQ(scores.Held(3), false, "a grade-3 report clears the hold");
+        ExpectShares(scores, epsilon / kSpines, "released");
+
+        // Pooled: the pool's grade holds the spine, and a lost sentinel keeps
+        // the pool's loss grade, and so the hold, at 0.
+        parameters.lossThresholds = std::array<double, 3>{0.1, 0.25, 0.5};
+        SpineScores pool(kSpines, parameters);
+        SpineScores toFirst(kSpines, parameters);
+        SpineScores toSecond(kSpines, parameters);
+        toFirst.Pool(pool, 0.5);
+        toSecond.Pool(pool, 0.5);
+        ScoresFixture::Feed(toFirst, std::vector<uint8_t>(40, 0));
+        NS_TEST_EXPECT_MSG_EQ(toSecond.Held(3), true, "the pooled grade holds the spine");
+        double pooledSum = 0;
+        for (uint32_t spine = 0; spine < kSpines; ++spine)
+        {
+            pooledSum += toFirst.Share(spine);
+        }
+        NS_TEST_EXPECT_MSG_EQ_TOL(pooledSum, 1.0, 1e-9, "the pooled shares sum to one");
+        NS_TEST_EXPECT_MSG_EQ(toFirst.Share(3), 0.0, "and the held spine's is 0");
+        PolicySpineSelector pooled(random, toSecond);
+        NS_TEST_EXPECT_MSG_EQ(uint32_t(RequestedSpine(pooled.Choose(40 * kInterval + 100))),
+                              3u,
+                              "the sentinel is due");
+        pooled.OnLoss(3, 40 * kInterval + 200);
+        std::vector<uint8_t> top(kSpines, 3);
+        toFirst.OnReport(ScoresFixture::Report(41, top), 41 * kInterval + 100);
+        NS_TEST_EXPECT_MSG_EQ(toSecond.Held(3), true, "a lost sentinel keeps the hold");
+        NS_TEST_EXPECT_MSG_EQ(uint32_t(RequestedSpine(pooled.Choose(41 * kInterval + 200))),
+                              3u,
+                              "the next sentinel is due an interval later");
+        toFirst.OnReport(ScoresFixture::Report(42, top), 42 * kInterval + 100);
+        NS_TEST_EXPECT_MSG_EQ(toSecond.Held(3), false, "a delivered one lets grade 3 clear it");
+
+        // A sentinel in the window after spine 5 fell silent, against a
+        // median of about 143 arrivals: below the floor's share, 1.43, which
+        // only releaseOnOneArrival lets one arrival pass.
+        for (const bool oneArrival : {false, true})
+        {
+            SpineGrader::Parameters graderParameters = GraderFixture::Defaults();
+            graderParameters.releaseOnOneArrival = oneArrival;
+            SpineGrader grader(graderParameters);
+            for (uint32_t interval = 0; interval < 5; ++interval)
+            {
+                grader.Advance(interval * kInterval);
+                for (uint32_t i = 0; i < 1000; ++i)
+                {
+                    const uint8_t k = i % 7 < 5 ? i % 7 : i % 7 + 1;
+                    grader.OnArrival(k, k, false, 0);
+                }
+                if (interval == 4)
+                {
+                    grader.OnArrival(5, 5, false, 0);
+                }
+            }
+            grader.Advance(5 * kInterval);
+            NS_TEST_EXPECT_MSG_EQ(grader.LastInterval()[5].held,
+                                  !oneArrival,
+                                  "one arrival per window releases only with the flag");
+        }
+    }
+
+  private:
+    static constexpr uint32_t kSpines = ScoresFixture::kSpines;
+    static constexpr uint64_t kInterval = ScoresFixture::kInterval;
+
+    // Each spine's share is its score's part and the epsilon term, which is
+    // 0 for held spine 3 and unheld for the others; the shares sum to one.
+    void ExpectShares(const SpineScores& scores, double unheld, const std::string& message)
+    {
+        const double epsilon = ScoresFixture::Defaults().epsilon;
+        double scoreSum = 0;
+        double sum = 0;
+        for (uint32_t spine = 0; spine < kSpines; ++spine)
+        {
+            scoreSum += scores.Score(spine);
+            sum += scores.Share(spine);
+        }
+        NS_TEST_EXPECT_MSG_EQ_TOL(sum, 1.0, 1e-9, message + ": the shares sum to one");
+        for (uint32_t spine = 0; spine < kSpines; ++spine)
+        {
+            const double term = scores.Held(spine) ? 0 : unheld;
+            NS_TEST_EXPECT_MSG_EQ_TOL(scores.Share(spine),
+                                      (1 - epsilon) * scores.Score(spine) / scoreSum + term,
+                                      1e-12,
+                                      message);
+        }
+    }
+};
+
+class SpinePoolHoldPropagationTest : public TestCase
+{
+  public:
+    SpinePoolHoldPropagationTest()
+        : TestCase("With pool hold propagation a spine the pool holds weighs nothing in every "
+                   "destination's draw and is sent the pool's sentinels, one per interval for "
+                   "the host; a spine held only by a destination keeps its own treatment")
+    {
+    }
+
+    void DoRun() override
+    {
+        Ptr<RdmaHw> hw = CreateObject<RdmaHw>();
+        BooleanValue attribute;
+        hw->GetAttribute("SprayPoolHoldPropagates", attribute);
+        NS_TEST_EXPECT_MSG_EQ(attribute.Get(), false, "SprayPoolHoldPropagates is false by default");
+        NS_TEST_EXPECT_MSG_EQ(ScoresFixture::Defaults().poolHoldPropagates,
+                              false,
+                              "and so is the scores' parameter");
+        hw->m_loadBalancing = static_cast<uint32_t>(LoadBalancingMode::SprayPolicy);
+        hw->m_sprayPoolHoldPropagates = true;
+        NS_TEST_EXPECT_MSG_EQ(hw->ValidPoolHoldPropagates(), false, "refused without a pool");
+        hw->m_spraySenderPoolWeight = 0.75;
+        NS_TEST_EXPECT_MSG_EQ(hw->ValidPoolHoldPropagates(), true, "read with a pool weight");
+
+        Shares();
+        Draws();
+        EpsilonExploration();
+        Release();
+        Sentinels();
+        Simulator::Destroy();
+    }
+
+  private:
+    static constexpr uint32_t kSpines = ScoresFixture::kSpines;
+    static constexpr uint64_t kInterval = ScoresFixture::kInterval;
+    static constexpr double kWeight = 0.75;
+
+    // A pool counting loss with a loss hold of 4 clean sends and a pool
+    // decay interval of one report interval, and two destinations pooled
+    // with it at weight 0.75 that count nothing themselves. The first sends
+    // spine 3 ten packets, six lost, and both report: the first grades spine
+    // 5 at 0, the second every spine 3. The pool holds spine 3, by its loss
+    // grade and its held flag, and not spine 5, whose mean grade is 1.5; the
+    // first destination holds spine 5 and the second nothing.
+    struct Setup
+    {
+        std::unique_ptr<SpineScores> pool, toFirst, toSecond;
+    };
+
+    static Setup Make(bool propagates,
+                      SpineScores::HeldExploration exploration =
+                          SpineScores::HeldExploration::Sentinel)
+    {
+        SpineScores::Parameters local = ScoresFixture::Defaults();
+        local.heldExploration = exploration;
+        local.poolHoldPropagates = propagates;
+        SpineScores::Parameters pooled = local;
+        pooled.lossThresholds = std::array<double, 3>{0.1, 0.25, 0.5};
+        pooled.lossHoldCleanSentinels = 4;
+        pooled.poolDecayIntervalNs = kInterval;
+        Setup setup;
+        setup.pool = std::make_unique<SpineScores>(kSpines, pooled);
+        setup.toFirst = std::make_unique<SpineScores>(kSpines, local);
+        setup.toSecond = std::make_unique<SpineScores>(kSpines, local);
+        setup.toFirst->Pool(*setup.pool, kWeight);
+        setup.toSecond->Pool(*setup.pool, kWeight);
+        for (uint32_t i = 0; i < 10; ++i)
+        {
+            setup.toFirst->OnSend(3, 6000);
+            if (i < 6)
+            {
+                setup.toFirst->OnLoss(3, 6000);
+            }
+        }
+        std::vector<uint8_t> grades(kSpines, 3);
+        grades[5] = 0;
+        setup.toFirst->OnReport(ScoresFixture::Report(1, grades), 15000);
+        setup.toSecond->OnReport(ScoresFixture::Report(1, std::vector<uint8_t>(kSpines, 3)),
+                                 16000);
+        return setup;
+    }
+
+    static double Mixed(const Setup& setup, const SpineScores& scores, uint32_t spine)
+    {
+        return kWeight * setup.pool->Score(spine) + (1 - kWeight) * scores.Score(spine);
+    }
+
+    // Each spine's share: the part of 1 - epsilon its mixed score earns over
+    // the spines not excluded, plus its epsilon term, which is spread over
+    // the spines held for neither scores; the shares sum to one.
+    void ExpectShares(const Setup& setup,
+                      const SpineScores& scores,
+                      const std::vector<uint32_t>& excluded,
+                      const std::vector<uint32_t>& held,
+                      const std::string& message)
+    {
+        const double epsilon = ScoresFixture::Defaults().epsilon;
+        auto in = [](const std::vector<uint32_t>& set, uint32_t spine) {
+            return std::find(set.begin(), set.end(), spine) != set.end();
+        };
+        double mixedSum = 0;
+        for (uint32_t spine = 0; spine < kSpines; ++spine)
+        {
+            mixedSum += in(excluded, spine) ? 0 : Mixed(setup, scores, spine);
+        }
+        double sum = 0;
+        for (uint32_t spine = 0; spine < kSpines; ++spine)
+        {
+            sum += scores.Share(spine);
+            const double part =
+                in(excluded, spine) ? 0 : (1 - epsilon) * Mixed(setup, scores, spine) / mixedSum;
+            const double term = in(held, spine) ? 0 : epsilon / (kSpines - held.size());
+            NS_TEST_EXPECT_MSG_EQ_TOL(scores.Share(spine),
+                                      part + term,
+                                      1e-12,
+                                      message + ", spine " + std::to_string(spine));
+            NS_TEST_EXPECT_MSG_EQ(scores.Held(spine),
+                                  in(held, spine),
+                                  message + ": held, spine " + std::to_string(spine));
+        }
+        NS_TEST_EXPECT_MSG_EQ_TOL(sum, 1.0, 1e-9, message + ": the shares sum to one");
+    }
+
+    void Shares()
+    {
+        Setup today = Make(false);
+        NS_TEST_EXPECT_MSG_EQ(today.pool->Held(3), true, "the pool holds spine 3");
+        NS_TEST_EXPECT_MSG_EQ(today.pool->Held(5), false, "and not spine 5");
+        NS_TEST_EXPECT_MSG_GT(today.toFirst->Score(3), 0u, "the destinations' scores do not");
+        // Unset: the pool's flag alone holds, and spine 3 keeps (1 - w) of
+        // the destination's score.
+        ExpectShares(today, *today.toFirst, {}, {3}, "unset, first");
+        ExpectShares(today, *today.toSecond, {}, {3}, "unset, second");
+        NS_TEST_EXPECT_MSG_GT(today.toFirst->Share(3), 0.0, "unset, the pool's hold leaks");
+
+        Setup set = Make(true);
+        for (uint32_t spine = 0; spine < kSpines; ++spine)
+        {
+            NS_TEST_EXPECT_MSG_EQ(set.pool->Score(spine),
+                                  today.pool->Score(spine),
+                                  "the pool's own scores do not depend on propagation");
+        }
+        ExpectShares(set, *set.toFirst, {3}, {3, 5}, "set, first");
+        ExpectShares(set, *set.toSecond, {3}, {3}, "set, second");
+        NS_TEST_EXPECT_MSG_EQ(set.toFirst->Share(3), 0.0, "the pool-held spine has no share");
+        NS_TEST_EXPECT_MSG_EQ(set.toSecond->Share(3), 0.0, "in either destination");
+        NS_TEST_EXPECT_MSG_GT(set.toFirst->Share(5),
+                              0.0,
+                              "a spine held only locally keeps the pool's part of its share");
+
+        // The local hold ends by the local rule.
+        set.toFirst->OnReport(ScoresFixture::Report(2, std::vector<uint8_t>(kSpines, 3)), 17000);
+        NS_TEST_EXPECT_MSG_EQ(set.toFirst->Held(5), false, "a grade-3 report clears it");
+        NS_TEST_EXPECT_MSG_EQ(set.toFirst->Held(3), true, "the pool's hold stands");
+    }
+
+    void Draws()
+    {
+        for (const bool propagates : {false, true})
+        {
+            Setup setup = Make(propagates);
+            Ptr<UniformRandomVariable> random =
+                CreateObjectWithAttributes<UniformRandomVariable>("Stream", IntegerValue(0));
+            uint32_t onHeld = 0;
+            for (uint32_t i = 0; i < 2000; ++i)
+            {
+                SpineScores& scores = i % 2 == 0 ? *setup.toFirst : *setup.toSecond;
+                onHeld += scores.Choose(*random, 16000 + i) == 3;
+            }
+            if (propagates)
+            {
+                NS_TEST_EXPECT_MSG_EQ(onHeld, 0u, "set, no draw lands on the pool-held spine");
+            }
+            else
+            {
+                NS_TEST_EXPECT_MSG_GT(onHeld, 0u, "unset, draws land on it");
+            }
+        }
+    }
+
+    // Under the epsilon held exploration the pool-held spine keeps epsilon
+    // / N and nothing of its mixed score.
+    void EpsilonExploration()
+    {
+        Setup setup = Make(true, SpineScores::HeldExploration::Epsilon);
+        const double epsilon = ScoresFixture::Defaults().epsilon;
+        NS_TEST_EXPECT_MSG_EQ_TOL(setup.toSecond->Share(3),
+                                  epsilon / kSpines,
+                                  1e-12,
+                                  "epsilon / N for the pool-held spine");
+        double sum = 0;
+        for (uint32_t spine = 0; spine < kSpines; ++spine)
+        {
+            sum += setup.toSecond->Share(spine);
+        }
+        NS_TEST_EXPECT_MSG_EQ_TOL(sum, 1.0, 1e-9, "the shares sum to one");
+    }
+
+    // Four clean sends on spine 3 and a report closing their loss interval
+    // end the pool's loss hold and, the pooled grade now 3, its flag: the
+    // share comes back in both destinations.
+    void Release()
+    {
+        Setup setup = Make(true);
+        for (uint32_t i = 0; i < 4; ++i)
+        {
+            setup.toSecond->OnSend(3, 16500);
+        }
+        NS_TEST_EXPECT_MSG_EQ(setup.toSecond->Share(3), 0.0, "held until the interval closes");
+        setup.toSecond->OnReport(ScoresFixture::Report(2, std::vector<uint8_t>(kSpines, 3)),
+                                 25000);
+        NS_TEST_EXPECT_MSG_EQ(setup.pool->Held(3), false, "the pool releases spine 3");
+        ExpectShares(setup, *setup.toFirst, {}, {5}, "released, first");
+        ExpectShares(setup, *setup.toSecond, {}, {}, "released, second");
+        NS_TEST_EXPECT_MSG_GT(setup.toSecond->Share(3), 0.0, "the share is restored");
+    }
+
+    // Two destinations drawing in turn for ten sentinel intervals: unset,
+    // each sends spine 3 its own sentinels, besides the draws that land on
+    // it; set, the host sends it the pool's, one per interval.
+    void Sentinels()
+    {
+        for (const bool propagates : {false, true})
+        {
+            Setup setup = Make(propagates);
+            Ptr<UniformRandomVariable> random =
+                CreateObjectWithAttributes<UniformRandomVariable>("Stream", IntegerValue(0));
+            PolicySpineSelector first(random, *setup.toFirst);
+            PolicySpineSelector second(random, *setup.toSecond);
+            uint32_t onHeld = 0;
+            uint32_t onLocal = 0;
+            uint32_t step = 0;
+            for (uint64_t now = 16100; now < 16100 + 10 * kInterval; now += 100, ++step)
+            {
+                PolicySpineSelector& selector = step % 2 == 0 ? first : second;
+                const uint8_t spine = RequestedSpine(selector.Choose(now));
+                onHeld += spine == 3;
+                onLocal += step % 2 == 0 && spine == 5;
+            }
+            if (propagates)
+            {
+                NS_TEST_EXPECT_MSG_EQ(onHeld, 10u, "set, one sentinel per interval for the host");
+                NS_TEST_EXPECT_MSG_GT_OR_EQ(onLocal,
+                                            10u,
+                                            "the locally held spine keeps its own sentinels");
+            }
+            else
+            {
+                NS_TEST_EXPECT_MSG_GT_OR_EQ(onHeld, 20u, "unset, one per interval per destination");
+            }
+        }
     }
 };
 
@@ -7223,6 +7984,7 @@ class SwitchQueueStateTest : public TestCase
         Marking();
         TwoHops();
         Loss();
+        ReverseLoss();
         Simulator::Destroy();
     }
 
@@ -7307,6 +8069,59 @@ class SwitchQueueStateTest : public TestCase
         NS_TEST_EXPECT_MSG_EQ(fromZero[3].lossFraction, 1.0, "a silent port loses everything");
         NS_TEST_EXPECT_MSG_EQ(fromOne[3].lossFraction, 1.0, "on every path through it");
         NS_TEST_EXPECT_MSG_EQ(fromZero[0].lossFraction, 0.0, "the others lose nothing");
+        // From the receiver's leaf both faults sit on the hops back.
+        const auto fromTwo = fabric.state->PathValues(2, 0, false);
+        NS_TEST_EXPECT_MSG_EQ_TOL(fromTwo[2].lossFraction,
+                                  0.01,
+                                  1e-12,
+                                  "the gray hop drops the ACK coming back");
+        NS_TEST_EXPECT_MSG_EQ(fromTwo[3].lossFraction, 1.0, "and the silent port does too");
+        NS_TEST_EXPECT_MSG_EQ(fromTwo[0].lossFraction, 0.0, "the others lose nothing back");
+    }
+
+    // The ACK returns through the spine that carried the packet, over the
+    // destination leaf's uplink and the spine's downlink to the source leaf.
+    void ReverseLoss()
+    {
+        {
+            SwitchQueueFabric fabric;
+            // The receiver's leaf's uplink to spine 1 silent.
+            fabric.spines[1]->SetBlackhole(fabric.downlink[1][2]);
+            // Its uplink to spine 1 queued above kmax.
+            fabric.QueueUp(2, 1, 400001);
+            const auto fromZero = fabric.state->PathValues(0, 2, false);
+            NS_TEST_EXPECT_MSG_EQ(fromZero[1].lossFraction,
+                                  1.0,
+                                  "a silent reverse hop loses every ACK");
+            NS_TEST_EXPECT_MSG_EQ(fromZero[1].markFraction,
+                                  0.0,
+                                  "the marked fraction is the forward hops' only");
+            for (uint32_t k : {0u, 2u, 3u})
+            {
+                NS_TEST_EXPECT_MSG_EQ(fromZero[k].lossFraction, 0.0, "the other spines lose nothing");
+            }
+        }
+        {
+            SwitchQueueFabric fabric;
+            // Five percent lost each way on the sender's leaf's link to spine 3.
+            const double e = 0.05;
+            for (const auto& [sw, port] :
+                 {std::make_pair(fabric.spines[3], fabric.downlink[3][0]),
+                  std::make_pair(fabric.leaves[0], fabric.uplink[0][3])})
+            {
+                Ptr<RateErrorModel> gray = CreateObject<RateErrorModel>();
+                gray->SetAttribute("ErrorUnit", StringValue("ERROR_UNIT_PACKET"));
+                gray->SetRate(e);
+                SwitchQueueFabric::Device(sw, port)->SetAttribute("LinkErrorModel",
+                                                                  PointerValue(gray));
+            }
+            const auto fromZero = fabric.state->PathValues(0, 2, false);
+            NS_TEST_EXPECT_MSG_EQ_TOL(fromZero[3].lossFraction,
+                                      1 - (1 - e) * (1 - e),
+                                      1e-12,
+                                      "the packet and its ACK each cross the lossy link");
+            NS_TEST_EXPECT_MSG_EQ(fromZero[0].lossFraction, 0.0, "the other spines lose nothing");
+        }
     }
 };
 
@@ -7839,6 +8654,8 @@ PointToPointTestSuite::PointToPointTestSuite()
     AddTestCase(new SpineScoresEdgeFreezeTest, TestCase::Duration::QUICK);
     AddTestCase(new SpineScoresPoolTest, TestCase::Duration::QUICK);
     AddTestCase(new SpineLossThresholdsTest, TestCase::Duration::QUICK);
+    AddTestCase(new SpineHeldExplorationTest, TestCase::Duration::QUICK);
+    AddTestCase(new SpinePoolHoldPropagationTest, TestCase::Duration::QUICK);
     AddTestCase(new SprayPolicyTransportTest, TestCase::Duration::QUICK);
     AddTestCase(new NsccReceiverPenaltyTest, TestCase::Duration::QUICK);
     AddTestCase(new SprayPolicyDefaultsTest, TestCase::Duration::QUICK);

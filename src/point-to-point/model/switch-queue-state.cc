@@ -40,11 +40,17 @@ std::vector<SpineGrader::SpineValues> SwitchQueueState::PathValues(
 	for (uint32_t k = 0; k < m_spines; k++){
 		const HopValues up = Read(m_uplinks[source * m_spines + k]);
 		const HopValues down = Read(m_downlinks[destination * m_spines + k]);
-		// The probability that a packet crossing both hops arrives marked, or
-		// is lost on one of them.
+		// The hops the ACK returns over through the same spine.
+		const HopValues reverseUp = Read(m_uplinks[destination * m_spines + k]);
+		const HopValues reverseDown = Read(m_downlinks[source * m_spines + k]);
+		// The probability that a packet crossing both forward hops arrives
+		// marked; the ACK echoes that marking.
 		values[k].markFraction = 1 - (1 - up.marking) * (1 - down.marking);
 		values[k].delayNs = delay ? up.delayNs + down.delayNs : 0;
-		values[k].lossFraction = 1 - (1 - up.loss) * (1 - down.loss);
+		// The probability that the packet or its ACK is lost on one of the
+		// four hops.
+		values[k].lossFraction = 1 - (1 - up.loss) * (1 - down.loss)
+			* (1 - reverseUp.loss) * (1 - reverseDown.loss);
 	}
 	return values;
 }

@@ -130,8 +130,9 @@ public:
 	// Zero counts no loss at the sender and leaves the loss fraction the
 	// grader grades under SwitchQueue on the congestion thresholds.
 	double m_sprayLossThreshold1, m_sprayLossThreshold2, m_sprayLossThreshold3;
-	// SpineScores::Parameters::lossIntervalNs.
+	// SpineScores::Parameters::lossIntervalNs and lossHoldCleanSentinels.
 	uint64_t m_sprayLossIntervalNs;
+	uint32_t m_sprayLossHoldCleanSentinels;
 	// The loss thresholds, unset while SprayLossThreshold1 is zero.
 	std::optional<std::array<double, 3>> SprayLossThresholds() const;
 	// Whether the sender's scores count sends and losses: under SprayPolicy
@@ -176,6 +177,13 @@ public:
 	double m_sprayEpsilon;
 	uint32_t m_sprayCandidates;
 	uint32_t m_sprayCandidateDraw; // SpineScores::CandidateDraw
+	// SpineScores::Parameters::heldExploration and sentinelIntervalNs.
+	SpineScores::HeldExploration m_sprayHeldExploration;
+	uint64_t m_sprayHeldSentinelIntervalNs;
+	// Whether the held exploration suits the cost source: none sends a held
+	// spine nothing, and only the switch_queue cost source releases one
+	// without its arrivals.
+	bool ValidHeldExploration() const;
 	// SpineScores::Parameters::edgeFreeze.
 	bool m_sprayEdgeFreeze;
 	// The Rcv_Cwnd_Pend NSCC is handed for an acknowledgement whose report has
@@ -192,6 +200,12 @@ public:
 	// which every queue pair's scores are mixed with (SpineScores::Pool),
 	// made at the first queue pair; null otherwise.
 	double m_spraySenderPoolWeight;
+	// The pooled scores' SpineScores::Parameters::poolDecayIntervalNs.
+	uint64_t m_sprayPoolDecayIntervalNs;
+	// Every queue pair's SpineScores::Parameters::poolHoldPropagates, and
+	// whether it is set only with a pool to propagate from.
+	bool m_sprayPoolHoldPropagates;
+	bool ValidPoolHoldPropagates() const;
 	std::unique_ptr<SpineScores> m_senderSpineScores;
 	// The SpineLossInterval trace source: the host's pooled scores closed a
 	// loss interval (SpineScores::LossIntervalCallback): the time it ended
