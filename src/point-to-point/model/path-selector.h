@@ -128,6 +128,19 @@ private:
 // receiver. Under none a held spine is sent nothing, so only a receiver whose
 // hold does not wait for arrivals, the switch_queue cost source's, can
 // release it.
+//
+// Scores used as a pool with a pool decay interval set decay once per fixed
+// pool decay interval, at the multiples of it, in place of once per report
+// taken: at the first report taken in an interval its base becomes the
+// scores decayed once, and each report taken in the interval, unless its
+// edge bit holds the scores, adds its grade to the interval's per-spine grade
+// sum and count. A spine's score is its base plus the interval's mean grade,
+// in 1/256 and rounded; a spine with nothing counted in the interval keeps its
+// base. The mean, not the sum, keeps the fixed point at grade / gamma
+// whatever the number of pooled sets of scores reporting. A spine is then
+// held while the interval's mean grade rounds to 0, under 1/2; one with
+// nothing counted in the interval keeps its held flag. Without reports the
+// scores still age as above.
 class SpineScores {
 public:
 	enum class CandidateDraw : uint32_t {
@@ -156,6 +169,9 @@ public:
 		// Under the sentinel held exploration, the interval between two
 		// sentinels on one held spine; zero, the report interval.
 		uint64_t sentinelIntervalNs = 0;
+		// As a pool: the pool decay interval; zero decays once per report
+		// taken.
+		uint64_t poolDecayIntervalNs = 0;
 	};
 	SpineScores(uint32_t spines, const Parameters &parameters);
 	void OnReport(const SpineReport &report, uint64_t nowNs);
@@ -195,12 +211,16 @@ private:
 	// Decay the scores and add report's grades, unless its edge bit holds
 	// them; whether report is newer than the last is the caller's test.
 	void Take(const SpineReport &report, uint64_t nowNs);
+	// As a pool with a pool decay interval: take report into the interval's
+	// mean grades, decaying the base once per interval.
+	void PoolTake(const SpineReport &report, uint64_t nowNs);
 	bool IsPooled() const;
 	// The score a pooled draw weighs spine by, and the sum over the spines.
 	double Mixed(uint32_t spine) const;
 	double MixedSum() const;
 	uint8_t DrawFromMixed(UniformRandomVariable &random) const;
 	void Decay();
+	void Decay(std::vector<uint32_t> &scores) const;
 	// Decay the scores for every report interval missed by now.
 	void Age(uint64_t nowNs);
 	void Accumulate();
@@ -245,6 +265,13 @@ private:
 	std::vector<bool> m_held;
 	std::vector<uint64_t> m_sentinelNs;
 	uint64_t m_sentinelIntervalNs;
+	// As a pool with a pool decay interval: the end of the interval in
+	// progress, the scores decayed once at its start, and per spine the sum
+	// and count of the grades taken in it.
+	uint64_t m_poolDecayEndNs;
+	std::vector<uint32_t> m_base;
+	std::vector<uint32_t> m_gradeSum;
+	std::vector<uint32_t> m_gradeCount;
 };
 
 // A spine drawn per packet from the scores towards the queue pair's

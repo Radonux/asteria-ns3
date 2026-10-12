@@ -548,6 +548,15 @@ TypeId RdmaHw::GetTypeId (void)
 				DoubleValue(0),
 				MakeDoubleAccessor(&RdmaHw::m_spraySenderPoolWeight),
 				MakeDoubleChecker<double>(0, 1))
+		.AddAttribute("SprayPoolDecayIntervalNs",
+				"Under LoadBalancing 3 with SpraySenderPoolWeight above zero, "
+				"the fixed interval once per which the host's pooled scores "
+				"decay, each spine's score being the interval's decayed base "
+				"plus the mean grade the reports taken in it gave the spine. "
+				"Default 0: the pooled scores decay once per report taken.",
+				UintegerValue(0),
+				MakeUintegerAccessor(&RdmaHw::m_sprayPoolDecayIntervalNs),
+				MakeUintegerChecker<uint64_t>())
 		.AddAttribute("SprayEdgeWindowPenalty",
 				"Under LoadBalancing 3 and CC mode 11, the Rcv_Cwnd_Pend (UEC "
 				"1.0.3 section 3.6.13.2) of an acknowledgement whose report says "
@@ -2378,8 +2387,10 @@ void RdmaHw::StartPathSelection(Ptr<RdmaQueuePair> qp, uint64_t bdpBytes,
 			parameters.lossIntervalNs = m_sprayLossIntervalNs;
 		}
 		if (m_spraySenderPoolWeight > 0 && !m_senderSpineScores){
+			SpineScores::Parameters poolParameters = parameters;
+			poolParameters.poolDecayIntervalNs = m_sprayPoolDecayIntervalNs;
 			m_senderSpineScores =
-				std::make_unique<SpineScores>(m_spineCount, parameters);
+				std::make_unique<SpineScores>(m_spineCount, poolParameters);
 			if (parameters.lossThresholds)
 				m_senderSpineScores->SetLossIntervalCallback(
 					[this](uint64_t endNs, const std::vector<uint32_t> &sent,

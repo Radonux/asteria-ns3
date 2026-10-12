@@ -199,6 +199,8 @@ public:
 	// which every queue pair's scores are mixed with (SpineScores::Pool),
 	// made at the first queue pair; null otherwise.
 	double m_spraySenderPoolWeight;
+	// The pooled scores' SpineScores::Parameters::poolDecayIntervalNs.
+	uint64_t m_sprayPoolDecayIntervalNs;
 	std::unique_ptr<SpineScores> m_senderSpineScores;
 	// The SpineLossInterval trace source: the host's pooled scores closed a
 	// loss interval (SpineScores::LossIntervalCallback): the time it ended

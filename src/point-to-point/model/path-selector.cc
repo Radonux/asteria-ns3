@@ -73,7 +73,9 @@ SpineScores::SpineScores(uint32_t spines, const Parameters &parameters)
 	  m_lossGrades(spines, SpineReport::kTopGrade), m_held(spines),
 	  m_sentinelNs(spines),
 	  m_sentinelIntervalNs(parameters.sentinelIntervalNs > 0
-		? parameters.sentinelIntervalNs : parameters.reportIntervalNs)
+		? parameters.sentinelIntervalNs : parameters.reportIntervalNs),
+	  m_poolDecayEndNs(parameters.poolDecayIntervalNs),
+	  m_gradeSum(spines), m_gradeCount(spines)
 {
 	NS_ASSERT_MSG(spines > 0 && spines <= SpineReport::kMaxSpines,
 		"a report grades at most SpineReport::kMaxSpines spines");
@@ -93,6 +95,10 @@ SpineScores::SpineScores(uint32_t spines, const Parameters &parameters)
 	m_scores.assign(spines,
 		SpineReport::kTopGrade * kGradeScale * uint64_t{65536} / m_decay);
 	Accumulate();
+	// The first pool decay interval starts from the scores decayed once, so
+	// that the top grade holds them where they start.
+	m_base = m_scores;
+	Decay(m_base);
 }
 
 void SpineScores::OnReport(const SpineReport &report, uint64_t nowNs){
@@ -126,7 +132,10 @@ void SpineScores::OnReport(const SpineReport &report, uint64_t nowNs){
 			pooled.SetGrade(k,
 				std::min(combined.Grade(k), m_pool->m_lossGrades[k]));
 	}
-	m_pool->Take(pooled, nowNs);
+	if (m_pool->m_parameters.poolDecayIntervalNs > 0)
+		m_pool->PoolTake(pooled, nowNs);
+	else
+		m_pool->Take(pooled, nowNs);
 }
 
 void SpineScores::OnSend(uint32_t spine, uint64_t nowNs){
@@ -194,6 +203,40 @@ void SpineScores::Take(const SpineReport &report, uint64_t nowNs){
 	for (uint32_t k = 0; k < m_scores.size(); k++){
 		m_scores[k] += report.Grade(k) * kGradeScale;
 		m_held[k] = report.Grade(k) == 0;
+	}
+	Accumulate();
+}
+
+void SpineScores::PoolTake(const SpineReport &report, uint64_t nowNs){
+	Age(nowNs);
+	m_reportedNs = nowNs;
+	m_nextDecayNs = nowNs + 2 * m_parameters.reportIntervalNs;
+	const uint64_t interval = m_parameters.poolDecayIntervalNs;
+	if (nowNs >= m_poolDecayEndNs){
+		m_base = m_scores;
+		Decay(m_base);
+		std::fill(m_gradeSum.begin(), m_gradeSum.end(), 0);
+		std::fill(m_gradeCount.begin(), m_gradeCount.end(), 0);
+		m_poolDecayEndNs += interval *
+			(1 + (nowNs - m_poolDecayEndNs) / interval);
+	}
+	if (!(report.edgeCongested && m_parameters.edgeFreeze)){
+		for (uint32_t k = 0; k < m_scores.size(); k++){
+			m_gradeSum[k] += report.Grade(k);
+			m_gradeCount[k]++;
+		}
+	}
+	for (uint32_t k = 0; k < m_scores.size(); k++){
+		const uint64_t count = m_gradeCount[k];
+		if (count == 0){
+			m_scores[k] = m_base[k];
+			continue;
+		}
+		const uint64_t sum = m_gradeSum[k];
+		// The mean grade in 1/256, rounded half up; it rounds to grade 0
+		// while 2 * sum < count.
+		m_scores[k] = m_base[k] + (kGradeScale * sum + count / 2) / count;
+		m_held[k] = 2 * sum < count;
 	}
 	Accumulate();
 }
@@ -314,7 +357,11 @@ uint32_t SpineScores::Score(uint32_t spine) const{
 }
 
 void SpineScores::Decay(){
-	for (uint32_t &score : m_scores)
+	Decay(m_scores);
+}
+
+void SpineScores::Decay(std::vector<uint32_t> &scores) const{
+	for (uint32_t &score : scores)
 		score -= (score * m_decay + 65535) >> 16;
 }
 

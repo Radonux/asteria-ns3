@@ -5536,7 +5536,8 @@ class SpineScoresPoolTest : public TestCase
   public:
     SpineScoresPoolTest()
         : TestCase("Pooled scores: at weight 0 the draws and shares are unchanged, at 1 every "
-                   "destination follows the pool, at 0.5 their arithmetic mixture")
+                   "destination follows the pool, at 0.5 their arithmetic mixture; with a pool "
+                   "decay interval the pool decays once per interval by the mean grade")
     {
     }
 
@@ -5545,10 +5546,21 @@ class SpineScoresPoolTest : public TestCase
         DoubleValue attribute;
         CreateObject<RdmaHw>()->GetAttribute("SpraySenderPoolWeight", attribute);
         NS_TEST_EXPECT_MSG_EQ(attribute.Get(), 0.0, "SpraySenderPoolWeight is 0 by default");
+        UintegerValue interval;
+        CreateObject<RdmaHw>()->GetAttribute("SprayPoolDecayIntervalNs", interval);
+        NS_TEST_EXPECT_MSG_EQ(interval.Get(), 0u, "SprayPoolDecayIntervalNs is 0 by default");
+        NS_TEST_EXPECT_MSG_EQ(ScoresFixture::Defaults().poolDecayIntervalNs,
+                              0u,
+                              "and so is the pool decay interval");
         WeightZero();
         WeightOne();
         WeightHalf();
         EdgeBit();
+        DecayIntervalIndependentOfDestinations();
+        PerReportDecayDependsOnDestinations();
+        DecayIntervalMean();
+        DecayIntervalEdgeBit();
+        DecayIntervalIdle();
         Simulator::Destroy();
     }
 
@@ -5736,6 +5748,204 @@ class SpineScoresPoolTest : public TestCase
                                   "the pool is held exactly when the scores are");
             NS_TEST_EXPECT_MSG_EQ(local.Score(4), pool.Score(4), "as the scores are");
         }
+    }
+
+    static SpineScores::Parameters PoolParameters(uint64_t decayIntervalNs)
+    {
+        SpineScores::Parameters parameters = ScoresFixture::Defaults();
+        parameters.poolDecayIntervalNs = decayIntervalNs;
+        return parameters;
+    }
+
+    // Pool A takes one destination's reports and pool B 63 destinations',
+    // every destination sending one report per interval, A's late in it and
+    // B's spread over it, all spines graded 3 but spine 3, graded 0 from
+    // interval 4. The pools' scores after each interval, A's then B's.
+    static std::vector<std::pair<std::vector<uint32_t>, std::vector<uint32_t>>> RunPools(
+        uint64_t decayIntervalNs)
+    {
+        constexpr uint32_t kDestinations = 63;
+        const SpineScores::Parameters parameters = ScoresFixture::Defaults();
+        SpineScores poolA(ScoresFixture::kSpines, PoolParameters(decayIntervalNs));
+        SpineScores poolB(ScoresFixture::kSpines, PoolParameters(decayIntervalNs));
+        SpineScores toA(ScoresFixture::kSpines, parameters);
+        toA.Pool(poolA, 0.5);
+        std::deque<SpineScores> toB;
+        for (uint32_t d = 0; d < kDestinations; ++d)
+        {
+            toB.emplace_back(ScoresFixture::kSpines, parameters);
+            toB.back().Pool(poolB, 0.5);
+        }
+        std::vector<std::pair<std::vector<uint32_t>, std::vector<uint32_t>>> scores;
+        for (uint32_t n = 0; n < 10; ++n)
+        {
+            std::vector<uint8_t> grades(ScoresFixture::kSpines, 3);
+            grades[3] = n >= 4 ? 0 : 3;
+            const SpineReport report = ScoresFixture::Report(n + 1, grades);
+            const uint64_t start = n * ScoresFixture::kInterval;
+            for (uint32_t d = 0; d < kDestinations; ++d)
+            {
+                toB[d].OnReport(report, start + 100 + 140 * d);
+            }
+            toA.OnReport(report, start + 9000);
+            std::vector<uint32_t> a;
+            std::vector<uint32_t> b;
+            for (uint32_t spine = 0; spine < ScoresFixture::kSpines; ++spine)
+            {
+                a.push_back(poolA.Score(spine));
+                b.push_back(poolB.Score(spine));
+            }
+            scores.emplace_back(a, b);
+        }
+        return scores;
+    }
+
+    // With a pool decay interval, the pool's scores depend on the grades
+    // within each interval and not on how many destinations report them.
+    void DecayIntervalIndependentOfDestinations()
+    {
+        const auto scores = RunPools(ScoresFixture::kInterval);
+        // Spine 3: 3072 through interval 3, then decayed once per interval.
+        const std::vector<uint32_t> spine3 = {3072, 3072, 3072, 3072, 2304,
+                                              1728, 1296, 972,  729,  546};
+        for (uint32_t n = 0; n < scores.size(); ++n)
+        {
+            for (uint32_t spine = 0; spine < ScoresFixture::kSpines; ++spine)
+            {
+                NS_TEST_EXPECT_MSG_EQ(scores[n].first[spine],
+                                      scores[n].second[spine],
+                                      "1 and 63 destinations give the same pooled score");
+                NS_TEST_EXPECT_MSG_EQ(scores[n].first[spine],
+                                      (spine == 3 ? spine3[n] : 3072u),
+                                      "the pool decays once per interval");
+            }
+        }
+    }
+
+    // Without one, the pool decays once per report taken, so 63 destinations
+    // take spine 3 to zero within the interval in which one takes it to 2304.
+    void PerReportDecayDependsOnDestinations()
+    {
+        const auto scores = RunPools(0);
+        for (uint32_t n = 0; n < 4; ++n)
+        {
+            NS_TEST_EXPECT_MSG_EQ((scores[n].first == scores[n].second),
+                                  true,
+                                  "the top grade holds both pools at 3072");
+        }
+        NS_TEST_EXPECT_MSG_EQ(scores[4].first[3], 2304u, "one report decays spine 3 once");
+        NS_TEST_EXPECT_MSG_EQ(scores[4].second[3], 0u, "63 reports decay it to zero");
+        NS_TEST_EXPECT_MSG_EQ(scores[9].first[3], 546u, "one report per interval: 546");
+        NS_TEST_EXPECT_MSG_EQ(scores[9].second[3], 0u, "63 per interval: zero");
+    }
+
+    // Two destinations grading differently in one interval: the decayed
+    // base, 2304 from 3072, plus 256 times the mean of their grades.
+    void DecayIntervalMean()
+    {
+        const SpineScores::Parameters parameters = ScoresFixture::Defaults();
+        SpineScores pool(ScoresFixture::kSpines, PoolParameters(ScoresFixture::kInterval));
+        SpineScores toFirst(ScoresFixture::kSpines, parameters);
+        SpineScores toSecond(ScoresFixture::kSpines, parameters);
+        toFirst.Pool(pool, 0.5);
+        toSecond.Pool(pool, 0.5);
+        std::vector<uint8_t> first(ScoresFixture::kSpines, 3);
+        std::vector<uint8_t> second(ScoresFixture::kSpines, 3);
+        first[0] = 0;
+        second[0] = 1;
+        first[1] = 0;
+        second[1] = 0;
+        first[2] = 2;
+        second[2] = 3;
+        second[4] = 0;
+        toFirst.OnReport(ScoresFixture::Report(1, first), 2000);
+        NS_TEST_EXPECT_MSG_EQ(pool.Score(0), 2304u, "one report: the base plus its grade");
+        NS_TEST_EXPECT_MSG_EQ(toFirst.Held(0), true, "and spine 0 is held at its grade 0");
+        toSecond.OnReport(ScoresFixture::Report(1, second), 6000);
+        const std::vector<uint32_t> expected = {2432, 2304, 2944, 3072, 2688, 3072, 3072, 3072};
+        for (uint32_t spine = 0; spine < ScoresFixture::kSpines; ++spine)
+        {
+            NS_TEST_EXPECT_MSG_EQ(pool.Score(spine), expected[spine], "2304 plus 256 x the mean");
+        }
+        NS_TEST_EXPECT_MSG_EQ(toFirst.Held(0), false, "a mean of 1/2 rounds to 1 and releases");
+        NS_TEST_EXPECT_MSG_EQ(toFirst.Held(1), true, "a mean of 0 holds");
+        NS_TEST_EXPECT_MSG_EQ(toFirst.Held(4), false, "a mean of 3/2 does not");
+        // The next interval decays the scores once: 2432 - 608 = 1824, and
+        // the one report's grade 3 adds 768.
+        std::vector<uint8_t> top(ScoresFixture::kSpines, 3);
+        toFirst.OnReport(ScoresFixture::Report(2, top), 12000);
+        NS_TEST_EXPECT_MSG_EQ(pool.Score(0), 2592u, "the next interval's base is decayed once");
+        NS_TEST_EXPECT_MSG_EQ(pool.Score(1), 2496u, "1728 plus 768 on spine 1");
+        NS_TEST_EXPECT_MSG_EQ(toFirst.Held(1), false, "and grade 3 releases it");
+    }
+
+    // A report the edge bit holds the scores under adds no grade to the
+    // interval's mean.
+    void DecayIntervalEdgeBit()
+    {
+        for (bool freeze : {true, false})
+        {
+            SpineScores::Parameters parameters = ScoresFixture::Defaults();
+            parameters.edgeFreeze = freeze;
+            SpineScores::Parameters poolParameters = parameters;
+            poolParameters.poolDecayIntervalNs = ScoresFixture::kInterval;
+            SpineScores pool(ScoresFixture::kSpines, poolParameters);
+            SpineScores toFirst(ScoresFixture::kSpines, parameters);
+            SpineScores toSecond(ScoresFixture::kSpines, parameters);
+            toFirst.Pool(pool, 0.5);
+            toSecond.Pool(pool, 0.5);
+            std::vector<uint8_t> grades(ScoresFixture::kSpines, 3);
+            grades[5] = 0;
+            SpineReport edge = ScoresFixture::Report(1, grades);
+            edge.edgeCongested = true;
+            toFirst.OnReport(edge, 2000);
+            NS_TEST_EXPECT_MSG_EQ(pool.Score(5),
+                                  2304u,
+                                  "frozen, nothing counted: the base; else grade 0");
+            NS_TEST_EXPECT_MSG_EQ(pool.Score(0),
+                                  (freeze ? 2304u : 3072u),
+                                  "frozen, nothing counted: the base; else grade 3");
+            NS_TEST_EXPECT_MSG_EQ(toFirst.Held(5), !freeze, "only a counted grade 0 holds");
+            grades[5] = 3;
+            toSecond.OnReport(ScoresFixture::Report(1, grades), 6000);
+            NS_TEST_EXPECT_MSG_EQ(pool.Score(5),
+                                  (freeze ? 3072u : 2688u),
+                                  "the frozen report is not in the mean");
+            NS_TEST_EXPECT_MSG_EQ(toFirst.Held(5), false, "and the mean releases");
+        }
+    }
+
+    // Without reports a pool with a decay interval ages as one without.
+    void DecayIntervalIdle()
+    {
+        const SpineScores::Parameters parameters = ScoresFixture::Defaults();
+        SpineScores interval(ScoresFixture::kSpines, PoolParameters(ScoresFixture::kInterval));
+        SpineScores perReport(ScoresFixture::kSpines, PoolParameters(0));
+        SpineScores toInterval(ScoresFixture::kSpines, parameters);
+        SpineScores toPerReport(ScoresFixture::kSpines, parameters);
+        toInterval.Pool(interval, 0.5);
+        toPerReport.Pool(perReport, 0.5);
+        std::vector<uint8_t> grades(ScoresFixture::kSpines, 3);
+        grades[2] = 1;
+        grades[6] = 0;
+        const SpineReport report = ScoresFixture::Report(1, grades);
+        toInterval.OnReport(report, 3000);
+        toPerReport.OnReport(report, 3000);
+        Ptr<UniformRandomVariable> first = Stream();
+        Ptr<UniformRandomVariable> second = Stream();
+        for (uint64_t now = 3000; now < 30 * ScoresFixture::kInterval; now += 7000)
+        {
+            NS_TEST_EXPECT_MSG_EQ(uint32_t(toInterval.Choose(*first, now)),
+                                  uint32_t(toPerReport.Choose(*second, now)),
+                                  "the same draws");
+            for (uint32_t spine = 0; spine < ScoresFixture::kSpines; ++spine)
+            {
+                NS_TEST_EXPECT_MSG_EQ(interval.Score(spine),
+                                      perReport.Score(spine),
+                                      "idle, both pools age alike");
+            }
+        }
+        NS_TEST_EXPECT_MSG_LT(interval.Score(0), 3072u, "and they did age");
     }
 };
 
