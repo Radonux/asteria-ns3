@@ -8586,7 +8586,13 @@ class SprayPathSeqTest : public TestCase
         Ptr<RdmaHw> off = CreateObject<RdmaHw>();
         NS_TEST_EXPECT_MSG_EQ(off->m_sprayPathSeq, false, "SprayPathSeq is off by default");
         off->m_sprayPathSeq = true;
-        NS_TEST_EXPECT_MSG_EQ(off->ValidPathSeq(), false, "refused outside reps_hold");
+        NS_TEST_EXPECT_MSG_EQ(off->ValidPathSeq(), false, "refused outside spray_uniform");
+        Ptr<RdmaHw> uniform = CreateObject<RdmaHw>();
+        uniform->m_loadBalancing = static_cast<uint32_t>(LoadBalancingMode::SprayUniform);
+        uniform->m_sprayPathSeq = true;
+        NS_TEST_EXPECT_MSG_EQ(uniform->ValidPathSeq(),
+                              true,
+                              "accepted under spray_uniform with any selector");
         CustomHeader::udpCarriesPathSeq = false;
         NS_TEST_EXPECT_MSG_EQ(sender.hw->ValidPathSeq(),
                               false,

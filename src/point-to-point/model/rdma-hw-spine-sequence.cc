@@ -11,7 +11,8 @@ namespace ns3 {
 
 bool RdmaHw::ValidPathSeq() const{
 	return CustomHeader::udpCarriesPathSeq == m_sprayPathSeq &&
-		(!m_sprayPathSeq || IsRepsHold());
+		(!m_sprayPathSeq || m_loadBalancing ==
+			static_cast<uint32_t>(LoadBalancingMode::SprayUniform));
 }
 
 void RdmaHw::CountPathSeq(Ptr<RdmaRxQueuePair> q, const CustomHeader &ch,

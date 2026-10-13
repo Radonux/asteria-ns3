@@ -631,7 +631,7 @@ TypeId RdmaHw::GetTypeId (void)
 					static_cast<uint32_t>(SentinelMode::Data),
 					static_cast<uint32_t>(SentinelMode::Duplicate)))
 		.AddAttribute("SprayPathSeq",
-				"Under PathSelector 6, 7 and 9, whether every data packet carries "
+				"Under LoadBalancing 2, whether every data packet carries "
 				"its queue pair's count of the data packets sent before it up "
 				"its requested spine, from which the receiver counts the "
 				"packets missing per carrying spine. Needs "
@@ -1025,7 +1025,7 @@ void RdmaHw::Setup(QpCompleteCallback cb, QpFailureCallback failure_cb){
 				static_cast<uint32_t>(SentinelMode::Data) && !IsRepsHold(),
 		"SpraySentinelMode 1 is read only under PathSelector 6, 7 and 9");
 	NS_ABORT_MSG_IF(!ValidPathSeq(),
-		"SprayPathSeq is read only under PathSelector 6, 7 and 9, and data "
+		"SprayPathSeq is read only under LoadBalancing 2, and data "
 		"headers carry the path sequence exactly when it is set "
 		"(CustomHeader::udpCarriesPathSeq)");
 	NS_ABORT_MSG_IF(!ValidReceiverHold(),

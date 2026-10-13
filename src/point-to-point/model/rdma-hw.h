@@ -321,7 +321,7 @@ public:
 	void GradeTrim(Ptr<RdmaRxQueuePair> q, const CustomHeader &ch, bool lastHop);
 	// Indexed by carrying spine; kept where the identification names one.
 	std::vector<SpineArrivals> m_spineArrivals;
-	// SprayPathSeq, under PathSelector RepsHold, RepsFlowHold or MrcHold:
+	// SprayPathSeq, under LoadBalancing SprayUniform, whatever the selector:
 	// every data packet carries its queue pair's path sequence on its
 	// requested spine, and the receiver counts the packets the gaps in it
 	// show missing, per carrying spine, in m_spineGaps

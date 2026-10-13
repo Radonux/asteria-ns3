@@ -243,8 +243,8 @@ std::string spray_hold_release = "sentinels";
 bool spray_hold_release_given = false;
 double spray_hold_trickle = 0.01;
 bool spray_hold_trickle_given = false;
-// Under reps_hold, reps_flow_hold or mrc_hold, SPRAY_PATH_SEQ on: every data
-// packet carries, in a 2-byte path_seq field after the INT header, its queue pair's
+// Under LOAD_BALANCING spray_uniform, with any PATH_SELECTOR, SPRAY_PATH_SEQ
+// on: every data packet carries, in a 2-byte path_seq field after the INT header, its queue pair's
 // count of the data packets sent before it up its requested spine. The
 // receiver keeps per queue pair and per path, the requested and the carrying
 // spine, the path sequence it expects next; an arrival ahead of it by g shows
@@ -2526,10 +2526,9 @@ bool ReadConf(string network_configuration) {
     std::cerr << "SPRAY_PATH_SEQ must be on or off\n";
     return false;
   }
-  if (spray_path_seq_given && !reps_hold()) {
+  if (spray_path_seq_given && load_balancing != "spray_uniform") {
     std::cerr << "SPRAY_PATH_SEQ is read only under LOAD_BALANCING "
-                 "spray_uniform with PATH_SELECTOR reps_hold, "
-                 "reps_flow_hold or mrc_hold\n";
+                 "spray_uniform\n";
     return false;
   }
   if (spray_receiver_hold != "on" && spray_receiver_hold != "off") {
