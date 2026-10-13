@@ -42,6 +42,11 @@ constexpr bool CarriesQbbHeader(uint8_t protocol){
 		protocol == kPathProbeProtocol;
 }
 
+// The most spines a data header's tail counts name (udpTailCounts), and the
+// bit of udp.tail_flags that marks a packet closing its requested spine.
+constexpr uint32_t kMaxTailCounts = 8;
+constexpr uint8_t kTailCloses = 1;
+
 // UET diffserv codepoints. UEC 1.0.3 section 3.6.4.7.1 names the codepoints
 // abstractly and section 4.1 states that "this spec does not place any
 // constraints on the values of the DSCPs used"; only distinctness is
@@ -145,6 +150,17 @@ public:
 		  uint16_t pg;
 		  uint32_t seq;
 		  IntHeader ih;
+		  // The sender's count of the data packets of this queue pair sent
+		  // before this one up the spine it requested. On the wire after the
+		  // INT header, only while udpCarriesPathSeq is set.
+		  uint16_t path_seq;
+		  // Under tail recovery, after path_seq, only while udpTailCounts is
+		  // not zero: kTailCloses set on a packet sent once its queue pair
+		  // has no new data left, which closes its requested spine, and then
+		  // per spine k below udpTailCounts the count of the data packets
+		  // the queue pair has sent up k, this one included.
+		  uint8_t tail_flags;
+		  uint16_t tail_counts[kMaxTailCounts];
 	  } udp;
 	  // CnHeader
 	  struct {
@@ -172,6 +188,17 @@ public:
 		  // none. On the wire, after the report, only while ackRedirectBytes
 		  // is not zero.
 		  uint8_t redirect;
+		  // The spines the receiving host holds for the sender's leaf, bit k
+		  // for spine k. On the wire, after the redirect field, only while
+		  // ackReceiverHoldBytes is not zero.
+		  uint8_t receiver_hold;
+		  // A tail repair request (qbbHeader::FLAG_TAIL_NACK): the spine,
+		  // the first path sequence missing on it and how many from there.
+		  // On the wire, after receiver_hold, only while ackTailNackBytes is
+		  // not zero.
+		  uint8_t tail_spine;
+		  uint16_t tail_seq;
+		  uint16_t tail_count;
 		  IntHeader ih;
 	  } ack;
 	  // PauseHeader
@@ -192,6 +219,20 @@ public:
   // How many bytes the redirect field takes, zero or one. Process-wide for
   // the same reason.
   static uint32_t ackRedirectBytes;
+  // Whether data headers carry udp.path_seq. Process-wide for the same
+  // reason.
+  static bool udpCarriesPathSeq;
+  // How many bytes the receiver_hold field takes, zero or one. Process-wide
+  // for the same reason.
+  static uint32_t ackReceiverHoldBytes;
+  // How many per-spine counts the tail fields of data headers carry, zero
+  // for none; the fields take 1 + 2 * udpTailCounts bytes. Process-wide for
+  // the same reason.
+  static uint32_t udpTailCounts;
+  // How many bytes the tail repair request fields take, zero or five.
+  // Process-wide for the same reason.
+  static uint32_t ackTailNackBytes;
+  static uint32_t GetUdpTailBytes(void);
 
   uint8_t GetIpv4EcnBits (void) const;
   uint8_t GetIpv4Dscp (void) const;

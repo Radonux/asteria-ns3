@@ -55,6 +55,8 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <deque>
+#include <functional>
 #include <map>
 #include <memory>
 #include <optional>
@@ -4173,7 +4175,9 @@ class GraderFixture
                 grader.OnArrival(spine, spine, i < marked, 0);
             }
         }
-        NS_ASSERT(grader.Advance((interval + 1) * kInterval));
+        // Advance outside the check, which NS_ASSERT drops without asserts.
+        const bool reported = grader.Advance((interval + 1) * kInterval);
+        NS_ABORT_MSG_UNLESS(reported, "the next interval's first event issues the report");
     }
 };
 
@@ -5064,6 +5068,116 @@ class ScoresFixture
             shares.push_back(scores.Share(3));
         }
         return shares;
+    }
+};
+
+class SpineCongestionGradeFloorTest : public TestCase
+{
+  public:
+    SpineCongestionGradeFloorTest()
+        : TestCase("A congestion grade floor raises the grades the marked and trimmed fractions "
+                   "and the delay earn, and leaves the loss grade and a held spine at 0")
+    {
+    }
+
+    void DoRun() override
+    {
+        Ptr<RdmaHw> hw = CreateObject<RdmaHw>();
+        UintegerValue attribute;
+        hw->GetAttribute("SprayCongestionGradeFloor", attribute);
+        NS_TEST_EXPECT_MSG_EQ(attribute.Get(), 0u, "SprayCongestionGradeFloor is 0 by default");
+        hw->SetNode(CreateObject<Node>());
+        hw->m_sprayBaseRttNs = 10000;
+        hw->m_loadBalancing = static_cast<uint32_t>(LoadBalancingMode::SprayPolicy);
+        NS_TEST_EXPECT_MSG_EQ(uint32_t(hw->GraderParameters().congestionGradeFloor),
+                              0u,
+                              "the grader takes the default");
+        hw->SetAttribute("SprayCongestionGradeFloor", UintegerValue(1));
+        NS_TEST_EXPECT_MSG_EQ(uint32_t(hw->GraderParameters().congestionGradeFloor),
+                              1u,
+                              "and the floor set");
+
+        Arrivals();
+        PathValues();
+        SenderLoss();
+    }
+
+  private:
+    static constexpr uint32_t kSpines = GraderFixture::kSpines;
+
+    // Spine 2 marks nine in ten of its arrivals, above the top threshold.
+    void Arrivals()
+    {
+        std::vector<double> marks(kSpines, 0);
+        marks[2] = 0.9;
+        for (const uint8_t floor : {0, 1, 2})
+        {
+            SpineGrader::Parameters parameters = GraderFixture::Absolute();
+            parameters.congestionGradeFloor = floor;
+            SpineGrader grader(parameters);
+            GraderFixture::Interval(grader, 0, marks);
+            NS_TEST_EXPECT_MSG_EQ(uint32_t(grader.Report().Grade(2)),
+                                  uint32_t(floor),
+                                  "the marked spine grades the floor");
+            NS_TEST_EXPECT_MSG_EQ(uint32_t(grader.Report().Grade(0)),
+                                  3u,
+                                  "an unmarked spine keeps the top grade");
+        }
+    }
+
+    // The switch_queue path's values: the marked fraction and the delay are
+    // floored, the loss fraction's grade and the loss hold are not.
+    void PathValues()
+    {
+        std::vector<SpineGrader::SpineValues> values(kSpines);
+        values[1].markFraction = 0.9;
+        values[2].lossFraction = 0.8;
+        values[3].lossFraction = 0.9;
+        values[4].delayNs = 9000;
+        std::vector<bool> held(kSpines, false);
+        held[5] = true;
+        for (const uint8_t floor : {0, 1})
+        {
+            SpineGrader::Parameters parameters = GraderFixture::Absolute(true);
+            parameters.congestionGradeFloor = floor;
+            const SpineReport report = SpineGrader(parameters).Graded(values, held, 0.875);
+            NS_TEST_EXPECT_MSG_EQ(uint32_t(report.Grade(1)),
+                                  uint32_t(floor),
+                                  "the marked fraction's grade is floored");
+            NS_TEST_EXPECT_MSG_EQ(uint32_t(report.Grade(2)),
+                                  0u,
+                                  "the loss fraction's grade is not");
+            NS_TEST_EXPECT_MSG_EQ(uint32_t(report.Grade(3)), 0u, "nor the loss hold");
+            NS_TEST_EXPECT_MSG_EQ(uint32_t(report.Grade(4)),
+                                  uint32_t(floor),
+                                  "the delay's grade is floored");
+            NS_TEST_EXPECT_MSG_EQ(uint32_t(report.Grade(5)), 0u, "a held spine grades 0");
+            NS_TEST_EXPECT_MSG_EQ(uint32_t(report.Grade(0)), 3u, "a clean spine grades 3");
+        }
+    }
+
+    // A report floored at 1 meets the sender's loss grade of 0, and the
+    // lower stands.
+    void SenderLoss()
+    {
+        SpineScores::Parameters parameters = ScoresFixture::Defaults();
+        parameters.lossThresholds = std::array<double, 3>{0.1, 0.25, 0.5};
+        SpineScores scores(kSpines, parameters);
+        for (uint32_t i = 0; i < 10; ++i)
+        {
+            scores.OnSend(3, 1000);
+            scores.OnSend(4, 1000);
+            if (i < 6)
+            {
+                scores.OnLoss(3, 1000);
+            }
+        }
+        std::vector<uint8_t> grades(kSpines, 3);
+        grades[3] = 1;
+        grades[4] = 1;
+        scores.OnReport(ScoresFixture::Report(1, grades), ScoresFixture::kInterval);
+        NS_TEST_EXPECT_MSG_EQ(scores.Held(3), true, "the loss grade of 0 holds the spine");
+        NS_TEST_EXPECT_MSG_EQ(scores.Held(4), false, "the floored grade alone does not");
     }
 };
 
@@ -6975,6 +7089,3243 @@ class SpinePoolHoldPropagationTest : public TestCase
     }
 };
 
+/**
+ * Scores used as a loss hold alone, as RdmaHw makes them under PathSelector
+ * RepsHold: eight spines, a loss interval and sentinel interval of 10 us, the
+ * loss thresholds 0.1, 0.25 and 0.5, and a hold of three clean sentinels.
+ */
+class LossHoldFixture
+{
+  public:
+    static constexpr uint32_t kSpines = 8;
+    static constexpr uint64_t kInterval = 10000;
+    static constexpr uint32_t kClean = 3;
+
+    static Ptr<RdmaHw> Hw()
+    {
+        Ptr<RdmaHw> hw = CreateObject<RdmaHw>();
+        hw->m_spineCount = kSpines;
+        hw->m_loadBalancing = static_cast<uint32_t>(LoadBalancingMode::SprayUniform);
+        hw->m_pathSelectorKind = static_cast<uint32_t>(PathSelectorKind::RepsHold);
+        hw->m_sprayLossThreshold1 = 0.1;
+        hw->m_sprayLossThreshold2 = 0.25;
+        hw->m_sprayLossThreshold3 = 0.5;
+        hw->m_sprayLossIntervalNs = kInterval;
+        hw->m_sprayLossHoldCleanSentinels = kClean;
+        hw->m_sprayHeldExploration = SpineScores::HeldExploration::Sentinel;
+        hw->m_sprayHoldScope = static_cast<uint32_t>(HoldScope::Host);
+        return hw;
+    }
+
+    static std::unique_ptr<RepsHoldSelector> Selector(SpineScores& hold)
+    {
+        return std::make_unique<RepsHoldSelector>(SelectorStream(), 8, 1000000, 20, kSpines, hold);
+    }
+
+    // One send of selector at nowNs, as the transport answers it: a send on a
+    // spine in lossy is declared lost, and of the others every second one is
+    // acknowledged unmarked and the rest marked, so that the buffer drains
+    // and fresh spines are drawn too. The spine sent on.
+    static uint8_t Send(PathSelector& selector,
+                        uint64_t nowNs,
+                        uint32_t step,
+                        const std::set<uint8_t>& lossy)
+    {
+        const uint8_t spine = RequestedSpine(selector.Choose(nowNs));
+        if (lossy.count(spine) > 0)
+        {
+            selector.OnLoss(spine, nowNs);
+        }
+        else
+        {
+            selector.OnAck(spine, step % 2 == 1, nowNs);
+        }
+        return spine;
+    }
+};
+
+class RepsHoldTest : public TestCase
+{
+  public:
+    RepsHoldTest()
+        : TestCase("Under reps_hold a spine whose losses grade it 0 leaves every flow's REPS "
+                   "choices, is sent one sentinel per interval for the host, and returns after "
+                   "the clean sentinels; the policy is refused without its loss hold")
+    {
+    }
+
+    void DoRun() override
+    {
+        Validation();
+        Hold();
+        Simulator::Destroy();
+    }
+
+  private:
+    static constexpr uint32_t kSpines = LossHoldFixture::kSpines;
+    static constexpr uint64_t kInterval = LossHoldFixture::kInterval;
+
+    void Validation()
+    {
+        NS_TEST_EXPECT_MSG_EQ(LossHoldFixture::Hw()->ValidRepsHold(), true, "a full loss hold");
+        NS_TEST_EXPECT_MSG_EQ(CreateObject<RdmaHw>()->ValidRepsHold(), true, "not reps_hold");
+        const std::vector<std::pair<std::function<void(RdmaHw&)>, std::string>> missing = {
+            {[](RdmaHw& hw) {
+                 hw.m_loadBalancing = static_cast<uint32_t>(LoadBalancingMode::EntropyHash);
+             },
+             "entropy values name no spine"},
+            {[](RdmaHw& hw) { hw.m_sprayLossThreshold1 = 0; }, "no loss thresholds"},
+            {[](RdmaHw& hw) { hw.m_sprayLossIntervalNs = 0; }, "no loss interval"},
+            {[](RdmaHw& hw) { hw.m_sprayLossHoldCleanSentinels = 0; }, "no loss hold"},
+            {[](RdmaHw& hw) { hw.m_sprayHeldExploration = SpineScores::HeldExploration::Epsilon; },
+             "no sentinels"},
+        };
+        for (const auto& [unset, message] : missing)
+        {
+            Ptr<RdmaHw> hw = LossHoldFixture::Hw();
+            unset(*hw);
+            NS_TEST_EXPECT_MSG_EQ(hw->ValidRepsHold(), false, "refused: " + message);
+        }
+        Ptr<RdmaHw> hw = LossHoldFixture::Hw();
+        NS_TEST_EXPECT_MSG_EQ(hw->CountsSprayLoss(), true, "the hold counts the sender's losses");
+        hw->m_selective_retransmission = false;
+        NS_TEST_EXPECT_MSG_EQ(hw->ValidSprayLoss(), false, "from selective retransmission's records");
+        const SpineScores::Parameters parameters = hw->LossHoldParameters();
+        NS_TEST_EXPECT_MSG_EQ(parameters.lossIntervalNs, kInterval, "the loss interval");
+        NS_TEST_EXPECT_MSG_EQ(parameters.lossHoldCleanSentinels, 3u, "the clean sentinels");
+    }
+
+    // Two flows of one host share the hold. Over the first interval every
+    // send on spine 3 is lost; over the next three each is sent its
+    // sentinel, which arrives; after the third the spine is chosen again.
+    void Hold()
+    {
+        Ptr<RdmaHw> hw = LossHoldFixture::Hw();
+        SpineScores hold(kSpines, hw->LossHoldParameters());
+        std::unique_ptr<RepsHoldSelector> flows[2] = {LossHoldFixture::Selector(hold),
+                                                      LossHoldFixture::Selector(hold)};
+        uint32_t step = 0;
+        std::vector<uint32_t> onSpine3(5);
+        std::vector<uint32_t> sentinelsByFlow(2);
+        for (uint32_t interval = 0; interval < 5; ++interval)
+        {
+            for (uint32_t i = 0; i < 100; ++i, ++step)
+            {
+                const uint64_t now = interval * kInterval + 100 * i;
+                const std::set<uint8_t> lossy =
+                    interval == 0 ? std::set<uint8_t>{3} : std::set<uint8_t>{};
+                const uint8_t spine =
+                    LossHoldFixture::Send(*flows[step % 2], now, step, lossy);
+                onSpine3[interval] += spine == 3;
+                if (interval >= 1 && interval <= 3 && spine == 3)
+                {
+                    sentinelsByFlow[step % 2]++;
+                }
+            }
+            if (interval == 0)
+            {
+                NS_TEST_EXPECT_MSG_GT(onSpine3[0], 0u, "spine 3 is sent on, and loses");
+            }
+        }
+        NS_TEST_EXPECT_MSG_EQ(onSpine3[1], 1u, "held: one sentinel in the first interval");
+        NS_TEST_EXPECT_MSG_EQ(onSpine3[2], 1u, "and in the second");
+        NS_TEST_EXPECT_MSG_EQ(onSpine3[3], 1u, "and in the third, for the whole host");
+        NS_TEST_EXPECT_MSG_EQ(sentinelsByFlow[0] + sentinelsByFlow[1], 3u, "taken by either flow");
+        NS_TEST_EXPECT_MSG_EQ(hold.Holds(3), false, "three clean sentinels release the spine");
+        NS_TEST_EXPECT_MSG_GT(onSpine3[4], 1u, "and REPS chooses it again");
+    }
+};
+
+class MrcHoldTest : public TestCase
+{
+  public:
+    MrcHoldTest()
+        : TestCase("Under mrc_hold a spine whose losses grade it 0 leaves every flow's MRC "
+                   "choices, is sent one sentinel per interval for the host, and returns after "
+                   "the clean sentinels; the policy is refused without its loss hold")
+    {
+    }
+
+    void DoRun() override
+    {
+        Validation();
+        Hold();
+        Simulator::Destroy();
+    }
+
+  private:
+    static constexpr uint32_t kSpines = LossHoldFixture::kSpines;
+    static constexpr uint64_t kInterval = LossHoldFixture::kInterval;
+
+    static Ptr<RdmaHw> Hw()
+    {
+        Ptr<RdmaHw> hw = LossHoldFixture::Hw();
+        hw->m_pathSelectorKind = static_cast<uint32_t>(PathSelectorKind::MrcHold);
+        return hw;
+    }
+
+    void Validation()
+    {
+        Ptr<RdmaHw> full = Hw();
+        NS_TEST_EXPECT_MSG_EQ(full->ValidRepsHold(), true, "a full loss hold");
+        NS_TEST_EXPECT_MSG_EQ(full->IsRepsHold(), true, "mrc_hold keeps reps_hold's loss hold");
+        NS_TEST_EXPECT_MSG_EQ(full->CountsSprayLoss(), true, "and counts the sender's losses");
+        const std::vector<std::pair<std::function<void(RdmaHw&)>, std::string>> missing = {
+            {[](RdmaHw& hw) {
+                 hw.m_loadBalancing = static_cast<uint32_t>(LoadBalancingMode::EntropyHash);
+             },
+             "entropy values name no spine"},
+            {[](RdmaHw& hw) { hw.m_sprayLossThreshold1 = 0; }, "no loss thresholds"},
+            {[](RdmaHw& hw) { hw.m_sprayLossIntervalNs = 0; }, "no loss interval"},
+            {[](RdmaHw& hw) { hw.m_sprayLossHoldCleanSentinels = 0; }, "no loss hold"},
+            {[](RdmaHw& hw) { hw.m_sprayHeldExploration = SpineScores::HeldExploration::Epsilon; },
+             "no sentinels"},
+            {[](RdmaHw& hw) { hw.m_sprayHoldScope = static_cast<uint32_t>(HoldScope::Leaf); },
+             "leaf scope without the hosts' leaves"},
+            {[](RdmaHw& hw) { hw.m_sprayHoldScope = static_cast<uint32_t>(HoldScope::Auto); },
+             "auto scope without the hosts' leaves"},
+        };
+        for (const auto& [unset, message] : missing)
+        {
+            Ptr<RdmaHw> hw = Hw();
+            unset(*hw);
+            NS_TEST_EXPECT_MSG_EQ(hw->ValidRepsHold(), false, "refused: " + message);
+        }
+    }
+
+    // Two flows of one host share the host's hold, made by StartPathSelection.
+    // Over the first interval every send on spine 3, data or probe, is lost,
+    // which also takes spine 3 out of MRC's service; from the second on
+    // spine 3's probes are answered, which returns it to MRC, but the hold
+    // keeps it out of every choice but its sentinel, one per interval for the
+    // host, until three clean sentinels release it.
+    void Hold()
+    {
+        Ptr<RdmaHw> hw = Hw();
+        hw->SetAttribute("Mtu", UintegerValue(1000));
+        hw->SetAttribute("PathRandomVariable", PointerValue(SelectorStream()));
+        hw->m_retransmission_timeout_ns = 2000;
+        std::vector<Ptr<RdmaQueuePair>> qps;
+        for (const char* destination : {"11.0.2.1", "11.0.3.1"})
+        {
+            qps.push_back(CreateObject<RdmaQueuePair>(
+                3, Ipv4Address("11.0.1.1"), Ipv4Address(destination), 10000, 100));
+            hw->StartPathSelection(qps.back(), 0, 1000);
+            NS_TEST_EXPECT_MSG_NE(dynamic_cast<MrcHoldSelector*>(qps.back()->m_pathSelector.get()),
+                                  nullptr,
+                                  "MRC over spines with the hold");
+        }
+        NS_TEST_EXPECT_MSG_NE(hw->m_senderSpineScores.get(), nullptr, "one hold for the host");
+        SpineScores& hold = *hw->m_senderSpineScores;
+        uint32_t step = 0;
+        std::vector<uint32_t> onSpine3(5);
+        std::vector<uint32_t> sentinelsByFlow(2);
+        uint32_t probesAnswered = 0;
+        bool probesNameSpines = true;
+        for (uint32_t interval = 0; interval < 5; ++interval)
+        {
+            for (uint32_t i = 0; i < 100; ++i, ++step)
+            {
+                const uint64_t now = interval * kInterval + 100 * i;
+                PathSelector& flow = *qps[step % 2]->m_pathSelector;
+                uint16_t probed;
+                if (flow.TakeProbe(now, probed))
+                {
+                    const uint8_t spine = RequestedSpine(probed);
+                    probesNameSpines = probesNameSpines && spine < kSpines &&
+                                       CarryingSpine(probed) == spine;
+                    if (interval > 0)
+                    {
+                        flow.OnProbeAnswer(spine, false, now);
+                        probesAnswered += spine == 3;
+                    }
+                }
+                const std::set<uint8_t> lossy =
+                    interval == 0 ? std::set<uint8_t>{3} : std::set<uint8_t>{};
+                const uint8_t spine = LossHoldFixture::Send(flow, now, step / 2, lossy);
+                onSpine3[interval] += spine == 3;
+                if (interval >= 1 && interval <= 3 && spine == 3)
+                {
+                    sentinelsByFlow[step % 2]++;
+                }
+            }
+            if (interval == 0)
+            {
+                NS_TEST_EXPECT_MSG_GT(onSpine3[0], 0u, "spine 3 is sent on, and loses");
+            }
+        }
+        NS_TEST_EXPECT_MSG_EQ(probesNameSpines, true, "a probe names the spine it probes");
+        NS_TEST_EXPECT_MSG_GT(probesAnswered, 0u, "spine 3's probes are answered while held");
+        NS_TEST_EXPECT_MSG_EQ(onSpine3[1], 1u, "held: one sentinel in the first interval");
+        NS_TEST_EXPECT_MSG_EQ(onSpine3[2], 1u, "and in the second");
+        NS_TEST_EXPECT_MSG_EQ(onSpine3[3], 1u, "and in the third, for the whole host");
+        NS_TEST_EXPECT_MSG_EQ(sentinelsByFlow[0] + sentinelsByFlow[1], 3u, "taken by either flow");
+        NS_TEST_EXPECT_MSG_EQ(hold.Holds(3), false, "three clean sentinels release the spine");
+        NS_TEST_EXPECT_MSG_GT(onSpine3[4], 1u, "and MRC chooses it again");
+    }
+};
+
+class MrcHoldExplorationTest : public TestCase
+{
+  public:
+    MrcHoldExplorationTest()
+        : TestCase("Under mrc_hold a receiver-held spine leaves MRC's choices and is sent the "
+                   "receivers' sentinel, a copy under SpraySentinelMode duplicate; a copy of a "
+                   "data packet goes up the held spine with that spine's own path sequence")
+    {
+    }
+
+    void DoRun() override
+    {
+        ReceiverHold(SentinelMode::Data);
+        ReceiverHold(SentinelMode::Duplicate);
+        Duplicate();
+        Simulator::Destroy();
+    }
+
+  private:
+    static constexpr uint32_t kSpines = LossHoldFixture::kSpines;
+    static constexpr uint64_t kInterval = LossHoldFixture::kInterval;
+    static constexpr uint64_t kSentinelNs = 100000;
+    static constexpr uint32_t kReceiverLeaf = 2;
+
+    static Ptr<RdmaHw> Hw(SentinelMode mode)
+    {
+        Ptr<RdmaHw> hw = LossHoldFixture::Hw();
+        hw->m_pathSelectorKind = static_cast<uint32_t>(PathSelectorKind::MrcHold);
+        hw->m_spraySentinelMode = static_cast<uint32_t>(mode);
+        return hw;
+    }
+
+    struct Sends
+    {
+        std::vector<uint32_t> live = std::vector<uint32_t>(kSpines, 0);
+        std::vector<uint32_t> copies = std::vector<uint32_t>(kSpines, 0);
+        uint32_t explorations = 0;
+    };
+
+    // count sends from nowNs, each answered clean, its copy too.
+    static Sends Draw(PathSelector& selector, uint64_t nowNs, uint32_t count)
+    {
+        Sends sends;
+        for (uint32_t i = 0; i < count; ++i)
+        {
+            const uint64_t now = nowNs + 10 * i;
+            const uint8_t spine = RequestedSpine(selector.Choose(now));
+            sends.live[spine]++;
+            sends.explorations += selector.ChoseExploration();
+            uint8_t copySpine;
+            bool trickle;
+            if (selector.TakeCopy(copySpine, trickle))
+            {
+                sends.copies[copySpine]++;
+                selector.OnAck(copySpine, false, now);
+            }
+            selector.OnAck(spine, false, now);
+        }
+        return sends;
+    }
+
+    // A receiver on kReceiverLeaf holds spine 3; the loss hold holds nothing.
+    void ReceiverHold(SentinelMode mode)
+    {
+        const bool duplicate = mode == SentinelMode::Duplicate;
+        const std::string which = duplicate ? "duplicate: " : "data: ";
+        Ptr<RdmaHw> hw = Hw(mode);
+        SpineScores hold(kSpines, hw->LossHoldParameters());
+        MrcHoldSelector selector(SelectorStream(), kSpines, 1000, 2000, hold);
+        selector.SetReceiverHold(std::make_shared<ReceiverHoldMarks>(kSpines, kSentinelNs),
+                                 kReceiverLeaf);
+        selector.OnReceiverHold(100, 0x08, 0);
+        Sends sends = Draw(selector, 0, 400);
+        NS_TEST_EXPECT_MSG_EQ(sends.live[3], 0u, which + "the held spine leaves MRC's choices");
+        NS_TEST_EXPECT_MSG_EQ(sends.explorations, 0u, which + "no sentinel before its interval");
+        sends = Draw(selector, kSentinelNs, 400);
+        // One receivers' sentinel in the interval: the data packet itself,
+        // or a copy, beside a data packet that is no exploration send.
+        NS_TEST_EXPECT_MSG_EQ(sends.live[3], duplicate ? 0u : 1u, which + "one sentinel on 3");
+        NS_TEST_EXPECT_MSG_EQ(sends.copies[3], duplicate ? 1u : 0u, which + "a copy under duplicate");
+        NS_TEST_EXPECT_MSG_EQ(sends.explorations, duplicate ? 0u : 1u, which + "the data's flag");
+        selector.OnReceiverHold(100, 0x00, 2 * kSentinelNs);
+        sends = Draw(selector, 2 * kSentinelNs, 400);
+        NS_TEST_EXPECT_MSG_GT(sends.live[3], 10u, which + "a clear bit returns it to MRC");
+    }
+
+    // Through the transport: spine 3 is held by the host's loss hold, so each
+    // interval's sentinel is a copy of a data packet sent on MRC's choice.
+    void Duplicate()
+    {
+        const IntHeader::Mode savedIntMode = IntHeader::mode;
+        const bool savedPathSeq = CustomHeader::udpCarriesPathSeq;
+        const bool savedPacketSeq = CustomHeader::ackCarriesPacketSeq;
+        IntHeader::mode = IntHeader::NONE;
+        CustomHeader::udpCarriesPathSeq = true;
+        CustomHeader::ackCarriesPacketSeq = true;
+
+        IsolatedHost sender(LoadBalancingMode::SprayUniform, kTestReceiver, kSpines);
+        Ptr<RdmaHw> hw = sender.hw;
+        hw->m_pathSelectorKind = static_cast<uint32_t>(PathSelectorKind::MrcHold);
+        hw->m_sprayHoldScope = static_cast<uint32_t>(HoldScope::Host);
+        hw->m_sprayLossThreshold1 = 0.1;
+        hw->m_sprayLossThreshold2 = 0.25;
+        hw->m_sprayLossThreshold3 = 0.5;
+        hw->m_sprayLossIntervalNs = kInterval;
+        hw->m_sprayLossHoldCleanSentinels = LossHoldFixture::kClean;
+        hw->m_sprayHeldExploration = SpineScores::HeldExploration::Sentinel;
+        hw->m_spraySentinelMode = static_cast<uint32_t>(SentinelMode::Duplicate);
+        hw->m_sprayPathSeq = true;
+        NS_TEST_EXPECT_MSG_EQ(hw->ValidRepsHold(), true, "a valid hold");
+        NS_TEST_EXPECT_MSG_EQ(hw->ValidPathSeq(), true, "path sequences under mrc_hold");
+        Ptr<RdmaQueuePair> qp =
+            sender.AddSender(kTestSender, kTestReceiver, 100 * IsolatedHost::kMtu);
+        NS_TEST_EXPECT_MSG_NE(dynamic_cast<MrcHoldSelector*>(qp->m_pathSelector.get()),
+                              nullptr,
+                              "MRC over spines with the hold");
+        SpineScores& hold = *hw->m_senderSpineScores;
+        for (uint32_t i = 0; i < 20; ++i)
+        {
+            hold.CountIntervalSend(3, 100 + i);
+        }
+        for (uint32_t i = 0; i < 10; ++i)
+        {
+            hold.CountIntervalLoss(3, 200 + i);
+        }
+
+        std::vector<uint16_t> nextLive(kSpines, 0);
+        bool liveInOrder = true;
+        uint32_t liveOn3 = 0;
+        std::vector<uint16_t> copyPathSeqs;
+        bool copiesMatch = true;
+        for (uint32_t interval = 1; interval <= 3; ++interval)
+        {
+            for (uint32_t i = 0; i < 5; ++i)
+            {
+                Simulator::Schedule(NanoSeconds(interval * kInterval + 100 * i), [&]() {
+                    const size_t before = sender.emitted.size();
+                    CustomHeader live(CustomHeader::L2_Header | CustomHeader::L3_Header |
+                                      CustomHeader::L4_Header);
+                    hw->GetNxtPacket(qp)->PeekHeader(live);
+                    const uint8_t spine = RequestedSpine(live.ipid);
+                    liveOn3 += spine == 3;
+                    liveInOrder = liveInOrder && live.udp.path_seq == nextLive[spine]++;
+                    if (sender.emitted.size() > before)
+                    {
+                        const CustomHeader& copy = sender.emitted.back();
+                        copiesMatch = copiesMatch && copy.udp.seq == live.udp.seq &&
+                                      RequestedSpine(copy.ipid) == 3;
+                        copyPathSeqs.push_back(copy.udp.path_seq);
+                    }
+                });
+            }
+        }
+        Simulator::Run();
+        NS_TEST_EXPECT_MSG_EQ(liveOn3, 0u, "no data packet goes up the held spine");
+        NS_TEST_EXPECT_MSG_EQ(liveInOrder, true, "the data packets' path sequences skip nothing");
+        NS_TEST_EXPECT_MSG_EQ(copiesMatch, true, "each copy is its data packet on spine 3");
+        NS_TEST_ASSERT_MSG_EQ(copyPathSeqs.size(), 3u, "one copy per interval for the host");
+        for (uint16_t i = 0; i < 3; ++i)
+        {
+            NS_TEST_EXPECT_MSG_EQ(copyPathSeqs[i], i, "each copy carries spine 3's path sequence");
+        }
+        NS_TEST_EXPECT_MSG_EQ(qp->m_exploration_copies, 3u, "each copy with its record");
+
+        CustomHeader::udpCarriesPathSeq = savedPathSeq;
+        CustomHeader::ackCarriesPacketSeq = savedPacketSeq;
+        IntHeader::mode = savedIntMode;
+        Simulator::Destroy();
+    }
+};
+
+class RepsFlowHoldTest : public TestCase
+{
+  public:
+    RepsFlowHoldTest()
+        : TestCase("Under reps_flow_hold each queue pair keeps its own loss hold: a spine one "
+                   "flow loses on leaves that flow's choices alone, and is sent that flow's "
+                   "sentinels; under reps_hold the queue pairs share the host's")
+    {
+    }
+
+    void DoRun() override
+    {
+        Ptr<RdmaHw> shared = Hw(PathSelectorKind::RepsHold);
+        Ptr<RdmaQueuePair> first = Qp(shared, 10000);
+        Ptr<RdmaQueuePair> second = Qp(shared, 10001);
+        NS_TEST_EXPECT_MSG_NE(shared->m_senderSpineScores.get(),
+                              nullptr,
+                              "reps_hold makes the host's loss hold");
+
+        Ptr<RdmaHw> hw = Hw(PathSelectorKind::RepsFlowHold);
+        NS_TEST_EXPECT_MSG_EQ(hw->ValidRepsHold(), true, "the loss hold is set");
+        hw->m_sprayLossHoldCleanSentinels = 0;
+        NS_TEST_EXPECT_MSG_EQ(hw->ValidRepsHold(), false, "refused without the loss hold");
+        hw->m_sprayLossHoldCleanSentinels = LossHoldFixture::kClean;
+        hw->m_sprayHeldExploration = SpineScores::HeldExploration::None;
+        NS_TEST_EXPECT_MSG_EQ(hw->ValidRepsHold(), false, "refused without sentinels");
+        hw->m_sprayHeldExploration = SpineScores::HeldExploration::Sentinel;
+        Ptr<RdmaQueuePair> lossy = Qp(hw, 10000);
+        Ptr<RdmaQueuePair> clean = Qp(hw, 10001);
+        NS_TEST_EXPECT_MSG_EQ(hw->m_senderSpineScores.get(),
+                              nullptr,
+                              "reps_flow_hold makes no host-wide hold");
+
+        // Over the first interval every send of the first flow on spine 3 is
+        // lost; the second flow loses nothing.
+        uint32_t step = 0;
+        std::vector<uint32_t> lossyOn3(4);
+        std::vector<uint32_t> cleanOn3(4);
+        for (uint32_t interval = 0; interval < 4; ++interval)
+        {
+            for (uint32_t i = 0; i < 200; ++i, ++step)
+            {
+                const uint64_t now = interval * kInterval + 50 * i;
+                const bool firstFlow = step % 2 == 0;
+                PathSelector& selector =
+                    *(firstFlow ? lossy : clean)->m_pathSelector;
+                const std::set<uint8_t> lost =
+                    firstFlow && interval == 0 ? std::set<uint8_t>{3} : std::set<uint8_t>{};
+                const uint8_t spine = LossHoldFixture::Send(selector, now, step / 2, lost);
+                (firstFlow ? lossyOn3 : cleanOn3)[interval] += spine == 3;
+            }
+        }
+        NS_TEST_EXPECT_MSG_GT(lossyOn3[0], 0u, "the first flow loses on spine 3");
+        for (uint32_t interval = 1; interval < 4; ++interval)
+        {
+            NS_TEST_EXPECT_MSG_EQ(lossyOn3[interval],
+                                  1u,
+                                  "the first flow sends spine 3 its sentinel alone");
+            NS_TEST_EXPECT_MSG_GT(cleanOn3[interval], 1u, "the second flow keeps spine 3");
+        }
+        Simulator::Destroy();
+    }
+
+  private:
+    static constexpr uint64_t kInterval = LossHoldFixture::kInterval;
+
+    static Ptr<RdmaHw> Hw(PathSelectorKind kind)
+    {
+        Ptr<RdmaHw> hw = LossHoldFixture::Hw();
+        hw->m_pathSelectorKind = static_cast<uint32_t>(kind);
+        hw->SetAttribute("Mtu", UintegerValue(1000));
+        hw->SetAttribute("PathRandomVariable", PointerValue(SelectorStream()));
+        return hw;
+    }
+
+    static Ptr<RdmaQueuePair> Qp(Ptr<RdmaHw> hw, uint16_t sport)
+    {
+        Ptr<RdmaQueuePair> qp = CreateObject<RdmaQueuePair>(
+            3, Ipv4Address("11.0.1.1"), Ipv4Address("11.0.2.1"), sport, 100);
+        hw->StartPathSelection(qp, 0, 0);
+        return qp;
+    }
+};
+
+class RepsHoldScopeTest : public TestCase
+{
+  public:
+    RepsHoldScopeTest()
+        : TestCase("Under reps_hold with SprayHoldScope leaf a spine lost on toward one leaf is "
+                   "held for that leaf's destinations alone, with one sentinel per interval for "
+                   "the leaf; the scope needs the hosts' leaves")
+    {
+    }
+
+    void DoRun() override
+    {
+        Ptr<RdmaHw> unset = CreateObject<RdmaHw>();
+        UintegerValue scope;
+        unset->GetAttribute("SprayHoldScope", scope);
+        NS_TEST_EXPECT_MSG_EQ(scope.Get(),
+                              static_cast<uint32_t>(HoldScope::Auto),
+                              "SprayHoldScope is auto by default");
+
+        Ptr<RdmaHw> hw = LossHoldFixture::Hw();
+        hw->m_sprayHoldScope = static_cast<uint32_t>(HoldScope::Leaf);
+        hw->SetAttribute("Mtu", UintegerValue(1000));
+        hw->SetAttribute("PathRandomVariable", PointerValue(SelectorStream()));
+        NS_TEST_EXPECT_MSG_EQ(hw->ValidRepsHold(), false, "refused without the hosts' leaves");
+        hw->m_switchQueues = Create<SwitchQueueState>(2, LossHoldFixture::kSpines);
+        hw->m_switchQueues->SetLeafOf(Ipv4Address("11.0.2.1").Get(), 0);
+        hw->m_switchQueues->SetLeafOf(Ipv4Address("11.0.3.1").Get(), 0);
+        hw->m_switchQueues->SetLeafOf(Ipv4Address("11.0.4.1").Get(), 1);
+        NS_TEST_EXPECT_MSG_EQ(hw->ValidRepsHold(), true, "accepted with them");
+        // Two destinations on leaf 0, the first lossy on spine 3 over the
+        // first interval, and one on leaf 1.
+        std::vector<Ptr<RdmaQueuePair>> qps;
+        for (const char* destination : {"11.0.2.1", "11.0.3.1", "11.0.4.1"})
+        {
+            qps.push_back(CreateObject<RdmaQueuePair>(
+                3, Ipv4Address("11.0.1.1"), Ipv4Address(destination), 10000, 100));
+            hw->StartPathSelection(qps.back(), 0, 0);
+        }
+        NS_TEST_EXPECT_MSG_EQ(hw->m_leafHolds.size(), 2u, "one hold per destination leaf");
+        NS_TEST_EXPECT_MSG_EQ(hw->m_senderSpineScores.get(), nullptr, "and none for the host");
+
+        uint32_t step = 0;
+        std::vector<std::vector<uint32_t>> on3(3, std::vector<uint32_t>(4));
+        for (uint32_t interval = 0; interval < 4; ++interval)
+        {
+            for (uint32_t i = 0; i < 300; ++i, ++step)
+            {
+                const uint32_t flow = step % 3;
+                const uint64_t now = interval * kInterval + 30 * i;
+                const std::set<uint8_t> lost =
+                    flow == 0 && interval == 0 ? std::set<uint8_t>{3} : std::set<uint8_t>{};
+                const uint8_t spine =
+                    LossHoldFixture::Send(*qps[flow]->m_pathSelector, now, step / 3, lost);
+                on3[flow][interval] += spine == 3;
+            }
+        }
+        NS_TEST_EXPECT_MSG_GT(on3[0][0], 0u, "the flow to leaf 0 loses on spine 3");
+        NS_TEST_EXPECT_MSG_EQ(hw->m_leafHolds.at(0).Holds(3), true, "leaf 0's hold holds it");
+        NS_TEST_EXPECT_MSG_EQ(hw->m_leafHolds.at(1).Holds(3), false, "leaf 1's does not");
+        for (uint32_t interval = 1; interval < 4; ++interval)
+        {
+            NS_TEST_EXPECT_MSG_EQ(on3[0][interval] + on3[1][interval],
+                                  1u,
+                                  "leaf 0's destinations send spine 3 one sentinel");
+            NS_TEST_EXPECT_MSG_GT(on3[2][interval], 1u, "leaf 1's destination keeps spine 3");
+        }
+        Simulator::Destroy();
+    }
+
+  private:
+    static constexpr uint64_t kInterval = LossHoldFixture::kInterval;
+};
+
+class RepsHoldAutoScopeTest : public TestCase
+{
+  public:
+    RepsHoldAutoScopeTest()
+        : TestCase("Under reps_hold with SprayHoldScope auto a spine lost on toward one leaf is "
+                   "held for that leaf alone, widens to every destination at a loss toward a "
+                   "second leaf, is sent one sentinel per interval for the host, and returns "
+                   "after the clean sentinels")
+    {
+    }
+
+    void DoRun() override
+    {
+        Ptr<RdmaHw> unset = CreateObject<RdmaHw>();
+        UintegerValue leaves;
+        unset->GetAttribute("SprayHoldAutoLeaves", leaves);
+        NS_TEST_EXPECT_MSG_EQ(leaves.Get(), 2u, "SprayHoldAutoLeaves is 2 by default");
+
+        Ptr<RdmaHw> hw = LossHoldFixture::Hw();
+        hw->m_sprayHoldScope = static_cast<uint32_t>(HoldScope::Auto);
+        hw->m_sprayHoldAutoLeaves = 2;
+        hw->SetAttribute("Mtu", UintegerValue(1000));
+        hw->SetAttribute("PathRandomVariable", PointerValue(SelectorStream()));
+        NS_TEST_EXPECT_MSG_EQ(hw->ValidRepsHold(), false, "refused without the hosts' leaves");
+        hw->m_switchQueues = Create<SwitchQueueState>(2, LossHoldFixture::kSpines);
+        hw->m_switchQueues->SetLeafOf(Ipv4Address("11.0.2.1").Get(), 0);
+        hw->m_switchQueues->SetLeafOf(Ipv4Address("11.0.4.1").Get(), 1);
+        NS_TEST_EXPECT_MSG_EQ(hw->ValidRepsHold(), true, "accepted with them");
+        std::map<uint32_t, uint32_t> intervals;
+        std::map<uint32_t, uint32_t> hostHeldRows;
+        hw->TraceConnectWithoutContext(
+            "LeafSpineLossInterval",
+            Callback<void,
+                     uint32_t,
+                     uint64_t,
+                     const std::vector<uint32_t>&,
+                     const std::vector<uint32_t>&,
+                     const std::vector<uint8_t>&>(
+                [&](uint32_t leaf,
+                    uint64_t,
+                    const std::vector<uint32_t>&,
+                    const std::vector<uint32_t>&,
+                    const std::vector<uint8_t>& grades) {
+                    intervals[leaf]++;
+                    hostHeldRows[leaf] += hw->m_autoHold->HostHolds(3) && grades[3] == 0;
+                }));
+        // One destination on leaf 0, lossy on spine 3 over interval 0, and
+        // one on leaf 1, whose first send on spine 3 in interval 2 is lost.
+        std::vector<Ptr<RdmaQueuePair>> qps;
+        for (const char* destination : {"11.0.2.1", "11.0.4.1"})
+        {
+            qps.push_back(CreateObject<RdmaQueuePair>(
+                3, Ipv4Address("11.0.1.1"), Ipv4Address(destination), 10000, 100));
+            hw->StartPathSelection(qps.back(), 0, 0);
+        }
+        NS_TEST_EXPECT_MSG_NE(hw->m_autoHold.get(), nullptr, "one hold for the host");
+        NS_TEST_EXPECT_MSG_EQ(hw->m_leafHolds.size(), 0u, "and no leaf's own");
+        AutoLossHold& hold = *hw->m_autoHold;
+
+        uint32_t step = 0;
+        bool loseToLeaf1 = false;
+        std::vector<std::vector<uint32_t>> on3(2, std::vector<uint32_t>(kIntervals));
+        for (uint32_t interval = 0; interval < kIntervals; ++interval)
+        {
+            loseToLeaf1 = interval == 2;
+            for (uint32_t i = 0; i < 300; ++i, ++step)
+            {
+                const uint32_t flow = step % 2;
+                const uint64_t now = interval * kInterval + 30 * i;
+                const bool lossy = flow == 0 ? interval == 0 : loseToLeaf1;
+                const uint8_t spine = LossHoldFixture::Send(
+                    *qps[flow]->m_pathSelector,
+                    now,
+                    step / 2,
+                    lossy ? std::set<uint8_t>{3} : std::set<uint8_t>{});
+                on3[flow][interval] += spine == 3;
+                if (flow == 1 && spine == 3 && loseToLeaf1)
+                {
+                    loseToLeaf1 = false;
+                    NS_TEST_EXPECT_MSG_EQ(hold.HostHolds(3),
+                                          true,
+                                          "the loss toward leaf 1 widens the hold at once");
+                }
+            }
+            if (interval == 1)
+            {
+                NS_TEST_EXPECT_MSG_EQ(hold.Holds(0, 3), true, "spine 3 is held toward leaf 0");
+                NS_TEST_EXPECT_MSG_EQ(hold.Holds(1, 3), false, "and not toward leaf 1");
+                NS_TEST_EXPECT_MSG_EQ(hold.HostHolds(3), false, "nor for the host");
+                NS_TEST_EXPECT_MSG_EQ(hold.LossLeaves(3), 1u, "one leaf has a loss on it");
+            }
+            if (interval == 4)
+            {
+                NS_TEST_EXPECT_MSG_EQ(hold.Holds(0, 3), true, "held toward leaf 0");
+                NS_TEST_EXPECT_MSG_EQ(hold.Holds(1, 3), true, "and toward leaf 1");
+                NS_TEST_EXPECT_MSG_EQ(hold.LossLeaves(3), 2u, "two leaves have a loss on it");
+            }
+        }
+        NS_TEST_EXPECT_MSG_GT(on3[0][0], 0u, "the flow to leaf 0 loses on spine 3");
+        NS_TEST_EXPECT_MSG_EQ(on3[0][1], 1u, "leaf 0 sends spine 3 one sentinel");
+        NS_TEST_EXPECT_MSG_GT(on3[1][1], 1u, "leaf 1 keeps spine 3");
+        NS_TEST_EXPECT_MSG_GT(on3[1][2], 0u, "leaf 1 sends on spine 3 and loses");
+        for (uint32_t interval = 3; interval < 6; ++interval)
+        {
+            NS_TEST_EXPECT_MSG_EQ(on3[0][interval] + on3[1][interval],
+                                  1u,
+                                  "the host sends spine 3 one sentinel");
+        }
+        // Interval 2 saw a loss; the sentinels of 3 to 5 are the clean sends,
+        // and interval 5's close releases spine 3 everywhere.
+        NS_TEST_EXPECT_MSG_EQ(hold.HostHolds(3), false, "the clean sentinels release it");
+        NS_TEST_EXPECT_MSG_EQ(hold.Holds(0, 3), false, "toward leaf 0");
+        NS_TEST_EXPECT_MSG_EQ(hold.Holds(1, 3), false, "and toward leaf 1");
+        NS_TEST_EXPECT_MSG_EQ(hold.LossLeaves(3), 0u, "and clears its leaves");
+        NS_TEST_EXPECT_MSG_GT(on3[0][6], 1u, "leaf 0 chooses spine 3 again");
+        NS_TEST_EXPECT_MSG_GT(on3[1][6], 1u, "and so does leaf 1");
+        NS_TEST_EXPECT_MSG_GT(intervals[0], 0u, "leaf 0's intervals are traced");
+        NS_TEST_EXPECT_MSG_EQ(intervals[0], intervals[1], "as many as leaf 1's");
+        NS_TEST_EXPECT_MSG_GT(hostHeldRows[1], 0u, "leaf 1's rows grade the host hold 0");
+        Simulator::Destroy();
+    }
+
+  private:
+    static constexpr uint64_t kInterval = LossHoldFixture::kInterval;
+    static constexpr uint32_t kIntervals = 7;
+};
+
+class RepsHoldLlrTest : public TestCase
+{
+  public:
+    RepsHoldLlrTest()
+        : TestCase("Under SprayHoldRule llr a hold key's likelihood ratio holds a spine at the "
+                   "loss that reaches its threshold: with SprayLossP0 zero at the first loss, "
+                   "with it above zero after enough losses close together, and a clean stretch "
+                   "decays the ratio to zero; the auto scope's leaves still choose the scope")
+    {
+    }
+
+    void DoRun() override
+    {
+        Validation();
+        FirstLoss();
+        Threshold();
+        AutoScope();
+        Simulator::Destroy();
+    }
+
+  private:
+    static constexpr uint32_t kSpines = LossHoldFixture::kSpines;
+    static constexpr uint64_t kInterval = LossHoldFixture::kInterval;
+
+    static Ptr<RdmaHw> Hw(double p0, double p1)
+    {
+        Ptr<RdmaHw> hw = LossHoldFixture::Hw();
+        hw->m_sprayHoldRule = static_cast<uint32_t>(HoldRule::Llr);
+        hw->m_sprayLossP0 = p0;
+        hw->m_sprayLossP1 = p1;
+        return hw;
+    }
+
+    void Validation()
+    {
+        Ptr<RdmaHw> unset = CreateObject<RdmaHw>();
+        UintegerValue rule;
+        unset->GetAttribute("SprayHoldRule", rule);
+        NS_TEST_EXPECT_MSG_EQ(rule.Get(),
+                              static_cast<uint32_t>(HoldRule::Count),
+                              "SprayHoldRule is count by default");
+        DoubleValue value;
+        unset->GetAttribute("SprayLossP0", value);
+        NS_TEST_EXPECT_MSG_EQ(value.Get(), 0.0, "SprayLossP0 is 0 by default");
+        unset->GetAttribute("SprayLossP1", value);
+        NS_TEST_EXPECT_MSG_EQ(value.Get(), 0.001, "SprayLossP1 is 0.001 by default");
+        unset->GetAttribute("SprayHoldAlpha", value);
+        NS_TEST_EXPECT_MSG_EQ(value.Get(), 0.001, "SprayHoldAlpha is 0.001 by default");
+        unset->GetAttribute("SprayHoldBeta", value);
+        NS_TEST_EXPECT_MSG_EQ(value.Get(), 0.001, "SprayHoldBeta is 0.001 by default");
+        NS_TEST_EXPECT_MSG_EQ(unset->ValidHoldRule(), true, "count needs nothing");
+        NS_TEST_EXPECT_MSG_EQ(Hw(0, 0.001)->ValidHoldRule(), true, "llr under reps_hold");
+        NS_TEST_EXPECT_MSG_EQ((Hw(0, 0.001)->LossHoldParameters().holdRule == HoldRule::Llr),
+                              true,
+                              "the hold's parameters carry the rule");
+        const std::vector<std::pair<std::function<void(RdmaHw&)>, std::string>> refused = {
+            {[](RdmaHw& hw) {
+                 hw.m_pathSelectorKind = static_cast<uint32_t>(PathSelectorKind::Reps);
+             },
+             "not reps_hold"},
+            {[](RdmaHw& hw) { hw.m_sprayLossP0 = hw.m_sprayLossP1; }, "p0 not below p1"},
+            {[](RdmaHw& hw) { hw.m_sprayLossP1 = 1; }, "p1 at 1"},
+            {[](RdmaHw& hw) { hw.m_sprayHoldAlpha = 0.5; }, "alpha at 0.5"},
+            {[](RdmaHw& hw) { hw.m_sprayHoldBeta = 0; }, "beta at 0"},
+        };
+        for (const auto& [set, message] : refused)
+        {
+            Ptr<RdmaHw> hw = Hw(0, 0.001);
+            set(*hw);
+            NS_TEST_EXPECT_MSG_EQ(hw->ValidHoldRule(), false, "refused: " + message);
+        }
+    }
+
+    // With p0 zero a loss adds +infinity: the first loss holds the spine at
+    // once, a send adds nothing, and the clean sentinels release it as under
+    // count, restarting the test.
+    void FirstLoss()
+    {
+        Ptr<RdmaHw> hw = Hw(0, 0.001);
+        SpineScores hold(kSpines, hw->LossHoldParameters());
+        for (uint32_t i = 0; i < 50; ++i)
+        {
+            hold.CountIntervalSend(3, 10 * i);
+        }
+        NS_TEST_EXPECT_MSG_EQ(hold.LossRatio(3), 0.0, "a send adds nothing");
+        hold.CountIntervalSend(3, 600);
+        hold.CountIntervalLoss(3, 600);
+        NS_TEST_EXPECT_MSG_EQ(hold.Holds(3), true, "the first loss holds at once");
+        NS_TEST_EXPECT_MSG_EQ(std::isinf(hold.LossRatio(3)), true, "L is +infinity");
+        // Interval 0 saw the loss; one clean sentinel, acknowledged, in each
+        // of the next three releases the spine at the close of the third.
+        uint8_t spine = kSpines;
+        for (uint32_t interval = 1; interval <= 3; ++interval)
+        {
+            const uint64_t now = interval * kInterval + 1;
+            NS_TEST_EXPECT_MSG_EQ(hold.TakeHoldSentinel(now, spine), true, "a sentinel is due");
+            NS_TEST_EXPECT_MSG_EQ(static_cast<uint32_t>(spine), 3u, "on spine 3");
+            hold.CountIntervalSend(spine, now);
+            hold.CountIntervalAnswer(spine, now + 1);
+        }
+        hold.TakeHoldSentinel(4 * kInterval + 1, spine);
+        NS_TEST_EXPECT_MSG_EQ(hold.Holds(3), false, "three clean sentinels release it");
+        NS_TEST_EXPECT_MSG_EQ(hold.LossRatio(3), 0.0, "and restart its test");
+    }
+
+    // p0 = 1e-4 and p1 = 1e-2, alpha = beta = 0.001: a send adds
+    // ln(0.99 / 0.9999), a loss ln(100), and the threshold is ln(999).
+    void Threshold()
+    {
+        const double p0 = 1e-4;
+        const double p1 = 1e-2;
+        Ptr<RdmaHw> hw = Hw(p0, p1);
+        SpineScores hold(kSpines, hw->LossHoldParameters());
+        const double send = std::log((1 - p1) / (1 - p0));
+        const double loss = std::log(p1 / p0);
+        const double threshold = std::log(0.999 / 0.001);
+        // Ten clean sends, then a lost one: L is clamped at 0 until the loss.
+        for (uint32_t i = 0; i < 11; ++i)
+        {
+            hold.CountIntervalSend(3, i);
+        }
+        hold.CountIntervalLoss(3, 11);
+        double expected = loss;
+        NS_TEST_EXPECT_MSG_EQ_TOL(hold.LossRatio(3), expected, 1e-9, "L after one loss");
+        NS_TEST_EXPECT_MSG_LT(expected, threshold, "below the threshold");
+        NS_TEST_EXPECT_MSG_EQ(hold.Holds(3), false, "one loss does not hold");
+        // Twenty clean sends and a lost one shortly after.
+        for (uint32_t i = 0; i < 21; ++i)
+        {
+            hold.CountIntervalSend(3, 20 + i);
+        }
+        expected += 21 * send;
+        NS_TEST_EXPECT_MSG_EQ_TOL(hold.LossRatio(3), expected, 1e-9, "L after the sends");
+        NS_TEST_EXPECT_MSG_EQ(hold.Holds(3), false, "still below the threshold");
+        hold.CountIntervalLoss(3, 50);
+        expected += loss;
+        NS_TEST_EXPECT_MSG_GT_OR_EQ(expected, threshold, "the second loss reaches it");
+        NS_TEST_EXPECT_MSG_EQ_TOL(hold.LossRatio(3), expected, 1e-9, "L after two losses");
+        NS_TEST_EXPECT_MSG_EQ(hold.Holds(3), true, "and holds the spine");
+
+        // On spine 5 one loss, then a long clean stretch: L falls by -send
+        // per send and reaches 0 after ceil(loss / -send) of them.
+        hold.CountIntervalSend(5, 100);
+        hold.CountIntervalLoss(5, 100);
+        const uint32_t decay = static_cast<uint32_t>(std::ceil(loss / -send));
+        for (uint32_t i = 0; i + 1 < decay; ++i)
+        {
+            hold.CountIntervalSend(5, 200);
+        }
+        NS_TEST_EXPECT_MSG_GT(hold.LossRatio(5), 0.0, "one send short of the decay");
+        hold.CountIntervalSend(5, 200);
+        NS_TEST_EXPECT_MSG_EQ(hold.LossRatio(5), 0.0, "decayed to 0");
+        for (uint32_t i = 0; i < 1000; ++i)
+        {
+            hold.CountIntervalSend(5, 300);
+        }
+        NS_TEST_EXPECT_MSG_EQ(hold.LossRatio(5), 0.0, "and clamped there");
+        hold.CountIntervalLoss(5, 400);
+        NS_TEST_EXPECT_MSG_EQ_TOL(hold.LossRatio(5), loss, 1e-9, "no credit against a loss");
+        NS_TEST_EXPECT_MSG_EQ(hold.Holds(5), false, "which does not hold");
+    }
+
+    // Under auto with p0 zero the first loss toward leaf 0 holds spine 3
+    // toward it alone, and a loss toward leaf 1 widens the hold.
+    void AutoScope()
+    {
+        Ptr<RdmaHw> hw = Hw(0, 0.001);
+        AutoLossHold hold(kSpines, hw->LossHoldParameters(), 2);
+        hold.AddLeaf(0);
+        hold.AddLeaf(1);
+        hold.CountSend(0, 3, 10);
+        hold.CountLoss(0, 3, 20);
+        NS_TEST_EXPECT_MSG_EQ(hold.Holds(0, 3), true, "held toward leaf 0 at the loss");
+        NS_TEST_EXPECT_MSG_EQ(hold.HostHolds(3), false, "in leaf scope");
+        NS_TEST_EXPECT_MSG_EQ(hold.Holds(1, 3), false, "not toward leaf 1");
+        NS_TEST_EXPECT_MSG_EQ(hold.LossRatio(1, 3), 0.0, "whose test is apart");
+        hold.CountSend(1, 3, 30);
+        hold.CountLoss(1, 3, 40);
+        NS_TEST_EXPECT_MSG_EQ(hold.HostHolds(3), true, "a second leaf widens it");
+    }
+};
+
+class RepsHoldTrickleTest : public TestCase
+{
+  public:
+    RepsHoldTrickleTest()
+        : TestCase("Under SprayHoldRelease trickle a held spine receives one in round(1 / "
+                   "SprayHoldTrickle) of a flow's sends, the answers to them reach the hold "
+                   "through the send records, a lost one restarts R, and the expected number of "
+                   "clean acknowledgements releases the spine")
+    {
+    }
+
+    void DoRun() override
+    {
+        Validation();
+        Release();
+        AutoScope();
+        Simulator::Destroy();
+    }
+
+  private:
+    static constexpr uint32_t kSpines = LossHoldFixture::kSpines;
+    static constexpr uint64_t kInterval = LossHoldFixture::kInterval;
+    static constexpr uint32_t kSize = 1000;
+
+    // Count rule with thresholds that grade a lost fraction of 0.04 0, and
+    // the trickle release in place of the clean sentinels.
+    static Ptr<RdmaHw> Hw()
+    {
+        Ptr<RdmaHw> hw = LossHoldFixture::Hw();
+        hw->m_sprayLossThreshold1 = 0.01;
+        hw->m_sprayLossThreshold2 = 0.02;
+        hw->m_sprayLossThreshold3 = 0.04;
+        hw->m_sprayLossHoldCleanSentinels = 0;
+        hw->m_sprayHoldRelease = static_cast<uint32_t>(HoldRelease::Trickle);
+        return hw;
+    }
+
+    // ceil(ln(1 / alpha) / -ln(1 - p1)) with p0 zero and alpha 0.001.
+    static uint32_t ExpectedAcks(double p1)
+    {
+        return static_cast<uint32_t>(std::ceil(std::log(1000.0) / -std::log(1 - p1)));
+    }
+
+    // Twenty sends on spine 3 in interval 0, one of them declared lost: the
+    // interval's lost fraction 0.05 grades it 0.
+    template <typename Count, typename Lose>
+    static void Onset(Count count, Lose lose)
+    {
+        for (uint32_t i = 0; i < 20; ++i)
+        {
+            count(100 + i);
+        }
+        lose(200);
+    }
+
+    void Validation()
+    {
+        Ptr<RdmaHw> unset = CreateObject<RdmaHw>();
+        UintegerValue release;
+        unset->GetAttribute("SprayHoldRelease", release);
+        NS_TEST_EXPECT_MSG_EQ(release.Get(),
+                              static_cast<uint32_t>(HoldRelease::Sentinels),
+                              "SprayHoldRelease is sentinels by default");
+        DoubleValue trickle;
+        unset->GetAttribute("SprayHoldTrickle", trickle);
+        NS_TEST_EXPECT_MSG_EQ(trickle.Get(), 0.01, "SprayHoldTrickle is 0.01 by default");
+        NS_TEST_EXPECT_MSG_EQ(unset->ValidHoldRelease(), true, "sentinels need nothing");
+        NS_TEST_EXPECT_MSG_EQ(Hw()->ValidHoldRelease(), true, "trickle under reps_hold");
+        NS_TEST_EXPECT_MSG_EQ(Hw()->ValidRepsHold(), true, "without clean sentinels");
+        NS_TEST_EXPECT_MSG_EQ(TrickleEvery(0.01), 100u, "one in 100 sends");
+        const std::vector<std::pair<std::function<void(RdmaHw&)>, std::string>> refused = {
+            {[](RdmaHw& hw) {
+                 hw.m_pathSelectorKind = static_cast<uint32_t>(PathSelectorKind::Reps);
+             },
+             "not reps_hold"},
+            {[](RdmaHw& hw) { hw.m_sprayLossHoldCleanSentinels = 3; }, "clean sentinels set"},
+            {[](RdmaHw& hw) { hw.m_sprayHeldSentinelIntervalNs = 1000; },
+             "sentinel interval set"},
+            {[](RdmaHw& hw) { hw.m_sprayHoldTrickle = 0; }, "no trickle"},
+            {[](RdmaHw& hw) { hw.m_sprayLossP0 = hw.m_sprayLossP1; }, "p0 not below p1"},
+        };
+        for (const auto& [set, message] : refused)
+        {
+            Ptr<RdmaHw> hw = Hw();
+            set(*hw);
+            NS_TEST_EXPECT_MSG_EQ(hw->ValidHoldRelease(), false, "refused: " + message);
+        }
+        Ptr<RdmaHw> sentinels = Hw();
+        sentinels->m_sprayHoldRelease = static_cast<uint32_t>(HoldRelease::Sentinels);
+        NS_TEST_EXPECT_MSG_EQ(sentinels->ValidRepsHold(),
+                              false,
+                              "the sentinels' release needs clean sentinels");
+    }
+
+    // One flow of the host through its send records.
+    void Release()
+    {
+        Ptr<RdmaHw> hw = Hw();
+        SpineScores hold(kSpines, hw->LossHoldParameters());
+        Ptr<RdmaQueuePair> qp = CreateObject<RdmaQueuePair>(
+            3, Ipv4Address("11.0.1.1"), Ipv4Address("11.0.2.1"), 10000, 100);
+        qp->m_outstanding.SetPacketSize(kSize);
+        qp->m_pathSelector = std::make_unique<RepsHoldSelector>(SelectorStream(),
+                                                                8,
+                                                                1000000,
+                                                                20,
+                                                                kSpines,
+                                                                hold);
+        Onset([&](uint64_t now) { hold.CountIntervalSend(3, now); },
+              [&](uint64_t now) { hold.CountIntervalLoss(3, now); });
+
+        uint64_t now = kInterval;
+        uint64_t seq = 0;
+        // One send at now, answered at once: acknowledged, or declared lost.
+        auto send = [&](bool lose) {
+            const uint16_t identification = qp->m_pathSelector->Choose(now);
+            const uint8_t spine = RequestedSpine(identification);
+            const bool trickle = qp->m_pathSelector->ChoseTrickle();
+            qp->m_outstanding.Add(seq, kSize, spine, now, trickle);
+            if (lose)
+            {
+                qp->DeclareLostSentBy(now);
+            }
+            else
+            {
+                qp->m_pathSelector->OnAck(spine, false, now);
+                qp->AcknowledgePacket(seq, spine);
+            }
+            seq += kSize;
+            qp->m_outstanding.RemoveBelow(seq);
+            now += 10;
+            NS_TEST_EXPECT_MSG_EQ((!trickle || spine == 3), true, "a trickle send is on 3");
+            return std::make_pair(spine, trickle);
+        };
+
+        // 1000 sends: spine 3 is held from the first, and is sent exactly
+        // the 100th, 200th, ... of them, each a trickle send.
+        uint32_t onSpine3 = 0;
+        bool everyHundredth = true;
+        for (uint32_t i = 1; i <= 1000; ++i)
+        {
+            const auto [spine, trickle] = send(false);
+            if (spine == 3)
+            {
+                onSpine3++;
+                everyHundredth &= trickle && i % 100 == 0;
+            }
+        }
+        NS_TEST_EXPECT_MSG_EQ(hold.Holds(3), true, "the interval's losses hold spine 3");
+        NS_TEST_EXPECT_MSG_EQ(onSpine3, 10u, "one in 100 of the flow's sends");
+        NS_TEST_EXPECT_MSG_EQ(everyHundredth, true, "every 100th, each a trickle send");
+        const double p1 = 0.05;
+        const double step = -std::log(1 - p1);
+        NS_TEST_EXPECT_MSG_EQ_TOL(hold.ReleaseP1(3), p1, 1e-12, "p1 is the interval's 1 / 20");
+        NS_TEST_EXPECT_MSG_EQ_TOL(hold.ReleaseValue(3),
+                                  10 * step,
+                                  1e-9,
+                                  "ten clean trickle acknowledgements");
+
+        // The next trickle send, the 1100th, is lost: R restarts.
+        for (uint32_t i = 1001; i < 1100; ++i)
+        {
+            send(false);
+        }
+        const auto [lostSpine, lostTrickle] = send(true);
+        NS_TEST_EXPECT_MSG_EQ(static_cast<uint32_t>(lostSpine), 3u, "the 1100th is on 3");
+        NS_TEST_EXPECT_MSG_EQ(lostTrickle, true, "a trickle send");
+        NS_TEST_EXPECT_MSG_EQ(hold.ReleaseValue(3), 0.0, "whose loss restarts R");
+        NS_TEST_EXPECT_MSG_EQ(hold.Holds(3), true, "and keeps the hold");
+
+        // ceil(ln(1000) / -ln(0.95)) = 135 clean trickle acknowledgements
+        // release it.
+        const uint32_t expected = ExpectedAcks(p1);
+        NS_TEST_EXPECT_MSG_EQ(expected, 135u, "135 clean trickle acknowledgements");
+        uint32_t acks = 0;
+        while (hold.Holds(3) && acks <= expected)
+        {
+            if (send(false).second)
+            {
+                acks++;
+            }
+        }
+        NS_TEST_EXPECT_MSG_EQ(acks, expected, "released at the expected acknowledgement");
+        NS_TEST_EXPECT_MSG_EQ(hold.Holds(3), false, "spine 3 is released");
+        NS_TEST_EXPECT_MSG_GT_OR_EQ(hold.ReleaseValue(3), std::log(1000.0), "R reached ln(1000)");
+        uint32_t chosen = 0;
+        for (uint32_t i = 0; i < 400; ++i)
+        {
+            const auto [spine, trickle] = send(false);
+            chosen += spine == 3 && !trickle;
+        }
+        NS_TEST_EXPECT_MSG_GT(chosen, 0u, "REPS chooses spine 3 again");
+    }
+
+    // Under auto a leaf-scope hold records its interval's rate and releases
+    // by the same count; a host-scope hold that ends it records the larger.
+    void AutoScope()
+    {
+        Ptr<RdmaHw> hw = Hw();
+        AutoLossHold hold(kSpines, hw->LossHoldParameters(), 2);
+        hold.AddLeaf(0);
+        hold.AddLeaf(1);
+        NS_TEST_EXPECT_MSG_EQ(hold.TrickleEvery(), 100u, "one in 100 sends");
+        Onset([&](uint64_t now) { hold.CountSend(0, 3, now); },
+              [&](uint64_t now) { hold.CountLoss(0, 3, now); });
+        uint8_t spine;
+        NS_TEST_EXPECT_MSG_EQ(hold.TakeSentinel(0, kInterval, spine), false, "no sentinel");
+        NS_TEST_EXPECT_MSG_EQ(hold.Holds(0, 3), true, "held toward leaf 0");
+        NS_TEST_EXPECT_MSG_EQ_TOL(hold.ReleaseP1(0, 3), 0.05, 1e-12, "on the interval's rate");
+        const uint32_t expected = ExpectedAcks(0.05);
+        for (uint32_t i = 1; i < expected; ++i)
+        {
+            hold.TrickleAnswer(0, 3, false, kInterval + i);
+        }
+        NS_TEST_EXPECT_MSG_EQ(hold.Holds(0, 3), true, "one acknowledgement short");
+        hold.TrickleAnswer(0, 3, false, 2 * kInterval - 1);
+        NS_TEST_EXPECT_MSG_EQ(hold.Holds(0, 3), false, "released");
+        NS_TEST_EXPECT_MSG_EQ(hold.LossLeaves(3), 0u, "clearing its leaves");
+
+        // Held again toward leaf 0 at 0.05; a loss toward leaf 1 widens it.
+        Onset([&](uint64_t now) { hold.CountSend(0, 3, 2 * kInterval + now); },
+              [&](uint64_t now) { hold.CountLoss(0, 3, 2 * kInterval + now); });
+        hold.TakeSentinel(0, 3 * kInterval, spine);
+        NS_TEST_EXPECT_MSG_EQ(hold.Holds(0, 3), true, "held toward leaf 0 again");
+        hold.CountSend(1, 3, 3 * kInterval + 10);
+        hold.CountLoss(1, 3, 3 * kInterval + 20);
+        NS_TEST_EXPECT_MSG_EQ(hold.HostHolds(3), true, "widened");
+        NS_TEST_EXPECT_MSG_EQ_TOL(hold.ReleaseP1(1, 3), 0.05, 1e-12, "keeping leaf 0's p1");
+    }
+};
+
+class RepsHoldDuplicateTest : public TestCase
+{
+  public:
+    RepsHoldDuplicateTest()
+        : TestCase("Under SpraySentinelMode duplicate each trickle send onto a held spine is a "
+                   "copy of a data packet sent on REPS's choice: losing every copy causes no "
+                   "retransmission timeout and no repair, the hold still counts the copies' "
+                   "losses, and the copies' clean acknowledgements release the spine")
+    {
+    }
+
+    void DoRun() override
+    {
+        const bool savedPacketSeq = CustomHeader::ackCarriesPacketSeq;
+        CustomHeader::ackCarriesPacketSeq = true;
+        Flow();
+        CustomHeader::ackCarriesPacketSeq = savedPacketSeq;
+        Simulator::Destroy();
+    }
+
+  private:
+    static constexpr uint32_t kSpines = 8;
+    static constexpr uint64_t kInterval = 10000;
+    static constexpr uint32_t kMtu = IsolatedHost::kMtu;
+    static constexpr uint32_t kPackets = 1500;
+    static constexpr uint32_t kLosingSends = 400;
+    static constexpr uint64_t kStepNs = 100;
+
+    void Flow()
+    {
+        IsolatedHost sender(LoadBalancingMode::SprayUniform, kTestReceiver, kSpines);
+        Ptr<RdmaHw> hw = sender.hw;
+        hw->m_pathSelectorKind = static_cast<uint32_t>(PathSelectorKind::RepsHold);
+        hw->m_sprayHoldScope = static_cast<uint32_t>(HoldScope::Host);
+        hw->m_sprayLossThreshold1 = 0.1;
+        hw->m_sprayLossThreshold2 = 0.25;
+        hw->m_sprayLossThreshold3 = 0.5;
+        hw->m_sprayLossIntervalNs = kInterval;
+        hw->m_sprayHeldExploration = SpineScores::HeldExploration::Sentinel;
+        hw->m_sprayLossHoldCleanSentinels = 0;
+        hw->m_sprayHoldRelease = static_cast<uint32_t>(HoldRelease::Trickle);
+        hw->m_spraySentinelMode = static_cast<uint32_t>(SentinelMode::Duplicate);
+        NS_TEST_EXPECT_MSG_EQ(hw->ValidRepsHold(), true, "a valid hold");
+        NS_TEST_EXPECT_MSG_EQ((hw->LossHoldParameters().sentinelMode == SentinelMode::Duplicate),
+                              true,
+                              "the hold's parameters carry the mode");
+        bool completed = false;
+        hw->m_qpCompleteCallback =
+            Callback<void, Ptr<RdmaQueuePair>>([&](Ptr<RdmaQueuePair>) { completed = true; });
+        Ptr<RdmaQueuePair> qp =
+            sender.AddSender(kTestSender, kTestReceiver, uint64_t{kPackets} * kMtu);
+        qp->m_baseRtt = 2000;
+        qp->m_notifyAppFinish = Callback<void>([]() {});
+        SpineScores& hold = *hw->m_senderSpineScores;
+        uint32_t intervalLosses = 0;
+        hw->TraceConnectWithoutContext(
+            "SpineLossInterval",
+            Callback<void,
+                     uint64_t,
+                     const std::vector<uint32_t>&,
+                     const std::vector<uint32_t>&,
+                     const std::vector<uint8_t>&>([&](uint64_t endNs,
+                                                      const std::vector<uint32_t>&,
+                                                      const std::vector<uint32_t>& lost,
+                                                      const std::vector<uint8_t>&) {
+                if (endNs > kInterval)
+                {
+                    intervalLosses += lost[3];
+                }
+            }));
+        // Interval 0: half of 20 sends on spine 3 lost; p1 is 0.5.
+        for (uint32_t i = 0; i < 20; ++i)
+        {
+            hold.CountIntervalSend(3, 100 + i);
+        }
+        for (uint32_t i = 0; i < 10; ++i)
+        {
+            hold.CountIntervalLoss(3, 200 + i);
+        }
+
+        uint32_t sends = 0;
+        uint32_t copies = 0;
+        uint32_t copyAcks = 0;
+        uint32_t liveOnHeld = 0;
+        uint32_t chosenAfterRelease = 0;
+        uint32_t copyAcksAtRelease = 0;
+        bool copiesMatch = true;
+        bool heldAfterLosses = false;
+        double releaseAfterLosses = -1;
+        uint32_t copiesLostAfterLosses = 0;
+        std::function<void()> step = [&]() {
+            if (qp->IsFinished())
+            {
+                return;
+            }
+            const size_t before = sender.emitted.size();
+            Ptr<Packet> packet = hw->GetNxtPacket(qp);
+            sends++;
+            hw->ArmRetransmissionTimeout(qp);
+            CustomHeader live(CustomHeader::L2_Header | CustomHeader::L3_Header |
+                              CustomHeader::L4_Header);
+            packet->PeekHeader(live);
+            const bool held = hold.Holds(3);
+            liveOnHeld += held && RequestedSpine(live.ipid) == 3;
+            if (!held && RequestedSpine(live.ipid) == 3)
+            {
+                chosenAfterRelease++;
+            }
+            sender.ReceiveAck(kTestReceiver, live.udp.seq + kMtu, live.udp.seq, live.ipid);
+            if (sender.emitted.size() > before)
+            {
+                const CustomHeader& copy = sender.emitted.back();
+                copies++;
+                copiesMatch &= copy.udp.seq == live.udp.seq && RequestedSpine(copy.ipid) == 3 &&
+                               copy.l3Prot == 0x11;
+                if (sends > kLosingSends)
+                {
+                    sender.ReceiveAck(kTestReceiver,
+                                      live.udp.seq + kMtu,
+                                      copy.udp.seq,
+                                      copy.ipid);
+                    copyAcks++;
+                    if (!hold.Holds(3) && copyAcksAtRelease == 0)
+                    {
+                        copyAcksAtRelease = copyAcks;
+                    }
+                }
+            }
+            if (sends == kLosingSends + 50)
+            {
+                heldAfterLosses = hold.Holds(3);
+                releaseAfterLosses = hold.ReleaseValue(3);
+                copiesLostAfterLosses = qp->m_exploration_copies_lost;
+            }
+            Simulator::Schedule(NanoSeconds(kStepNs), step);
+        };
+        Simulator::Schedule(NanoSeconds(kInterval), step);
+        Simulator::Run();
+
+        NS_TEST_EXPECT_MSG_EQ(completed, true, "the flow completes");
+        NS_TEST_EXPECT_MSG_EQ(sends, kPackets, "in one send per packet");
+        NS_TEST_EXPECT_MSG_EQ(qp->m_retransmitted_bytes, 0u, "with no repair");
+        NS_TEST_EXPECT_MSG_EQ(qp->m_timeouts, 0u, "and no retransmission timeout");
+        NS_TEST_EXPECT_MSG_EQ(qp->m_recovery_events, 0u, "nor a data send declared lost");
+        NS_TEST_EXPECT_MSG_EQ(liveOnHeld, 0u, "no data send goes up the held spine");
+        NS_TEST_EXPECT_MSG_EQ(copiesMatch, true, "each copy is the data packet on spine 3");
+        // One copy per 100 sends: 4 lost over the first 400, then 10 clean
+        // ones, ceil(ln(1000) / ln(2)), release the spine.
+        const uint32_t expected =
+            static_cast<uint32_t>(std::ceil(std::log(1000.0) / -std::log(1 - 0.5)));
+        NS_TEST_EXPECT_MSG_EQ(expected, 10u, "ten clean copy acknowledgements");
+        NS_TEST_EXPECT_MSG_EQ(copies, 4 + expected, "the copies, besides the sends");
+        NS_TEST_EXPECT_MSG_EQ(qp->m_exploration_copies, copies, "each with a record");
+        NS_TEST_EXPECT_MSG_EQ(heldAfterLosses, true, "the lost copies keep the hold");
+        NS_TEST_EXPECT_MSG_EQ(releaseAfterLosses, 0.0, "and R at 0");
+        NS_TEST_EXPECT_MSG_EQ(copiesLostAfterLosses, 4u, "four copies declared lost");
+        NS_TEST_EXPECT_MSG_EQ(qp->m_exploration_copies_lost, 4u, "and no other");
+        NS_TEST_EXPECT_MSG_EQ(intervalLosses, 4u, "the hold's intervals count them");
+        NS_TEST_EXPECT_MSG_EQ(copyAcksAtRelease, expected, "released at the tenth copy ack");
+        NS_TEST_EXPECT_MSG_EQ(hold.Holds(3), false, "spine 3 is released");
+        NS_TEST_EXPECT_MSG_GT(chosenAfterRelease, 0u, "and REPS chooses it again");
+    }
+};
+
+class HeldSpineLeakTest : public TestCase
+{
+  public:
+    HeldSpineLeakTest()
+        : TestCase("Under reps_hold and mrc_hold with SpraySentinelMode duplicate, over many "
+                   "messages from a host whose hold holds spine 3, which delivers nothing, at "
+                   "host and at leaf scope, with answers that take longer than a loss interval: "
+                   "a held spine's clean sends are its acknowledged sends, so the hold never "
+                   "releases, no data send that is not an exploration send goes up spine 3 and "
+                   "no retransmission timeout fires")
+    {
+    }
+
+    void DoRun() override
+    {
+        const bool savedPacketSeq = CustomHeader::ackCarriesPacketSeq;
+        CustomHeader::ackCarriesPacketSeq = true;
+        for (const bool leafScope : {false, true})
+        {
+            Flow(PathSelectorKind::RepsHold, leafScope);
+            Flow(PathSelectorKind::MrcHold, leafScope);
+        }
+        CustomHeader::ackCarriesPacketSeq = savedPacketSeq;
+    }
+
+  private:
+    static constexpr uint32_t kSpines = 8;
+    static constexpr uint64_t kInterval = 10000;
+    static constexpr uint32_t kMtu = IsolatedHost::kMtu;
+    static constexpr uint32_t kMessages = 20;
+    static constexpr uint32_t kPackets = 400;
+    static constexpr uint64_t kStepNs = 100;
+    // Longer than the loss interval: a copy's loss is declared one base RTT
+    // after its data send's acknowledgement, intervals after the copy was
+    // counted as a send.
+    static constexpr uint64_t kRttNs = 15000;
+
+    // Messages of kPackets, one queue pair each, 5 loss intervals apart; one
+    // send per kStepNs. Every send on spine 3, data or copy, is dropped; every
+    // other send is acknowledged kRttNs after it, with the receiver's
+    // cumulative sequence. Spine 3 is held toward leaf 1 from the start, in
+    // the host's SpineScores or, at leaf scope, in an AutoLossHold.
+    void Flow(PathSelectorKind kind, bool leafScope)
+    {
+        IsolatedHost sender(LoadBalancingMode::SprayUniform, kTestReceiver, kSpines);
+        Ptr<RdmaHw> hw = sender.hw;
+        hw->m_pathSelectorKind = static_cast<uint32_t>(kind);
+        hw->m_sprayHoldScope = static_cast<uint32_t>(HoldScope::Host);
+        hw->m_sprayLossThreshold1 = 0.1;
+        hw->m_sprayLossThreshold2 = 0.25;
+        hw->m_sprayLossThreshold3 = 0.5;
+        hw->m_sprayLossIntervalNs = kInterval;
+        hw->m_sprayHeldExploration = SpineScores::HeldExploration::Sentinel;
+        hw->m_sprayHeldSentinelIntervalNs = kInterval / 4;
+        hw->m_sprayLossHoldCleanSentinels = 3;
+        hw->m_spraySentinelMode = static_cast<uint32_t>(SentinelMode::Duplicate);
+        hw->m_retransmission_timeout_ns = 10 * kRttNs;
+        hw->m_max_retransmission_retries = 100;
+        const std::string which = std::string(kind == PathSelectorKind::RepsHold
+                                                  ? "reps_hold"
+                                                  : "mrc_hold") +
+                                  (leafScope ? " leaf: " : " host: ");
+        NS_TEST_EXPECT_MSG_EQ(hw->ValidRepsHold(), true, which + "a valid hold");
+        uint32_t completed = 0;
+        hw->m_qpCompleteCallback =
+            Callback<void, Ptr<RdmaQueuePair>>([&](Ptr<RdmaQueuePair>) { completed++; });
+        AutoLossHold autoHold(kSpines, hw->LossHoldParameters(), 2);
+        autoHold.AddLeaf(1);
+        SpineScores& hostHold = hw->HostScores(hw->LossHoldParameters());
+        auto holds = [&]() { return leafScope ? autoHold.Holds(1, 3) : hostHold.Holds(3); };
+        for (uint32_t i = 0; i < 20; ++i)
+        {
+            if (leafScope)
+            {
+                autoHold.CountSend(1, 3, 100 + i);
+                autoHold.CountLoss(1, 3, 200 + i);
+            }
+            else
+            {
+                hostHold.CountIntervalSend(3, 100 + i);
+                hostHold.CountIntervalLoss(3, 200 + i);
+            }
+        }
+        uint32_t timeouts = 0;
+        hw->TraceConnectWithoutContext(
+            "RetransmissionTimeout",
+            Callback<void, uint64_t, Ptr<RdmaQueuePair>, int32_t, bool, uint64_t>(
+                [&](uint64_t, Ptr<RdmaQueuePair>, int32_t, bool, uint64_t) { timeouts++; }));
+        uint32_t sends = 0;
+        uint32_t heldAtSend = 0;
+        uint32_t dataOnSpine3 = 0;
+        Ptr<RdmaQueuePair> qp;
+        uint64_t received = 0;
+        std::set<uint64_t> arrived;
+        std::function<void()> start;
+        auto answer = [&](Ptr<RdmaQueuePair> to, uint32_t seq, uint16_t identification) {
+            if (to != qp || to->IsFinished())
+            {
+                return;
+            }
+            arrived.insert(seq);
+            while (arrived.count(received) > 0)
+            {
+                received += kMtu;
+            }
+            sender.ReceiveAck(kTestReceiver, received, seq, identification);
+        };
+        std::function<void()> step = [&]() {
+            if (qp->IsFinished())
+            {
+                if (completed < kMessages)
+                {
+                    Simulator::Schedule(NanoSeconds(5 * kInterval), start);
+                }
+                return;
+            }
+            if (qp->snd_nxt >= qp->m_size && qp->RepairBytesLeft() == 0)
+            {
+                Simulator::Schedule(NanoSeconds(kStepNs), step);
+                return;
+            }
+            const size_t before = sender.emitted.size();
+            Ptr<Packet> packet = hw->GetNxtPacket(qp);
+            hw->ArmRetransmissionTimeout(qp);
+            CustomHeader live(CustomHeader::L2_Header | CustomHeader::L3_Header |
+                              CustomHeader::L4_Header);
+            packet->PeekHeader(live);
+            const bool held = holds();
+            sends++;
+            heldAtSend += held;
+            Ptr<RdmaQueuePair> to = qp;
+            if (RequestedSpine(live.ipid) == 3)
+            {
+                dataOnSpine3 += !qp->m_pathSelector->ChoseExploration();
+            }
+            else
+            {
+                const uint32_t seq = live.udp.seq;
+                const uint16_t ipid = live.ipid;
+                Simulator::Schedule(NanoSeconds(kRttNs),
+                                    [&, to, seq, ipid]() { answer(to, seq, ipid); });
+            }
+            if (sender.emitted.size() > before &&
+                RequestedSpine(sender.emitted.back().ipid) != 3)
+            {
+                const uint32_t seq = sender.emitted.back().udp.seq;
+                const uint16_t ipid = sender.emitted.back().ipid;
+                Simulator::Schedule(NanoSeconds(kRttNs),
+                                    [&, to, seq, ipid]() { answer(to, seq, ipid); });
+            }
+            Simulator::Schedule(NanoSeconds(kStepNs), step);
+        };
+        start = [&]() {
+            received = 0;
+            arrived.clear();
+            qp = sender.AddSender(kTestSender, kTestReceiver, uint64_t{kPackets} * kMtu);
+            qp->m_baseRtt = kRttNs;
+            qp->m_notifyAppFinish = Callback<void>([]() {});
+            if (leafScope && kind == PathSelectorKind::RepsHold)
+            {
+                qp->m_pathSelector = std::make_unique<RepsHoldSelector>(
+                    SelectorStream(), 8, 1000000, 20, kSpines, autoHold, 1);
+            }
+            else if (leafScope)
+            {
+                qp->m_pathSelector = std::make_unique<MrcHoldSelector>(
+                    SelectorStream(), kSpines, kRttNs, 10 * kRttNs, autoHold, 1);
+            }
+            step();
+        };
+        Simulator::Schedule(NanoSeconds(kInterval), start);
+        Simulator::Stop(Seconds(1));
+        Simulator::Run();
+        NS_TEST_EXPECT_MSG_EQ(completed, kMessages, which + "every message completes");
+        NS_TEST_EXPECT_MSG_EQ(heldAtSend, sends, which + "spine 3 is held at every send");
+        NS_TEST_EXPECT_MSG_EQ(dataOnSpine3, 0u, which + "no data send but an exploration send on 3");
+        NS_TEST_EXPECT_MSG_EQ(timeouts, 0u, which + "and no retransmission timeout fires");
+        Simulator::Destroy();
+    }
+};
+
+class HeldSpineFastLossTest : public TestCase
+{
+  public:
+    HeldSpineFastLossTest()
+        : TestCase("Under reps_hold and mrc_hold a data send up a spine held as it is chosen, "
+                   "here the sentinel under SpraySentinelMode data, still unacknowledged "
+                   "SprayHeldLossRtts base RTTs after it is declared lost and repaired, with "
+                   "no retransmission timeout; with SprayHeldLossRtts 0 the timeout declares it "
+                   "lost")
+    {
+    }
+
+    void DoRun() override
+    {
+        const bool savedPacketSeq = CustomHeader::ackCarriesPacketSeq;
+        CustomHeader::ackCarriesPacketSeq = true;
+        Ptr<RdmaHw> unset = CreateObject<RdmaHw>();
+        DoubleValue rtts;
+        unset->GetAttribute("SprayHeldLossRtts", rtts);
+        NS_TEST_EXPECT_MSG_EQ(rtts.Get(), 2.0, "SprayHeldLossRtts is 2 by default");
+        Flow(PathSelectorKind::RepsHold, 2);
+        Flow(PathSelectorKind::MrcHold, 2);
+        Flow(PathSelectorKind::RepsHold, 0);
+        CustomHeader::ackCarriesPacketSeq = savedPacketSeq;
+    }
+
+  private:
+    static constexpr uint32_t kSpines = 8;
+    static constexpr uint64_t kInterval = 10000;
+    static constexpr uint32_t kMtu = IsolatedHost::kMtu;
+    static constexpr uint32_t kPackets = 300;
+    static constexpr uint64_t kStepNs = 100;
+    static constexpr uint64_t kRttNs = 2000;
+    static constexpr uint64_t kTimeoutNs = 50 * kRttNs;
+
+    // One message, one send per kStepNs, spine 3 held from the start with a
+    // sentinel per loss interval. Every send on spine 3 is dropped, every
+    // other one acknowledged kRttNs after it.
+    void Flow(PathSelectorKind kind, double heldLossRtts)
+    {
+        IsolatedHost sender(LoadBalancingMode::SprayUniform, kTestReceiver, kSpines);
+        Ptr<RdmaHw> hw = sender.hw;
+        hw->m_pathSelectorKind = static_cast<uint32_t>(kind);
+        hw->m_sprayHoldScope = static_cast<uint32_t>(HoldScope::Host);
+        hw->m_sprayLossThreshold1 = 0.1;
+        hw->m_sprayLossThreshold2 = 0.25;
+        hw->m_sprayLossThreshold3 = 0.5;
+        hw->m_sprayLossIntervalNs = kInterval;
+        hw->m_sprayHeldExploration = SpineScores::HeldExploration::Sentinel;
+        hw->m_sprayLossHoldCleanSentinels = 3;
+        hw->m_sprayHeldLossRtts = heldLossRtts;
+        hw->m_retransmission_timeout_ns = kTimeoutNs;
+        const std::string which = std::string(kind == PathSelectorKind::RepsHold
+                                                  ? "reps_hold"
+                                                  : "mrc_hold") +
+                                  (heldLossRtts > 0 ? ": " : " without: ");
+        bool completed = false;
+        hw->m_qpCompleteCallback =
+            Callback<void, Ptr<RdmaQueuePair>>([&](Ptr<RdmaQueuePair>) { completed = true; });
+        uint32_t failure = 0;
+        hw->m_qpFailureCallback = Callback<void, Ptr<RdmaQueuePair>, uint32_t>(
+            [&](Ptr<RdmaQueuePair>, uint32_t reason) { failure = reason + 1; });
+        std::vector<bool> timeoutExploration;
+        hw->TraceConnectWithoutContext(
+            "RetransmissionTimeout",
+            Callback<void, uint64_t, Ptr<RdmaQueuePair>, int32_t, bool, uint64_t>(
+                [&](uint64_t, Ptr<RdmaQueuePair>, int32_t, bool exploration, uint64_t) {
+                    timeoutExploration.push_back(exploration);
+                }));
+        Ptr<RdmaQueuePair> qp =
+            sender.AddSender(kTestSender, kTestReceiver, uint64_t{kPackets} * kMtu);
+        qp->m_baseRtt = kRttNs;
+        qp->m_notifyAppFinish = Callback<void>([]() {});
+        SpineScores& hold = *hw->m_senderSpineScores;
+        hold.CountIntervalSend(3, 100);
+        hold.CountIntervalLoss(3, 200);
+        uint64_t received = 0;
+        std::set<uint64_t> arrived;
+        // Per sequence, when it was last sent up the held spine 3; and the
+        // delays from such a send to the repair of its sequence.
+        std::map<uint32_t, uint64_t> onHeld;
+        std::vector<uint64_t> repairDelays;
+        uint32_t heldSends = 0;
+        std::function<void()> step = [&]() {
+            if (qp->IsFinished())
+            {
+                return;
+            }
+            if (qp->snd_nxt >= qp->m_size && qp->RepairBytesLeft() == 0)
+            {
+                Simulator::Schedule(NanoSeconds(kStepNs), step);
+                return;
+            }
+            const uint64_t now = Simulator::Now().GetNanoSeconds();
+            Ptr<Packet> packet = hw->GetNxtPacket(qp);
+            hw->ArmRetransmissionTimeout(qp);
+            CustomHeader live(CustomHeader::L2_Header | CustomHeader::L3_Header |
+                              CustomHeader::L4_Header);
+            packet->PeekHeader(live);
+            const uint32_t seq = live.udp.seq;
+            const auto earlier = onHeld.find(seq);
+            if (earlier != onHeld.end())
+            {
+                repairDelays.push_back(now - earlier->second);
+                onHeld.erase(earlier);
+            }
+            if (RequestedSpine(live.ipid) == 3)
+            {
+                NS_TEST_EXPECT_MSG_EQ(qp->m_pathSelector->ChoseHeld(), true,
+                                      which + "a send up spine 3 is one up a held spine");
+                heldSends++;
+                onHeld[seq] = now;
+            }
+            else
+            {
+                const uint16_t ipid = live.ipid;
+                Simulator::Schedule(NanoSeconds(kRttNs), [&, seq, ipid]() {
+                    if (qp->IsFinished())
+                    {
+                        return;
+                    }
+                    arrived.insert(seq);
+                    while (arrived.count(received) > 0)
+                    {
+                        received += kMtu;
+                    }
+                    sender.ReceiveAck(kTestReceiver, received, seq, ipid);
+                });
+            }
+            Simulator::Schedule(NanoSeconds(kStepNs), step);
+        };
+        Simulator::Schedule(NanoSeconds(kInterval), step);
+        // Without the early loss, up to the first timeout only: once nothing
+        // but repairs is left to send, each repair a loss interval after the
+        // last sentinel is the next sentinel.
+        Simulator::Stop(heldLossRtts > 0 ? Seconds(1)
+                                         : NanoSeconds(kInterval + kPackets * kStepNs +
+                                                       kTimeoutNs));
+        Simulator::Run();
+
+        NS_TEST_EXPECT_MSG_GT(heldSends, 1u, which + "sentinels go up spine 3");
+        if (heldLossRtts > 0)
+        {
+            NS_TEST_EXPECT_MSG_EQ(failure, 0u, which + "the queue pair does not fail");
+            NS_TEST_EXPECT_MSG_EQ(completed, true, which + "the message completes");
+            NS_TEST_EXPECT_MSG_EQ(repairDelays.size(), heldSends, which + "each one is repaired");
+            NS_TEST_EXPECT_MSG_EQ(qp->m_held_declared_lost, heldSends,
+                                  which + "each declared lost as a send on a held spine");
+            NS_TEST_EXPECT_MSG_EQ(timeoutExploration.size(), 0u,
+                                  which + "and no retransmission timeout fires");
+            for (const uint64_t delay : repairDelays)
+            {
+                NS_TEST_EXPECT_MSG_GT_OR_EQ(delay, 2 * kRttNs, which + "after two base RTTs");
+                NS_TEST_EXPECT_MSG_LT_OR_EQ(delay, 2 * kRttNs + kStepNs,
+                                            which + "at the next send after them");
+            }
+        }
+        else
+        {
+            NS_TEST_EXPECT_MSG_EQ(qp->m_held_declared_lost, 0u, which + "none declared early");
+            NS_TEST_EXPECT_MSG_GT(timeoutExploration.size(), 0u, which + "the timeout fires");
+            NS_TEST_EXPECT_MSG_EQ(timeoutExploration.empty() || timeoutExploration[0],
+                                  true,
+                                  which + "for a sentinel");
+        }
+        Simulator::Destroy();
+    }
+};
+
+class RetransmissionTimeoutTraceTest : public TestCase
+{
+  public:
+    RetransmissionTimeoutTraceTest()
+        : TestCase("A retransmission timeout taken is traced once, with the requested spine of "
+                   "the oldest outstanding send and whether it was an exploration send")
+    {
+    }
+
+    void DoRun() override
+    {
+        const bool savedPacketSeq = CustomHeader::ackCarriesPacketSeq;
+        CustomHeader::ackCarriesPacketSeq = true;
+        Timeout(true);
+        Timeout(false);
+        CustomHeader::ackCarriesPacketSeq = savedPacketSeq;
+    }
+
+  private:
+    struct Row
+    {
+        uint64_t nowNs;
+        int32_t spine;
+        bool exploration;
+        uint64_t bytes;
+    };
+
+    // Two sends at 10 us, unanswered; with heldSpine3 spine 3 is held, so
+    // the first of them is its sentinel.
+    void Timeout(bool heldSpine3)
+    {
+        constexpr uint64_t kStart = 10000;
+        IsolatedHost sender(LoadBalancingMode::SprayUniform, kTestReceiver, 8);
+        Ptr<RdmaHw> hw = sender.hw;
+        hw->m_pathSelectorKind = static_cast<uint32_t>(PathSelectorKind::RepsHold);
+        hw->m_sprayHoldScope = static_cast<uint32_t>(HoldScope::Host);
+        hw->m_sprayLossThreshold1 = 0.1;
+        hw->m_sprayLossThreshold2 = 0.25;
+        hw->m_sprayLossThreshold3 = 0.5;
+        hw->m_sprayLossIntervalNs = kStart;
+        hw->m_sprayLossHoldCleanSentinels = 3;
+        hw->m_sprayHeldExploration = SpineScores::HeldExploration::Sentinel;
+        std::vector<Row> rows;
+        hw->TraceConnectWithoutContext(
+            "RetransmissionTimeout",
+            Callback<void, uint64_t, Ptr<RdmaQueuePair>, int32_t, bool, uint64_t>(
+                [&](uint64_t nowNs, Ptr<RdmaQueuePair>, int32_t spine, bool exploration,
+                    uint64_t bytes) { rows.push_back(Row{nowNs, spine, exploration, bytes}); }));
+        Ptr<RdmaQueuePair> qp =
+            sender.AddSender(kTestSender, kTestReceiver, 10 * IsolatedHost::kMtu);
+        SpineScores& hold = *hw->m_senderSpineScores;
+        if (heldSpine3)
+        {
+            hold.CountIntervalSend(3, 0);
+            hold.CountIntervalLoss(3, 0);
+        }
+        uint8_t first = 0;
+        Simulator::Schedule(NanoSeconds(kStart), [&]() {
+            CustomHeader parsed(CustomHeader::L2_Header | CustomHeader::L3_Header);
+            hw->GetNxtPacket(qp)->PeekHeader(parsed);
+            first = RequestedSpine(parsed.ipid);
+            hw->GetNxtPacket(qp);
+            hw->ArmRetransmissionTimeout(qp);
+        });
+        Simulator::Stop(NanoSeconds(kStart + IsolatedHost::kTimeoutNs + 1));
+        Simulator::Run();
+        const std::string which = heldSpine3 ? "sentinel: " : "data: ";
+        NS_TEST_EXPECT_MSG_EQ(rows.size(), 1u, which + "one timeout, one row");
+        if (!rows.empty())
+        {
+            NS_TEST_EXPECT_MSG_EQ(rows[0].nowNs, kStart + IsolatedHost::kTimeoutNs,
+                                  which + "at the oldest send's timeout");
+            NS_TEST_EXPECT_MSG_EQ(rows[0].spine, static_cast<int32_t>(first),
+                                  which + "the oldest send's spine");
+            NS_TEST_EXPECT_MSG_EQ(rows[0].exploration, heldSpine3, which + "the sentinel flag");
+            NS_TEST_EXPECT_MSG_EQ(rows[0].bytes, 2u * IsolatedHost::kMtu,
+                                  which + "two packets outstanding");
+        }
+        if (heldSpine3)
+        {
+            NS_TEST_EXPECT_MSG_EQ(static_cast<uint32_t>(first), 3u, "the sentinel is on spine 3");
+        }
+        NS_TEST_EXPECT_MSG_EQ(qp->m_timeouts, 1u, which + "the queue pair counts it");
+        Simulator::Destroy();
+    }
+};
+
+
+class SprayPathSeqTest : public TestCase
+{
+  public:
+    SprayPathSeqTest()
+        : TestCase("Under SprayPathSeq every data packet carries its path sequence and the "
+                   "receiver counts the packets missing per carrying spine")
+    {
+    }
+
+    void DoRun() override
+    {
+        const IntHeader::Mode savedIntMode = IntHeader::mode;
+        const bool savedPathSeq = CustomHeader::udpCarriesPathSeq;
+        const bool savedPacketSeq = CustomHeader::ackCarriesPacketSeq;
+        IntHeader::mode = IntHeader::NONE;
+        CustomHeader::ackCarriesPacketSeq = true;
+
+        CustomHeader::udpCarriesPathSeq = false;
+        const uint32_t without = CustomHeader::GetUdpHeaderSize();
+        NS_TEST_EXPECT_MSG_EQ(SeqTsHeader().GetSerializedSize(),
+                              6u,
+                              "without the path sequence the data header keeps its size");
+        CustomHeader::udpCarriesPathSeq = true;
+        NS_TEST_EXPECT_MSG_EQ(CustomHeader::GetUdpHeaderSize(),
+                              without + 2,
+                              "the path sequence adds two bytes");
+        NS_TEST_EXPECT_MSG_EQ(SeqTsHeader().GetSerializedSize(),
+                              8u,
+                              "the writer agrees on the size");
+        Unit();
+        Transport();
+
+        CustomHeader::udpCarriesPathSeq = savedPathSeq;
+        CustomHeader::ackCarriesPacketSeq = savedPacketSeq;
+        IntHeader::mode = savedIntMode;
+        Simulator::Destroy();
+    }
+
+  private:
+    static constexpr uint32_t kSpines = 8;
+    static constexpr uint8_t kLossy = 3;
+
+    void Unit()
+    {
+        SpineSequenceSender sender;
+        NS_TEST_EXPECT_MSG_EQ(sender.Next(2), 0u, "a spine's first packet carries 0");
+        NS_TEST_EXPECT_MSG_EQ(sender.Next(2), 1u, "and the next 1");
+        NS_TEST_EXPECT_MSG_EQ(sender.Next(5), 0u, "each spine counts apart");
+
+        SpineSequenceReceiver receiver;
+        auto arrive = [&](uint8_t requested, uint8_t carrying, uint16_t seq) {
+            return receiver.OnArrival(requested, carrying, seq);
+        };
+        NS_TEST_EXPECT_MSG_EQ(arrive(1, 1, 0).gaps, 0u, "in order");
+        NS_TEST_EXPECT_MSG_EQ(arrive(1, 1, 3).gaps, 2u, "1 and 2 are missing");
+        const SpineSequenceReceiver::Arrival late = arrive(1, 1, 2);
+        NS_TEST_EXPECT_MSG_EQ(late.late, true, "2 arrives late");
+        NS_TEST_EXPECT_MSG_EQ(late.gaps, 0u, "and counts nothing");
+        NS_TEST_EXPECT_MSG_EQ(arrive(1, 1, 4).gaps, 0u, "4 follows 3");
+        NS_TEST_EXPECT_MSG_EQ(arrive(4, 4, 1).gaps, 1u, "a spine's first packet is expected");
+        // A swap of two packets on one spine shows one missing, then one late.
+        NS_TEST_EXPECT_MSG_EQ(arrive(6, 6, 1).gaps, 1u, "the second of a swap shows a gap");
+        NS_TEST_EXPECT_MSG_EQ(arrive(6, 6, 0).late, true, "the first is late");
+        // Moved from spine 2 to spine 7 by a source leaf: tracked apart from
+        // spine 7's own packets, from its first arrival.
+        NS_TEST_EXPECT_MSG_EQ(arrive(7, 7, 0).gaps, 0u, "spine 7's own packet");
+        NS_TEST_EXPECT_MSG_EQ(arrive(2, 7, 40).gaps, 0u, "a moved path starts at its first arrival");
+        NS_TEST_EXPECT_MSG_EQ(arrive(2, 7, 41).gaps, 0u, "and follows on");
+        NS_TEST_EXPECT_MSG_EQ(arrive(7, 7, 1).gaps, 0u, "spine 7's own count is not disturbed");
+        // The counter wraps at 2^16.
+        for (uint32_t seq = 2; seq <= 0xFFFF; ++seq)
+        {
+            arrive(7, 7, static_cast<uint16_t>(seq));
+        }
+        NS_TEST_EXPECT_MSG_EQ(arrive(7, 7, 0).gaps, 0u, "the sequence wraps");
+        NS_TEST_EXPECT_MSG_EQ(arrive(7, 7, 2).gaps, 1u, "and counts across the wrap");
+    }
+
+    // A queue pair under reps_hold sends through a fabric that drops 1% of
+    // the packets up spine 3 and delays every packet up spine 1 behind the
+    // next few, to a receiver that counts the gaps.
+    void Transport()
+    {
+        IsolatedHost sender(LoadBalancingMode::SprayUniform, kTestReceiver, kSpines);
+        IsolatedHost receiver(LoadBalancingMode::SprayUniform, kTestSender, kSpines);
+        for (IsolatedHost* host : {&sender, &receiver})
+        {
+            Ptr<RdmaHw> hw = host->hw;
+            hw->m_pathSelectorKind = static_cast<uint32_t>(PathSelectorKind::RepsHold);
+            hw->m_sprayHoldScope = static_cast<uint32_t>(HoldScope::Host);
+            hw->m_sprayLossThreshold1 = 0.1;
+            hw->m_sprayLossThreshold2 = 0.25;
+            hw->m_sprayLossThreshold3 = 0.5;
+            hw->m_sprayLossIntervalNs = 10000;
+            hw->m_sprayLossHoldCleanSentinels = 3;
+            hw->m_sprayHeldExploration = SpineScores::HeldExploration::Sentinel;
+            hw->m_sprayPathSeq = true;
+            NS_TEST_EXPECT_MSG_EQ(hw->ValidPathSeq(), true, "accepted under reps_hold");
+        }
+        Ptr<RdmaHw> off = CreateObject<RdmaHw>();
+        NS_TEST_EXPECT_MSG_EQ(off->m_sprayPathSeq, false, "SprayPathSeq is off by default");
+        off->m_sprayPathSeq = true;
+        NS_TEST_EXPECT_MSG_EQ(off->ValidPathSeq(), false, "refused outside spray_uniform");
+        Ptr<RdmaHw> uniform = CreateObject<RdmaHw>();
+        uniform->m_loadBalancing = static_cast<uint32_t>(LoadBalancingMode::SprayUniform);
+        uniform->m_sprayPathSeq = true;
+        NS_TEST_EXPECT_MSG_EQ(uniform->ValidPathSeq(),
+                              true,
+                              "accepted under spray_uniform with any selector");
+        CustomHeader::udpCarriesPathSeq = false;
+        NS_TEST_EXPECT_MSG_EQ(sender.hw->ValidPathSeq(),
+                              false,
+                              "refused unless the data header carries it");
+        CustomHeader::udpCarriesPathSeq = true;
+
+        constexpr uint32_t kPackets = 20000;
+        Ptr<RdmaQueuePair> qp = sender.AddSender(kTestSender, kTestReceiver,
+                                                 static_cast<uint64_t>(kPackets) * IsolatedHost::kMtu);
+        Ptr<UniformRandomVariable> loss =
+            CreateObjectWithAttributes<UniformRandomVariable>("Stream", IntegerValue(7));
+        std::vector<uint32_t> sent(kSpines, 0);
+        std::vector<uint16_t> lastSeq(kSpines, 0);
+        uint32_t dropped = 0;
+        std::deque<Ptr<Packet>> delayed;
+        auto deliver = [&](Ptr<Packet> packet) {
+            CustomHeader parsed(CustomHeader::L2_Header | CustomHeader::L3_Header |
+                                CustomHeader::L4_Header);
+            packet->PeekHeader(parsed);
+            receiver.hw->Receive(packet, parsed);
+        };
+        for (uint32_t i = 0; i < kPackets; ++i)
+        {
+            Ptr<Packet> packet = sender.hw->GetNxtPacket(qp);
+            CustomHeader parsed(CustomHeader::L2_Header | CustomHeader::L3_Header |
+                                CustomHeader::L4_Header);
+            packet->PeekHeader(parsed);
+            const uint8_t spine = RequestedSpine(parsed.ipid);
+            NS_TEST_ASSERT_MSG_EQ(parsed.udp.path_seq,
+                                  static_cast<uint16_t>(sent[spine]),
+                                  "each spine's packets carry its count");
+            NS_TEST_ASSERT_MSG_EQ(parsed.udp.seq,
+                                  i * IsolatedHost::kMtu,
+                                  "the sequence keeps its place");
+            ++sent[spine];
+            if (spine == kLossy && loss->GetValue() < 0.01)
+            {
+                ++dropped;
+                continue;
+            }
+            if (spine == 1)
+            {
+                delayed.push_back(packet);
+                continue;
+            }
+            deliver(packet);
+            if (delayed.size() > 4)
+            {
+                deliver(delayed.front());
+                delayed.pop_front();
+            }
+        }
+        while (!delayed.empty())
+        {
+            deliver(delayed.front());
+            delayed.pop_front();
+        }
+        NS_TEST_EXPECT_MSG_GT(dropped, 10u, "some packets up spine 3 are dropped");
+        NS_TEST_ASSERT_MSG_EQ(receiver.hw->m_spineGaps.size(), kSpines, "every spine arrived");
+        NS_TEST_EXPECT_MSG_EQ(receiver.hw->m_spineGaps[kLossy],
+                              dropped,
+                              "the gaps on spine 3 are its dropped packets");
+        for (uint32_t spine = 0; spine < kSpines; ++spine)
+        {
+            NS_TEST_EXPECT_MSG_GT(sent[spine], 0u, "every spine is sent on");
+            if (spine != kLossy)
+            {
+                NS_TEST_EXPECT_MSG_EQ(receiver.hw->m_spineGaps[spine],
+                                      0u,
+                                      "no other spine shows a gap");
+            }
+        }
+    }
+};
+
+class SprayReceiverHoldTest : public TestCase
+{
+  public:
+    SprayReceiverHoldTest()
+        : TestCase("Under SprayReceiverHold the receiver holds a spine for one sender leaf or "
+                   "every one by the leaves losing on it, reports it in each acknowledgement, "
+                   "and the senders hold it toward its leaf until the bit clears")
+    {
+    }
+
+    void DoRun() override
+    {
+        const IntHeader::Mode savedIntMode = IntHeader::mode;
+        const bool savedPathSeq = CustomHeader::udpCarriesPathSeq;
+        const bool savedPacketSeq = CustomHeader::ackCarriesPacketSeq;
+        const uint32_t savedHoldBytes = CustomHeader::ackReceiverHoldBytes;
+        IntHeader::mode = IntHeader::NONE;
+        CustomHeader::ackCarriesPacketSeq = true;
+        CustomHeader::udpCarriesPathSeq = true;
+
+        CustomHeader::ackReceiverHoldBytes = 0;
+        const uint32_t without = qbbHeader().GetSerializedSize();
+        CustomHeader::ackReceiverHoldBytes = 1;
+        NS_TEST_EXPECT_MSG_EQ(qbbHeader().GetSerializedSize(),
+                              without + 1,
+                              "the bitmap adds one byte");
+        NS_TEST_EXPECT_MSG_EQ(CustomHeader::GetAckSerializedSize(),
+                              without + 1,
+                              "the parser agrees on the size");
+
+        Unit();
+        Transport();
+
+        CustomHeader::ackReceiverHoldBytes = savedHoldBytes;
+        CustomHeader::udpCarriesPathSeq = savedPathSeq;
+        CustomHeader::ackCarriesPacketSeq = savedPacketSeq;
+        IntHeader::mode = savedIntMode;
+        Simulator::Destroy();
+    }
+
+  private:
+    static constexpr uint32_t kSpines = 8;
+    static constexpr uint32_t kClean = 20;
+    static constexpr uint64_t kSentinelNs = 1000;
+
+    void Unit()
+    {
+        ReceiverHold hold(kSpines, 2, 3, 0);
+        hold.OnArrival(0, 3, 1, false, 0);
+        NS_TEST_EXPECT_MSG_EQ(hold.Holds(0, 3), true, "a loss holds the spine for its leaf");
+        NS_TEST_EXPECT_MSG_EQ(hold.Holds(1, 3), false, "and not for another");
+        NS_TEST_EXPECT_MSG_EQ(hold.Bitmap(0), 0x08, "bit 3 for leaf 0");
+        hold.OnArrival(0, 3, 0, false, 0);
+        hold.OnArrival(0, 3, 0, true, 0);
+        NS_TEST_EXPECT_MSG_EQ(hold.Clean(0, 3), 1u, "a late arrival counts nothing");
+        hold.OnArrival(0, 3, 2, false, 0);
+        NS_TEST_EXPECT_MSG_EQ(hold.Clean(0, 3), 0u, "a gap restarts the count");
+        hold.OnArrival(1, 3, 0, false, 0);
+        NS_TEST_EXPECT_MSG_EQ(hold.Clean(0, 3), 0u, "another leaf's arrival is not leaf 0's");
+        for (uint32_t i = 0; i < 3; ++i)
+        {
+            hold.OnArrival(0, 3, 0, false, 0);
+        }
+        NS_TEST_EXPECT_MSG_EQ(hold.Holds(0, 3), false, "the clean arrivals release it");
+        NS_TEST_EXPECT_MSG_EQ(hold.LossLeaves(3), 0u, "and take leaf 0 out");
+
+        hold.OnArrival(0, 5, 1, false, 0);
+        hold.OnArrival(2, 5, 1, false, 0);
+        NS_TEST_EXPECT_MSG_EQ(hold.HostHolds(5), true, "a second leaf widens to every leaf");
+        NS_TEST_EXPECT_MSG_EQ(hold.Bitmap(7), 0x20, "even toward a leaf that lost nothing");
+        hold.OnArrival(7, 5, 0, false, 0);
+        hold.OnArrival(0, 5, 0, false, 0);
+        hold.OnArrival(2, 5, 0, false, 0);
+        NS_TEST_EXPECT_MSG_EQ(hold.HostHolds(5), false, "arrivals from any leaf release it");
+        NS_TEST_EXPECT_MSG_EQ(hold.LossLeaves(5), 0u, "and clear its leaves");
+
+        ReceiverHoldMarks marks(kSpines, kSentinelNs);
+        marks.OnBitmap(4, 100, 0x08);
+        marks.OnBitmap(4, 101, 0x08);
+        marks.OnBitmap(4, 100, 0x00);
+        NS_TEST_EXPECT_MSG_EQ(marks.Holds(4, 3), true, "held while one receiver holds it");
+        marks.OnBitmap(4, 101, 0x00);
+        NS_TEST_EXPECT_MSG_EQ(marks.Holds(4, 3), false, "and released by the last of them");
+    }
+
+    struct Host
+    {
+        Host(Ipv4Address self, const std::vector<Ipv4Address>& peers, Ptr<SwitchQueueState> leaves)
+            : address(self),
+              host(LoadBalancingMode::SprayUniform, peers.front(), kSpines)
+        {
+            Ptr<RdmaHw> hw = host.hw;
+            for (const Ipv4Address& peer : peers)
+            {
+                hw->m_rtTable[peer.Get()] = {0};
+            }
+            hw->m_retransmission_timeout_ns = 0;
+            hw->m_pathSelectorKind = static_cast<uint32_t>(PathSelectorKind::RepsHold);
+            hw->m_sprayHoldScope = static_cast<uint32_t>(HoldScope::Auto);
+            hw->m_sprayHoldAutoLeaves = 2;
+            hw->m_sprayLossThreshold1 = 0.1;
+            hw->m_sprayLossThreshold2 = 0.25;
+            hw->m_sprayLossThreshold3 = 0.5;
+            hw->m_sprayLossIntervalNs = 100000;
+            hw->m_sprayLossHoldCleanSentinels = 3;
+            hw->m_sprayHeldExploration = SpineScores::HeldExploration::Sentinel;
+            hw->m_sprayHeldSentinelIntervalNs = kSentinelNs;
+            hw->m_sprayPathSeq = true;
+            hw->m_sprayReceiverHold = true;
+            hw->m_sprayReceiverHoldClean = kClean;
+            hw->m_switchQueues = leaves;
+        }
+
+        Ipv4Address address;
+        IsolatedHost host;
+    };
+
+    // A data packet from sender carried by spine with path sequence pathSeq,
+    // handed to receiver; the receiver_hold bitmap of its acknowledgement.
+    static uint8_t Deliver(Host& receiver, Host& sender, uint32_t seq, uint8_t spine, uint16_t pathSeq)
+    {
+        Ptr<Packet> packet = Create<Packet>(IsolatedHost::kMtu);
+        SeqTsHeader seqTs;
+        seqTs.SetSeq(seq);
+        seqTs.SetPG(IsolatedHost::kPriorityGroup);
+        seqTs.SetPathSeq(pathSeq);
+        packet->AddHeader(seqTs);
+        UdpHeader udp;
+        udp.SetSourcePort(IsolatedHost::kSenderPort);
+        udp.SetDestinationPort(IsolatedHost::kReceiverPort);
+        udp.ForcePayloadSize(CustomHeader::GetUdpHeaderSize() + IsolatedHost::kMtu);
+        packet->AddHeader(udp);
+        Ipv4Header ip;
+        ip.SetSource(sender.address);
+        ip.SetDestination(receiver.address);
+        ip.SetProtocol(0x11);
+        ip.SetDscp(static_cast<Ipv4Header::DscpType>(kUetDscpTrimmable));
+        ip.SetIdentification(SpineIdentification(spine, spine));
+        ip.SetPayloadSize(packet->GetSize());
+        packet->AddHeader(ip);
+        PppHeader ppp;
+        ppp.SetProtocol(0x0021);
+        packet->AddHeader(ppp);
+        CustomHeader parsed(CustomHeader::L2_Header | CustomHeader::L3_Header |
+                            CustomHeader::L4_Header);
+        packet->PeekHeader(parsed);
+        const size_t before = receiver.host.emitted.size();
+        receiver.host.hw->Receive(packet, parsed);
+        NS_ASSERT_MSG(receiver.host.emitted.size() == before + 1, "every arrival is acknowledged");
+        const CustomHeader& ack = receiver.host.emitted.back();
+        // The acknowledgement reaches its sender, whose queue pair follows it.
+        CustomHeader answer = ack;
+        answer.ack.seq = 0;
+        sender.host.hw->ReceiveAck(Create<Packet>(), answer);
+        return ack.ack.receiver_hold;
+    }
+
+    // Spines chosen by the queue pair at times from nowNs, one per 2 ns, so
+    // that the draws span less than a sentinel interval.
+    static std::vector<uint32_t> Draws(Ptr<RdmaQueuePair> qp, uint64_t nowNs, uint32_t sends)
+    {
+        std::vector<uint32_t> perSpine(kSpines, 0);
+        for (uint32_t i = 0; i < sends; ++i)
+        {
+            const uint16_t id = qp->m_pathSelector->Choose(nowNs + 2 * i);
+            ++perSpine[RequestedSpine(id)];
+            // Every second answer marked, so that REPS draws fresh spines too.
+            qp->m_pathSelector->OnAck(RequestedSpine(id), i % 2 == 1, nowNs + 2 * i);
+        }
+        return perSpine;
+    }
+
+    void Transport()
+    {
+        // Senders a1 and a2 on leaf 0, b on leaf 1, receivers r on leaf 2 and
+        // q on leaf 3.
+        const Ipv4Address a1("11.0.1.1"), a2("11.0.1.2"), b("11.0.3.1"), r("11.0.2.1"),
+            q("11.0.4.1");
+        Ptr<SwitchQueueState> leaves = Create<SwitchQueueState>(4, kSpines);
+        leaves->SetLeafOf(a1.Get(), 0);
+        leaves->SetLeafOf(a2.Get(), 0);
+        leaves->SetLeafOf(b.Get(), 1);
+        leaves->SetLeafOf(r.Get(), 2);
+        leaves->SetLeafOf(q.Get(), 3);
+        Host receiver(r, {a1, a2, b}, leaves);
+        Host sa1(a1, {r, q}, leaves), sa2(a2, {r}, leaves), sb(b, {r}, leaves);
+        NS_TEST_EXPECT_MSG_EQ(receiver.host.hw->ValidReceiverHold(), true, "accepted");
+        Ptr<RdmaHw> unset = CreateObject<RdmaHw>();
+        NS_TEST_EXPECT_MSG_EQ(unset->m_sprayReceiverHold, false, "off by default");
+        UintegerValue clean;
+        unset->GetAttribute("SprayReceiverHoldClean", clean);
+        NS_TEST_EXPECT_MSG_EQ(clean.Get(), 1024u, "SprayReceiverHoldClean is 1024 by default");
+        receiver.host.hw->m_sprayPathSeq = false;
+        NS_TEST_EXPECT_MSG_EQ(receiver.host.hw->ValidReceiverHold(),
+                              false,
+                              "refused without the path sequences");
+        receiver.host.hw->m_sprayPathSeq = true;
+
+        std::map<Host*, Ptr<RdmaQueuePair>> qps;
+        for (Host* sender : {&sa1, &sa2, &sb})
+        {
+            qps[sender] = sender->host.AddSender(sender->address, r, 1000000000);
+            sender->host.hw->AttachReceiverHold(qps[sender]);
+        }
+        Ptr<RdmaQueuePair> toQ = sa1.host.AddSender(a1, q, 1000000000, 10002);
+        sa1.host.hw->AttachReceiverHold(toQ);
+        std::map<std::pair<Host*, uint8_t>, uint16_t> pathSeq;
+        uint32_t seq = 0;
+        auto deliver = [&](Host& sender, uint8_t spine, uint16_t skip = 0) {
+            uint16_t& next = pathSeq[{&sender, spine}];
+            next += skip;
+            seq += IsolatedHost::kMtu;
+            return Deliver(receiver, sender, seq, spine, next++);
+        };
+        auto spine3 = [&](Host& sender) { return deliver(sender, 3) & 0x08; };
+
+        // (b) Sender leaf 0 loses on spine 3: only its senders see the bit.
+        deliver(sa1, 3);
+        NS_TEST_EXPECT_MSG_EQ(deliver(sa1, 3, 1), 0x08, "a loss from leaf 0 holds spine 3 for it");
+        NS_TEST_EXPECT_MSG_EQ(receiver.host.hw->m_receiverHold->HostHolds(3),
+                              false,
+                              "for leaf 0 alone");
+        NS_TEST_EXPECT_MSG_EQ(deliver(sa2, 1), 0x08, "the other sender on leaf 0 sees it");
+        NS_TEST_EXPECT_MSG_EQ(deliver(sb, 1), 0x00, "the sender on leaf 1 does not");
+        std::vector<uint32_t> drawn = Draws(qps[&sa2], 0, 400);
+        NS_TEST_EXPECT_MSG_EQ(drawn[3], 0u, "leaf 0's sender stops drawing spine 3");
+        drawn = Draws(qps[&sa1], 0, 400);
+        NS_TEST_EXPECT_MSG_EQ(drawn[3], 0u, "as does the sender that lost");
+        drawn = Draws(qps[&sb], 0, 400);
+        NS_TEST_EXPECT_MSG_GT(drawn[3], 10u, "leaf 1's sender keeps it");
+        drawn = Draws(toQ, 0, 400);
+        NS_TEST_EXPECT_MSG_GT(drawn[3], 10u, "and toward another leaf spine 3 is kept");
+
+        // (a) Sender leaf 1 loses on spine 3 too: the receiver holds it for
+        // every leaf and both leaves' senders see the bit.
+        deliver(sb, 3);
+        NS_TEST_EXPECT_MSG_EQ(deliver(sb, 3, 2), 0x08, "a loss from leaf 1 holds spine 3");
+        NS_TEST_EXPECT_MSG_EQ(receiver.host.hw->m_receiverHold->HostHolds(3),
+                              true,
+                              "for every sender leaf");
+        NS_TEST_EXPECT_MSG_EQ(deliver(sa1, 1), 0x08, "leaf 0's sender sees it");
+        for (Host* sender : {&sa1, &sa2, &sb})
+        {
+            drawn = Draws(qps[sender], 1000000, 400);
+            NS_TEST_EXPECT_MSG_EQ(drawn[3],
+                                  1u,
+                                  "toward the receiver's leaf spine 3 is sent one sentinel");
+        }
+        drawn = Draws(toQ, 1000000, 400);
+        NS_TEST_EXPECT_MSG_GT(drawn[3], 10u, "toward another leaf it is kept");
+
+        // (c) The clean arrivals release it; the next acknowledgements clear
+        // the bit and the senders draw spine 3 again.
+        for (uint32_t i = 0; i + 1 < kClean; ++i)
+        {
+            NS_TEST_EXPECT_MSG_EQ(spine3(i % 2 == 0 ? sa1 : sb), 0x08, "held until the count");
+        }
+        NS_TEST_EXPECT_MSG_EQ(spine3(sb), 0x00, "released after the clean arrivals");
+        deliver(sa1, 1);
+        deliver(sa2, 1);
+        for (Host* sender : {&sa1, &sa2, &sb})
+        {
+            drawn = Draws(qps[sender], 2000000, 400);
+            NS_TEST_EXPECT_MSG_GT(drawn[3], 10u, "the senders re-admit spine 3");
+        }
+
+        // Every scope of reps_hold, and reps_flow_hold, follows the bitmap.
+        for (uint32_t scope : {static_cast<uint32_t>(HoldScope::Host),
+                               static_cast<uint32_t>(HoldScope::Leaf),
+                               kFlowHold})
+        {
+            Host sender(a1, {r}, leaves);
+            Ptr<RdmaHw> hw = sender.host.hw;
+            if (scope == kFlowHold)
+            {
+                hw->m_pathSelectorKind = static_cast<uint32_t>(PathSelectorKind::RepsFlowHold);
+            }
+            else
+            {
+                hw->m_sprayHoldScope = scope;
+            }
+            Ptr<RdmaQueuePair> flow = sender.host.AddSender(a1, r, 1000000000);
+            hw->AttachReceiverHold(flow);
+            flow->m_pathSelector->OnReceiverHold(r.Get(), 0x08, 0);
+            drawn = Draws(flow, 0, 400);
+            NS_TEST_EXPECT_MSG_EQ(drawn[3], 0u, "a set bit holds the spine under every scope");
+            drawn = Draws(flow, 1000000, 400);
+            NS_TEST_EXPECT_MSG_EQ(drawn[3], 1u, "and sends it one sentinel per interval");
+            flow->m_pathSelector->OnReceiverHold(r.Get(), 0x00, 2000000);
+            drawn = Draws(flow, 2000000, 400);
+            NS_TEST_EXPECT_MSG_GT(drawn[3], 10u, "a clear bit releases it");
+        }
+    }
+
+    static constexpr uint32_t kFlowHold = 99;
+};
+
+class SprayReceiverHoldTraceTest : public TestCase
+{
+  public:
+    SprayReceiverHoldTraceTest()
+        : TestCase("Under SprayReceiverHold the receiving host traces each closed interval per "
+                   "sender leaf with the arrivals, the missing packets and each spine's hold")
+    {
+    }
+
+    void DoRun() override
+    {
+        Ptr<RdmaHw> hw = CreateObject<RdmaHw>();
+        hw->m_spineCount = 8;
+        hw->m_loadBalancing = static_cast<uint32_t>(LoadBalancingMode::SprayUniform);
+        hw->m_pathSelectorKind = static_cast<uint32_t>(PathSelectorKind::RepsHold);
+        hw->m_sprayLossIntervalNs = 1000;
+        hw->m_sprayHoldAutoLeaves = 2;
+        hw->m_sprayReceiverHoldClean = 3;
+        hw->m_sprayPathSeq = true;
+        hw->m_sprayReceiverHold = true;
+        struct Row
+        {
+            uint32_t leaf;
+            uint64_t endNs;
+            std::vector<uint32_t> arrivals;
+            std::vector<uint32_t> lost;
+            std::vector<uint8_t> holds;
+        };
+        std::vector<Row> rows;
+        hw->TraceConnectWithoutContext(
+            "ReceiverHoldInterval",
+            Callback<void,
+                     uint32_t,
+                     uint64_t,
+                     const std::vector<uint32_t>&,
+                     const std::vector<uint32_t>&,
+                     const std::vector<uint8_t>&>(
+                [&](uint32_t leaf,
+                    uint64_t endNs,
+                    const std::vector<uint32_t>& arrivals,
+                    const std::vector<uint32_t>& lost,
+                    const std::vector<uint8_t>& holds) {
+                    rows.push_back(Row{leaf, endNs, arrivals, lost, holds});
+                }));
+        ReceiverHold& hold = hw->ReceiverHoldOf();
+        hold.OnArrival(0, 3, 2, false, 100);
+        hold.OnArrival(1, 2, 0, false, 500);
+        NS_TEST_EXPECT_MSG_EQ(rows.size(), 0u, "nothing is traced before the interval ends");
+        hold.OnArrival(1, 3, 1, false, 2500);
+        NS_TEST_ASSERT_MSG_EQ(rows.size(), 2u, "one row set per sender leaf seen");
+        NS_TEST_EXPECT_MSG_EQ(rows[0].leaf, 0u, "in leaf order");
+        NS_TEST_EXPECT_MSG_EQ(rows[0].endNs, 1000u, "at the end of the interval counted");
+        NS_TEST_EXPECT_MSG_EQ(rows[0].arrivals[3], 1u, "leaf 0's arrival on spine 3");
+        NS_TEST_EXPECT_MSG_EQ(rows[0].lost[3], 2u, "and its missing packets");
+        NS_TEST_EXPECT_MSG_EQ(rows[0].holds[3],
+                              static_cast<uint8_t>(ReceiverHold::Scope::Leaf),
+                              "spine 3 held for leaf 0");
+        NS_TEST_EXPECT_MSG_EQ(rows[1].arrivals[2], 1u, "leaf 1's arrival on spine 2");
+        NS_TEST_EXPECT_MSG_EQ(rows[1].holds[3],
+                              static_cast<uint8_t>(ReceiverHold::Scope::None),
+                              "and spine 3 not held for leaf 1");
+        hold.OnArrival(0, 1, 0, false, 3100);
+        NS_TEST_ASSERT_MSG_EQ(rows.size(), 4u, "the next interval closes");
+        NS_TEST_EXPECT_MSG_EQ(rows[2].endNs, 3000u, "the empty interval between is skipped");
+        NS_TEST_EXPECT_MSG_EQ(rows[3].lost[3], 1u, "leaf 1's missing packet");
+        NS_TEST_EXPECT_MSG_EQ(rows[3].holds[3],
+                              static_cast<uint8_t>(ReceiverHold::Scope::Host),
+                              "widened spine 3 to every sender leaf");
+        NS_TEST_EXPECT_MSG_EQ(rows[2].holds[3],
+                              static_cast<uint8_t>(ReceiverHold::Scope::Host),
+                              "for leaf 0 too");
+        Simulator::Destroy();
+    }
+};
+
+class SprayPathSeqTrimTest : public TestCase
+{
+  public:
+    SprayPathSeqTrimTest()
+        : TestCase("Under SprayPathSeq a trimmed header accounts its path sequence without "
+                   "moving the receiver's expected one on, so trims alone, also ahead of "
+                   "the data they overtake, hold no spine")
+    {
+    }
+
+    void DoRun() override
+    {
+        const IntHeader::Mode savedIntMode = IntHeader::mode;
+        const bool savedPathSeq = CustomHeader::udpCarriesPathSeq;
+        const bool savedPacketSeq = CustomHeader::ackCarriesPacketSeq;
+        const uint32_t savedHoldBytes = CustomHeader::ackReceiverHoldBytes;
+        IntHeader::mode = IntHeader::NONE;
+        CustomHeader::ackCarriesPacketSeq = true;
+        CustomHeader::udpCarriesPathSeq = true;
+        CustomHeader::ackReceiverHoldBytes = 1;
+
+        Overtaking();
+
+        // Trims on spines 2 and 3, no link loss.
+        Outcome trimsOnly = Run(false);
+        NS_TEST_EXPECT_MSG_GT(trimsOnly.trims, 100u, "the congested spines trim");
+        for (uint32_t spine = 0; spine < kSpines; ++spine)
+        {
+            NS_TEST_EXPECT_MSG_EQ(trimsOnly.gaps[spine], 0u, "a trim is not a missing packet");
+            NS_TEST_EXPECT_MSG_EQ(trimsOnly.lossLeaves[spine], 0u, "nor a loss of the hold");
+        }
+        NS_TEST_EXPECT_MSG_EQ(static_cast<uint32_t>(trimsOnly.bitmap),
+                              0u,
+                              "trims alone hold no spine");
+
+        // The same trims and a 1% link loss on spine 3.
+        Outcome lossy = Run(true);
+        NS_TEST_EXPECT_MSG_GT(lossy.drops, 10u, "spine 3 drops packets");
+        NS_TEST_EXPECT_MSG_EQ(lossy.gaps[kLossy],
+                              lossy.drops,
+                              "the missing packets on spine 3 are its link drops");
+        for (uint32_t spine = 0; spine < kSpines; ++spine)
+        {
+            if (spine != kLossy)
+            {
+                NS_TEST_EXPECT_MSG_EQ(lossy.gaps[spine], 0u, "no other spine misses a packet");
+            }
+        }
+        NS_TEST_EXPECT_MSG_EQ(lossy.lossLeaves[kLossy], 1u, "the link drops hold spine 3");
+
+        // The trimmed headers of path sequences 10 to 20 on spine 5 overtake
+        // the data of 5 to 9, as the switches' high-priority queue lets them.
+        Outcome overtaken = Run(false, true);
+        NS_TEST_EXPECT_MSG_EQ(overtaken.overtaking, 11u, "eleven trimmed headers overtake");
+        NS_TEST_EXPECT_MSG_EQ(overtaken.overtaken, 5u, "five data packets");
+        for (uint32_t spine = 0; spine < kSpines; ++spine)
+        {
+            NS_TEST_EXPECT_MSG_EQ(overtaken.gaps[spine], 0u, "no packet is missing");
+            NS_TEST_EXPECT_MSG_EQ(overtaken.lossLeaves[spine], 0u, "nor a loss of the hold");
+        }
+        NS_TEST_EXPECT_MSG_EQ(static_cast<uint32_t>(overtaken.bitmap),
+                              0u,
+                              "the overtaking trims hold no spine");
+
+        CustomHeader::ackReceiverHoldBytes = savedHoldBytes;
+        CustomHeader::udpCarriesPathSeq = savedPathSeq;
+        CustomHeader::ackCarriesPacketSeq = savedPacketSeq;
+        IntHeader::mode = savedIntMode;
+        Simulator::Destroy();
+    }
+
+  private:
+    static constexpr uint32_t kSpines = 8;
+    static constexpr uint8_t kLossy = 3;
+
+    static constexpr uint8_t kOvertaken = 5;
+
+    // Trimmed headers of sequences 10 to 20 arrive before the data of 5 to 9
+    // on one path: nothing is missing, and the data arrive in order.
+    void Overtaking()
+    {
+        SpineSequenceReceiver receiver;
+        for (uint16_t seq = 0; seq < 5; ++seq)
+        {
+            NS_TEST_EXPECT_MSG_EQ(receiver.OnArrival(kOvertaken, kOvertaken, seq).gaps,
+                                  0u,
+                                  "the data before the trims in order");
+        }
+        for (uint16_t seq = 10; seq <= 20; ++seq)
+        {
+            receiver.OnTrim(kOvertaken, kOvertaken, seq);
+        }
+        for (uint16_t seq = 5; seq < 10; ++seq)
+        {
+            const SpineSequenceReceiver::Arrival arrival =
+                receiver.OnArrival(kOvertaken, kOvertaken, seq);
+            NS_TEST_EXPECT_MSG_EQ(arrival.gaps, 0u, "the overtaken data shows no gap");
+            NS_TEST_EXPECT_MSG_EQ(arrival.late, false, "and is consumed in order");
+        }
+        NS_TEST_EXPECT_MSG_EQ(receiver.OnArrival(kOvertaken, kOvertaken, 21).gaps,
+                              0u,
+                              "the trims accounted 10 to 20");
+        NS_TEST_EXPECT_MSG_EQ(receiver.Accounted(kOvertaken, 15),
+                              false,
+                              "and are dropped once passed");
+        NS_TEST_EXPECT_MSG_EQ(receiver.OnArrival(kOvertaken, kOvertaken, 23).gaps,
+                              1u,
+                              "a data packet lost after them is missing");
+        // A trimmed header behind the expected sequence, or too far ahead of
+        // it, is not accounted.
+        receiver.OnTrim(kOvertaken, kOvertaken, 2);
+        NS_TEST_EXPECT_MSG_EQ(receiver.Accounted(kOvertaken, 2), false, "behind");
+        receiver.OnTrim(kOvertaken,
+                        kOvertaken,
+                        24 + SpineSequenceReceiver::kAccountedWindow);
+        NS_TEST_EXPECT_MSG_EQ(receiver.Accounted(kOvertaken,
+                                                 24 + SpineSequenceReceiver::kAccountedWindow),
+                              false,
+                              "beyond the window");
+        receiver.OnTrim(kOvertaken,
+                        kOvertaken,
+                        23 + SpineSequenceReceiver::kAccountedWindow);
+        NS_TEST_EXPECT_MSG_EQ(receiver.Accounted(kOvertaken,
+                                                 23 + SpineSequenceReceiver::kAccountedWindow),
+                              true,
+                              "the window's last");
+        // A moved path's trims before its first data arrival.
+        receiver.OnTrim(2, 6, 30);
+        receiver.OnTrim(2, 6, 12);
+        NS_TEST_EXPECT_MSG_EQ(receiver.OnArrival(2, 6, 28).gaps, 0u, "a moved path starts");
+        NS_TEST_EXPECT_MSG_EQ(receiver.Accounted(2, 12), false, "the trims behind it dropped");
+        NS_TEST_EXPECT_MSG_EQ(receiver.OnArrival(2, 6, 31).gaps, 1u, "29 missing, 30 accounted");
+    }
+
+    struct Outcome
+    {
+        uint32_t trims = 0;
+        uint32_t drops = 0;
+        uint32_t overtaking = 0;
+        uint32_t overtaken = 0;
+        std::vector<uint64_t> gaps;
+        std::vector<uint32_t> lossLeaves;
+        uint8_t bitmap = 0;
+    };
+
+    // Trim packet as SwitchNode::TrimInPlace does with MIN_TRIM_SIZE 24: keep
+    // the larger of it and the data headers of IP payload, and mark it.
+    static void Trim(Ptr<Packet> packet)
+    {
+        const uint32_t kept = std::max<uint32_t>(std::max<uint32_t>(24, CustomHeader::GetUdpHeaderSize()),
+                                                 60 - 14 - 20);
+        packet->RemoveAtEnd(packet->GetSize() - PppHeader::GetStaticSize() - 20 - kept);
+        PppHeader ppp;
+        Ipv4Header ip;
+        packet->RemoveHeader(ppp);
+        packet->RemoveHeader(ip);
+        ip.SetDscp(static_cast<Ipv4Header::DscpType>(kUetDscpTrimmed));
+        ip.SetPayloadSize(kept);
+        packet->AddHeader(ip);
+        packet->AddHeader(ppp);
+    }
+
+    // With overtake, no other trim or loss: spine kOvertaken's data packets
+    // of path sequences 5 to 9 are held back, its packets of 10 to 20 are
+    // trimmed and delivered at once, and the held ones follow the last trim.
+    Outcome Run(bool linkLoss, bool overtake = false)
+    {
+        IsolatedHost sender(LoadBalancingMode::SprayUniform, kTestReceiver, kSpines);
+        IsolatedHost receiver(LoadBalancingMode::SprayUniform, kTestSender, kSpines);
+        Ptr<SwitchQueueState> leaves = Create<SwitchQueueState>(2, kSpines);
+        leaves->SetLeafOf(kTestSender.Get(), 0);
+        leaves->SetLeafOf(kTestReceiver.Get(), 1);
+        for (IsolatedHost* host : {&sender, &receiver})
+        {
+            Ptr<RdmaHw> hw = host->hw;
+            hw->m_retransmission_timeout_ns = 0;
+            hw->m_pathSelectorKind = static_cast<uint32_t>(PathSelectorKind::RepsHold);
+            hw->m_sprayHoldScope = static_cast<uint32_t>(HoldScope::Host);
+            hw->m_sprayLossThreshold1 = 0.1;
+            hw->m_sprayLossThreshold2 = 0.25;
+            hw->m_sprayLossThreshold3 = 0.5;
+            hw->m_sprayLossIntervalNs = 10000;
+            hw->m_sprayLossHoldCleanSentinels = 3;
+            hw->m_sprayHeldExploration = SpineScores::HeldExploration::Sentinel;
+            hw->m_sprayPathSeq = true;
+            hw->m_sprayReceiverHold = true;
+            hw->m_sprayHoldAutoLeaves = 2;
+            hw->m_switchQueues = leaves;
+        }
+        constexpr uint32_t kPackets = 20000;
+        Ptr<RdmaQueuePair> qp = sender.AddSender(kTestSender, kTestReceiver,
+                                                 static_cast<uint64_t>(kPackets) * IsolatedHost::kMtu);
+        Ptr<UniformRandomVariable> draw =
+            CreateObjectWithAttributes<UniformRandomVariable>("Stream", IntegerValue(11));
+        Outcome outcome;
+        std::vector<Ptr<Packet>> heldBack;
+        for (uint32_t i = 0; i < kPackets; ++i)
+        {
+            Ptr<Packet> packet = sender.hw->GetNxtPacket(qp);
+            CustomHeader sent(CustomHeader::L2_Header | CustomHeader::L3_Header |
+                              CustomHeader::L4_Header);
+            packet->PeekHeader(sent);
+            const uint8_t spine = RequestedSpine(sent.ipid);
+            const double u = draw->GetValue();
+            if (linkLoss && spine == kLossy && u < 0.01)
+            {
+                ++outcome.drops;
+                continue;
+            }
+            const bool onOvertaken = overtake && spine == kOvertaken;
+            if (onOvertaken && sent.udp.path_seq >= 5 && sent.udp.path_seq <= 9)
+            {
+                heldBack.push_back(packet);
+                continue;
+            }
+            const bool overtaking =
+                onOvertaken && sent.udp.path_seq >= 10 && sent.udp.path_seq <= 20;
+            const bool trimmed = overtake
+                ? overtaking
+                : (spine == 2 && u < 0.3) || (spine == kLossy && u > 0.9);
+            if (trimmed)
+            {
+                Trim(packet);
+                ++outcome.trims;
+            }
+            CustomHeader parsed(CustomHeader::L2_Header | CustomHeader::L3_Header |
+                                CustomHeader::L4_Header);
+            packet->PeekHeader(parsed);
+            NS_TEST_EXPECT_MSG_EQ(parsed.udp.path_seq,
+                                  sent.udp.path_seq,
+                                  "the trimmed header keeps the path sequence");
+            receiver.hw->Receive(packet, parsed);
+            outcome.overtaking += overtaking;
+            if (overtaking && sent.udp.path_seq == 20)
+            {
+                for (Ptr<Packet> held : heldBack)
+                {
+                    CustomHeader late(CustomHeader::L2_Header | CustomHeader::L3_Header |
+                                      CustomHeader::L4_Header);
+                    held->PeekHeader(late);
+                    receiver.hw->Receive(held, late);
+                    ++outcome.overtaken;
+                }
+                heldBack.clear();
+            }
+        }
+        Ptr<RdmaHw> hw = receiver.hw;
+        outcome.gaps = hw->m_spineGaps;
+        outcome.gaps.resize(kSpines, 0);
+        ReceiverHold& hold = hw->ReceiverHoldOf();
+        for (uint32_t spine = 0; spine < kSpines; ++spine)
+        {
+            outcome.lossLeaves.push_back(hold.LossLeaves(spine));
+        }
+        outcome.bitmap = hold.Bitmap(0);
+        return outcome;
+    }
+};
+
+class SprayTailRecoveryTest : public TestCase
+{
+  public:
+    SprayTailRecoveryTest()
+        : TestCase("Under SprayTailRecovery the packets a queue pair sends once it has no new "
+                   "data left close their spines and carry each spine's count, the receiver asks "
+                   "for the path sequences still missing after its delay, and the sender repairs "
+                   "a lost tail without a retransmission timeout")
+    {
+    }
+
+    void DoRun() override
+    {
+        const IntHeader::Mode savedIntMode = IntHeader::mode;
+        const bool savedPathSeq = CustomHeader::udpCarriesPathSeq;
+        const bool savedPacketSeq = CustomHeader::ackCarriesPacketSeq;
+        const uint32_t savedCounts = CustomHeader::udpTailCounts;
+        const uint32_t savedNack = CustomHeader::ackTailNackBytes;
+        IntHeader::mode = IntHeader::NONE;
+        CustomHeader::ackCarriesPacketSeq = true;
+        CustomHeader::udpCarriesPathSeq = true;
+
+        Unit();
+        Refusals();
+        TailLoss();
+        LostClosingPacket();
+        OvertakenClosingPacket();
+
+        CustomHeader::ackTailNackBytes = savedNack;
+        CustomHeader::udpTailCounts = savedCounts;
+        CustomHeader::udpCarriesPathSeq = savedPathSeq;
+        CustomHeader::ackCarriesPacketSeq = savedPacketSeq;
+        IntHeader::mode = savedIntMode;
+        Simulator::Destroy();
+    }
+
+  private:
+    static constexpr uint32_t kSpines = 8;
+    static constexpr uint8_t kLossy = 3;
+    static constexpr uint32_t kMtu = IsolatedHost::kMtu;
+    static constexpr uint64_t kOneWayNs = 1000;
+    static constexpr uint64_t kBaseRttNs = 2 * kOneWayNs;
+    static constexpr uint64_t kStepNs = 100;
+    static constexpr uint64_t kTimeoutNs = 20000;
+    // The receiver's delay, the base RTT by default.
+    static constexpr uint64_t kDelayNs = kBaseRttNs;
+    // How long after the last packet a slower spine delivers its own last.
+    static constexpr uint64_t kOvertakeNs = kDelayNs / 2;
+    // The new data packets up spine 3 among the message's last ones that a
+    // tail loss drops.
+    static constexpr uint32_t kTailPackets = 16;
+
+    static void SetHeaders(bool on)
+    {
+        CustomHeader::udpTailCounts = on ? kSpines : 0;
+        CustomHeader::ackTailNackBytes = on ? 5 : 0;
+    }
+
+    static CustomHeader Parse(Ptr<const Packet> packet)
+    {
+        CustomHeader parsed(CustomHeader::L2_Header | CustomHeader::L3_Header |
+                            CustomHeader::L4_Header);
+        packet->PeekHeader(parsed);
+        return parsed;
+    }
+
+    void Unit()
+    {
+        SetHeaders(false);
+        const uint32_t udp = CustomHeader::GetUdpHeaderSize();
+        const uint32_t ack = CustomHeader::GetAckSerializedSize();
+        const uint32_t qbb = qbbHeader().GetSerializedSize();
+        SetHeaders(true);
+        NS_TEST_EXPECT_MSG_EQ(CustomHeader::GetUdpHeaderSize(),
+                              udp + 1 + 2 * kSpines,
+                              "the data header grows by a flag byte and a count per spine");
+        NS_TEST_EXPECT_MSG_EQ(SeqTsHeader().GetSerializedSize(),
+                              8u + 1 + 2 * kSpines,
+                              "the writer agrees on the size");
+        NS_TEST_EXPECT_MSG_EQ(CustomHeader::GetAckSerializedSize(),
+                              ack + 5,
+                              "the acknowledgement header grows by the spine, sequence and count");
+        NS_TEST_EXPECT_MSG_EQ(qbbHeader().GetSerializedSize(), qbb + 5, "the writer agrees");
+
+        // A data header's tail fields, written and parsed.
+        uint16_t counts[kSpines] = {1, 2, 3, 65535, 0, 7, 8, 9};
+        SeqTsHeader seqTs;
+        seqTs.SetSeq(5000);
+        seqTs.SetPG(IsolatedHost::kPriorityGroup);
+        seqTs.SetPathSeq(41);
+        seqTs.SetTail(kTailCloses, counts, kSpines);
+        Ptr<Packet> data = Create<Packet>(kMtu);
+        data->AddHeader(seqTs);
+        UdpHeader udpHeader;
+        udpHeader.ForcePayloadSize(CustomHeader::GetUdpHeaderSize() + kMtu);
+        data->AddHeader(udpHeader);
+        Ipv4Header ip;
+        ip.SetProtocol(0x11);
+        ip.SetPayloadSize(data->GetSize());
+        data->AddHeader(ip);
+        PppHeader ppp;
+        ppp.SetProtocol(0x0021);
+        data->AddHeader(ppp);
+        const CustomHeader parsed = Parse(data);
+        NS_TEST_EXPECT_MSG_EQ(parsed.udp.path_seq, 41u, "the path sequence before the fields");
+        NS_TEST_EXPECT_MSG_EQ(static_cast<uint32_t>(parsed.udp.tail_flags),
+                              static_cast<uint32_t>(kTailCloses),
+                              "the closing flag");
+        for (uint32_t k = 0; k < kSpines; ++k)
+        {
+            NS_TEST_EXPECT_MSG_EQ(parsed.udp.tail_counts[k], counts[k], "each spine's count");
+        }
+        NS_TEST_EXPECT_MSG_EQ(data->GetSize() - parsed.GetSerializedSize(),
+                              kMtu,
+                              "the payload follows the fields");
+
+        // A tail repair request, written and parsed.
+        qbbHeader request;
+        request.SetTailNack(kLossy, 65530, 7);
+        NS_TEST_EXPECT_MSG_EQ(request.IsTailNack(), true, "the flag is set");
+        Ptr<Packet> nack = Create<Packet>();
+        nack->AddHeader(request);
+        Ipv4Header nackIp;
+        nackIp.SetProtocol(kUecTrimRepairProtocol);
+        nackIp.SetPayloadSize(nack->GetSize());
+        nack->AddHeader(nackIp);
+        nack->AddHeader(ppp);
+        const CustomHeader parsedNack = Parse(nack);
+        NS_TEST_EXPECT_MSG_EQ(((parsedNack.ack.flags >> qbbHeader::FLAG_TAIL_NACK) & 1), 1,
+                              "the parser reads the flag");
+        NS_TEST_EXPECT_MSG_EQ(static_cast<uint32_t>(parsedNack.ack.tail_spine), 3u, "the spine");
+        NS_TEST_EXPECT_MSG_EQ(parsedNack.ack.tail_seq, 65530u, "the first missing sequence");
+        NS_TEST_EXPECT_MSG_EQ(parsedNack.ack.tail_count, 7u, "and the count");
+        NS_TEST_EXPECT_MSG_EQ(((qbbHeader().GetSerializedSize() > 0) &&
+                               !qbbHeader().IsTailNack()),
+                              true,
+                              "an acknowledgement is no tail repair request");
+
+        SpineSequenceSender sender;
+        NS_TEST_EXPECT_MSG_EQ(sender.Count(2), 0u, "nothing sent up spine 2");
+        sender.Next(2);
+        sender.Next(2);
+        NS_TEST_EXPECT_MSG_EQ(sender.Count(2), 2u, "two sent up spine 2");
+        NS_TEST_EXPECT_MSG_EQ(sender.Count(5), 0u, "each spine counts apart");
+
+        SpineSequenceReceiver receiver;
+        // The single run TakeMissing returns, or an empty one.
+        auto take = [&](uint8_t spine, uint16_t owed) {
+            const std::vector<SpineSequenceReceiver::Missing> runs =
+                receiver.TakeMissing(spine, owed);
+            NS_TEST_EXPECT_MSG_LT(runs.size(), 2u, "one run at most without trims");
+            return runs.empty() ? SpineSequenceReceiver::Missing{0, 0} : runs.front();
+        };
+        SpineSequenceReceiver::Missing missing = take(1, 3);
+        NS_TEST_EXPECT_MSG_EQ(missing.first, 0u, "nothing arrived: from 0");
+        NS_TEST_EXPECT_MSG_EQ(missing.count, 3u, "three owed");
+        NS_TEST_EXPECT_MSG_EQ(take(1, 3).count, 0u, "a run is taken once");
+        missing = take(1, 5);
+        NS_TEST_EXPECT_MSG_EQ(missing.first, 3u, "a later count takes the rest");
+        NS_TEST_EXPECT_MSG_EQ(missing.count, 2u, "two more");
+        receiver.OnArrival(2, 2, 0);
+        receiver.OnArrival(2, 2, 1);
+        NS_TEST_EXPECT_MSG_EQ(take(2, 2).count, 0u, "both arrived");
+        missing = take(2, 4);
+        NS_TEST_EXPECT_MSG_EQ(missing.first, 2u, "the tail after them");
+        NS_TEST_EXPECT_MSG_EQ(missing.count, 2u, "is missing");
+        // A packet requested up 4 that a source leaf moved onto 6 is
+        // furthest on the path (4, 6).
+        receiver.OnArrival(4, 4, 0);
+        receiver.OnArrival(4, 6, 5);
+        missing = take(4, 8);
+        NS_TEST_EXPECT_MSG_EQ(missing.first, 6u, "from the moved packet on");
+        NS_TEST_EXPECT_MSG_EQ(missing.count, 2u, "two owed");
+        NS_TEST_EXPECT_MSG_EQ(take(7, 0).count, 0u, "nothing owed");
+        receiver.OnArrival(5, 6, 65534);
+        missing = take(5, 1);
+        NS_TEST_EXPECT_MSG_EQ(missing.first, 65535u, "across the wrap");
+        NS_TEST_EXPECT_MSG_EQ(missing.count, 2u, "65535 and 0");
+
+        TrimmedNotRequested();
+
+        PendingTailRuns runs;
+        NS_TEST_EXPECT_MSG_EQ(runs.NextDue(), PendingTailRuns::kNone, "nothing pending");
+        runs.Add(3, 10, 4, 100);
+        runs.Add(5, 0, 1, 100);
+        runs.Add(6, 7, 2, 200);
+        runs.OnArrival(3, 11);
+        runs.OnArrival(5, 0);
+        runs.OnArrival(4, 12);
+        NS_TEST_EXPECT_MSG_EQ(runs.NextDue(), 100u, "the earliest due");
+        NS_TEST_EXPECT_MSG_EQ(runs.TakeDue(99).size(), 0u, "nothing due before it");
+        const std::vector<PendingTailRuns::Request> due = runs.TakeDue(100);
+        NS_TEST_EXPECT_MSG_EQ(due.size(), 2u, "spine 3's run split by its arrival, 5's gone");
+        if (due.size() == 2)
+        {
+            NS_TEST_EXPECT_MSG_EQ(static_cast<uint32_t>(due[0].spine), 3u, "spine 3");
+            NS_TEST_EXPECT_MSG_EQ(due[0].first, 10u, "10 alone");
+            NS_TEST_EXPECT_MSG_EQ(due[0].count, 1u, "11 arrived");
+            NS_TEST_EXPECT_MSG_EQ(due[1].first, 12u, "12 and 13");
+            NS_TEST_EXPECT_MSG_EQ(due[1].count, 2u, "an arrival on spine 4 takes nothing");
+        }
+        NS_TEST_EXPECT_MSG_EQ(runs.NextDue(), 200u, "spine 6's run waits");
+        runs.OnArrival(6, 7);
+        runs.OnArrival(6, 8);
+        NS_TEST_EXPECT_MSG_EQ(runs.TakeDue(200).size(), 0u, "all of it arrived");
+        NS_TEST_EXPECT_MSG_EQ(runs.Empty(), true, "and is gone");
+    }
+
+    // A trimmed header accounts its path sequence: tail recovery treats it
+    // as present and does not request it, while the data behind it on a
+    // slower path is still owed.
+    void TrimmedNotRequested()
+    {
+        SpineSequenceReceiver receiver;
+        receiver.OnArrival(3, 3, 0);
+        receiver.OnArrival(3, 3, 1);
+        // The trimmed headers of 3 and 5 overtake the data of 2 and 4.
+        receiver.OnTrim(3, 3, 3);
+        receiver.OnTrim(3, 3, 5);
+        NS_TEST_EXPECT_MSG_EQ(receiver.Accounted(3, 3), true, "3 is accounted");
+        NS_TEST_EXPECT_MSG_EQ(receiver.Accounted(3, 2), false, "2 is not");
+        NS_TEST_EXPECT_MSG_EQ(receiver.Accounted(4, 3), false, "per requested spine");
+        std::vector<SpineSequenceReceiver::Missing> runs = receiver.TakeMissing(3, 7);
+        NS_TEST_EXPECT_MSG_EQ(runs.size(), 3u, "2, 4 and 6, the trims left out");
+        if (runs.size() == 3)
+        {
+            NS_TEST_EXPECT_MSG_EQ(runs[0].first, 2u, "2");
+            NS_TEST_EXPECT_MSG_EQ(runs[0].count, 1u, "alone");
+            NS_TEST_EXPECT_MSG_EQ(runs[1].first, 4u, "4");
+            NS_TEST_EXPECT_MSG_EQ(runs[1].count, 1u, "alone");
+            NS_TEST_EXPECT_MSG_EQ(runs[2].first, 6u, "6");
+            NS_TEST_EXPECT_MSG_EQ(runs[2].count, 1u, "alone");
+        }
+        NS_TEST_EXPECT_MSG_EQ(receiver.TakeMissing(3, 7).size(), 0u, "taken once");
+        // A trimmed sequence ahead of the expected one on a moved path is
+        // accounted for its requested spine too.
+        receiver.OnArrival(5, 5, 0);
+        receiver.OnArrival(5, 1, 8);
+        receiver.OnTrim(5, 1, 10);
+        runs = receiver.TakeMissing(5, 12);
+        NS_TEST_EXPECT_MSG_EQ(runs.size(), 2u, "9 and 11");
+        if (runs.size() == 2)
+        {
+            NS_TEST_EXPECT_MSG_EQ(runs[0].first, 9u, "9");
+            NS_TEST_EXPECT_MSG_EQ(runs[0].count, 1u, "alone");
+            NS_TEST_EXPECT_MSG_EQ(runs[1].first, 11u, "11");
+            NS_TEST_EXPECT_MSG_EQ(runs[1].count, 1u, "alone");
+        }
+        // Every owed sequence trimmed: nothing is requested.
+        receiver.OnTrim(6, 6, 0);
+        receiver.OnTrim(6, 6, 1);
+        NS_TEST_EXPECT_MSG_EQ(receiver.TakeMissing(6, 2).size(), 0u, "both trimmed");
+    }
+
+    void Refusals()
+    {
+        NS_TEST_EXPECT_MSG_EQ(CreateObject<RdmaHw>()->m_sprayTailRecovery,
+                              false,
+                              "SprayTailRecovery is off by default");
+        Ptr<RdmaHw> delayed = CreateObject<RdmaHw>();
+        NS_TEST_EXPECT_MSG_EQ(delayed->m_sprayTailRecoveryDelayNs,
+                              RdmaHw::kTailDelayBaseRtt,
+                              "the delay is the base RTT by default");
+        delayed->m_sprayBaseRttNs = 1234;
+        NS_TEST_EXPECT_MSG_EQ(delayed->TailRecoveryDelayNs(), 1234u, "SprayBaseRttNs");
+        delayed->m_sprayTailRecoveryDelayNs = 0;
+        NS_TEST_EXPECT_MSG_EQ(delayed->TailRecoveryDelayNs(), 0u, "or as set");
+        SetHeaders(false);
+        NS_TEST_EXPECT_MSG_EQ(CreateObject<RdmaHw>()->ValidTailRecovery(),
+                              true,
+                              "off, with the headers as they are");
+        Ptr<RdmaHw> hw = CreateObject<RdmaHw>();
+        hw->m_loadBalancing = static_cast<uint32_t>(LoadBalancingMode::SprayUniform);
+        hw->m_spineCount = kSpines;
+        hw->m_selective_retransmission = true;
+        hw->m_sprayPathSeq = true;
+        hw->m_sprayTailRecovery = true;
+        NS_TEST_EXPECT_MSG_EQ(hw->ValidTailRecovery(), false, "refused unless the headers grow");
+        SetHeaders(true);
+        for (PathSelectorKind kind : {PathSelectorKind::Ops,
+                                      PathSelectorKind::Reps,
+                                      PathSelectorKind::AckRedirect,
+                                      PathSelectorKind::RepsHold,
+                                      PathSelectorKind::RepsFlowHold,
+                                      PathSelectorKind::RepsOracle,
+                                      PathSelectorKind::MrcHold})
+        {
+            hw->m_pathSelectorKind = static_cast<uint32_t>(kind);
+            NS_TEST_EXPECT_MSG_EQ(hw->ValidTailRecovery(),
+                                  true,
+                                  "accepted under every selector of spray_uniform");
+        }
+        hw->m_sprayPathSeq = false;
+        NS_TEST_EXPECT_MSG_EQ(hw->ValidTailRecovery(), false, "refused without SprayPathSeq");
+        hw->m_sprayPathSeq = true;
+        hw->m_selective_retransmission = false;
+        NS_TEST_EXPECT_MSG_EQ(hw->ValidTailRecovery(),
+                              false,
+                              "refused without SelectiveRetransmission");
+        hw->m_selective_retransmission = true;
+        hw->m_spineCount = kMaxTailCounts + 1;
+        CustomHeader::udpTailCounts = kMaxTailCounts + 1;
+        NS_TEST_EXPECT_MSG_EQ(hw->ValidTailRecovery(), false, "refused above 8 spines");
+        hw->m_spineCount = kSpines;
+        CustomHeader::udpTailCounts = kSpines - 1;
+        NS_TEST_EXPECT_MSG_EQ(hw->ValidTailRecovery(),
+                              false,
+                              "refused unless the data header counts every spine");
+        CustomHeader::udpTailCounts = kSpines;
+        CustomHeader::ackTailNackBytes = 0;
+        NS_TEST_EXPECT_MSG_EQ(hw->ValidTailRecovery(),
+                              false,
+                              "refused unless the repair request carries the fields");
+        CustomHeader::ackTailNackBytes = 5;
+        hw->m_sprayTailRecovery = false;
+        NS_TEST_EXPECT_MSG_EQ(hw->ValidTailRecovery(), false, "off, the headers do not grow");
+        hw->m_sprayTailRecovery = true;
+        NS_TEST_EXPECT_MSG_EQ(hw->ValidTailRecovery(), true, "accepted again");
+    }
+
+    enum class Loss
+    {
+        // 1% of the new data packets up spine 3 and every one among the
+        // message's last kTailPackets, the last packet itself excepted.
+        TailOnSpine3,
+        // The newest new data packet still in flight when the last one is
+        // sent, on a spine other than the last one's.
+        ClosingPacket,
+        // The same packet delayed instead, to arrive kOvertakeNs after the
+        // last one.
+        Overtaken,
+    };
+
+    struct Nack
+    {
+        uint8_t spine;
+        uint16_t first;
+        uint16_t count;
+    };
+
+    struct Outcome
+    {
+        bool completed = false;
+        uint32_t timeouts = 0;
+        uint32_t qpTimeouts = 0;
+        // When the message's last new data packet was sent, and up which
+        // spine, and when the receiver held every byte.
+        uint64_t endNs = 0;
+        uint8_t lastSpine = 0;
+        uint64_t receivedNs = 0;
+        uint32_t drops = 0;
+        uint32_t tailDrops = 0;
+        uint8_t droppedSpine = 0;
+        uint16_t droppedPathSeq = 0;
+        uint32_t tailDeclared = 0;
+        uint32_t tailIgnored = 0;
+        uint32_t closingSends = 0;
+        std::vector<Nack> nacks;
+        std::vector<uint32_t> lossesTraced = std::vector<uint32_t>(kSpines, 0);
+        uint32_t declaredLost = 0;
+        uint64_t overtakenNs = 0;
+    };
+
+    static void Configure(Ptr<RdmaHw> hw,
+                          bool tailRecovery,
+                          PathSelectorKind kind,
+                          uint64_t delayNs)
+    {
+        hw->m_sprayBaseRttNs = kBaseRttNs;
+        hw->m_sprayTailRecoveryDelayNs = delayNs;
+        hw->m_sprayPathSeq = true;
+        hw->m_sprayTailRecovery = tailRecovery;
+        hw->m_pathSelectorKind = static_cast<uint32_t>(kind);
+        if (kind == PathSelectorKind::RepsHold)
+        {
+            hw->m_sprayHoldScope = static_cast<uint32_t>(HoldScope::Host);
+            hw->m_sprayLossThreshold1 = 0.1;
+            hw->m_sprayLossThreshold2 = 0.25;
+            hw->m_sprayLossThreshold3 = 0.5;
+            hw->m_sprayLossIntervalNs = 10000;
+            hw->m_sprayLossHoldCleanSentinels = 3;
+            hw->m_sprayHeldExploration = SpineScores::HeldExploration::Sentinel;
+        }
+    }
+
+    // One queue pair of packets data packets, one send per kStepNs, to a
+    // receiver kOneWayNs away each way, with loss.
+    Outcome Flow(bool tailRecovery,
+                 Loss loss,
+                 PathSelectorKind kind,
+                 uint32_t packets,
+                 uint64_t delayNs = RdmaHw::kTailDelayBaseRtt)
+    {
+        SetHeaders(tailRecovery);
+        Outcome outcome;
+        {
+            IsolatedHost sender(LoadBalancingMode::SprayUniform, kTestReceiver, kSpines);
+            IsolatedHost receiver(LoadBalancingMode::SprayUniform, kTestSender, kSpines);
+            Configure(sender.hw, tailRecovery, kind, delayNs);
+            Configure(receiver.hw, tailRecovery, kind, delayNs);
+            Ptr<RdmaHw> hw = sender.hw;
+            hw->m_retransmission_timeout_ns = kTimeoutNs;
+            NS_TEST_EXPECT_MSG_EQ(hw->ValidTailRecovery(), true, "a valid configuration");
+            NS_TEST_EXPECT_MSG_EQ(hw->ValidPathSeq(), true, "with path sequences");
+            hw->m_qpCompleteCallback = Callback<void, Ptr<RdmaQueuePair>>(
+                [&](Ptr<RdmaQueuePair>) { outcome.completed = true; });
+            hw->TraceConnectWithoutContext(
+                "RetransmissionTimeout",
+                Callback<void, uint64_t, Ptr<RdmaQueuePair>, int32_t, bool, uint64_t>(
+                    [&](uint64_t, Ptr<RdmaQueuePair>, int32_t, bool, uint64_t) {
+                        outcome.timeouts++;
+                    }));
+            const uint64_t size = uint64_t{packets} * kMtu;
+            Ptr<RdmaQueuePair> qp = sender.AddSender(kTestSender, kTestReceiver, size);
+            qp->m_baseRtt = kBaseRttNs;
+            qp->m_notifyAppFinish = Callback<void>([]() {});
+            if (kind == PathSelectorKind::RepsHold)
+            {
+                hw->TraceConnectWithoutContext(
+                    "SpineLossInterval",
+                    Callback<void,
+                             uint64_t,
+                             const std::vector<uint32_t>&,
+                             const std::vector<uint32_t>&,
+                             const std::vector<uint8_t>&>(
+                        [&](uint64_t,
+                            const std::vector<uint32_t>&,
+                            const std::vector<uint32_t>& lost,
+                            const std::vector<uint8_t>&) {
+                            for (uint32_t k = 0; k < kSpines && k < lost.size(); ++k)
+                            {
+                                outcome.lossesTraced[k] += lost[k];
+                            }
+                        }));
+            }
+
+            // The receiver's answers reach the sender kOneWayNs later.
+            receiver.hw->m_nic[0].dev->m_traceEnqueue.ConnectWithoutContext(
+                Callback<void, Ptr<const Packet>, uint32_t>([&](Ptr<const Packet> sent, uint32_t) {
+                    Ptr<Packet> packet = sent->Copy();
+                    const CustomHeader parsed = Parse(packet);
+                    if (parsed.l3Prot == kUecTrimRepairProtocol &&
+                        ((parsed.ack.flags >> qbbHeader::FLAG_TAIL_NACK) & 1))
+                    {
+                        outcome.nacks.push_back(
+                            Nack{parsed.ack.tail_spine, parsed.ack.tail_seq, parsed.ack.tail_count});
+                    }
+                    Simulator::Schedule(NanoSeconds(kOneWayNs), [&sender, packet]() {
+                        CustomHeader header = Parse(packet);
+                        sender.hw->Receive(packet, header);
+                    });
+                }));
+            auto deliver = [&](Ptr<Packet> packet) {
+                CustomHeader header = Parse(packet);
+                receiver.hw->Receive(packet, header);
+                const Ptr<RdmaRxQueuePair> rx =
+                    receiver.hw->GetRxQp(kTestReceiver.Get(),
+                                         kTestSender.Get(),
+                                         IsolatedHost::kReceiverPort,
+                                         IsolatedHost::kSenderPort,
+                                         IsolatedHost::kPriorityGroup,
+                                         false);
+                if (rx && outcome.receivedNs == 0 && rx->ReceiverNextExpectedSeq >= size)
+                {
+                    outcome.receivedNs = Simulator::Now().GetNanoSeconds();
+                }
+            };
+
+            Ptr<UniformRandomVariable> draw =
+                CreateObjectWithAttributes<UniformRandomVariable>("Stream", IntegerValue(23));
+            std::set<uint64_t> sent;
+            std::vector<EventId> inFlight(kSpines);
+            std::vector<uint16_t> inFlightPathSeq(kSpines, 0);
+            std::vector<uint64_t> inFlightSentNs(kSpines, 0);
+            std::vector<Ptr<Packet>> inFlightPacket(kSpines);
+            std::function<void()> step = [&]() {
+                if (outcome.completed)
+                {
+                    return;
+                }
+                if (qp->GetBytesLeft() > 0)
+                {
+                    Ptr<Packet> packet = hw->GetNxtPacket(qp);
+                    hw->ArmRetransmissionTimeout(qp);
+                    const CustomHeader header = Parse(packet);
+                    const uint8_t spine = RequestedSpine(header.ipid);
+                    const uint64_t now = Simulator::Now().GetNanoSeconds();
+                    const bool fresh = sent.insert(header.udp.seq).second;
+                    const bool last = fresh && header.udp.seq + kMtu >= size;
+                    outcome.closingSends +=
+                        tailRecovery && (header.udp.tail_flags & kTailCloses) != 0;
+                    if (last)
+                    {
+                        outcome.endNs = now;
+                        outcome.lastSpine = spine;
+                    }
+                    bool drop = false;
+                    if (loss == Loss::TailOnSpine3 && fresh && !last && spine == kLossy)
+                    {
+                        const bool tail = header.udp.seq >= size - uint64_t{kTailPackets} * kMtu;
+                        drop = draw->GetValue() < 0.01 || tail;
+                        outcome.tailDrops += tail;
+                    }
+                    if (last && loss != Loss::TailOnSpine3)
+                    {
+                        // The newest packet in flight on another spine is its
+                        // spine's last before the end.
+                        int32_t newest = -1;
+                        for (uint32_t k = 0; k < kSpines; ++k)
+                        {
+                            if (k != spine && inFlight[k].IsPending() &&
+                                (newest < 0 || inFlightSentNs[k] > inFlightSentNs[newest]))
+                            {
+                                newest = static_cast<int32_t>(k);
+                            }
+                        }
+                        NS_TEST_EXPECT_MSG_GT(newest, -1, "a packet is in flight on another spine");
+                        if (newest >= 0)
+                        {
+                            Simulator::Cancel(inFlight[newest]);
+                            outcome.droppedSpine = static_cast<uint8_t>(newest);
+                            outcome.droppedPathSeq = inFlightPathSeq[newest];
+                            if (loss == Loss::ClosingPacket)
+                            {
+                                outcome.drops++;
+                            }
+                            else
+                            {
+                                // Still undelivered, so its delivery moves
+                                // behind the last packet's.
+                                const Ptr<Packet> late = inFlightPacket[newest];
+                                outcome.overtakenNs = kOneWayNs + kOvertakeNs;
+                                Simulator::Schedule(NanoSeconds(kOneWayNs + kOvertakeNs),
+                                                    [&deliver, late]() { deliver(late); });
+                            }
+                        }
+                    }
+                    if (drop)
+                    {
+                        outcome.drops++;
+                    }
+                    else
+                    {
+                        const EventId arrival =
+                            Simulator::Schedule(NanoSeconds(kOneWayNs), [&deliver, packet]() {
+                                deliver(packet);
+                            });
+                        if (fresh)
+                        {
+                            inFlight[spine] = arrival;
+                            inFlightPathSeq[spine] = header.udp.path_seq;
+                            inFlightSentNs[spine] = now;
+                            inFlightPacket[spine] = packet;
+                        }
+                    }
+                }
+                Simulator::Schedule(NanoSeconds(kStepNs), step);
+            };
+            Simulator::Schedule(NanoSeconds(kStepNs), step);
+            Simulator::Stop(NanoSeconds(uint64_t{packets} * kStepNs + 10 * kTimeoutNs));
+            Simulator::Run();
+            if (kind == PathSelectorKind::RepsHold)
+            {
+                // A send long after closes the loss intervals counted.
+                hw->m_senderSpineScores->CountIntervalSend(
+                    0,
+                    Simulator::Now().GetNanoSeconds() + 100 * hw->m_sprayLossIntervalNs);
+            }
+            outcome.qpTimeouts = qp->m_timeouts;
+            outcome.tailDeclared = qp->m_tail_declared_lost;
+            outcome.tailIgnored = qp->m_tail_nacks_ignored;
+            outcome.declaredLost = qp->m_recovery_events;
+            Simulator::Destroy();
+        }
+        return outcome;
+    }
+
+    // Test (a): spine 3 loses 1% of its packets and every one among the
+    // message's last ones.
+    void TailLoss()
+    {
+        constexpr uint32_t kPackets = 4000;
+        const Outcome on = Flow(true, Loss::TailOnSpine3, PathSelectorKind::Ops, kPackets);
+        NS_TEST_EXPECT_MSG_EQ(on.completed, true, "on: the flow completes");
+        NS_TEST_EXPECT_MSG_NE(static_cast<uint32_t>(on.lastSpine),
+                              static_cast<uint32_t>(kLossy),
+                              "the last packet goes up another spine");
+        NS_TEST_EXPECT_MSG_GT(on.tailDrops, 0u, "spine 3 loses packets at the tail");
+        NS_TEST_EXPECT_MSG_GT(on.drops, on.tailDrops, "and before it");
+        NS_TEST_EXPECT_MSG_GT(on.closingSends, 0u, "closing packets are sent");
+        NS_TEST_EXPECT_MSG_EQ(on.timeouts, 0u, "on: no retransmission timeout is traced");
+        NS_TEST_EXPECT_MSG_EQ(on.qpTimeouts, 0u, "nor counted");
+        NS_TEST_EXPECT_MSG_GT(on.nacks.size(), 0u, "the receiver asks for the tail");
+        for (const Nack& nack : on.nacks)
+        {
+            NS_TEST_EXPECT_MSG_EQ(static_cast<uint32_t>(nack.spine),
+                                  static_cast<uint32_t>(kLossy),
+                                  "only spine 3 misses packets");
+        }
+        NS_TEST_EXPECT_MSG_GT_OR_EQ(on.tailDeclared, on.tailDrops, "every tail loss is repaired");
+        NS_TEST_EXPECT_MSG_LT_OR_EQ(on.tailDeclared, on.drops, "and nothing that arrived");
+        NS_TEST_EXPECT_MSG_GT(on.receivedNs, on.endNs, "received after the end");
+        NS_TEST_EXPECT_MSG_LT_OR_EQ(on.receivedNs - on.endNs,
+                                    kBaseRttNs * 3 / 2 + kDelayNs + (on.tailDeclared + 1) * kStepNs,
+                                    "within 1.5 base RTT and the delay of the end, and the "
+                                    "repairs' sends");
+
+        const Outcome off = Flow(false, Loss::TailOnSpine3, PathSelectorKind::Ops, kPackets);
+        NS_TEST_EXPECT_MSG_EQ(off.tailDrops, on.tailDrops, "off: the same tail losses");
+        NS_TEST_EXPECT_MSG_EQ(off.completed, true, "off: the flow completes");
+        NS_TEST_EXPECT_MSG_GT(off.timeouts, 0u, "off: a retransmission timeout is traced");
+        NS_TEST_EXPECT_MSG_EQ(off.qpTimeouts, off.timeouts, "and counted");
+        NS_TEST_EXPECT_MSG_EQ(off.nacks.size(), 0u, "off: no tail repair request");
+        NS_TEST_EXPECT_MSG_GT(off.receivedNs, off.endNs + kTimeoutNs - kTailPackets * kStepNs,
+                              "off: the tail waits out the timeout");
+    }
+
+    // Test (b): spine k's last packet before the end is lost, and only the
+    // last packet's counts show it.
+    void LostClosingPacket()
+    {
+        constexpr uint32_t kPackets = 400;
+        const Outcome on = Flow(true, Loss::ClosingPacket, PathSelectorKind::RepsHold, kPackets);
+        NS_TEST_EXPECT_MSG_EQ(on.completed, true, "on: the flow completes");
+        NS_TEST_EXPECT_MSG_EQ(on.drops, 1u, "one packet lost");
+        NS_TEST_EXPECT_MSG_EQ(on.timeouts, 0u, "on: no retransmission timeout");
+        NS_TEST_EXPECT_MSG_EQ(on.nacks.size(), 1u, "one tail repair request");
+        if (!on.nacks.empty())
+        {
+            NS_TEST_EXPECT_MSG_EQ(static_cast<uint32_t>(on.nacks[0].spine),
+                                  static_cast<uint32_t>(on.droppedSpine),
+                                  "for the spine that lost it");
+            NS_TEST_EXPECT_MSG_EQ(on.nacks[0].first, on.droppedPathSeq, "its path sequence");
+            NS_TEST_EXPECT_MSG_EQ(on.nacks[0].count, 1u, "alone");
+        }
+        NS_TEST_EXPECT_MSG_EQ(on.tailDeclared, 1u, "declared lost by the request");
+        NS_TEST_EXPECT_MSG_EQ(on.tailIgnored, 0u, "which names an outstanding send");
+        NS_TEST_EXPECT_MSG_EQ(on.lossesTraced[on.droppedSpine],
+                              1u,
+                              "the hold's loss trace counts it on its spine");
+        NS_TEST_EXPECT_MSG_LT_OR_EQ(on.receivedNs - on.endNs,
+                                    kBaseRttNs * 3 / 2 + kDelayNs + kStepNs,
+                                    "within 1.5 base RTT and the delay of the end");
+        NS_TEST_EXPECT_MSG_GT(on.receivedNs - on.endNs,
+                              kBaseRttNs * 3 / 2 + kDelayNs - kStepNs,
+                              "the request waits out the delay");
+
+        const Outcome off = Flow(false, Loss::ClosingPacket, PathSelectorKind::RepsHold, kPackets);
+        NS_TEST_EXPECT_MSG_EQ(off.completed, true, "off: the flow completes");
+        NS_TEST_EXPECT_MSG_GT(off.timeouts, 0u, "off: the loss waits out the timeout");
+    }
+
+    // The last packet overtakes the last one of a slower spine by less than
+    // the delay: nothing is requested and nothing declared lost.
+    void OvertakenClosingPacket()
+    {
+        constexpr uint32_t kPackets = 400;
+        const Outcome on = Flow(true, Loss::Overtaken, PathSelectorKind::RepsHold, kPackets);
+        NS_TEST_EXPECT_MSG_GT(on.overtakenNs, 0u, "a packet is overtaken");
+        NS_TEST_EXPECT_MSG_LT(kOvertakeNs, kDelayNs, "by less than the delay");
+        NS_TEST_EXPECT_MSG_EQ(on.completed, true, "the flow completes");
+        NS_TEST_EXPECT_MSG_EQ(on.drops, 0u, "nothing is lost");
+        NS_TEST_EXPECT_MSG_EQ(on.nacks.size(), 0u, "no tail repair request");
+        NS_TEST_EXPECT_MSG_EQ(on.tailDeclared, 0u, "no send declared lost by one");
+        NS_TEST_EXPECT_MSG_EQ(on.declaredLost, 0u, "nor at all");
+        NS_TEST_EXPECT_MSG_EQ(on.lossesTraced[on.droppedSpine], 0u, "nor traced as a loss");
+        NS_TEST_EXPECT_MSG_EQ(on.timeouts, 0u, "and no retransmission timeout");
+
+        // Requested at once, the same packet is asked for before it arrives.
+        const Outcome atOnce = Flow(true, Loss::Overtaken, PathSelectorKind::RepsHold, kPackets, 0);
+        NS_TEST_EXPECT_MSG_EQ(atOnce.completed, true, "at once: the flow completes");
+        NS_TEST_EXPECT_MSG_EQ(atOnce.nacks.size(), 1u, "at once: the packet is requested");
+        NS_TEST_EXPECT_MSG_EQ(atOnce.tailDeclared, 1u, "and declared lost");
+    }
+};
+
 class SprayPolicyTransportTest : public TestCase
 {
   public:
@@ -8125,6 +11476,133 @@ class SwitchQueueStateTest : public TestCase
     }
 };
 
+class RepsOracleTest : public TestCase
+{
+  public:
+    RepsOracleTest()
+        : TestCase("Under reps_oracle a spine the switches' state shows a loss or a slow port on "
+                   "toward a destination leaf leaves the REPS choices of the flows to that leaf "
+                   "for the run; the policy needs the switch_queue cost source")
+    {
+    }
+
+    void DoRun() override
+    {
+        SwitchQueueFabric fabric;
+        Ptr<RdmaHw> hw = CreateObject<RdmaHw>();
+        hw->SetAttribute("Mtu", UintegerValue(1000));
+        hw->SetAttribute("PathRandomVariable", PointerValue(SelectorStream()));
+        hw->m_spineCount = SwitchQueueFabric::kSpines;
+        hw->m_loadBalancing = static_cast<uint32_t>(LoadBalancingMode::SprayUniform);
+        hw->m_pathSelectorKind = static_cast<uint32_t>(PathSelectorKind::RepsOracle);
+        NS_TEST_EXPECT_MSG_EQ(hw->ValidRepsOracle(), false, "refused without the cost source");
+        hw->m_sprayGradeCostSource = static_cast<uint32_t>(GradeCostSource::SwitchQueue);
+        NS_TEST_EXPECT_MSG_EQ(hw->ValidRepsOracle(), false, "and without the switches' state");
+        hw->m_switchQueues = fabric.state;
+        NS_TEST_EXPECT_MSG_EQ(hw->ValidRepsOracle(), true, "accepted with both");
+        hw->m_loadBalancing = static_cast<uint32_t>(LoadBalancingMode::EntropyHash);
+        NS_TEST_EXPECT_MSG_EQ(hw->ValidRepsOracle(), false, "refused without named spines");
+        hw->m_loadBalancing = static_cast<uint32_t>(LoadBalancingMode::SprayUniform);
+        hw->m_sprayBaseRttNs = 1000;
+        // The sending host is on leaf 1.
+        hw->m_leaf = fabric.state->LeafOf(SwitchQueueFabric::kOtherSender.Get());
+
+        // One percent lost where spine 3's downlink to leaf 0 is received,
+        // and spine 2's downlink to leaf 2 at half rate.
+        Ptr<RateErrorModel> gray = CreateObject<RateErrorModel>();
+        gray->SetAttribute("ErrorUnit", StringValue("ERROR_UNIT_PACKET"));
+        gray->SetRate(0.01);
+        SwitchQueueFabric::Device(fabric.leaves[0], fabric.uplink[0][3])
+            ->SetAttribute("LinkErrorModel", PointerValue(gray));
+        Ptr<QbbNetDevice> slow = SwitchQueueFabric::Device(fabric.spines[2], fabric.downlink[2][2]);
+        slow->SetDataRate(DataRate(slow->GetDataRate().GetBitRate() / 2));
+        NS_TEST_EXPECT_MSG_EQ((fabric.state->Faulted(1, 0) ==
+                               std::vector<bool>{false, false, false, true}),
+                              true,
+                              "toward leaf 0 the lossy spine is faulted");
+        NS_TEST_EXPECT_MSG_EQ((fabric.state->Faulted(1, 2) ==
+                               std::vector<bool>{false, false, true, false}),
+                              true,
+                              "toward leaf 2 the slow spine is");
+
+        Ptr<RdmaQueuePair> toZero = CreateObject<RdmaQueuePair>(
+            3, SwitchQueueFabric::kOtherSender, kTestSender, 10000, 100);
+        Ptr<RdmaQueuePair> toTwo = CreateObject<RdmaQueuePair>(
+            3, SwitchQueueFabric::kOtherSender, kTestReceiver, 10001, 100);
+        hw->StartPathSelection(toZero, 0, 0);
+        hw->StartPathSelection(toTwo, 0, 0);
+        std::vector<uint32_t> zeroOn(SwitchQueueFabric::kSpines);
+        std::vector<uint32_t> twoOn(SwitchQueueFabric::kSpines);
+        for (uint32_t step = 0; step < 800; ++step)
+        {
+            // Halfway the faults are cleared; the spines stay out.
+            if (step == 400)
+            {
+                gray->Disable();
+                slow->SetDataRate(DataRate(slow->GetDataRate().GetBitRate() * 2));
+            }
+            const bool zero = step % 2 == 0;
+            const uint8_t spine = LossHoldFixture::Send(
+                *(zero ? toZero : toTwo)->m_pathSelector, 100 * step, step / 2, {});
+            (zero ? zeroOn : twoOn)[spine]++;
+        }
+        NS_TEST_EXPECT_MSG_EQ(zeroOn[3], 0u, "the flow to leaf 0 never sends on spine 3");
+        NS_TEST_EXPECT_MSG_GT(twoOn[3], 0u, "the flow to leaf 2 does");
+        NS_TEST_EXPECT_MSG_EQ(twoOn[2], 0u, "the flow to leaf 2 never sends on spine 2");
+        NS_TEST_EXPECT_MSG_GT(zeroOn[2], 0u, "the flow to leaf 0 does");
+        Simulator::Destroy();
+    }
+};
+
+class RepsSpineTest : public TestCase
+{
+  public:
+    RepsSpineTest()
+        : TestCase("Under reps_spine REPS draws spine indices, reuses each unmarked "
+                   "acknowledgement's spine once and caches no marked one")
+    {
+    }
+
+    void DoRun() override
+    {
+        constexpr uint32_t kSpines = 4;
+        Ptr<RdmaHw> hw = CreateObject<RdmaHw>();
+        hw->SetAttribute("Mtu", UintegerValue(1000));
+        hw->SetAttribute("PathRandomVariable", PointerValue(SelectorStream()));
+        hw->m_spineCount = kSpines;
+        hw->m_loadBalancing = static_cast<uint32_t>(LoadBalancingMode::SprayUniform);
+        hw->m_pathSelectorKind = static_cast<uint32_t>(PathSelectorKind::RepsSpine);
+        NS_TEST_EXPECT_MSG_EQ(hw->IsRepsHold(), false, "no loss hold");
+        NS_TEST_EXPECT_MSG_EQ(hw->CountsSprayLoss(), false, "no loss counted");
+        Ptr<RdmaQueuePair> qp =
+            CreateObject<RdmaQueuePair>(3, kTestSender, kTestReceiver, 10000, 100);
+        hw->StartPathSelection(qp, 0, 0);
+        PathSelector& reps = *qp->m_pathSelector;
+        // A uniform spine draw on the same stream: what a fresh draw is.
+        UniformSpineSelector fresh(SelectorStream(), kSpines);
+        const auto freshSends = [&reps, &fresh](uint32_t sends) {
+            uint32_t drawn = 0;
+            for (uint32_t i = 0; i < sends; ++i)
+            {
+                const uint16_t identification = reps.Choose(0);
+                drawn += identification == fresh.Choose(0) &&
+                         RequestedSpine(identification) < kSpines &&
+                         RequestedSpine(identification) == CarryingSpine(identification);
+            }
+            return drawn;
+        };
+        NS_TEST_EXPECT_MSG_EQ(freshSends(50), 50u, "fresh draws are spine indices");
+
+        reps.OnAck(2, false, 0);
+        const uint16_t reused = reps.Choose(0);
+        NS_TEST_EXPECT_MSG_EQ(reused, SpineIdentification(2, 2), "an unmarked spine is reused");
+        NS_TEST_EXPECT_MSG_EQ(freshSends(20), 20u, "and only once");
+        reps.OnAck(3, true, 0);
+        NS_TEST_EXPECT_MSG_EQ(freshSends(20), 20u, "a marked spine is not cached");
+        Simulator::Destroy();
+    }
+};
+
 class SwitchQueueGradeTest : public TestCase
 {
   public:
@@ -8647,6 +12125,7 @@ PointToPointTestSuite::PointToPointTestSuite()
     AddTestCase(new SpineGradeReferenceTest, TestCase::Duration::QUICK);
     AddTestCase(new SpineDelayReferenceTest, TestCase::Duration::QUICK);
     AddTestCase(new SpineAbsenceTest, TestCase::Duration::QUICK);
+    AddTestCase(new SpineCongestionGradeFloorTest, TestCase::Duration::QUICK);
     AddTestCase(new SpineScoresDrainTest, TestCase::Duration::QUICK);
     AddTestCase(new SpineScoresFloorTest, TestCase::Duration::QUICK);
     AddTestCase(new SpineScoresFlapTest, TestCase::Duration::QUICK);
@@ -8656,6 +12135,23 @@ PointToPointTestSuite::PointToPointTestSuite()
     AddTestCase(new SpineLossThresholdsTest, TestCase::Duration::QUICK);
     AddTestCase(new SpineHeldExplorationTest, TestCase::Duration::QUICK);
     AddTestCase(new SpinePoolHoldPropagationTest, TestCase::Duration::QUICK);
+    AddTestCase(new RepsHoldTest, TestCase::Duration::QUICK);
+    AddTestCase(new MrcHoldTest, TestCase::Duration::QUICK);
+    AddTestCase(new MrcHoldExplorationTest, TestCase::Duration::QUICK);
+    AddTestCase(new RepsFlowHoldTest, TestCase::Duration::QUICK);
+    AddTestCase(new RepsHoldScopeTest, TestCase::Duration::QUICK);
+    AddTestCase(new RepsHoldAutoScopeTest, TestCase::Duration::QUICK);
+    AddTestCase(new RepsHoldLlrTest, TestCase::Duration::QUICK);
+    AddTestCase(new RepsHoldTrickleTest, TestCase::Duration::QUICK);
+    AddTestCase(new RepsHoldDuplicateTest, TestCase::Duration::QUICK);
+    AddTestCase(new RetransmissionTimeoutTraceTest, TestCase::Duration::QUICK);
+    AddTestCase(new HeldSpineLeakTest, TestCase::Duration::QUICK);
+    AddTestCase(new HeldSpineFastLossTest, TestCase::Duration::QUICK);
+    AddTestCase(new SprayTailRecoveryTest, TestCase::Duration::QUICK);
+    AddTestCase(new SprayPathSeqTest, TestCase::Duration::QUICK);
+    AddTestCase(new SprayReceiverHoldTest, TestCase::Duration::QUICK);
+    AddTestCase(new SprayReceiverHoldTraceTest, TestCase::Duration::QUICK);
+    AddTestCase(new SprayPathSeqTrimTest, TestCase::Duration::QUICK);
     AddTestCase(new SprayPolicyTransportTest, TestCase::Duration::QUICK);
     AddTestCase(new NsccReceiverPenaltyTest, TestCase::Duration::QUICK);
     AddTestCase(new SprayPolicyDefaultsTest, TestCase::Duration::QUICK);
@@ -8667,6 +12163,8 @@ PointToPointTestSuite::PointToPointTestSuite()
     AddTestCase(new AckRedirectScopeTest, TestCase::Duration::QUICK);
     AddTestCase(new SwitchQueueStateTest, TestCase::Duration::QUICK);
     AddTestCase(new SwitchQueueGradeTest, TestCase::Duration::QUICK);
+    AddTestCase(new RepsOracleTest, TestCase::Duration::QUICK);
+    AddTestCase(new RepsSpineTest, TestCase::Duration::QUICK);
 }
 
 static PointToPointTestSuite g_pointToPointTestSuite; //!< The testsuite

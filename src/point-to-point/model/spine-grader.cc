@@ -35,6 +35,8 @@ SpineGrader::SpineGrader(const Parameters &parameters)
 			parameters.spines <= SpineReport::kMaxSpines,
 		"a report grades at most SpineReport::kMaxSpines spines");
 	NS_ASSERT_MSG(parameters.intervalNs > 0, "a report is issued per interval");
+	NS_ASSERT_MSG(parameters.congestionGradeFloor <= SpineReport::kTopGrade,
+		"the congestion grade floor is a grade");
 }
 
 bool SpineGrader::Advance(uint64_t nowNs){
@@ -172,11 +174,11 @@ SpineReport SpineGrader::Graded(const std::vector<SpineValues> &values,
 		const double (&thresholds)[3] = m_parameters.congestionThresholds;
 		double absolute = std::max(marks[k], trims[k]);
 		const double trimCost = trims[k] - trimReference;
-		uint8_t byCongestion = std::min(
-			QuantizeGrade(marks[k] - markReference, thresholds),
-			m_parameters.trimThresholds ?
-				QuantizeGrade(trimCost, *m_parameters.trimThresholds) :
-				QuantizeGrade(trimCost, thresholds));
+		uint8_t byCongestion = std::max(m_parameters.congestionGradeFloor,
+			std::min(QuantizeGrade(marks[k] - markReference, thresholds),
+				m_parameters.trimThresholds ?
+					QuantizeGrade(trimCost, *m_parameters.trimThresholds) :
+					QuantizeGrade(trimCost, thresholds)));
 		if (lossHold){
 			absolute = std::max(absolute, losses[k]);
 			const double lossCost = losses[k] - lossReference;
@@ -189,8 +191,13 @@ SpineReport SpineGrader::Graded(const std::vector<SpineValues> &values,
 			Earned(QuantizeGrade(absolute, thresholds), delays[k]) <
 				SpineReport::kTopGrade;
 		const bool lossHeld = lossHold && losses[k] >= *lossHold;
-		report.SetGrade(k, held[k] || lossHeld ? 0 : Earned(byCongestion,
-			delays[k] - delayReference));
+		// The floor holds a grade the delay cost earns as it holds the
+		// congestion grade, and not one the loss fraction's cost earns.
+		const uint8_t earned = byCongestion < SpineReport::kTopGrade
+			? byCongestion
+			: std::max(m_parameters.congestionGradeFloor,
+				Earned(byCongestion, delays[k] - delayReference));
+		report.SetGrade(k, held[k] || lossHeld ? 0 : earned);
 	}
 	report.edgeCongested = everySpineBelowTop;
 	return report;

@@ -32,6 +32,10 @@ NS_OBJECT_ENSURE_REGISTERED (CustomHeader);
 bool CustomHeader::ackCarriesPacketSeq = false;
 uint32_t CustomHeader::ackReportBytes = 0;
 uint32_t CustomHeader::ackRedirectBytes = 0;
+bool CustomHeader::udpCarriesPathSeq = false;
+uint32_t CustomHeader::ackReceiverHoldBytes = 0;
+uint32_t CustomHeader::udpTailCounts = 0;
+uint32_t CustomHeader::ackTailNackBytes = 0;
 
 CustomHeader::CustomHeader ()
   : brief(0), headerType(L3_Header | L4_Header), 
@@ -166,6 +170,17 @@ void CustomHeader::Serialize (Buffer::Iterator start) const{
 		  i.WriteHtonU32 (udp.seq);
 		  i.WriteHtonU16 (udp.pg);
 		  udp.ih.Serialize(i);
+		  // After the INT header, whose offset switches write it at.
+		  if (udpCarriesPathSeq){
+			  i.Next(IntHeader::GetStaticSize());
+			  i.WriteHtonU16(udp.path_seq);
+			  // The tail fields follow the path sequence, which they need.
+			  if (udpTailCounts > 0){
+				  i.WriteU8(udp.tail_flags);
+				  for (uint32_t k = 0; k < udpTailCounts; k++)
+					  i.WriteHtonU16(udp.tail_counts[k]);
+			  }
+		  }
 	  }else if (l3Prot == 0xFF){ // CNP
 		  i.WriteU8(cnp.qIndex);
 		  i.WriteU16(cnp.fid);
@@ -185,6 +200,13 @@ void CustomHeader::Serialize (Buffer::Iterator start) const{
 			  i.Write(ack.spine_report, ackReportBytes);
 		  if (ackRedirectBytes > 0)
 			  i.WriteU8(ack.redirect);
+		  if (ackReceiverHoldBytes > 0)
+			  i.WriteU8(ack.receiver_hold);
+		  if (ackTailNackBytes > 0){
+			  i.WriteU8(ack.tail_spine);
+			  i.WriteU16(ack.tail_seq);
+			  i.WriteU16(ack.tail_count);
+		  }
 		  ack.ih.Serialize(i);
 	  }else if (l3Prot == 0xFE){ // PFC
 		  i.WriteU32 (pfc.time);
@@ -309,6 +331,15 @@ CustomHeader::Deserialize (Buffer::Iterator start)
 		  udp.pg =  i.ReadNtohU16 ();
 		  if (getInt)
 			  udp.ih.Deserialize(i);
+		  if (udpCarriesPathSeq){
+			  i.Next(IntHeader::GetStaticSize());
+			  udp.path_seq = i.ReadNtohU16();
+			  if (udpTailCounts > 0){
+				  udp.tail_flags = i.ReadU8();
+				  for (uint32_t k = 0; k < udpTailCounts; k++)
+					  udp.tail_counts[k] = i.ReadNtohU16();
+			  }
+		  }
 
 		  l4Size = GetUdpHeaderSize();
 	  }else if (l3Prot == 0xFF){
@@ -331,6 +362,13 @@ CustomHeader::Deserialize (Buffer::Iterator start)
 			  i.Read(ack.spine_report, ackReportBytes);
 		  if (ackRedirectBytes > 0)
 			  ack.redirect = i.ReadU8();
+		  if (ackReceiverHoldBytes > 0)
+			  ack.receiver_hold = i.ReadU8();
+		  if (ackTailNackBytes > 0){
+			  ack.tail_spine = i.ReadU8();
+			  ack.tail_seq = i.ReadU16();
+			  ack.tail_count = i.ReadU16();
+		  }
 		  if (getInt)
 			  ack.ih.Deserialize(i);
 		  l4Size = GetAckSerializedSize();
@@ -354,11 +392,15 @@ uint8_t CustomHeader::GetIpv4Dscp (void) const{
 }
 
 uint32_t CustomHeader::GetAckSerializedSize(void){
-	return sizeof(ack.sport) + sizeof(ack.dport) + sizeof(ack.flags) + sizeof(ack.pg) + sizeof(ack.seq) + sizeof(ack.trim_payload_size) + (ackCarriesPacketSeq ? sizeof(ack.packet_seq) : 0) + ackReportBytes + ackRedirectBytes + IntHeader::GetStaticSize();
+	return sizeof(ack.sport) + sizeof(ack.dport) + sizeof(ack.flags) + sizeof(ack.pg) + sizeof(ack.seq) + sizeof(ack.trim_payload_size) + (ackCarriesPacketSeq ? sizeof(ack.packet_seq) : 0) + ackReportBytes + ackRedirectBytes + ackReceiverHoldBytes + ackTailNackBytes + IntHeader::GetStaticSize();
 }
 
 uint32_t CustomHeader::GetUdpHeaderSize(void){
-	return 8 + sizeof(udp.pg) + sizeof(udp.seq) + IntHeader::GetStaticSize();
+	return 8 + sizeof(udp.pg) + sizeof(udp.seq) + IntHeader::GetStaticSize() + (udpCarriesPathSeq ? sizeof(udp.path_seq) : 0) + GetUdpTailBytes();
+}
+
+uint32_t CustomHeader::GetUdpTailBytes(void){
+	return udpTailCounts > 0 ? 1 + 2 * udpTailCounts : 0;
 }
 
 uint32_t CustomHeader::GetStaticWholeHeaderSize(void){

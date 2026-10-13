@@ -23,6 +23,7 @@
 #include "ns3/header.h"
 #include "ns3/nstime.h"
 #include "ns3/int-header.h"
+#include "custom-header.h"
 
 namespace ns3
 {
@@ -62,6 +63,16 @@ class SeqTsHeader : public Header
 
     void SetPG (uint16_t pg);
     uint16_t GetPG () const;
+    // The path sequence, serialized after the INT header only while
+    // CustomHeader::udpCarriesPathSeq is set.
+    void SetPathSeq (uint16_t pathSeq);
+    uint16_t GetPathSeq () const;
+    // The tail fields, serialized after the path sequence only while
+    // CustomHeader::udpTailCounts is not zero: the flags (kTailCloses) and
+    // the first CustomHeader::udpTailCounts of counts.
+    void SetTail (uint8_t flags, const uint16_t* counts, uint32_t n);
+    uint8_t GetTailFlags () const;
+    uint16_t GetTailCount (uint32_t spine) const;
 
     /**
      * \brief Get the type ID.
@@ -80,6 +91,9 @@ class SeqTsHeader : public Header
     uint32_t m_seq; //!< Sequence number
     uint64_t m_ts;  //!< Timestamp
     uint16_t m_pg;
+    uint16_t m_pathSeq;
+    uint8_t m_tailFlags;
+    uint16_t m_tailCounts[kMaxTailCounts];
   public:
     IntHeader ih;
 };

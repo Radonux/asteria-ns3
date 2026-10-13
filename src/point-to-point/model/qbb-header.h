@@ -42,7 +42,10 @@ public:
     FLAG_PROBE_ANSWER = 4,
     // The spine report this header carries says the receiver's own downlink
     // is congested.
-    FLAG_EDGE_CONGESTED = 5
+    FLAG_EDGE_CONGESTED = 5,
+    // A repair request names missing path sequences on a spine (SetTailNack)
+    // rather than a trimmed byte range.
+    FLAG_TAIL_NACK = 6
   };
   qbbHeader (uint16_t pg);
   qbbHeader ();
@@ -72,6 +75,14 @@ public:
   // The spine the receiver asks the sender to move to, 255 for none, the
   // default; serialized only while CustomHeader::ackRedirectBytes is not zero.
   void SetRedirect(uint8_t spine);
+  // The spines the receiving host holds for the sender's leaf, bit k for
+  // spine k, zero by default; serialized only while
+  // CustomHeader::ackReceiverHoldBytes is not zero.
+  void SetReceiverHold(uint8_t bitmap);
+  // The count path sequences from seq on spine that the receiver misses,
+  // and FLAG_TAIL_NACK; serialized only while CustomHeader::ackTailNackBytes
+  // is not zero.
+  void SetTailNack(uint8_t spine, uint16_t seq, uint16_t count);
   void SetIntHeader(const IntHeader &_ih);
 
 //Getters
@@ -91,6 +102,11 @@ public:
   uint32_t GetPacketSeq() const;
   const SpineReport &GetSpineReport() const;
   uint8_t GetRedirect() const;
+  uint8_t GetReceiverHold() const;
+  bool IsTailNack() const;
+  uint8_t GetTailSpine() const;
+  uint16_t GetTailSeq() const;
+  uint16_t GetTailCount() const;
 
   static TypeId GetTypeId (void);
   virtual TypeId GetInstanceTypeId (void) const;
@@ -109,6 +125,10 @@ private:
   uint32_t m_packetSeq;
   SpineReport m_spineReport;
   uint8_t m_redirect;
+  uint8_t m_receiverHold;
+  uint8_t m_tailSpine;
+  uint16_t m_tailSeq;
+  uint16_t m_tailCount;
   IntHeader ih;
   
 };

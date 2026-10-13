@@ -6,10 +6,13 @@
 #include <ns3/node.h>
 #include <ns3/custom-header.h>
 #include <ns3/random-variable-stream.h>
+#include <ns3/seq-ts-header.h>
+#include "qbb-header.h"
 #include <ns3/traced-callback.h>
 #include "qbb-net-device.h"
 #include "load-balancing.h"
 #include "nscc-window.h"
+#include "receiver-hold.h"
 #include "spine-grader.h"
 #include "spine-redirect.h"
 #include "switch-queue-state.h"
@@ -127,6 +130,8 @@ public:
 	double m_sprayCongestionThreshold1, m_sprayCongestionThreshold2, m_sprayCongestionThreshold3;
 	// Zero leaves the trimmed fraction on the congestion thresholds.
 	double m_sprayTrimThreshold1, m_sprayTrimThreshold2, m_sprayTrimThreshold3;
+	// SpineGrader::Parameters::congestionGradeFloor.
+	uint8_t m_sprayCongestionGradeFloor;
 	// Zero counts no loss at the sender and leaves the loss fraction the
 	// grader grades under SwitchQueue on the congestion thresholds.
 	double m_sprayLossThreshold1, m_sprayLossThreshold2, m_sprayLossThreshold3;
@@ -136,7 +141,8 @@ public:
 	// The loss thresholds, unset while SprayLossThreshold1 is zero.
 	std::optional<std::array<double, 3>> SprayLossThresholds() const;
 	// Whether the sender's scores count sends and losses: under SprayPolicy
-	// with the loss thresholds set, outside SwitchQueue.
+	// with the loss thresholds set, outside SwitchQueue, and under
+	// PathSelector RepsHold.
 	bool CountsSprayLoss() const;
 	// Whether the loss counting has the send records it needs.
 	bool ValidSprayLoss() const;
@@ -206,7 +212,87 @@ public:
 	// whether it is set only with a pool to propagate from.
 	bool m_sprayPoolHoldPropagates;
 	bool ValidPoolHoldPropagates() const;
+	// The host's pooled scores, or under PathSelector RepsHold or MrcHold its
+	// loss hold; null until the first queue pair that uses them.
 	std::unique_ptr<SpineScores> m_senderSpineScores;
+	// m_senderSpineScores, made with parameters if it is null, its loss
+	// intervals traced to SpineLossInterval when they are graded.
+	SpineScores &HostScores(const SpineScores::Parameters &parameters);
+	// PathSelector RepsHold, RepsFlowHold or MrcHold, and whether its loss
+	// hold has what it needs:
+	// spines named per packet, the loss thresholds, a loss interval, a loss
+	// hold and the sentinels that release it.
+	bool IsRepsHold() const;
+	bool IsMrcHold() const;
+	bool ValidRepsHold() const;
+	// The parameters of scores used as a loss hold alone.
+	SpineScores::Parameters LossHoldParameters() const;
+	// HoldRule of PathSelector RepsHold, RepsFlowHold and MrcHold, and under
+	// Llr its LossLikelihoodRatio::Parameters; whether Llr is set only under
+	// them, with a valid test.
+	uint32_t m_sprayHoldRule;
+	double m_sprayLossP0, m_sprayLossP1, m_sprayHoldAlpha, m_sprayHoldBeta;
+	bool ValidHoldRule() const;
+	LossLikelihoodRatio::Parameters Likelihood() const;
+	// HoldRelease of PathSelector RepsHold, RepsFlowHold and MrcHold and its
+	// trickle fraction; whether Trickle is set only under them, without the
+	// keys of the sentinels' release, with a fraction in (0, 0.5] and the p0,
+	// p1 and alpha TrickleRelease reads valid.
+	uint32_t m_sprayHoldRelease;
+	double m_sprayHoldTrickle;
+	bool IsTrickleRelease() const;
+	bool ValidHoldRelease() const;
+	// SentinelMode of PathSelector RepsHold, RepsFlowHold and MrcHold.
+	uint32_t m_spraySentinelMode;
+	// Under PathSelector RepsHold, RepsFlowHold and MrcHold, the base RTTs
+	// after which a send on a held spine (PathSelector::ChoseHeld) still
+	// outstanding is declared lost and repaired (HeldSendDue); zero waits
+	// for the retransmission timeout.
+	double m_sprayHeldLossRtts;
+	// HoldScope of PathSelector RepsHold and MrcHold. Under Leaf the queue
+	// pairs to the hosts of one leaf, which m_switchQueues names, share that
+	// leaf's loss hold in m_leafHolds, made at the first of them; under Host
+	// every queue pair shares m_senderSpineScores. Under Auto every queue
+	// pair shares m_autoHold, made at the first of them, toward its
+	// destination's leaf, which m_switchQueues names; m_sprayHoldAutoLeaves
+	// is its AutoLossHold autoLeaves.
+	uint32_t m_sprayHoldScope;
+	uint32_t m_sprayHoldAutoLeaves;
+	std::unordered_map<uint32_t, SpineScores> m_leafHolds;
+	std::unique_ptr<AutoLossHold> m_autoHold;
+	bool IsLeafHold() const;
+	bool IsAutoHold() const;
+	AutoLossHold &AutoHold();
+	// PathSelector RepsOracle, whether it has the switches' state to read,
+	// and per destination leaf the spines it excludes, made at the first
+	// queue pair to that leaf and read once per base RTT.
+	bool IsRepsOracle() const;
+	bool ValidRepsOracle() const;
+	// PathSelector RepsSpine: REPS over spines under LoadBalancing 2.
+	bool IsRepsSpine() const;
+	std::unordered_map<uint32_t, FaultedSpines> m_faultedSpines;
+	FaultedSpines &FaultedSpinesTo(uint32_t leaf);
+	SpineScores &LeafHold(uint32_t leaf);
+	// The LeafSpineLossInterval trace source: a destination leaf's loss hold
+	// closed a loss interval, or under Auto the host's did toward one
+	// destination leaf, as SpineLossInterval passes it.
+	typedef void (*LeafSpineLossIntervalTracedCallback)(uint32_t leaf,
+		uint64_t endNs, const std::vector<uint32_t> &sent,
+		const std::vector<uint32_t> &lost, const std::vector<uint8_t> &grades);
+	TracedCallback<uint32_t, uint64_t, const std::vector<uint32_t> &,
+		const std::vector<uint32_t> &, const std::vector<uint8_t> &>
+		m_traceLeafSpineLossInterval;
+	// The RetransmissionTimeout trace source: a queue pair's timeout fired
+	// and was taken, with the requested spine of its oldest outstanding send,
+	// -1 where none is kept or the mode names no spine, whether that send was
+	// an exploration send onto a held spine (OutstandingPackets::Exploration;
+	// a copy under SentinelMode::Duplicate has no send record, so no timeout
+	// waits for one), and the bytes outstanding.
+	typedef void (*RetransmissionTimeoutTracedCallback)(uint64_t nowNs,
+		Ptr<RdmaQueuePair> qp, int32_t spine, bool exploration,
+		uint64_t bytesOutstanding);
+	TracedCallback<uint64_t, Ptr<RdmaQueuePair>, int32_t, bool, uint64_t>
+		m_traceRetransmissionTimeout;
 	// The SpineLossInterval trace source: the host's pooled scores closed a
 	// loss interval (SpineScores::LossIntervalCallback): the time it ended
 	// at and, per spine, the sends and losses counted in it and the grade
@@ -244,6 +330,91 @@ public:
 	void GradeTrim(Ptr<RdmaRxQueuePair> q, const CustomHeader &ch, bool lastHop);
 	// Indexed by carrying spine; kept where the identification names one.
 	std::vector<SpineArrivals> m_spineArrivals;
+	// SprayPathSeq, under LoadBalancing SprayUniform, whatever the selector:
+	// every data packet carries its queue pair's path sequence on its
+	// requested spine, and the receiver counts the packets the gaps in it
+	// show missing, per carrying spine, in m_spineGaps
+	// (SpineSequenceReceiver).
+	bool m_sprayPathSeq;
+	std::vector<uint64_t> m_spineGaps;
+	bool ValidPathSeq() const;
+	// The path sequence of the data packet ch arriving at q, or with trimmed
+	// of its trimmed header, counted. Only data arrivals count gaps; a
+	// trimmed header, which can overtake earlier data of its path in the
+	// switches' high-priority queue, marks its sequence as accounted and
+	// neither moves the expected sequence on nor counts a gap, and the
+	// receiver's hold takes it for no arrival.
+	void CountPathSeq(Ptr<RdmaRxQueuePair> q, const CustomHeader &ch,
+		bool trimmed = false);
+	// SprayTailRecovery, under SprayPathSeq: every data packet a queue pair
+	// sends once it has no new data left (the last packet of its data and
+	// every repair after it) is marked as closing its requested spine
+	// (kTailCloses) and carries the count of the data packets sent so far up
+	// each spine, CustomHeader::udpTailCounts of them. The receiver of such
+	// a packet compares each count with the furthest path sequence it
+	// expects of that requested spine, the arriving packet's own spine with
+	// its path sequence, and records the path sequences missing, those its
+	// trimmed headers accounted left out (SpineSequenceReceiver::TakeMissing). After TailRecoveryDelayNs() it
+	// requests what of them is still missing, packets that arrived meanwhile
+	// left out, in repair requests with qbbHeader::FLAG_TAIL_NACK, one per
+	// stretch of consecutive path sequences of a spine. The sender declares
+	// lost the outstanding sends those path sequences name on that spine,
+	// as the per-path rule does, and repairs them; the retransmission
+	// timeout is left as it is. A lost tail packet whose spine's count
+	// arrives about half a base RTT after the message's end is repaired at
+	// the receiver about 1.5 base RTT + the delay after that end.
+	bool m_sprayTailRecovery;
+	// SprayTailRecoveryDelayNs: how long the receiver waits on a missing run
+	// before it requests it; kTailDelayBaseRtt, the default, is
+	// m_sprayBaseRttNs, and zero requests it at once.
+	static constexpr uint64_t kTailDelayBaseRtt = UINT64_MAX;
+	uint64_t m_sprayTailRecoveryDelayNs;
+	uint64_t TailRecoveryDelayNs() const;
+	bool ValidTailRecovery() const;
+	// The runs of q due by now, requested, and q's timer set for the next.
+	void RequestTailRuns(Ptr<RdmaRxQueuePair> q);
+	// The tail fields of the data packet of qp being sent, closing when the
+	// queue pair has no new data left.
+	void SetTailFields(Ptr<RdmaQueuePair> qp, SeqTsHeader &seqTs,
+		bool closing) const;
+	// The tail repair requests the closing data packet or trimmed header ch
+	// arriving at q asks for, before ch's own path sequence is counted.
+	void AskTailMissing(Ptr<RdmaRxQueuePair> q, const CustomHeader &ch);
+	// The repair request of q's flow for count path sequences from first on
+	// spine.
+	void SendTailNack(Ptr<RdmaRxQueuePair> q, uint8_t spine, uint16_t first,
+		uint16_t count);
+	// The sender's handling of a tail repair request for qp.
+	void RecoverTail(Ptr<RdmaQueuePair> qp, const CustomHeader &ch);
+	// SprayReceiverHold, under SprayPathSeq: the host's ReceiverHold, made at
+	// its first arrival, counts the arrivals and the missing packets per
+	// sender leaf, which m_switchQueues names, holds spines by them with
+	// SprayHoldAutoLeaves as its autoLeaves and m_sprayReceiverHoldClean as
+	// its clean arrivals, and every acknowledgement carries the bitmap of
+	// the spines it holds for its destination's leaf. As a sender, every
+	// queue pair's selector holds the spines the bitmaps hold toward its
+	// destination's leaf, in m_receiverHoldMarks, shared by the host's queue
+	// pairs, or under PathSelector 7 in marks of its own.
+	bool m_sprayReceiverHold;
+	uint32_t m_sprayReceiverHoldClean;
+	std::unique_ptr<ReceiverHold> m_receiverHold;
+	std::shared_ptr<ReceiverHoldMarks> m_receiverHoldMarks;
+	bool IsReceiverHold() const;
+	bool ValidReceiverHold() const;
+	ReceiverHold &ReceiverHoldOf();
+	// The receiver_hold field of an answer to the host at senderIp.
+	uint8_t ReceiverHoldBitmap(uint32_t senderIp) const;
+	// Give qp's selector the marks it holds by.
+	void AttachReceiverHold(Ptr<RdmaQueuePair> qp);
+	// The ReceiverHoldInterval trace source: the host's ReceiverHold closed an
+	// interval of SprayLossIntervalNs, once per sender leaf
+	// (ReceiverHold::IntervalCallback), with each spine's ReceiverHold::Scope.
+	typedef void (*ReceiverHoldIntervalTracedCallback)(uint32_t leaf,
+		uint64_t endNs, const std::vector<uint32_t> &arrivals,
+		const std::vector<uint32_t> &lost, const std::vector<uint8_t> &holds);
+	TracedCallback<uint32_t, uint64_t, const std::vector<uint32_t> &,
+		const std::vector<uint32_t> &, const std::vector<uint8_t> &>
+		m_traceReceiverHoldInterval;
 	bool m_var_win, m_fast_react;
 	bool m_rateBound;
 	uint32_t m_total_pause_times; 
@@ -360,6 +531,10 @@ public:
 		uint32_t sourceIp, uint32_t destinationIp, uint16_t sport,
 		uint16_t dport, uint16_t pg, uint32_t seq, uint32_t payloadSize,
 		bool lastHop, bool spent, bool eligible);
+	// A repair request carrying header, to destinationIp, with the IPv4
+	// identification identification.
+	void SendRepairRequest(const qbbHeader &header, uint32_t sourceIp,
+		uint32_t destinationIp, uint16_t identification);
 	// packetSeq and identification describe the data packet answered, or with
 	// probeAnswer the probe; redirect is the redirect field, kNoRedirect
 	// outside AckRedirect.
@@ -397,6 +572,10 @@ public:
 	void QpFail(Ptr<RdmaQueuePair> qp, uint32_t reason);
 	void ArmRetransmissionTimeout(Ptr<RdmaQueuePair> qp);
 	void HandleRetransmissionTimeout(Ptr<RdmaQueuePair> qp);
+	// The send of seq along path at sentNs, on a held spine, is due: declared
+	// lost if still outstanding, and its repair sent.
+	void HeldSendDue(Ptr<RdmaQueuePair> qp, uint64_t seq, uint16_t path,
+		uint64_t sentNs);
 	bool EnforceProgressDeadline(Ptr<RdmaQueuePair> qp);
 	void SetLinkDown(Ptr<QbbNetDevice> dev);
 

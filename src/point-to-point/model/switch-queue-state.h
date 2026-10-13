@@ -6,6 +6,7 @@
 #include "spine-grader.h"
 #include "switch-node.h"
 #include <stdint.h>
+#include <array>
 #include <unordered_map>
 #include <vector>
 
@@ -58,13 +59,23 @@ public:
 	// forward hops' only, as the ACK echoes the packet's marking.
 	std::vector<SpineGrader::SpineValues> PathValues(uint32_t source,
 		uint32_t destination, bool delay) const;
+	// Per spine, whether the path from leaf source to leaf destination over
+	// it is faulted as the switches stand now: a receiving port of the
+	// forward or the reverse hops, the four PathValues reads the loss
+	// fraction over, has a link error rate or is black-holed, or a sending
+	// port of them sends slower than the slowest of another spine's path.
+	std::vector<bool> Faulted(uint32_t source, uint32_t destination) const;
 
 private:
 	struct HopValues {
 		double marking;
 		double delayNs;
 		double loss;
+		uint64_t rateBps;
 	};
+	// The four hops of the path over spine k, forward then reverse.
+	std::array<HopValues, 4> PathHops(uint32_t source, uint32_t destination,
+		uint32_t k) const;
 	static HopValues Read(const Hop &hop);
 
 	uint32_t m_spines;

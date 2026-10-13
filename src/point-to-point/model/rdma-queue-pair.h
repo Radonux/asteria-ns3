@@ -12,6 +12,7 @@
 #include "path-selector.h"
 #include "spine-grader.h"
 #include "spine-redirect.h"
+#include "spine-sequence.h"
 #include <map>
 #include <memory>
 #include <set>
@@ -37,8 +38,16 @@ public:
 	void SetPacketSize(uint32_t size);
 	bool IsKept() const;
 	// Every sequence is a multiple of the packet size, and a packet is resent
-	// only after its previous send has been removed.
-	void Add(uint64_t seq, uint32_t size, uint16_t path, uint64_t sentNs);
+	// only after its previous send has been removed. trickle marks a trickle
+	// send of a loss hold (PathSelector::ChoseTrickle), whose answer is told
+	// to PathSelector::OnTrickleAnswer; exploration marks any exploration
+	// send onto a held spine (PathSelector::ChoseExploration).
+	// pathSeq is the send's path sequence under SprayPathSeq. held marks a
+	// send up a spine a loss hold held as it was chosen
+	// (PathSelector::ChoseHeld).
+	void Add(uint64_t seq, uint32_t size, uint16_t path, uint64_t sentNs,
+		bool trickle = false, bool exploration = false, uint16_t pathSeq = 0,
+		bool held = false);
 	// The packet number of the outstanding send of seq along path, or kNone.
 	uint64_t Find(uint64_t seq, uint16_t path) const;
 	uint64_t Oldest() const;
@@ -47,10 +56,16 @@ public:
 	uint32_t Size(uint64_t packet) const;
 	uint64_t SentNs(uint64_t packet) const;
 	uint16_t Path(uint64_t packet) const;
+	uint16_t PathSeq(uint64_t packet) const;
 	// Whether the send resends a packet whose previous send was declared
 	// lost. A send declared lost may still arrive, and the answer to it would
 	// name the resend's record.
 	bool ResendsLost(uint64_t packet) const;
+	bool Trickle(uint64_t packet) const;
+	bool Exploration(uint64_t packet) const;
+	bool Held(uint64_t packet) const;
+	// The newest outstanding send along path, or kNone.
+	uint64_t NewestOnPath(uint16_t path) const;
 	void Remove(uint64_t packet);
 	// Remove the record of a send declared lost.
 	void RemoveLost(uint64_t packet);
@@ -66,8 +81,12 @@ private:
 		uint64_t sent_ns;
 		uint32_t size;
 		uint16_t path;
+		uint16_t path_seq;
 		bool outstanding;
 		bool resends_lost;
+		bool trickle;
+		bool exploration;
+		bool held;
 		// Neighbouring outstanding sends as packet numbers, kNone at either
 		// end: across every path, then along this record's path.
 		uint64_t older, newer;
@@ -162,6 +181,42 @@ public:
 	OutstandingPackets m_outstanding;
 	// What draws those paths, set together with the send records.
 	std::unique_ptr<PathSelector> m_pathSelector;
+	// Under SentinelMode::Duplicate, the copies of data packets sent onto a
+	// held spine (PathSelector::TakeCopy) not yet answered, by sequence,
+	// apart from the send records: a copy is in no window, no retransmission
+	// timeout waits for it and its loss queues no repair. A copy ends in one
+	// of three ways. Its own acknowledgement, found by its sequence and
+	// path, answers it clean; the selector hears of it as of any answer,
+	// the window not at all. The per-path rule declares it lost as a send along its
+	// path: the acknowledgement of a newer send along that path, data or
+	// copy, finds it outstanding; and its own acknowledgement declares lost
+	// the older data sends and copies along its path as a data
+	// acknowledgement does. Once the data send of its sequence is
+	// acknowledged, by its own answer or cumulatively, a copy outstanding
+	// for more than one base RTT since it was sent is declared lost, and one
+	// younger waits for its own answer. A declared loss is told to the
+	// selector's OnLoss, and of a trickle copy to OnTrickleAnswer, and
+	// nothing else.
+	struct ExplorationCopy {
+		uint32_t size;
+		uint16_t path;
+		uint64_t sentNs;
+		bool trickle;
+		bool dataAcknowledged;
+	};
+	std::map<uint64_t, ExplorationCopy> m_copies;
+	uint32_t m_exploration_copies;
+	uint32_t m_exploration_copies_lost;
+	// A copy of the send of seq along path, at sentNs. A copy of seq still
+	// outstanding is released without a loss.
+	void AddCopy(uint64_t seq, uint32_t size, uint16_t path, uint64_t sentNs,
+		bool trickle);
+	// Whether the acknowledgement of seq along path answers a copy rather
+	// than a data send; if so the answer is taken, and lost is set to the
+	// data bytes the per-path rule declared lost.
+	bool AcknowledgeCopy(uint64_t seq, uint16_t path, uint64_t &lost);
+	// Under SprayPathSeq, the path sequence each data packet carries.
+	SpineSequenceSender m_pathSeqSender;
 	EventId m_retransmissionTimer;
 	uint16_t m_pg;
 	uint16_t m_ipid;
@@ -252,6 +307,25 @@ public:
 	// Declare lost every outstanding send made at or before sentNs and queue
 	// its range for repair. Returns the bytes declared lost.
 	uint64_t DeclareLostSentBy(uint64_t sentNs);
+	// Under SprayTailRecovery, a tail repair request: declare lost every
+	// outstanding send along path whose path sequence is one of the count
+	// from first, and queue its range for repair. A send already
+	// acknowledged or declared lost is no longer outstanding and is left
+	// alone, as is a later send of the same packet, which carries a path
+	// sequence of its own. Returns the bytes declared lost.
+	uint64_t DeclareLostOnPathSeqs(uint16_t path, uint16_t first,
+		uint16_t count);
+	// Sends declared lost by tail repair requests, and the requests that
+	// found no outstanding send.
+	uint32_t m_tail_declared_lost;
+	uint32_t m_tail_nacks_ignored;
+	// Declare lost the send of seq along path made at sentNs, a send on a
+	// held spine (OutstandingPackets::Held), if it is still outstanding, and
+	// queue its range for repair. Returns the bytes declared lost: zero when
+	// it was acknowledged or declared lost since, or seq was sent again.
+	uint64_t DeclareHeldSendLost(uint64_t seq, uint16_t path, uint64_t sentNs);
+	// Sends on a held spine declared lost by DeclareHeldSendLost.
+	uint32_t m_held_declared_lost;
 
 	uint64_t GetBytesLeft();
 	uint64_t GetInitialSize();
@@ -271,6 +345,13 @@ public:
 private:
 	// Returns the bytes declared lost.
 	uint32_t DeclareLost(uint64_t packet);
+	// Declare lost, for the selector alone, the copies along path sent
+	// before sentNs, and those whose data send is acknowledged and that are
+	// outstanding past one base RTT by nowNs.
+	void DeclareCopiesLostOnPath(uint16_t path, uint64_t sentNs, uint64_t nowNs);
+	void ExpireCopies(uint64_t nowNs);
+	void DeclareCopyLost(std::map<uint64_t, ExplorationCopy>::iterator copy,
+		uint64_t nowNs);
 };
 
 class RdmaRxQueuePair : public Object { // Rx side queue pair
@@ -309,6 +390,12 @@ public:
 	// leaf carried on a spine other than the one requested.
 	uint64_t m_data_arrivals;
 	uint64_t m_folded_arrivals;
+	// Under SprayPathSeq, the path sequence expected next per path.
+	SpineSequenceReceiver m_pathSeqReceiver;
+	// Under SprayTailRecovery with a delay, the missing runs not yet
+	// requested, and the one timer that requests those due.
+	PendingTailRuns m_tailRuns;
+	EventId m_tailTimer;
 	// Whether the experiment layer may forgive this flow on this step, asked
 	// once when the queue pair is created. Every acknowledgement this queue
 	// pair emits carries it, and an acknowledgement carrying it without the
