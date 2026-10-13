@@ -244,6 +244,11 @@ public:
 	bool ValidHoldRelease() const;
 	// SentinelMode of PathSelector RepsHold, RepsFlowHold and MrcHold.
 	uint32_t m_spraySentinelMode;
+	// Under PathSelector RepsHold, RepsFlowHold and MrcHold, the base RTTs
+	// after which a send on a held spine (PathSelector::ChoseHeld) still
+	// outstanding is declared lost and repaired (HeldSendDue); zero waits
+	// for the retransmission timeout.
+	double m_sprayHeldLossRtts;
 	// HoldScope of PathSelector RepsHold and MrcHold. Under Leaf the queue
 	// pairs to the hosts of one leaf, which m_switchQueues names, share that
 	// leaf's loss hold in m_leafHolds, made at the first of them; under Host
@@ -567,6 +572,10 @@ public:
 	void QpFail(Ptr<RdmaQueuePair> qp, uint32_t reason);
 	void ArmRetransmissionTimeout(Ptr<RdmaQueuePair> qp);
 	void HandleRetransmissionTimeout(Ptr<RdmaQueuePair> qp);
+	// The send of seq along path at sentNs, on a held spine, is due: declared
+	// lost if still outstanding, and its repair sent.
+	void HeldSendDue(Ptr<RdmaQueuePair> qp, uint64_t seq, uint16_t path,
+		uint64_t sentNs);
 	bool EnforceProgressDeadline(Ptr<RdmaQueuePair> qp);
 	void SetLinkDown(Ptr<QbbNetDevice> dev);
 

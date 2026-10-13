@@ -8578,6 +8578,175 @@ class HeldSpineLeakTest : public TestCase
     }
 };
 
+class HeldSpineFastLossTest : public TestCase
+{
+  public:
+    HeldSpineFastLossTest()
+        : TestCase("Under reps_hold and mrc_hold a data send up a spine held as it is chosen, "
+                   "here the sentinel under SpraySentinelMode data, still unacknowledged "
+                   "SprayHeldLossRtts base RTTs after it is declared lost and repaired, with "
+                   "no retransmission timeout; with SprayHeldLossRtts 0 the timeout declares it "
+                   "lost")
+    {
+    }
+
+    void DoRun() override
+    {
+        const bool savedPacketSeq = CustomHeader::ackCarriesPacketSeq;
+        CustomHeader::ackCarriesPacketSeq = true;
+        Ptr<RdmaHw> unset = CreateObject<RdmaHw>();
+        DoubleValue rtts;
+        unset->GetAttribute("SprayHeldLossRtts", rtts);
+        NS_TEST_EXPECT_MSG_EQ(rtts.Get(), 2.0, "SprayHeldLossRtts is 2 by default");
+        Flow(PathSelectorKind::RepsHold, 2);
+        Flow(PathSelectorKind::MrcHold, 2);
+        Flow(PathSelectorKind::RepsHold, 0);
+        CustomHeader::ackCarriesPacketSeq = savedPacketSeq;
+    }
+
+  private:
+    static constexpr uint32_t kSpines = 8;
+    static constexpr uint64_t kInterval = 10000;
+    static constexpr uint32_t kMtu = IsolatedHost::kMtu;
+    static constexpr uint32_t kPackets = 300;
+    static constexpr uint64_t kStepNs = 100;
+    static constexpr uint64_t kRttNs = 2000;
+    static constexpr uint64_t kTimeoutNs = 50 * kRttNs;
+
+    // One message, one send per kStepNs, spine 3 held from the start with a
+    // sentinel per loss interval. Every send on spine 3 is dropped, every
+    // other one acknowledged kRttNs after it.
+    void Flow(PathSelectorKind kind, double heldLossRtts)
+    {
+        IsolatedHost sender(LoadBalancingMode::SprayUniform, kTestReceiver, kSpines);
+        Ptr<RdmaHw> hw = sender.hw;
+        hw->m_pathSelectorKind = static_cast<uint32_t>(kind);
+        hw->m_sprayHoldScope = static_cast<uint32_t>(HoldScope::Host);
+        hw->m_sprayLossThreshold1 = 0.1;
+        hw->m_sprayLossThreshold2 = 0.25;
+        hw->m_sprayLossThreshold3 = 0.5;
+        hw->m_sprayLossIntervalNs = kInterval;
+        hw->m_sprayHeldExploration = SpineScores::HeldExploration::Sentinel;
+        hw->m_sprayLossHoldCleanSentinels = 3;
+        hw->m_sprayHeldLossRtts = heldLossRtts;
+        hw->m_retransmission_timeout_ns = kTimeoutNs;
+        const std::string which = std::string(kind == PathSelectorKind::RepsHold
+                                                  ? "reps_hold"
+                                                  : "mrc_hold") +
+                                  (heldLossRtts > 0 ? ": " : " without: ");
+        bool completed = false;
+        hw->m_qpCompleteCallback =
+            Callback<void, Ptr<RdmaQueuePair>>([&](Ptr<RdmaQueuePair>) { completed = true; });
+        uint32_t failure = 0;
+        hw->m_qpFailureCallback = Callback<void, Ptr<RdmaQueuePair>, uint32_t>(
+            [&](Ptr<RdmaQueuePair>, uint32_t reason) { failure = reason + 1; });
+        std::vector<bool> timeoutExploration;
+        hw->TraceConnectWithoutContext(
+            "RetransmissionTimeout",
+            Callback<void, uint64_t, Ptr<RdmaQueuePair>, int32_t, bool, uint64_t>(
+                [&](uint64_t, Ptr<RdmaQueuePair>, int32_t, bool exploration, uint64_t) {
+                    timeoutExploration.push_back(exploration);
+                }));
+        Ptr<RdmaQueuePair> qp =
+            sender.AddSender(kTestSender, kTestReceiver, uint64_t{kPackets} * kMtu);
+        qp->m_baseRtt = kRttNs;
+        qp->m_notifyAppFinish = Callback<void>([]() {});
+        SpineScores& hold = *hw->m_senderSpineScores;
+        hold.CountIntervalSend(3, 100);
+        hold.CountIntervalLoss(3, 200);
+        uint64_t received = 0;
+        std::set<uint64_t> arrived;
+        // Per sequence, when it was last sent up the held spine 3; and the
+        // delays from such a send to the repair of its sequence.
+        std::map<uint32_t, uint64_t> onHeld;
+        std::vector<uint64_t> repairDelays;
+        uint32_t heldSends = 0;
+        std::function<void()> step = [&]() {
+            if (qp->IsFinished())
+            {
+                return;
+            }
+            if (qp->snd_nxt >= qp->m_size && qp->RepairBytesLeft() == 0)
+            {
+                Simulator::Schedule(NanoSeconds(kStepNs), step);
+                return;
+            }
+            const uint64_t now = Simulator::Now().GetNanoSeconds();
+            Ptr<Packet> packet = hw->GetNxtPacket(qp);
+            hw->ArmRetransmissionTimeout(qp);
+            CustomHeader live(CustomHeader::L2_Header | CustomHeader::L3_Header |
+                              CustomHeader::L4_Header);
+            packet->PeekHeader(live);
+            const uint32_t seq = live.udp.seq;
+            const auto earlier = onHeld.find(seq);
+            if (earlier != onHeld.end())
+            {
+                repairDelays.push_back(now - earlier->second);
+                onHeld.erase(earlier);
+            }
+            if (RequestedSpine(live.ipid) == 3)
+            {
+                NS_TEST_EXPECT_MSG_EQ(qp->m_pathSelector->ChoseHeld(), true,
+                                      which + "a send up spine 3 is one up a held spine");
+                heldSends++;
+                onHeld[seq] = now;
+            }
+            else
+            {
+                const uint16_t ipid = live.ipid;
+                Simulator::Schedule(NanoSeconds(kRttNs), [&, seq, ipid]() {
+                    if (qp->IsFinished())
+                    {
+                        return;
+                    }
+                    arrived.insert(seq);
+                    while (arrived.count(received) > 0)
+                    {
+                        received += kMtu;
+                    }
+                    sender.ReceiveAck(kTestReceiver, received, seq, ipid);
+                });
+            }
+            Simulator::Schedule(NanoSeconds(kStepNs), step);
+        };
+        Simulator::Schedule(NanoSeconds(kInterval), step);
+        // Without the early loss, up to the first timeout only: once nothing
+        // but repairs is left to send, each repair a loss interval after the
+        // last sentinel is the next sentinel.
+        Simulator::Stop(heldLossRtts > 0 ? Seconds(1)
+                                         : NanoSeconds(kInterval + kPackets * kStepNs +
+                                                       kTimeoutNs));
+        Simulator::Run();
+
+        NS_TEST_EXPECT_MSG_GT(heldSends, 1u, which + "sentinels go up spine 3");
+        if (heldLossRtts > 0)
+        {
+            NS_TEST_EXPECT_MSG_EQ(failure, 0u, which + "the queue pair does not fail");
+            NS_TEST_EXPECT_MSG_EQ(completed, true, which + "the message completes");
+            NS_TEST_EXPECT_MSG_EQ(repairDelays.size(), heldSends, which + "each one is repaired");
+            NS_TEST_EXPECT_MSG_EQ(qp->m_held_declared_lost, heldSends,
+                                  which + "each declared lost as a send on a held spine");
+            NS_TEST_EXPECT_MSG_EQ(timeoutExploration.size(), 0u,
+                                  which + "and no retransmission timeout fires");
+            for (const uint64_t delay : repairDelays)
+            {
+                NS_TEST_EXPECT_MSG_GT_OR_EQ(delay, 2 * kRttNs, which + "after two base RTTs");
+                NS_TEST_EXPECT_MSG_LT_OR_EQ(delay, 2 * kRttNs + kStepNs,
+                                            which + "at the next send after them");
+            }
+        }
+        else
+        {
+            NS_TEST_EXPECT_MSG_EQ(qp->m_held_declared_lost, 0u, which + "none declared early");
+            NS_TEST_EXPECT_MSG_GT(timeoutExploration.size(), 0u, which + "the timeout fires");
+            NS_TEST_EXPECT_MSG_EQ(timeoutExploration.empty() || timeoutExploration[0],
+                                  true,
+                                  which + "for a sentinel");
+        }
+        Simulator::Destroy();
+    }
+};
+
 class RetransmissionTimeoutTraceTest : public TestCase
 {
   public:
@@ -11977,6 +12146,7 @@ PointToPointTestSuite::PointToPointTestSuite()
     AddTestCase(new RepsHoldDuplicateTest, TestCase::Duration::QUICK);
     AddTestCase(new RetransmissionTimeoutTraceTest, TestCase::Duration::QUICK);
     AddTestCase(new HeldSpineLeakTest, TestCase::Duration::QUICK);
+    AddTestCase(new HeldSpineFastLossTest, TestCase::Duration::QUICK);
     AddTestCase(new SprayTailRecoveryTest, TestCase::Duration::QUICK);
     AddTestCase(new SprayPathSeqTest, TestCase::Duration::QUICK);
     AddTestCase(new SprayReceiverHoldTest, TestCase::Duration::QUICK);

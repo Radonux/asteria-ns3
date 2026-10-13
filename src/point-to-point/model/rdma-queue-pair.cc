@@ -50,7 +50,8 @@ void OutstandingPackets::Reserve(uint64_t packet){
 }
 
 void OutstandingPackets::Add(uint64_t seq, uint32_t size, uint16_t path,
-		uint64_t sentNs, bool trickle, bool exploration, uint16_t pathSeq){
+		uint64_t sentNs, bool trickle, bool exploration, uint16_t pathSeq,
+		bool held){
 	NS_ASSERT_MSG(m_packet_size != 0 && seq % m_packet_size == 0,
 		"a send record is indexed by its packet number");
 	const uint64_t packet = seq / m_packet_size;
@@ -65,7 +66,7 @@ void OutstandingPackets::Add(uint64_t seq, uint32_t size, uint16_t path,
 		? kNone : newestOnPath->second;
 	const bool resendsLost = m_lost.erase(packet) > 0;
 	record = {sentNs, size, path, pathSeq, true, resendsLost, trickle,
-		trickle || exploration, m_newest, kNone, olderOnPath, kNone};
+		trickle || exploration, held, m_newest, kNone, olderOnPath, kNone};
 	if (m_newest != kNone)
 		At(m_newest).newer = packet;
 	else
@@ -128,6 +129,10 @@ bool OutstandingPackets::Trickle(uint64_t packet) const{
 
 bool OutstandingPackets::Exploration(uint64_t packet) const{
 	return At(packet).exploration;
+}
+
+bool OutstandingPackets::Held(uint64_t packet) const{
+	return At(packet).held;
 }
 
 uint64_t OutstandingPackets::NewestOnPath(uint16_t path) const{
@@ -217,6 +222,7 @@ RdmaQueuePair::RdmaQueuePair(uint16_t pg, Ipv4Address _sip, Ipv4Address _dip, ui
 	m_recovery_retries = 0;
 	m_duplicate_repairs = 0;
 	m_tail_declared_lost = 0;
+	m_held_declared_lost = 0;
 	m_tail_nacks_ignored = 0;
 	m_exploration_copies = 0;
 	m_exploration_copies_lost = 0;
@@ -539,6 +545,16 @@ uint64_t RdmaQueuePair::DeclareLostOnPathSeqs(uint16_t path, uint16_t first,
 	if (named.empty())
 		m_tail_nacks_ignored++;
 	return lost;
+}
+
+uint64_t RdmaQueuePair::DeclareHeldSendLost(uint64_t seq, uint16_t path,
+		uint64_t sentNs){
+	const uint64_t packet = m_outstanding.Find(seq, path);
+	if (packet == OutstandingPackets::kNone ||
+			m_outstanding.SentNs(packet) != sentNs || !m_outstanding.Held(packet))
+		return 0;
+	m_held_declared_lost++;
+	return DeclareLost(packet);
 }
 
 uint32_t RdmaQueuePair::DeclareLost(uint64_t packet){

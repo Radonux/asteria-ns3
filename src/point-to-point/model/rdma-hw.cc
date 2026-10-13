@@ -632,6 +632,17 @@ TypeId RdmaHw::GetTypeId (void)
 				MakeUintegerChecker<uint32_t>(
 					static_cast<uint32_t>(SentinelMode::Data),
 					static_cast<uint32_t>(SentinelMode::Duplicate)))
+		.AddAttribute("SprayHeldLossRtts",
+				"Under PathSelector 6, 7 and 9, the queue pair's base RTTs "
+				"after which a data send up a spine the loss hold, or the "
+				"receivers' hold, held as it was chosen, an exploration send "
+				"under SpraySentinelMode 0 or any send while every spine is "
+				"held, is declared lost if it is still unacknowledged, and "
+				"repaired, without waiting for the retransmission timeout. "
+				"0 waits for the timeout. Default 2.",
+				DoubleValue(2),
+				MakeDoubleAccessor(&RdmaHw::m_sprayHeldLossRtts),
+				MakeDoubleChecker<double>(0))
 		.AddAttribute("SprayPathSeq",
 				"Under LoadBalancing 2, whether every data packet carries "
 				"its queue pair's count of the data packets sent before it up "
@@ -2614,6 +2625,21 @@ void RdmaHw::HandleRetransmissionTimeout(Ptr<RdmaQueuePair> qp){
 	ArmRetransmissionTimeout(qp);
 }
 
+void RdmaHw::HeldSendDue(Ptr<RdmaQueuePair> qp, uint64_t seq, uint16_t path,
+		uint64_t sentNs){
+	if (qp->IsFinished() || qp->IsFailed())
+		return;
+	const uint64_t lost = qp->DeclareHeldSendLost(seq, path, sentNs);
+	if (lost == 0)
+		return;
+	if (m_cc_mode == 11 && DeliverCongestionSignal(qp)){
+		qp->nscc.OnLoss(lost);
+		ApplyNsccWindow(qp);
+	}
+	m_nic[GetNicIdxOfQp(qp)].dev->TriggerTransmit();
+	ArmRetransmissionTimeout(qp);
+}
+
 void RdmaHw::ReportTransportEvent(const char* event, uint64_t bytes){
 	if (!m_transportEventCallback.IsNull())
 		m_transportEventCallback(event, bytes);
@@ -2776,11 +2802,18 @@ Ptr<Packet> RdmaHw::GetNxtPacket(Ptr<RdmaQueuePair> qp){
 	ipHeader.SetDscp (static_cast<Ipv4Header::DscpType>(kUetDscpTrimmable));
 	if (IsPathPerPacket()){
 		ipHeader.SetIdentification(identification);
-		qp->m_outstanding.Add(seq, payload_size,
-			PathOf(static_cast<LoadBalancingMode>(m_loadBalancing), identification),
-			Simulator::Now().GetNanoSeconds(),
+		const uint16_t path =
+			PathOf(static_cast<LoadBalancingMode>(m_loadBalancing), identification);
+		const uint64_t sentNs = Simulator::Now().GetNanoSeconds();
+		const bool held = IsRepsHold() && qp->m_pathSelector->ChoseHeld();
+		qp->m_outstanding.Add(seq, payload_size, path, sentNs,
 			qp->m_pathSelector->ChoseTrickle(),
-			qp->m_pathSelector->ChoseExploration(), pathSeq);
+			qp->m_pathSelector->ChoseExploration(), pathSeq, held);
+		const uint64_t heldLossNs =
+			static_cast<uint64_t>(m_sprayHeldLossRtts * qp->m_baseRtt);
+		if (held && heldLossNs > 0)
+			Simulator::Schedule(NanoSeconds(heldLossNs), &RdmaHw::HeldSendDue,
+				this, qp, seq, path, sentNs);
 		if (copy){
 			// The copy leaves ahead of the data packet, through the NIC's
 			// high-priority queue, outside the queue pair's pacing; switches

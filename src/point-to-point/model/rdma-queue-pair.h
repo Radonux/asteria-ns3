@@ -42,9 +42,12 @@ public:
 	// send of a loss hold (PathSelector::ChoseTrickle), whose answer is told
 	// to PathSelector::OnTrickleAnswer; exploration marks any exploration
 	// send onto a held spine (PathSelector::ChoseExploration).
-	// pathSeq is the send's path sequence under SprayPathSeq.
+	// pathSeq is the send's path sequence under SprayPathSeq. held marks a
+	// send up a spine a loss hold held as it was chosen
+	// (PathSelector::ChoseHeld).
 	void Add(uint64_t seq, uint32_t size, uint16_t path, uint64_t sentNs,
-		bool trickle = false, bool exploration = false, uint16_t pathSeq = 0);
+		bool trickle = false, bool exploration = false, uint16_t pathSeq = 0,
+		bool held = false);
 	// The packet number of the outstanding send of seq along path, or kNone.
 	uint64_t Find(uint64_t seq, uint16_t path) const;
 	uint64_t Oldest() const;
@@ -60,6 +63,7 @@ public:
 	bool ResendsLost(uint64_t packet) const;
 	bool Trickle(uint64_t packet) const;
 	bool Exploration(uint64_t packet) const;
+	bool Held(uint64_t packet) const;
 	// The newest outstanding send along path, or kNone.
 	uint64_t NewestOnPath(uint16_t path) const;
 	void Remove(uint64_t packet);
@@ -82,6 +86,7 @@ private:
 		bool resends_lost;
 		bool trickle;
 		bool exploration;
+		bool held;
 		// Neighbouring outstanding sends as packet numbers, kNone at either
 		// end: across every path, then along this record's path.
 		uint64_t older, newer;
@@ -314,6 +319,13 @@ public:
 	// found no outstanding send.
 	uint32_t m_tail_declared_lost;
 	uint32_t m_tail_nacks_ignored;
+	// Declare lost the send of seq along path made at sentNs, a send on a
+	// held spine (OutstandingPackets::Held), if it is still outstanding, and
+	// queue its range for repair. Returns the bytes declared lost: zero when
+	// it was acknowledged or declared lost since, or seq was sent again.
+	uint64_t DeclareHeldSendLost(uint64_t seq, uint16_t path, uint64_t sentNs);
+	// Sends on a held spine declared lost by DeclareHeldSendLost.
+	uint32_t m_held_declared_lost;
 
 	uint64_t GetBytesLeft();
 	uint64_t GetInitialSize();

@@ -245,6 +245,15 @@ std::set<std::string> hold_test_keys_given;
 // packet sent up it.
 std::string spray_sentinel_mode = "data";
 bool spray_sentinel_mode_given = false;
+// Under reps_hold, reps_flow_hold and mrc_hold, the queue pair's base RTTs
+// after which a data send up a spine held as it was chosen, by the loss hold
+// or under SPRAY_RECEIVER_HOLD by the receivers' (the sentinel or trickle send
+// under SPRAY_SENTINEL_MODE data, or any send while every spine is held), is
+// declared lost if it is still unacknowledged and repaired, without waiting
+// for the retransmission timeout; a later answer to it is taken as a
+// resend's. 0 waits for the timeout. At least 0.
+double spray_held_loss_rtts = 2;
+bool spray_held_loss_rtts_given = false;
 std::string spray_hold_release = "sentinels";
 bool spray_hold_release_given = false;
 double spray_hold_trickle = 0.01;
@@ -1874,6 +1883,15 @@ bool valid_hold_rule() {
     std::cerr << "SPRAY_SENTINEL_MODE must be data or duplicate\n";
     return false;
   }
+  if (spray_held_loss_rtts_given && !reps_hold()) {
+    std::cerr << "SPRAY_HELD_LOSS_RTTS is read only under PATH_SELECTOR "
+                 "reps_hold, reps_flow_hold or mrc_hold\n";
+    return false;
+  }
+  if (!(spray_held_loss_rtts >= 0)) {
+    std::cerr << "SPRAY_HELD_LOSS_RTTS must be at least 0\n";
+    return false;
+  }
   if (spray_hold_release_value() == std::numeric_limits<uint32_t>::max()) {
     std::cerr << "SPRAY_HOLD_RELEASE must be sentinels or trickle\n";
     return false;
@@ -2152,6 +2170,9 @@ bool ReadConf(string network_configuration) {
     } else if (key.compare("SPRAY_SENTINEL_MODE") == 0) {
       conf >> spray_sentinel_mode;
       spray_sentinel_mode_given = true;
+    } else if (key.compare("SPRAY_HELD_LOSS_RTTS") == 0) {
+      conf >> spray_held_loss_rtts;
+      spray_held_loss_rtts_given = true;
     } else if (key.compare("SPRAY_HOLD_RELEASE") == 0) {
       conf >> spray_hold_release;
       spray_hold_release_given = true;
@@ -3196,6 +3217,8 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),
       rdmaHw->SetAttribute("SprayHoldTrickle", DoubleValue(spray_hold_trickle));
       rdmaHw->SetAttribute("SpraySentinelMode",
                            UintegerValue(spray_sentinel_mode_value()));
+      rdmaHw->SetAttribute("SprayHeldLossRtts",
+                           DoubleValue(spray_held_loss_rtts));
       rdmaHw->SetAttribute("SprayPathSeq",
                            BooleanValue(spray_path_seq == "on"));
       rdmaHw->SetAttribute("SprayTailRecovery", BooleanValue(tail_recovery()));

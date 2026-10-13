@@ -228,6 +228,10 @@ public:
 	// Whether the latest Choose's data packet was an exploration send onto a
 	// held spine: a sentinel or a trickle send.
 	virtual bool ChoseExploration() const;
+	// Whether the latest Choose's data packet goes up a spine a loss hold, or
+	// the receivers' hold, holds as it is chosen: an exploration send under
+	// SentinelMode::Data, or any send while every spine is held.
+	virtual bool ChoseHeld() const;
 	// A trickle send along path acknowledged, or declared lost, after
 	// OnAck or OnLoss has been told.
 	virtual void OnTrickleAnswer(uint16_t path, bool lost, uint64_t nowNs);
@@ -841,6 +845,7 @@ public:
 	bool Excluded(uint32_t spine) const;
 	bool ChoseTrickle() const;
 	bool ChoseExploration() const;
+	bool ChoseHeld() const;
 	bool TakeCopy(uint8_t &spine, bool &trickle);
 	// The acknowledgement of a send on spine, data or copy, and a send on
 	// spine declared lost.
@@ -869,6 +874,7 @@ private:
 	TrickleSchedule m_trickle;
 	bool m_choseTrickle;
 	bool m_choseExploration;
+	bool m_choseHeld;
 	PendingCopy m_copy;
 	ReceiverHoldView m_receiverHold;
 };
@@ -901,6 +907,7 @@ public:
 	void OnLoss(uint16_t path, uint64_t nowNs) override;
 	bool ChoseTrickle() const override;
 	bool ChoseExploration() const override;
+	bool ChoseHeld() const override;
 	void OnTrickleAnswer(uint16_t path, bool lost, uint64_t nowNs) override;
 	bool TakeCopy(uint8_t &spine, bool &trickle) override;
 	void SetReceiverHold(std::shared_ptr<ReceiverHoldMarks> marks,
@@ -1090,6 +1097,7 @@ public:
 	bool TakeProbe(uint64_t nowNs, uint16_t &path) override;
 	bool ChoseTrickle() const override;
 	bool ChoseExploration() const override;
+	bool ChoseHeld() const override;
 	void OnTrickleAnswer(uint16_t path, bool lost, uint64_t nowNs) override;
 	bool TakeCopy(uint8_t &spine, bool &trickle) override;
 	void SetReceiverHold(std::shared_ptr<ReceiverHoldMarks> marks,

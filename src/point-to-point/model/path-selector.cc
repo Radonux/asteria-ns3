@@ -35,6 +35,10 @@ bool PathSelector::ChoseTrickle() const{
 void PathSelector::OnTrickleAnswer(uint16_t, bool, uint64_t){
 }
 
+bool PathSelector::ChoseHeld() const{
+	return false;
+}
+
 bool PathSelector::ChoseExploration() const{
 	return false;
 }
@@ -1282,14 +1286,16 @@ bool AutoLossHold::SentinelDue(uint64_t &lastNs, uint64_t nowNs) const{
 
 LossHoldExploration::LossHoldExploration(uint32_t spines, SpineScores &hold)
 	: m_scores(&hold), m_autoHold(nullptr), m_leaf(0), m_excluding(false),
-	  m_trickle(spines), m_choseTrickle(false), m_choseExploration(false)
+	  m_trickle(spines), m_choseTrickle(false), m_choseExploration(false),
+	  m_choseHeld(false)
 {
 }
 
 LossHoldExploration::LossHoldExploration(uint32_t spines, AutoLossHold &hold,
 		uint32_t leaf)
 	: m_scores(nullptr), m_autoHold(&hold), m_leaf(leaf), m_excluding(false),
-	  m_trickle(spines), m_choseTrickle(false), m_choseExploration(false)
+	  m_trickle(spines), m_choseTrickle(false), m_choseExploration(false),
+	  m_choseHeld(false)
 {
 	m_autoHold->AddLeaf(leaf);
 }
@@ -1326,6 +1332,7 @@ uint8_t LossHoldExploration::Choose(uint64_t nowNs,
 				CountSend(explored, nowNs);
 		}
 	}
+	m_choseHeld = Holds(spine) || m_receiverHold.Holds(spine);
 	CountSend(spine, nowNs);
 	return spine;
 }
@@ -1340,6 +1347,10 @@ bool LossHoldExploration::ChoseTrickle() const{
 
 bool LossHoldExploration::ChoseExploration() const{
 	return m_choseExploration;
+}
+
+bool LossHoldExploration::ChoseHeld() const{
+	return m_choseHeld;
 }
 
 bool LossHoldExploration::TakeCopy(uint8_t &spine, bool &trickle){
@@ -1446,6 +1457,10 @@ bool RepsHoldSelector::ChoseTrickle() const{
 
 bool RepsHoldSelector::ChoseExploration() const{
 	return m_exploration.ChoseExploration();
+}
+
+bool RepsHoldSelector::ChoseHeld() const{
+	return m_exploration.ChoseHeld();
 }
 
 void RepsHoldSelector::OnTrickleAnswer(uint16_t path, bool lost,
@@ -1750,6 +1765,10 @@ bool MrcHoldSelector::ChoseTrickle() const{
 
 bool MrcHoldSelector::ChoseExploration() const{
 	return m_exploration.ChoseExploration();
+}
+
+bool MrcHoldSelector::ChoseHeld() const{
+	return m_exploration.ChoseHeld();
 }
 
 void MrcHoldSelector::OnTrickleAnswer(uint16_t path, bool lost,
