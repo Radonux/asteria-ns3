@@ -27,9 +27,9 @@ enum class HoldScope : uint32_t {
 	Auto,
 };
 
-// What puts a spine in the loss hold of RepsHold and RepsFlowHold, per hold
-// key: Count, a closed loss interval whose lost fraction grades it 0 through
-// the loss thresholds; Llr, the key's LossLikelihoodRatio reaching its
+// What puts a spine in the loss hold of RepsHold, RepsFlowHold and MrcHold,
+// per hold key: Count, a closed loss interval whose lost fraction grades it 0
+// through the loss thresholds; Llr, the key's LossLikelihoodRatio reaching its
 // threshold, at the send declared lost that takes it there.
 enum class HoldRule : uint32_t {
 	Count = 0,
@@ -80,10 +80,10 @@ private:
 	uint32_t m_windowLost;
 };
 
-// How a spine leaves the loss hold of RepsHold and RepsFlowHold: Sentinels,
-// by the clean sends of the sentinels sent one per sentinel interval;
-// Trickle, by TrickleRelease, its trickle sends being a fraction of each
-// queue pair's sends (TrickleSchedule).
+// How a spine leaves the loss hold of RepsHold, RepsFlowHold and MrcHold:
+// Sentinels, by the clean sends of the sentinels sent one per sentinel
+// interval; Trickle, by TrickleRelease, its trickle sends being a fraction of
+// each queue pair's sends (TrickleSchedule).
 enum class HoldRelease : uint32_t {
 	Sentinels = 0,
 	Trickle,
@@ -123,19 +123,18 @@ private:
 };
 
 // What an exploration send onto a held spine of a loss hold carries, for
-// every selector that sends through the hold (RepsHoldSelector,
-// RepsAutoHoldSelector, and any later one sharing SpineScores or
-// AutoLossHold as a loss hold): Data, the exploration send is the data
-// packet itself, in place of REPS's choice (a sentinel under
-// HoldRelease::Sentinels, a trickle send under Trickle); Duplicate, the data
-// packet goes up the spine REPS chooses, as if no exploration were due, and
-// a copy of it with the same sequence goes up the held spine in the same
-// send (PathSelector::TakeCopy). The copy is counted in the hold as a send on
-// the held spine, its acknowledgement and its loss move the hold's
-// statistics as a data exploration send's do, and it never asks for a
-// retransmission or a timeout (RdmaQueuePair::AddCopy). Where REPS chooses
-// the held spine itself, which it does only while every spine is held, the
-// data packet is the exploration send and no copy is made.
+// every selector that sends through the hold (LossHoldExploration): Data,
+// the exploration send is the data packet itself, in place of the selector's
+// choice (a sentinel under HoldRelease::Sentinels, a trickle send under
+// Trickle); Duplicate, the data packet goes up the spine the selector
+// chooses, as if no exploration were due, and a copy of it with the same
+// sequence goes up the held spine in the same send (PathSelector::TakeCopy).
+// The copy is counted in the hold as a send on the held spine, its
+// acknowledgement and its loss move the hold's statistics as a data
+// exploration send's do, and it never asks for a retransmission or a timeout
+// (RdmaQueuePair::AddCopy). Where the selector chooses the held spine
+// itself, which it does only while every spine is held, the data packet is
+// the exploration send and no copy is made.
 enum class SentinelMode : uint32_t {
 	Data = 0,
 	Duplicate,
@@ -247,6 +246,11 @@ public:
 	// answer itself is told.
 	virtual void OnReceiverHold(uint32_t receiver, uint8_t bitmap,
 		uint64_t nowNs);
+	// Under SprayReceiverHold, the marks of the receivers on the destination's
+	// leaf, which a selector with a loss hold holds spines by; others ignore
+	// them.
+	virtual void SetReceiverHold(std::shared_ptr<ReceiverHoldMarks> marks,
+		uint32_t leaf);
 };
 
 // A spine drawn uniformly per packet, named as both the requested and the
@@ -664,55 +668,6 @@ private:
 	uint32_t m_exploreCounter;
 };
 
-// REPS (RepsSelector) over spines under SprayUniform, with a loss hold: the
-// spines that scores used as a loss hold (SpineScores) hold are left out of
-// REPS's choices unless they hold every spine, and each held spine is sent
-// the hold's sentinels, one per sentinel interval for every selector that
-// shares the hold, in place of REPS's choice. Every send, sentinel or chosen,
-// and every send declared lost is counted in the hold, which grades its
-// spines per loss interval as the host's pooled scores do and holds a spine
-// by the same loss hold. The hold is shared by every queue pair of a host,
-// or owned by this queue pair alone, whose sentinels it then sends alone.
-// Under HoldRelease::Trickle the queue pair sends each held spine its trickle
-// sends by its own TrickleSchedule instead, and tells the hold their answers.
-class RepsHoldSelector : public RepsSelector {
-public:
-	RepsHoldSelector(Ptr<UniformRandomVariable> random, uint32_t bufferSize,
-		uint64_t freezingTimeoutNs, uint32_t explorePackets, uint32_t spines,
-		SpineScores &hold);
-	RepsHoldSelector(Ptr<UniformRandomVariable> random, uint32_t bufferSize,
-		uint64_t freezingTimeoutNs, uint32_t explorePackets, uint32_t spines,
-		std::unique_ptr<SpineScores> hold);
-	uint16_t Choose(uint64_t nowNs) override;
-	void OnLoss(uint16_t path, uint64_t nowNs) override;
-	bool ChoseTrickle() const override;
-	bool ChoseExploration() const override;
-	void OnTrickleAnswer(uint16_t path, bool lost, uint64_t nowNs) override;
-	bool TakeCopy(uint8_t &spine, bool &trickle) override;
-	// Under SprayReceiverHold: the spines the receivers hold toward leaf, in
-	// marks, are held as the loss hold holds them, and sent marks'
-	// sentinels where the loss hold does not hold them.
-	void SetReceiverHold(std::shared_ptr<ReceiverHoldMarks> marks,
-		uint32_t leaf);
-	void OnReceiverHold(uint32_t receiver, uint8_t bitmap,
-		uint64_t nowNs) override;
-
-protected:
-	bool Excluded(uint16_t path) const override;
-
-private:
-	// Declared before m_hold, which refers to it when it is set.
-	std::unique_ptr<SpineScores> m_ownHold;
-	SpineScores &m_hold;
-	// Whether the hold leaves a spine out, set before each choice.
-	bool m_excluding;
-	TrickleSchedule m_trickle;
-	bool m_choseTrickle;
-	bool m_choseExploration;
-	PendingCopy m_copy;
-	ReceiverHoldView m_receiverHold;
-};
-
 // The host-wide loss hold of RepsHold under HoldScope::Auto. Per destination
 // leaf and spine it counts the sends and the sends declared lost over each
 // loss interval, one interval clock for the host, and per spine it keeps the
@@ -841,27 +796,89 @@ private:
 	LeafLossIntervalCallback m_onLossInterval;
 };
 
-// REPS (RepsSelector) over spines under SprayUniform toward one destination
-// leaf, with the host's AutoLossHold in place of RepsHoldSelector's loss
-// hold: the spines it holds toward the leaf are left out of REPS's choices
-// unless it holds every spine toward it, its sentinels toward the leaf are
-// sent in place of REPS's choice, and every send and every send declared
-// lost is counted in it toward the leaf.
-class RepsAutoHoldSelector : public RepsSelector {
+// The exploration of a loss hold's held spines and the counting in it that
+// every selector sending through the hold shares: RepsHoldSelector and
+// MrcHoldSelector. The hold is SpineScores, the host's, a destination leaf's
+// or a queue pair's own, or the host's AutoLossHold toward one destination
+// leaf. Per send, the exploration send due, if any, is the hold's sentinel,
+// else under SprayReceiverHold the receivers' sentinel onto a spine they
+// hold and the hold does not, else under HoldRelease::Trickle the queue
+// pair's trickle send (TrickleSchedule). Under SentinelMode::Data it is the
+// data packet itself; otherwise the selector's own choice is taken, leaving
+// out the spines the hold or the receivers hold unless they hold every
+// spine, and under Duplicate the exploration send due is a copy onto its
+// spine (TakeCopy). The send, and the copy, are counted in the hold, and so
+// is every send declared lost.
+class LossHoldExploration {
 public:
-	RepsAutoHoldSelector(Ptr<UniformRandomVariable> random,
-		uint32_t bufferSize, uint64_t freezingTimeoutNs,
-		uint32_t explorePackets, uint32_t spines, AutoLossHold &hold,
+	LossHoldExploration(uint32_t spines, SpineScores &hold);
+	// Adds leaf to hold.
+	LossHoldExploration(uint32_t spines, AutoLossHold &hold, uint32_t leaf);
+	// The spine of the send in progress; choose is the selector's own choice,
+	// called with Excluded set for it.
+	uint8_t Choose(uint64_t nowNs, const std::function<uint8_t()> &choose);
+	bool Excluded(uint32_t spine) const;
+	bool ChoseTrickle() const;
+	bool ChoseExploration() const;
+	bool TakeCopy(uint8_t &spine, bool &trickle);
+	void OnLoss(uint32_t spine, uint64_t nowNs);
+	void OnTrickleAnswer(uint32_t spine, bool lost, uint64_t nowNs);
+	// Under SprayReceiverHold: the spines the receivers hold toward leaf, in
+	// marks, are held as the loss hold holds them, and sent marks'
+	// sentinels where the loss hold does not hold them.
+	void SetReceiverHold(std::shared_ptr<ReceiverHoldMarks> marks,
 		uint32_t leaf);
+	void OnReceiverHold(uint32_t receiver, uint8_t bitmap);
+
+private:
+	bool TakeHoldSentinel(uint64_t nowNs, uint8_t &spine);
+	bool Holds(uint32_t spine) const;
+	bool HoldsEvery() const;
+	void CountSend(uint32_t spine, uint64_t nowNs);
+
+	// One of the two is set.
+	SpineScores *m_scores;
+	AutoLossHold *m_autoHold;
+	uint32_t m_leaf;
+	// Whether the holds leave a spine out, set before each choice.
+	bool m_excluding;
+	TrickleSchedule m_trickle;
+	bool m_choseTrickle;
+	bool m_choseExploration;
+	PendingCopy m_copy;
+	ReceiverHoldView m_receiverHold;
+};
+
+// REPS (RepsSelector) over spines under SprayUniform, with a loss hold
+// through LossHoldExploration: the spines the hold holds are left out of
+// REPS's choices unless it holds every spine, and each held spine is sent
+// the hold's sentinels, one per sentinel interval for every selector that
+// shares the hold, or its trickle sends, as the exploration sends. Every
+// send and every send declared lost is counted in the hold, which grades its
+// spines per loss interval as the host's pooled scores do and holds a spine
+// by the same loss hold. The hold is SpineScores, shared by every queue pair
+// of a host or of a destination leaf, or owned by this queue pair alone,
+// whose sentinels it then sends alone; or the host's AutoLossHold toward the
+// destination leaf.
+class RepsHoldSelector : public RepsSelector {
+public:
+	RepsHoldSelector(Ptr<UniformRandomVariable> random, uint32_t bufferSize,
+		uint64_t freezingTimeoutNs, uint32_t explorePackets, uint32_t spines,
+		SpineScores &hold);
+	RepsHoldSelector(Ptr<UniformRandomVariable> random, uint32_t bufferSize,
+		uint64_t freezingTimeoutNs, uint32_t explorePackets, uint32_t spines,
+		std::unique_ptr<SpineScores> hold);
+	RepsHoldSelector(Ptr<UniformRandomVariable> random, uint32_t bufferSize,
+		uint64_t freezingTimeoutNs, uint32_t explorePackets, uint32_t spines,
+		AutoLossHold &hold, uint32_t leaf);
 	uint16_t Choose(uint64_t nowNs) override;
 	void OnLoss(uint16_t path, uint64_t nowNs) override;
 	bool ChoseTrickle() const override;
 	bool ChoseExploration() const override;
 	void OnTrickleAnswer(uint16_t path, bool lost, uint64_t nowNs) override;
 	bool TakeCopy(uint8_t &spine, bool &trickle) override;
-	// As RepsHoldSelector's, toward this selector's leaf.
 	void SetReceiverHold(std::shared_ptr<ReceiverHoldMarks> marks,
-		uint32_t leaf);
+		uint32_t leaf) override;
 	void OnReceiverHold(uint32_t receiver, uint8_t bitmap,
 		uint64_t nowNs) override;
 
@@ -869,15 +886,9 @@ protected:
 	bool Excluded(uint16_t path) const override;
 
 private:
-	AutoLossHold &m_hold;
-	uint32_t m_leaf;
-	// Whether the hold leaves a spine out, set before each choice.
-	bool m_excluding;
-	TrickleSchedule m_trickle;
-	bool m_choseTrickle;
-	bool m_choseExploration;
-	PendingCopy m_copy;
-	ReceiverHoldView m_receiverHold;
+	// Declared before m_exploration, which refers to it when it is set.
+	std::unique_ptr<SpineScores> m_ownHold;
+	LossHoldExploration m_exploration;
 };
 
 // Simulation only: the spines toward one destination leaf that a reader of
@@ -1020,13 +1031,15 @@ private:
 };
 
 // MRC (MrcSelector) over spines under SprayUniform, its set the spine
-// indices, with RepsHold's loss hold: the spines the hold holds toward the
-// queue pair's destination are left out of MRC's choices unless it holds
-// every spine, its sentinels are sent in place of MRC's choice, and every
-// send and every send declared lost is counted in it, as RepsHoldSelector
-// and RepsAutoHoldSelector do. The hold is SpineScores, the host's or the
-// destination leaf's, or the host's AutoLossHold toward the destination leaf.
-// A declared loss moves MRC's state too, and MRC's probes name spines.
+// indices, with RepsHold's loss hold through LossHoldExploration, as
+// RepsHoldSelector has it: the spines the hold, or the receivers under
+// SprayReceiverHold, hold toward the queue pair's destination are left out
+// of MRC's choices unless they hold every spine, the exploration sends are
+// sent as the hold's HoldRelease and SentinelMode have them, and every send
+// and every send declared lost is counted in the hold. The hold is
+// SpineScores, the host's or the destination leaf's, or the host's
+// AutoLossHold toward the destination leaf. A declared loss moves MRC's
+// state too, and MRC's probes name spines.
 class MrcHoldSelector : public MrcSelector {
 public:
 	MrcHoldSelector(Ptr<UniformRandomVariable> random, uint32_t spines,
@@ -1037,20 +1050,20 @@ public:
 	uint16_t Choose(uint64_t nowNs) override;
 	void OnLoss(uint16_t path, uint64_t nowNs) override;
 	bool TakeProbe(uint64_t nowNs, uint16_t &path) override;
+	bool ChoseTrickle() const override;
+	bool ChoseExploration() const override;
+	void OnTrickleAnswer(uint16_t path, bool lost, uint64_t nowNs) override;
+	bool TakeCopy(uint8_t &spine, bool &trickle) override;
+	void SetReceiverHold(std::shared_ptr<ReceiverHoldMarks> marks,
+		uint32_t leaf) override;
+	void OnReceiverHold(uint32_t receiver, uint8_t bitmap,
+		uint64_t nowNs) override;
 
 protected:
 	bool Excluded(uint16_t path) const override;
 
 private:
-	bool Holds(uint32_t spine) const;
-	bool HoldsEvery() const;
-
-	// One of the two is set.
-	SpineScores *m_hold;
-	AutoLossHold *m_autoHold;
-	uint32_t m_leaf;
-	// Whether the hold leaves a spine out, set before each choice.
-	bool m_excluding;
+	LossHoldExploration m_exploration;
 };
 
 } /* namespace ns3 */

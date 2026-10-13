@@ -173,9 +173,9 @@ bool spray_hold_scope_given = false;
 // from which its hold is kept for every destination; at least 2.
 uint32_t spray_hold_auto_leaves = 2;
 bool spray_hold_auto_leaves_given = false;
-// Under reps_hold and reps_flow_hold, what puts a spine in loss hold, per
-// hold key: the (destination leaf, spine) under SPRAY_HOLD_SCOPE leaf and
-// auto, the spine under host, and the queue pair's spine under
+// Under reps_hold, reps_flow_hold and mrc_hold, what puts a spine in loss
+// hold, per hold key: the (destination leaf, spine) under SPRAY_HOLD_SCOPE
+// leaf and auto, the spine under host, and the queue pair's spine under
 // reps_flow_hold. count: a loss interval whose lost fraction grades the
 // spine 0 through SPRAY_LOSS_THRESHOLDS. llr: a sequential likelihood-ratio
 // test per key, of the loss probability SPRAY_LOSS_P0 of a working path
@@ -201,7 +201,7 @@ double spray_loss_p1 = 0.001;
 double spray_hold_alpha = 0.001;
 double spray_hold_beta = 0.001;
 std::set<std::string> hold_test_keys_given;
-// Under reps_hold and reps_flow_hold, how a held key is released.
+// Under reps_hold, reps_flow_hold and mrc_hold, how a held key is released.
 // sentinels: SPRAY_LOSS_HOLD_CLEAN_SENTINELS clean sends of the sentinels
 // sent one per SPRAY_HELD_SENTINEL_INTERVAL_NS. trickle: each queue pair
 // sends each spine its hold holds one in round(1 / SPRAY_HOLD_TRICKLE) of its
@@ -218,31 +218,33 @@ std::set<std::string> hold_test_keys_given;
 // of its evidence's p1 and that of the leaf-scope holds it ends. Under
 // trickle SPRAY_LOSS_HOLD_CLEAN_SENTINELS and SPRAY_HELD_SENTINEL_INTERVAL_NS
 // are refused, and SPRAY_HOLD_TRICKLE, in (0, 0.5], is read only under it.
-// Under reps_hold and reps_flow_hold, and every later selector that sends
-// through their loss hold, what an exploration send onto a held spine (a
-// sentinel under SPRAY_HOLD_RELEASE sentinels, a trickle send under trickle)
-// is. data: the data packet itself, in place of the spine REPS would choose.
-// duplicate: the data packet goes up the spine REPS chooses among the spines
-// not held, and a copy of it, the same sequence, goes up the held spine in
-// the same send, ahead of it through the NIC's high-priority queue. The
-// receiver takes whichever arrives first and discards the other as a
-// duplicate, acknowledging each with the spine it came by. The copy has a
-// record of its own on the held spine, apart from the data send records: its
-// acknowledgement and its loss move the hold's counts, its test and its
-// release statistic as a data exploration send's do, and the per-path rule
-// treats it as a send on its spine. Its loss queues no repair and no
-// retransmission timeout waits for it: once the data send is acknowledged, a
-// copy unanswered for more than one base RTT since it was sent is declared
-// lost for the hold alone. Where REPS's choice is the held spine itself,
-// which it is only while every spine is held, no copy is made.
+// Under reps_hold, reps_flow_hold and mrc_hold, what an exploration send onto a
+// held spine (a sentinel under SPRAY_HOLD_RELEASE sentinels, or of the
+// receivers' hold under SPRAY_RECEIVER_HOLD, a trickle send under trickle) is.
+// data: the data packet itself, in place of the spine REPS, or MRC under
+// mrc_hold, would choose. duplicate: the data packet goes up the spine the
+// selector chooses among the spines not held, and a copy of it, the same
+// sequence, goes up the held spine in the same send, ahead of it through the
+// NIC's high-priority queue. The receiver takes whichever arrives first and
+// discards the other as a duplicate, acknowledging each with the spine it came
+// by. The copy has a record of its own on the held spine, apart from the data
+// send records: its acknowledgement and its loss move the hold's counts, its
+// test and its release statistic as a data exploration send's do, and the
+// per-path rule treats it as a send on its spine. Its loss queues no repair and
+// no retransmission timeout waits for it: once the data send is acknowledged, a
+// copy unanswered for more than one base RTT since it was sent is declared lost
+// for the hold alone. Where the selector's choice is the held spine itself,
+// which it is only while every spine is held, no copy is made. Under
+// SPRAY_PATH_SEQ the copy carries the path sequence of the held spine, as a
+// packet sent up it.
 std::string spray_sentinel_mode = "data";
 bool spray_sentinel_mode_given = false;
 std::string spray_hold_release = "sentinels";
 bool spray_hold_release_given = false;
 double spray_hold_trickle = 0.01;
 bool spray_hold_trickle_given = false;
-// Under reps_hold or reps_flow_hold, SPRAY_PATH_SEQ on: every data packet
-// carries, in a 2-byte path_seq field after the INT header, its queue pair's
+// Under reps_hold, reps_flow_hold or mrc_hold, SPRAY_PATH_SEQ on: every data
+// packet carries, in a 2-byte path_seq field after the INT header, its queue pair's
 // count of the data packets sent before it up its requested spine. The
 // receiver keeps per queue pair and per path, the requested and the carrying
 // spine, the path sequence it expects next; an arrival ahead of it by g shows
@@ -254,8 +256,8 @@ bool spray_hold_trickle_given = false;
 // it. Off, the default, leaves the data header as it is.
 std::string spray_path_seq = "off";
 bool spray_path_seq_given = false;
-// Under reps_hold or reps_flow_hold with SPRAY_PATH_SEQ on, SPRAY_RECEIVER_HOLD
-// on: each receiving host counts, per sender leaf and spine, the data packets
+// Under reps_hold, reps_flow_hold or mrc_hold with SPRAY_PATH_SEQ on,
+// SPRAY_RECEIVER_HOLD on: each receiving host counts, per sender leaf and spine, the data packets
 // that arrived and the packets the path sequences show missing. A missing
 // packet on spine k from sender leaf a holds k for a alone, or for every
 // sender leaf once SPRAY_HOLD_AUTO_LEAVES sender leaves have a missing packet
@@ -1792,13 +1794,13 @@ bool valid_loss_hold() {
   return true;
 }
 
-// The hold rule of reps_hold and reps_flow_hold, and the keys of its test
+// The hold rule of reps_hold, reps_flow_hold and mrc_hold, and the keys of its test
 // read only where it reads them, within the ranges its RdmaHw attributes
 // take.
 bool valid_hold_rule() {
   if (spray_hold_rule_given && !reps_hold()) {
-    std::cerr << "SPRAY_HOLD_RULE is read only under PATH_SELECTOR reps_hold "
-                 "or reps_flow_hold\n";
+    std::cerr << "SPRAY_HOLD_RULE is read only under PATH_SELECTOR reps_hold, "
+                 "reps_flow_hold or mrc_hold\n";
     return false;
   }
   if (spray_hold_rule_value() == std::numeric_limits<uint32_t>::max()) {
@@ -1807,12 +1809,12 @@ bool valid_hold_rule() {
   }
   if (spray_hold_release_given && !reps_hold()) {
     std::cerr << "SPRAY_HOLD_RELEASE is read only under PATH_SELECTOR "
-                 "reps_hold or reps_flow_hold\n";
+                 "reps_hold, reps_flow_hold or mrc_hold\n";
     return false;
   }
   if (spray_sentinel_mode_given && !reps_hold()) {
     std::cerr << "SPRAY_SENTINEL_MODE is read only under PATH_SELECTOR "
-                 "reps_hold or reps_flow_hold\n";
+                 "reps_hold, reps_flow_hold or mrc_hold\n";
     return false;
   }
   if (spray_sentinel_mode_value() == std::numeric_limits<uint32_t>::max()) {
@@ -2526,8 +2528,8 @@ bool ReadConf(string network_configuration) {
   }
   if (spray_path_seq_given && !reps_hold()) {
     std::cerr << "SPRAY_PATH_SEQ is read only under LOAD_BALANCING "
-                 "spray_uniform with PATH_SELECTOR reps_hold or "
-                 "reps_flow_hold\n";
+                 "spray_uniform with PATH_SELECTOR reps_hold, "
+                 "reps_flow_hold or mrc_hold\n";
     return false;
   }
   if (spray_receiver_hold != "on" && spray_receiver_hold != "off") {
@@ -2536,8 +2538,8 @@ bool ReadConf(string network_configuration) {
   }
   if (spray_receiver_hold_given && !reps_hold()) {
     std::cerr << "SPRAY_RECEIVER_HOLD is read only under LOAD_BALANCING "
-                 "spray_uniform with PATH_SELECTOR reps_hold or "
-                 "reps_flow_hold\n";
+                 "spray_uniform with PATH_SELECTOR reps_hold, "
+                 "reps_flow_hold or mrc_hold\n";
     return false;
   }
   if (receiver_hold() && spray_path_seq != "on") {

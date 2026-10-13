@@ -4175,7 +4175,9 @@ class GraderFixture
                 grader.OnArrival(spine, spine, i < marked, 0);
             }
         }
-        NS_ASSERT(grader.Advance((interval + 1) * kInterval));
+        // Advance outside the check, which NS_ASSERT drops without asserts.
+        const bool reported = grader.Advance((interval + 1) * kInterval);
+        NS_ABORT_MSG_UNLESS(reported, "the next interval's first event issues the report");
     }
 };
 
@@ -7360,6 +7362,177 @@ class MrcHoldTest : public TestCase
         NS_TEST_EXPECT_MSG_EQ(sentinelsByFlow[0] + sentinelsByFlow[1], 3u, "taken by either flow");
         NS_TEST_EXPECT_MSG_EQ(hold.Holds(3), false, "three clean sentinels release the spine");
         NS_TEST_EXPECT_MSG_GT(onSpine3[4], 1u, "and MRC chooses it again");
+    }
+};
+
+class MrcHoldExplorationTest : public TestCase
+{
+  public:
+    MrcHoldExplorationTest()
+        : TestCase("Under mrc_hold a receiver-held spine leaves MRC's choices and is sent the "
+                   "receivers' sentinel, a copy under SpraySentinelMode duplicate; a copy of a "
+                   "data packet goes up the held spine with that spine's own path sequence")
+    {
+    }
+
+    void DoRun() override
+    {
+        ReceiverHold(SentinelMode::Data);
+        ReceiverHold(SentinelMode::Duplicate);
+        Duplicate();
+        Simulator::Destroy();
+    }
+
+  private:
+    static constexpr uint32_t kSpines = LossHoldFixture::kSpines;
+    static constexpr uint64_t kInterval = LossHoldFixture::kInterval;
+    static constexpr uint64_t kSentinelNs = 100000;
+    static constexpr uint32_t kReceiverLeaf = 2;
+
+    static Ptr<RdmaHw> Hw(SentinelMode mode)
+    {
+        Ptr<RdmaHw> hw = LossHoldFixture::Hw();
+        hw->m_pathSelectorKind = static_cast<uint32_t>(PathSelectorKind::MrcHold);
+        hw->m_spraySentinelMode = static_cast<uint32_t>(mode);
+        return hw;
+    }
+
+    struct Sends
+    {
+        std::vector<uint32_t> live = std::vector<uint32_t>(kSpines, 0);
+        std::vector<uint32_t> copies = std::vector<uint32_t>(kSpines, 0);
+        uint32_t explorations = 0;
+    };
+
+    // count sends from nowNs, each answered clean, its copy too.
+    static Sends Draw(PathSelector& selector, uint64_t nowNs, uint32_t count)
+    {
+        Sends sends;
+        for (uint32_t i = 0; i < count; ++i)
+        {
+            const uint64_t now = nowNs + 10 * i;
+            const uint8_t spine = RequestedSpine(selector.Choose(now));
+            sends.live[spine]++;
+            sends.explorations += selector.ChoseExploration();
+            uint8_t copySpine;
+            bool trickle;
+            if (selector.TakeCopy(copySpine, trickle))
+            {
+                sends.copies[copySpine]++;
+                selector.OnAck(copySpine, false, now);
+            }
+            selector.OnAck(spine, false, now);
+        }
+        return sends;
+    }
+
+    // A receiver on kReceiverLeaf holds spine 3; the loss hold holds nothing.
+    void ReceiverHold(SentinelMode mode)
+    {
+        const bool duplicate = mode == SentinelMode::Duplicate;
+        const std::string which = duplicate ? "duplicate: " : "data: ";
+        Ptr<RdmaHw> hw = Hw(mode);
+        SpineScores hold(kSpines, hw->LossHoldParameters());
+        MrcHoldSelector selector(SelectorStream(), kSpines, 1000, 2000, hold);
+        selector.SetReceiverHold(std::make_shared<ReceiverHoldMarks>(kSpines, kSentinelNs),
+                                 kReceiverLeaf);
+        selector.OnReceiverHold(100, 0x08, 0);
+        Sends sends = Draw(selector, 0, 400);
+        NS_TEST_EXPECT_MSG_EQ(sends.live[3], 0u, which + "the held spine leaves MRC's choices");
+        NS_TEST_EXPECT_MSG_EQ(sends.explorations, 0u, which + "no sentinel before its interval");
+        sends = Draw(selector, kSentinelNs, 400);
+        // One receivers' sentinel in the interval: the data packet itself,
+        // or a copy, beside a data packet that is no exploration send.
+        NS_TEST_EXPECT_MSG_EQ(sends.live[3], duplicate ? 0u : 1u, which + "one sentinel on 3");
+        NS_TEST_EXPECT_MSG_EQ(sends.copies[3], duplicate ? 1u : 0u, which + "a copy under duplicate");
+        NS_TEST_EXPECT_MSG_EQ(sends.explorations, duplicate ? 0u : 1u, which + "the data's flag");
+        selector.OnReceiverHold(100, 0x00, 2 * kSentinelNs);
+        sends = Draw(selector, 2 * kSentinelNs, 400);
+        NS_TEST_EXPECT_MSG_GT(sends.live[3], 10u, which + "a clear bit returns it to MRC");
+    }
+
+    // Through the transport: spine 3 is held by the host's loss hold, so each
+    // interval's sentinel is a copy of a data packet sent on MRC's choice.
+    void Duplicate()
+    {
+        const IntHeader::Mode savedIntMode = IntHeader::mode;
+        const bool savedPathSeq = CustomHeader::udpCarriesPathSeq;
+        const bool savedPacketSeq = CustomHeader::ackCarriesPacketSeq;
+        IntHeader::mode = IntHeader::NONE;
+        CustomHeader::udpCarriesPathSeq = true;
+        CustomHeader::ackCarriesPacketSeq = true;
+
+        IsolatedHost sender(LoadBalancingMode::SprayUniform, kTestReceiver, kSpines);
+        Ptr<RdmaHw> hw = sender.hw;
+        hw->m_pathSelectorKind = static_cast<uint32_t>(PathSelectorKind::MrcHold);
+        hw->m_sprayHoldScope = static_cast<uint32_t>(HoldScope::Host);
+        hw->m_sprayLossThreshold1 = 0.1;
+        hw->m_sprayLossThreshold2 = 0.25;
+        hw->m_sprayLossThreshold3 = 0.5;
+        hw->m_sprayLossIntervalNs = kInterval;
+        hw->m_sprayLossHoldCleanSentinels = LossHoldFixture::kClean;
+        hw->m_sprayHeldExploration = SpineScores::HeldExploration::Sentinel;
+        hw->m_spraySentinelMode = static_cast<uint32_t>(SentinelMode::Duplicate);
+        hw->m_sprayPathSeq = true;
+        NS_TEST_EXPECT_MSG_EQ(hw->ValidRepsHold(), true, "a valid hold");
+        NS_TEST_EXPECT_MSG_EQ(hw->ValidPathSeq(), true, "path sequences under mrc_hold");
+        Ptr<RdmaQueuePair> qp =
+            sender.AddSender(kTestSender, kTestReceiver, 100 * IsolatedHost::kMtu);
+        NS_TEST_EXPECT_MSG_NE(dynamic_cast<MrcHoldSelector*>(qp->m_pathSelector.get()),
+                              nullptr,
+                              "MRC over spines with the hold");
+        SpineScores& hold = *hw->m_senderSpineScores;
+        for (uint32_t i = 0; i < 20; ++i)
+        {
+            hold.CountIntervalSend(3, 100 + i);
+        }
+        for (uint32_t i = 0; i < 10; ++i)
+        {
+            hold.CountIntervalLoss(3, 200 + i);
+        }
+
+        std::vector<uint16_t> nextLive(kSpines, 0);
+        bool liveInOrder = true;
+        uint32_t liveOn3 = 0;
+        std::vector<uint16_t> copyPathSeqs;
+        bool copiesMatch = true;
+        for (uint32_t interval = 1; interval <= 3; ++interval)
+        {
+            for (uint32_t i = 0; i < 5; ++i)
+            {
+                Simulator::Schedule(NanoSeconds(interval * kInterval + 100 * i), [&]() {
+                    const size_t before = sender.emitted.size();
+                    CustomHeader live(CustomHeader::L2_Header | CustomHeader::L3_Header |
+                                      CustomHeader::L4_Header);
+                    hw->GetNxtPacket(qp)->PeekHeader(live);
+                    const uint8_t spine = RequestedSpine(live.ipid);
+                    liveOn3 += spine == 3;
+                    liveInOrder = liveInOrder && live.udp.path_seq == nextLive[spine]++;
+                    if (sender.emitted.size() > before)
+                    {
+                        const CustomHeader& copy = sender.emitted.back();
+                        copiesMatch = copiesMatch && copy.udp.seq == live.udp.seq &&
+                                      RequestedSpine(copy.ipid) == 3;
+                        copyPathSeqs.push_back(copy.udp.path_seq);
+                    }
+                });
+            }
+        }
+        Simulator::Run();
+        NS_TEST_EXPECT_MSG_EQ(liveOn3, 0u, "no data packet goes up the held spine");
+        NS_TEST_EXPECT_MSG_EQ(liveInOrder, true, "the data packets' path sequences skip nothing");
+        NS_TEST_EXPECT_MSG_EQ(copiesMatch, true, "each copy is its data packet on spine 3");
+        NS_TEST_ASSERT_MSG_EQ(copyPathSeqs.size(), 3u, "one copy per interval for the host");
+        for (uint16_t i = 0; i < 3; ++i)
+        {
+            NS_TEST_EXPECT_MSG_EQ(copyPathSeqs[i], i, "each copy carries spine 3's path sequence");
+        }
+        NS_TEST_EXPECT_MSG_EQ(qp->m_exploration_copies, 3u, "each copy with its record");
+
+        CustomHeader::udpCarriesPathSeq = savedPathSeq;
+        CustomHeader::ackCarriesPacketSeq = savedPacketSeq;
+        IntHeader::mode = savedIntMode;
+        Simulator::Destroy();
     }
 };
 
@@ -10777,6 +10950,7 @@ PointToPointTestSuite::PointToPointTestSuite()
     AddTestCase(new SpinePoolHoldPropagationTest, TestCase::Duration::QUICK);
     AddTestCase(new RepsHoldTest, TestCase::Duration::QUICK);
     AddTestCase(new MrcHoldTest, TestCase::Duration::QUICK);
+    AddTestCase(new MrcHoldExplorationTest, TestCase::Duration::QUICK);
     AddTestCase(new RepsFlowHoldTest, TestCase::Duration::QUICK);
     AddTestCase(new RepsHoldScopeTest, TestCase::Duration::QUICK);
     AddTestCase(new RepsHoldAutoScopeTest, TestCase::Duration::QUICK);

@@ -76,6 +76,10 @@ void PathSelector::OnRedirect(uint8_t, uint8_t, uint64_t){
 void PathSelector::OnReceiverHold(uint32_t, uint8_t, uint64_t){
 }
 
+void PathSelector::SetReceiverHold(std::shared_ptr<ReceiverHoldMarks>,
+		uint32_t){
+}
+
 UniformSpineSelector::UniformSpineSelector(Ptr<UniformRandomVariable> random,
 		uint32_t spines)
 	: m_random(random), m_spines(spines)
@@ -953,92 +957,6 @@ void RepsSelector::OnTimeout(uint64_t nowNs){
 	m_exitFreezingNs = nowNs + m_freezingTimeoutNs;
 }
 
-RepsHoldSelector::RepsHoldSelector(Ptr<UniformRandomVariable> random,
-		uint32_t bufferSize, uint64_t freezingTimeoutNs, uint32_t explorePackets,
-		uint32_t spines, SpineScores &hold)
-	: RepsSelector(random, bufferSize, freezingTimeoutNs, explorePackets,
-		spines),
-	  m_hold(hold), m_excluding(false), m_trickle(spines),
-	  m_choseTrickle(false), m_choseExploration(false)
-{
-}
-
-RepsHoldSelector::RepsHoldSelector(Ptr<UniformRandomVariable> random,
-		uint32_t bufferSize, uint64_t freezingTimeoutNs, uint32_t explorePackets,
-		uint32_t spines, std::unique_ptr<SpineScores> hold)
-	: RepsSelector(random, bufferSize, freezingTimeoutNs, explorePackets,
-		spines),
-	  m_ownHold(std::move(hold)), m_hold(*m_ownHold), m_excluding(false),
-	  m_trickle(spines), m_choseTrickle(false), m_choseExploration(false)
-{
-}
-
-uint16_t RepsHoldSelector::Choose(uint64_t nowNs){
-	const auto local = [this](uint32_t k){ return m_hold.Holds(k); };
-	uint8_t explored;
-	bool trickle = false;
-	const bool exploring = m_hold.TakeHoldSentinel(nowNs, explored) ||
-		(m_receiverHold.Active() &&
-			m_receiverHold.TakeSentinel(nowNs, local, explored)) ||
-		(trickle = m_trickle.Take(m_hold.TrickleEvery(), local, explored));
-	m_choseTrickle = false;
-	m_choseExploration = false;
-	m_copy.pending = false;
-	uint8_t spine = explored;
-	if (exploring && m_hold.Sentinels() == SentinelMode::Data){
-		m_choseTrickle = trickle;
-		m_choseExploration = true;
-	}else{
-		m_excluding = m_receiverHold.Active()
-			? !m_receiverHold.HoldsEvery(local) : !m_hold.HoldsEvery();
-		spine = RepsSelector::Choose(nowNs);
-		if (exploring){
-			if (m_copy.Set(spine, explored, trickle)){
-				m_choseTrickle = trickle;
-				m_choseExploration = true;
-			}else
-				m_hold.CountIntervalSend(explored, nowNs);
-		}
-	}
-	m_hold.CountIntervalSend(spine, nowNs);
-	return SpineIdentification(spine, spine);
-}
-
-bool RepsHoldSelector::ChoseExploration() const{
-	return m_choseExploration;
-}
-
-bool RepsHoldSelector::TakeCopy(uint8_t &spine, bool &trickle){
-	return m_copy.Take(spine, trickle);
-}
-
-void RepsHoldSelector::OnLoss(uint16_t path, uint64_t nowNs){
-	m_hold.CountIntervalLoss(path, nowNs);
-}
-
-bool RepsHoldSelector::ChoseTrickle() const{
-	return m_choseTrickle;
-}
-
-void RepsHoldSelector::OnTrickleAnswer(uint16_t path, bool lost,
-		uint64_t nowNs){
-	m_hold.TrickleAnswer(path, lost, nowNs);
-}
-
-bool RepsHoldSelector::Excluded(uint16_t path) const{
-	return m_excluding && (m_hold.Holds(path) || m_receiverHold.Holds(path));
-}
-
-void RepsHoldSelector::SetReceiverHold(
-		std::shared_ptr<ReceiverHoldMarks> marks, uint32_t leaf){
-	m_receiverHold.Set(std::move(marks), leaf);
-}
-
-void RepsHoldSelector::OnReceiverHold(uint32_t receiver, uint8_t bitmap,
-		uint64_t){
-	m_receiverHold.OnBitmap(receiver, bitmap);
-}
-
 AutoLossHold::Leaf::Leaf(uint32_t spines,
 		const LossLikelihoodRatio::Parameters &likelihood)
 	: sent(spines), lost(spines), held(spines), clean(spines),
@@ -1338,83 +1256,183 @@ bool AutoLossHold::SentinelDue(uint64_t &lastNs, uint64_t nowNs) const{
 	return true;
 }
 
-RepsAutoHoldSelector::RepsAutoHoldSelector(Ptr<UniformRandomVariable> random,
-		uint32_t bufferSize, uint64_t freezingTimeoutNs,
-		uint32_t explorePackets, uint32_t spines, AutoLossHold &hold,
-		uint32_t leaf)
-	: RepsSelector(random, bufferSize, freezingTimeoutNs, explorePackets,
-		spines),
-	  m_hold(hold), m_leaf(leaf), m_excluding(false), m_trickle(spines),
-	  m_choseTrickle(false), m_choseExploration(false)
+LossHoldExploration::LossHoldExploration(uint32_t spines, SpineScores &hold)
+	: m_scores(&hold), m_autoHold(nullptr), m_leaf(0), m_excluding(false),
+	  m_trickle(spines), m_choseTrickle(false), m_choseExploration(false)
 {
-	m_hold.AddLeaf(leaf);
 }
 
-uint16_t RepsAutoHoldSelector::Choose(uint64_t nowNs){
-	const auto local = [this](uint32_t k){ return m_hold.Holds(m_leaf, k); };
+LossHoldExploration::LossHoldExploration(uint32_t spines, AutoLossHold &hold,
+		uint32_t leaf)
+	: m_scores(nullptr), m_autoHold(&hold), m_leaf(leaf), m_excluding(false),
+	  m_trickle(spines), m_choseTrickle(false), m_choseExploration(false)
+{
+	m_autoHold->AddLeaf(leaf);
+}
+
+uint8_t LossHoldExploration::Choose(uint64_t nowNs,
+		const std::function<uint8_t()> &choose){
+	const auto local = [this](uint32_t k){ return Holds(k); };
+	const uint32_t trickleEvery = m_autoHold
+		? m_autoHold->TrickleEvery() : m_scores->TrickleEvery();
+	const SentinelMode sentinels = m_autoHold
+		? m_autoHold->Sentinels() : m_scores->Sentinels();
 	uint8_t explored;
 	bool trickle = false;
-	const bool exploring = m_hold.TakeSentinel(m_leaf, nowNs, explored) ||
+	const bool exploring = TakeHoldSentinel(nowNs, explored) ||
 		(m_receiverHold.Active() &&
 			m_receiverHold.TakeSentinel(nowNs, local, explored)) ||
-		(trickle = m_trickle.Take(m_hold.TrickleEvery(), local, explored));
+		(trickle = m_trickle.Take(trickleEvery, local, explored));
 	m_choseTrickle = false;
 	m_choseExploration = false;
 	m_copy.pending = false;
 	uint8_t spine = explored;
-	if (exploring && m_hold.Sentinels() == SentinelMode::Data){
+	if (exploring && sentinels == SentinelMode::Data){
 		m_choseTrickle = trickle;
 		m_choseExploration = true;
 	}else{
 		m_excluding = m_receiverHold.Active()
-			? !m_receiverHold.HoldsEvery(local) : !m_hold.HoldsEvery(m_leaf);
-		spine = RepsSelector::Choose(nowNs);
+			? !m_receiverHold.HoldsEvery(local) : !HoldsEvery();
+		spine = choose();
 		if (exploring){
 			if (m_copy.Set(spine, explored, trickle)){
 				m_choseTrickle = trickle;
 				m_choseExploration = true;
 			}else
-				m_hold.CountSend(m_leaf, explored, nowNs);
+				CountSend(explored, nowNs);
 		}
 	}
-	m_hold.CountSend(m_leaf, spine, nowNs);
-	return SpineIdentification(spine, spine);
+	CountSend(spine, nowNs);
+	return spine;
 }
 
-bool RepsAutoHoldSelector::ChoseExploration() const{
-	return m_choseExploration;
+bool LossHoldExploration::Excluded(uint32_t spine) const{
+	return m_excluding && (Holds(spine) || m_receiverHold.Holds(spine));
 }
 
-bool RepsAutoHoldSelector::TakeCopy(uint8_t &spine, bool &trickle){
-	return m_copy.Take(spine, trickle);
-}
-
-void RepsAutoHoldSelector::OnLoss(uint16_t path, uint64_t nowNs){
-	m_hold.CountLoss(m_leaf, path, nowNs);
-}
-
-bool RepsAutoHoldSelector::ChoseTrickle() const{
+bool LossHoldExploration::ChoseTrickle() const{
 	return m_choseTrickle;
 }
 
-void RepsAutoHoldSelector::OnTrickleAnswer(uint16_t path, bool lost,
+bool LossHoldExploration::ChoseExploration() const{
+	return m_choseExploration;
+}
+
+bool LossHoldExploration::TakeCopy(uint8_t &spine, bool &trickle){
+	return m_copy.Take(spine, trickle);
+}
+
+void LossHoldExploration::OnLoss(uint32_t spine, uint64_t nowNs){
+	if (m_autoHold)
+		m_autoHold->CountLoss(m_leaf, spine, nowNs);
+	else
+		m_scores->CountIntervalLoss(spine, nowNs);
+}
+
+void LossHoldExploration::OnTrickleAnswer(uint32_t spine, bool lost,
 		uint64_t nowNs){
-	m_hold.TrickleAnswer(m_leaf, path, lost, nowNs);
+	if (m_autoHold)
+		m_autoHold->TrickleAnswer(m_leaf, spine, lost, nowNs);
+	else
+		m_scores->TrickleAnswer(spine, lost, nowNs);
 }
 
-bool RepsAutoHoldSelector::Excluded(uint16_t path) const{
-	return m_excluding &&
-		(m_hold.Holds(m_leaf, path) || m_receiverHold.Holds(path));
-}
-
-void RepsAutoHoldSelector::SetReceiverHold(
+void LossHoldExploration::SetReceiverHold(
 		std::shared_ptr<ReceiverHoldMarks> marks, uint32_t leaf){
 	m_receiverHold.Set(std::move(marks), leaf);
 }
 
-void RepsAutoHoldSelector::OnReceiverHold(uint32_t receiver, uint8_t bitmap,
-		uint64_t){
+void LossHoldExploration::OnReceiverHold(uint32_t receiver, uint8_t bitmap){
 	m_receiverHold.OnBitmap(receiver, bitmap);
+}
+
+bool LossHoldExploration::TakeHoldSentinel(uint64_t nowNs, uint8_t &spine){
+	return m_autoHold ? m_autoHold->TakeSentinel(m_leaf, nowNs, spine)
+		: m_scores->TakeHoldSentinel(nowNs, spine);
+}
+
+bool LossHoldExploration::Holds(uint32_t spine) const{
+	return m_autoHold ? m_autoHold->Holds(m_leaf, spine)
+		: m_scores->Holds(spine);
+}
+
+bool LossHoldExploration::HoldsEvery() const{
+	return m_autoHold ? m_autoHold->HoldsEvery(m_leaf) : m_scores->HoldsEvery();
+}
+
+void LossHoldExploration::CountSend(uint32_t spine, uint64_t nowNs){
+	if (m_autoHold)
+		m_autoHold->CountSend(m_leaf, spine, nowNs);
+	else
+		m_scores->CountIntervalSend(spine, nowNs);
+}
+
+RepsHoldSelector::RepsHoldSelector(Ptr<UniformRandomVariable> random,
+		uint32_t bufferSize, uint64_t freezingTimeoutNs, uint32_t explorePackets,
+		uint32_t spines, SpineScores &hold)
+	: RepsSelector(random, bufferSize, freezingTimeoutNs, explorePackets,
+		spines),
+	  m_exploration(spines, hold)
+{
+}
+
+RepsHoldSelector::RepsHoldSelector(Ptr<UniformRandomVariable> random,
+		uint32_t bufferSize, uint64_t freezingTimeoutNs, uint32_t explorePackets,
+		uint32_t spines, std::unique_ptr<SpineScores> hold)
+	: RepsSelector(random, bufferSize, freezingTimeoutNs, explorePackets,
+		spines),
+	  m_ownHold(std::move(hold)), m_exploration(spines, *m_ownHold)
+{
+}
+
+RepsHoldSelector::RepsHoldSelector(Ptr<UniformRandomVariable> random,
+		uint32_t bufferSize, uint64_t freezingTimeoutNs, uint32_t explorePackets,
+		uint32_t spines, AutoLossHold &hold, uint32_t leaf)
+	: RepsSelector(random, bufferSize, freezingTimeoutNs, explorePackets,
+		spines),
+	  m_exploration(spines, hold, leaf)
+{
+}
+
+uint16_t RepsHoldSelector::Choose(uint64_t nowNs){
+	const uint8_t spine = m_exploration.Choose(nowNs,
+		[this, nowNs]{ return static_cast<uint8_t>(RepsSelector::Choose(nowNs)); });
+	return SpineIdentification(spine, spine);
+}
+
+void RepsHoldSelector::OnLoss(uint16_t path, uint64_t nowNs){
+	m_exploration.OnLoss(path, nowNs);
+}
+
+bool RepsHoldSelector::ChoseTrickle() const{
+	return m_exploration.ChoseTrickle();
+}
+
+bool RepsHoldSelector::ChoseExploration() const{
+	return m_exploration.ChoseExploration();
+}
+
+void RepsHoldSelector::OnTrickleAnswer(uint16_t path, bool lost,
+		uint64_t nowNs){
+	m_exploration.OnTrickleAnswer(path, lost, nowNs);
+}
+
+bool RepsHoldSelector::TakeCopy(uint8_t &spine, bool &trickle){
+	return m_exploration.TakeCopy(spine, trickle);
+}
+
+void RepsHoldSelector::SetReceiverHold(
+		std::shared_ptr<ReceiverHoldMarks> marks, uint32_t leaf){
+	m_exploration.SetReceiverHold(std::move(marks), leaf);
+}
+
+void RepsHoldSelector::OnReceiverHold(uint32_t receiver, uint8_t bitmap,
+		uint64_t){
+	m_exploration.OnReceiverHold(receiver, bitmap);
+}
+
+bool RepsHoldSelector::Excluded(uint16_t path) const{
+	return m_exploration.Excluded(path);
 }
 
 FaultedSpines::FaultedSpines(uint32_t spines, uint64_t readIntervalNs,
@@ -1639,41 +1657,27 @@ void MrcSelector::Skip(uint16_t ev, uint64_t nowNs){
 MrcHoldSelector::MrcHoldSelector(Ptr<UniformRandomVariable> random,
 		uint32_t spines, uint64_t skipNs, uint64_t probeIntervalNs,
 		SpineScores &hold)
-	: MrcSelector(random, spines, skipNs, probeIntervalNs), m_hold(&hold),
-	  m_autoHold(nullptr), m_leaf(0), m_excluding(false)
+	: MrcSelector(random, spines, skipNs, probeIntervalNs),
+	  m_exploration(spines, hold)
 {
 }
 
 MrcHoldSelector::MrcHoldSelector(Ptr<UniformRandomVariable> random,
 		uint32_t spines, uint64_t skipNs, uint64_t probeIntervalNs,
 		AutoLossHold &hold, uint32_t leaf)
-	: MrcSelector(random, spines, skipNs, probeIntervalNs), m_hold(nullptr),
-	  m_autoHold(&hold), m_leaf(leaf), m_excluding(false)
+	: MrcSelector(random, spines, skipNs, probeIntervalNs),
+	  m_exploration(spines, hold, leaf)
 {
-	m_autoHold->AddLeaf(leaf);
 }
 
 uint16_t MrcHoldSelector::Choose(uint64_t nowNs){
-	uint8_t spine;
-	const bool sentinel = m_autoHold
-		? m_autoHold->TakeSentinel(m_leaf, nowNs, spine)
-		: m_hold->TakeHoldSentinel(nowNs, spine);
-	if (!sentinel){
-		m_excluding = !HoldsEvery();
-		spine = MrcSelector::Choose(nowNs);
-	}
-	if (m_autoHold)
-		m_autoHold->CountSend(m_leaf, spine, nowNs);
-	else
-		m_hold->CountIntervalSend(spine, nowNs);
+	const uint8_t spine = m_exploration.Choose(nowNs,
+		[this, nowNs]{ return static_cast<uint8_t>(MrcSelector::Choose(nowNs)); });
 	return SpineIdentification(spine, spine);
 }
 
 void MrcHoldSelector::OnLoss(uint16_t path, uint64_t nowNs){
-	if (m_autoHold)
-		m_autoHold->CountLoss(m_leaf, path, nowNs);
-	else
-		m_hold->CountIntervalLoss(path, nowNs);
+	m_exploration.OnLoss(path, nowNs);
 	MrcSelector::OnLoss(path, nowNs);
 }
 
@@ -1686,16 +1690,35 @@ bool MrcHoldSelector::TakeProbe(uint64_t nowNs, uint16_t &path){
 	return true;
 }
 
+bool MrcHoldSelector::ChoseTrickle() const{
+	return m_exploration.ChoseTrickle();
+}
+
+bool MrcHoldSelector::ChoseExploration() const{
+	return m_exploration.ChoseExploration();
+}
+
+void MrcHoldSelector::OnTrickleAnswer(uint16_t path, bool lost,
+		uint64_t nowNs){
+	m_exploration.OnTrickleAnswer(path, lost, nowNs);
+}
+
+bool MrcHoldSelector::TakeCopy(uint8_t &spine, bool &trickle){
+	return m_exploration.TakeCopy(spine, trickle);
+}
+
+void MrcHoldSelector::SetReceiverHold(
+		std::shared_ptr<ReceiverHoldMarks> marks, uint32_t leaf){
+	m_exploration.SetReceiverHold(std::move(marks), leaf);
+}
+
+void MrcHoldSelector::OnReceiverHold(uint32_t receiver, uint8_t bitmap,
+		uint64_t){
+	m_exploration.OnReceiverHold(receiver, bitmap);
+}
+
 bool MrcHoldSelector::Excluded(uint16_t path) const{
-	return m_excluding && Holds(path);
-}
-
-bool MrcHoldSelector::Holds(uint32_t spine) const{
-	return m_autoHold ? m_autoHold->Holds(m_leaf, spine) : m_hold->Holds(spine);
-}
-
-bool MrcHoldSelector::HoldsEvery() const{
-	return m_autoHold ? m_autoHold->HoldsEvery(m_leaf) : m_hold->HoldsEvery();
+	return m_exploration.Excluded(path);
 }
 
 } /* namespace ns3 */

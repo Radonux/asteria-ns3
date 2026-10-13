@@ -225,30 +225,30 @@ public:
 	bool ValidRepsHold() const;
 	// The parameters of scores used as a loss hold alone.
 	SpineScores::Parameters LossHoldParameters() const;
-	// HoldRule of PathSelector RepsHold and RepsFlowHold, and under Llr its
-	// LossLikelihoodRatio::Parameters; whether Llr is set only under them,
-	// with a valid test.
+	// HoldRule of PathSelector RepsHold, RepsFlowHold and MrcHold, and under
+	// Llr its LossLikelihoodRatio::Parameters; whether Llr is set only under
+	// them, with a valid test.
 	uint32_t m_sprayHoldRule;
 	double m_sprayLossP0, m_sprayLossP1, m_sprayHoldAlpha, m_sprayHoldBeta;
 	bool ValidHoldRule() const;
 	LossLikelihoodRatio::Parameters Likelihood() const;
-	// HoldRelease of PathSelector RepsHold and RepsFlowHold and its trickle
-	// fraction; whether Trickle is set only under them, without the keys of
-	// the sentinels' release, with a fraction in (0, 0.5] and the p0, p1 and
-	// alpha TrickleRelease reads valid.
+	// HoldRelease of PathSelector RepsHold, RepsFlowHold and MrcHold and its
+	// trickle fraction; whether Trickle is set only under them, without the
+	// keys of the sentinels' release, with a fraction in (0, 0.5] and the p0,
+	// p1 and alpha TrickleRelease reads valid.
 	uint32_t m_sprayHoldRelease;
 	double m_sprayHoldTrickle;
 	bool IsTrickleRelease() const;
 	bool ValidHoldRelease() const;
-	// SentinelMode of PathSelector RepsHold and RepsFlowHold.
+	// SentinelMode of PathSelector RepsHold, RepsFlowHold and MrcHold.
 	uint32_t m_spraySentinelMode;
-	// HoldScope of PathSelector RepsHold and MrcHold. Under Leaf the queue pairs to the
-	// hosts of one leaf, which m_switchQueues names, share that leaf's loss
-	// hold in m_leafHolds, made at the first of them; under Host every queue
-	// pair shares m_senderSpineScores. Under Auto every queue pair shares
-	// m_autoHold, made at the first of them, toward its destination's leaf,
-	// which m_switchQueues names; m_sprayHoldAutoLeaves is its
-	// AutoLossHold autoLeaves.
+	// HoldScope of PathSelector RepsHold and MrcHold. Under Leaf the queue
+	// pairs to the hosts of one leaf, which m_switchQueues names, share that
+	// leaf's loss hold in m_leafHolds, made at the first of them; under Host
+	// every queue pair shares m_senderSpineScores. Under Auto every queue
+	// pair shares m_autoHold, made at the first of them, toward its
+	// destination's leaf, which m_switchQueues names; m_sprayHoldAutoLeaves
+	// is its AutoLossHold autoLeaves.
 	uint32_t m_sprayHoldScope;
 	uint32_t m_sprayHoldAutoLeaves;
 	std::unordered_map<uint32_t, SpineScores> m_leafHolds;
@@ -321,10 +321,11 @@ public:
 	void GradeTrim(Ptr<RdmaRxQueuePair> q, const CustomHeader &ch, bool lastHop);
 	// Indexed by carrying spine; kept where the identification names one.
 	std::vector<SpineArrivals> m_spineArrivals;
-	// SprayPathSeq, under PathSelector RepsHold or RepsFlowHold: every data
-	// packet carries its queue pair's path sequence on its requested spine,
-	// and the receiver counts the packets the gaps in it show missing, per
-	// carrying spine, in m_spineGaps (SpineSequenceReceiver).
+	// SprayPathSeq, under PathSelector RepsHold, RepsFlowHold or MrcHold:
+	// every data packet carries its queue pair's path sequence on its
+	// requested spine, and the receiver counts the packets the gaps in it
+	// show missing, per carrying spine, in m_spineGaps
+	// (SpineSequenceReceiver).
 	bool m_sprayPathSeq;
 	std::vector<uint64_t> m_spineGaps;
 	bool ValidPathSeq() const;

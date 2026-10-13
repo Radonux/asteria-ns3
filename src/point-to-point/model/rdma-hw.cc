@@ -564,7 +564,7 @@ TypeId RdmaHw::GetTypeId (void)
 				MakeUintegerAccessor(&RdmaHw::m_sprayHoldAutoLeaves),
 				MakeUintegerChecker<uint32_t>(2))
 		.AddAttribute("SprayHoldRule",
-				"Under PathSelector 6 and 7, what puts a spine in loss hold, per "
+				"Under PathSelector 6, 7 and 9, what puts a spine in loss hold, per "
 				"hold key: 0=a loss interval whose lost fraction grades it 0 "
 				"through SprayLossThreshold1-3; 1=the key's sequential "
 				"likelihood-ratio test (LossLikelihoodRatio) of SprayLossP0 "
@@ -601,7 +601,7 @@ TypeId RdmaHw::GetTypeId (void)
 				MakeDoubleAccessor(&RdmaHw::m_sprayHoldBeta),
 				MakeDoubleChecker<double>(0, 0.5))
 		.AddAttribute("SprayHoldRelease",
-				"Under PathSelector 6 and 7, how a spine leaves loss hold: "
+				"Under PathSelector 6, 7 and 9, how a spine leaves loss hold: "
 				"0=SprayLossHoldCleanSentinels clean sends of its sentinels, "
 				"one per SprayHeldSentinelIntervalNs; 1=its trickle sends, "
 				"SprayHoldTrickle of each queue pair's sends, whose clean "
@@ -620,10 +620,10 @@ TypeId RdmaHw::GetTypeId (void)
 				MakeDoubleAccessor(&RdmaHw::m_sprayHoldTrickle),
 				MakeDoubleChecker<double>(0, 0.5))
 		.AddAttribute("SpraySentinelMode",
-				"Under PathSelector 6 and 7, what an exploration send onto a "
+				"Under PathSelector 6, 7 and 9, what an exploration send onto a "
 				"held spine, a sentinel or a trickle send, is: 0=the data "
 				"packet itself; 1=a copy of a data packet sent on the spine "
-				"REPS chooses, in the same send, which no retransmission or "
+				"the selector chooses, in the same send, which no retransmission or "
 				"timeout waits for (RdmaQueuePair::AddCopy). Default 0.",
 				UintegerValue(static_cast<uint32_t>(SentinelMode::Data)),
 				MakeUintegerAccessor(&RdmaHw::m_spraySentinelMode),
@@ -631,7 +631,7 @@ TypeId RdmaHw::GetTypeId (void)
 					static_cast<uint32_t>(SentinelMode::Data),
 					static_cast<uint32_t>(SentinelMode::Duplicate)))
 		.AddAttribute("SprayPathSeq",
-				"Under PathSelector 6 and 7, whether every data packet carries "
+				"Under PathSelector 6, 7 and 9, whether every data packet carries "
 				"its queue pair's count of the data packets sent before it up "
 				"its requested spine, from which the receiver counts the "
 				"packets missing per carrying spine. Needs "
@@ -640,7 +640,7 @@ TypeId RdmaHw::GetTypeId (void)
 				MakeBooleanAccessor(&RdmaHw::m_sprayPathSeq),
 				MakeBooleanChecker())
 		.AddAttribute("SprayReceiverHold",
-				"Under PathSelector 6 and 7 with SprayPathSeq, whether the "
+				"Under PathSelector 6, 7 and 9 with SprayPathSeq, whether the "
 				"receiver holds spines by the packets missing on them per "
 				"sender leaf (ReceiverHold) and reports them in every "
 				"acknowledgement, whose senders hold them toward its leaf. "
@@ -1013,23 +1013,23 @@ void RdmaHw::Setup(QpCompleteCallback cb, QpFailureCallback failure_cb){
 		"and SprayHeldExploration sentinel, and PathSelector 6 and 9 under "
 		"SprayHoldScope 1 or 2 need SwitchQueueState for the hosts' leaves");
 	NS_ABORT_MSG_IF(!ValidHoldRule(),
-		"SprayHoldRule 1 is read only under PathSelector 6 and 7 and needs "
+		"SprayHoldRule 1 is read only under PathSelector 6, 7 and 9 and needs "
 		"0 <= SprayLossP0 < SprayLossP1 < 1 and SprayHoldAlpha and "
 		"SprayHoldBeta in (0, 0.5)");
 	NS_ABORT_MSG_IF(!ValidHoldRelease(),
-		"SprayHoldRelease 1 is read only under PathSelector 6 and 7, reads "
+		"SprayHoldRelease 1 is read only under PathSelector 6, 7 and 9, reads "
 		"neither SprayLossHoldCleanSentinels nor SprayHeldSentinelIntervalNs, "
 		"and needs SprayHoldTrickle in (0, 0.5], 0 <= SprayLossP0 < "
 		"SprayLossP1 < 1 and SprayHoldAlpha in (0, 0.5)");
 	NS_ABORT_MSG_IF(m_spraySentinelMode !=
 				static_cast<uint32_t>(SentinelMode::Data) && !IsRepsHold(),
-		"SpraySentinelMode 1 is read only under PathSelector 6 and 7");
+		"SpraySentinelMode 1 is read only under PathSelector 6, 7 and 9");
 	NS_ABORT_MSG_IF(!ValidPathSeq(),
-		"SprayPathSeq is read only under PathSelector 6 and 7, and data "
+		"SprayPathSeq is read only under PathSelector 6, 7 and 9, and data "
 		"headers carry the path sequence exactly when it is set "
 		"(CustomHeader::udpCarriesPathSeq)");
 	NS_ABORT_MSG_IF(!ValidReceiverHold(),
-		"SprayReceiverHold needs SprayPathSeq, PathSelector 6 or 7, "
+		"SprayReceiverHold needs SprayPathSeq, PathSelector 6, 7 or 9, "
 		"SwitchQueueState for the hosts' leaves and at most 8 spines, and "
 		"acknowledgements carry the receiver_hold field exactly when it is "
 		"set (CustomHeader::ackReceiverHoldBytes)");
@@ -2669,6 +2669,11 @@ Ptr<Packet> RdmaHw::GetNxtPacket(Ptr<RdmaQueuePair> qp){
 			SendPathProbe(qp, probed);
 		identification = qp->m_pathSelector->Choose(now);
 	}
+	uint8_t copySpine = 0;
+	bool copyTrickle = false;
+	const Ptr<Packet> copy =
+		IsPathPerPacket() && qp->m_pathSelector->TakeCopy(copySpine, copyTrickle)
+		? p->Copy() : nullptr;
 	// add SeqTsHeader
 	SeqTsHeader seqTs;
 	seqTs.SetSeq (seq);
@@ -2677,6 +2682,13 @@ Ptr<Packet> RdmaHw::GetNxtPacket(Ptr<RdmaQueuePair> qp){
 		seqTs.SetPathSeq(
 			qp->m_pathSeqSender.Next(RequestedSpine(identification)));
 	p->AddHeader (seqTs);
+	// A copy is a packet up its own spine, so it carries that spine's path
+	// sequence, or the receiver would count it against the data's spine.
+	if (copy){
+		if (m_sprayPathSeq)
+			seqTs.SetPathSeq(qp->m_pathSeqSender.Next(copySpine));
+		copy->AddHeader(seqTs);
+	}
 	// add udp header
 	UdpHeader udpHeader;
 	udpHeader.SetDestinationPort (qp->dport);
@@ -2688,6 +2700,8 @@ Ptr<Packet> RdmaHw::GetNxtPacket(Ptr<RdmaQueuePair> qp){
 	// explicitly.
 	udpHeader.ForcePayloadSize (CustomHeader::GetUdpHeaderSize() + payload_size);
 	p->AddHeader (udpHeader);
+	if (copy)
+		copy->AddHeader(udpHeader);
 	// add ipv4 header
 	Ipv4Header ipHeader;
 	ipHeader.SetSource (qp->sip);
@@ -2707,13 +2721,10 @@ Ptr<Packet> RdmaHw::GetNxtPacket(Ptr<RdmaQueuePair> qp){
 			Simulator::Now().GetNanoSeconds(),
 			qp->m_pathSelector->ChoseTrickle(),
 			qp->m_pathSelector->ChoseExploration());
-		uint8_t copySpine;
-		bool copyTrickle;
-		if (qp->m_pathSelector->TakeCopy(copySpine, copyTrickle)){
+		if (copy){
 			// The copy leaves ahead of the data packet, through the NIC's
 			// high-priority queue, outside the queue pair's pacing; switches
 			// queue it by its priority group as any data packet.
-			Ptr<Packet> copy = p->Copy();
 			Ipv4Header copyHeader = ipHeader;
 			copyHeader.SetIdentification(SpineIdentification(copySpine, copySpine));
 			copy->AddHeader(copyHeader);
@@ -2822,7 +2833,7 @@ void RdmaHw::StartPathSelection(Ptr<RdmaQueuePair> qp, uint64_t bdpBytes,
 		return;
 	}
 	if (IsAutoHold()){
-		qp->m_pathSelector = std::make_unique<RepsAutoHoldSelector>(
+		qp->m_pathSelector = std::make_unique<RepsHoldSelector>(
 			m_pathRandom, m_repsBufferSize, m_repsFreezingTimeoutNs,
 			bdpBytes / m_mtu, m_spineCount, AutoHold(),
 			m_switchQueues->LeafOf(qp->dip.Get()));

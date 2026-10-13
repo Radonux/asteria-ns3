@@ -84,11 +84,7 @@ void RdmaHw::AttachReceiverHold(Ptr<RdmaQueuePair> qp){
 		marks = m_receiverHoldMarks;
 	}
 	const uint32_t leaf = m_switchQueues->LeafOf(qp->dip.Get());
-	PathSelector *selector = qp->m_pathSelector.get();
-	if (auto *hold = dynamic_cast<RepsHoldSelector *>(selector))
-		hold->SetReceiverHold(std::move(marks), leaf);
-	else if (auto *autoHold = dynamic_cast<RepsAutoHoldSelector *>(selector))
-		autoHold->SetReceiverHold(std::move(marks), leaf);
+	qp->m_pathSelector->SetReceiverHold(std::move(marks), leaf);
 }
 
 } // namespace ns3
