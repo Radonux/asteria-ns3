@@ -7909,8 +7909,8 @@ class RepsHoldLlrTest : public TestCase
         hold.CountIntervalLoss(3, 600);
         NS_TEST_EXPECT_MSG_EQ(hold.Holds(3), true, "the first loss holds at once");
         NS_TEST_EXPECT_MSG_EQ(std::isinf(hold.LossRatio(3)), true, "L is +infinity");
-        // Interval 0 saw the loss; one clean sentinel in each of the next
-        // three releases the spine at the close of the third.
+        // Interval 0 saw the loss; one clean sentinel, acknowledged, in each
+        // of the next three releases the spine at the close of the third.
         uint8_t spine = kSpines;
         for (uint32_t interval = 1; interval <= 3; ++interval)
         {
@@ -7918,6 +7918,7 @@ class RepsHoldLlrTest : public TestCase
             NS_TEST_EXPECT_MSG_EQ(hold.TakeHoldSentinel(now, spine), true, "a sentinel is due");
             NS_TEST_EXPECT_MSG_EQ(static_cast<uint32_t>(spine), 3u, "on spine 3");
             hold.CountIntervalSend(spine, now);
+            hold.CountIntervalAnswer(spine, now + 1);
         }
         hold.TakeHoldSentinel(4 * kInterval + 1, spine);
         NS_TEST_EXPECT_MSG_EQ(hold.Holds(3), false, "three clean sentinels release it");
@@ -8393,6 +8394,187 @@ class RepsHoldDuplicateTest : public TestCase
         NS_TEST_EXPECT_MSG_EQ(copyAcksAtRelease, expected, "released at the tenth copy ack");
         NS_TEST_EXPECT_MSG_EQ(hold.Holds(3), false, "spine 3 is released");
         NS_TEST_EXPECT_MSG_GT(chosenAfterRelease, 0u, "and REPS chooses it again");
+    }
+};
+
+class HeldSpineLeakTest : public TestCase
+{
+  public:
+    HeldSpineLeakTest()
+        : TestCase("Under reps_hold and mrc_hold with SpraySentinelMode duplicate, over many "
+                   "messages from a host whose hold holds spine 3, which delivers nothing, at "
+                   "host and at leaf scope, with answers that take longer than a loss interval: "
+                   "a held spine's clean sends are its acknowledged sends, so the hold never "
+                   "releases, no data send that is not an exploration send goes up spine 3 and "
+                   "no retransmission timeout fires")
+    {
+    }
+
+    void DoRun() override
+    {
+        const bool savedPacketSeq = CustomHeader::ackCarriesPacketSeq;
+        CustomHeader::ackCarriesPacketSeq = true;
+        for (const bool leafScope : {false, true})
+        {
+            Flow(PathSelectorKind::RepsHold, leafScope);
+            Flow(PathSelectorKind::MrcHold, leafScope);
+        }
+        CustomHeader::ackCarriesPacketSeq = savedPacketSeq;
+    }
+
+  private:
+    static constexpr uint32_t kSpines = 8;
+    static constexpr uint64_t kInterval = 10000;
+    static constexpr uint32_t kMtu = IsolatedHost::kMtu;
+    static constexpr uint32_t kMessages = 20;
+    static constexpr uint32_t kPackets = 400;
+    static constexpr uint64_t kStepNs = 100;
+    // Longer than the loss interval: a copy's loss is declared one base RTT
+    // after its data send's acknowledgement, intervals after the copy was
+    // counted as a send.
+    static constexpr uint64_t kRttNs = 15000;
+
+    // Messages of kPackets, one queue pair each, 5 loss intervals apart; one
+    // send per kStepNs. Every send on spine 3, data or copy, is dropped; every
+    // other send is acknowledged kRttNs after it, with the receiver's
+    // cumulative sequence. Spine 3 is held toward leaf 1 from the start, in
+    // the host's SpineScores or, at leaf scope, in an AutoLossHold.
+    void Flow(PathSelectorKind kind, bool leafScope)
+    {
+        IsolatedHost sender(LoadBalancingMode::SprayUniform, kTestReceiver, kSpines);
+        Ptr<RdmaHw> hw = sender.hw;
+        hw->m_pathSelectorKind = static_cast<uint32_t>(kind);
+        hw->m_sprayHoldScope = static_cast<uint32_t>(HoldScope::Host);
+        hw->m_sprayLossThreshold1 = 0.1;
+        hw->m_sprayLossThreshold2 = 0.25;
+        hw->m_sprayLossThreshold3 = 0.5;
+        hw->m_sprayLossIntervalNs = kInterval;
+        hw->m_sprayHeldExploration = SpineScores::HeldExploration::Sentinel;
+        hw->m_sprayHeldSentinelIntervalNs = kInterval / 4;
+        hw->m_sprayLossHoldCleanSentinels = 3;
+        hw->m_spraySentinelMode = static_cast<uint32_t>(SentinelMode::Duplicate);
+        hw->m_retransmission_timeout_ns = 10 * kRttNs;
+        hw->m_max_retransmission_retries = 100;
+        const std::string which = std::string(kind == PathSelectorKind::RepsHold
+                                                  ? "reps_hold"
+                                                  : "mrc_hold") +
+                                  (leafScope ? " leaf: " : " host: ");
+        NS_TEST_EXPECT_MSG_EQ(hw->ValidRepsHold(), true, which + "a valid hold");
+        uint32_t completed = 0;
+        hw->m_qpCompleteCallback =
+            Callback<void, Ptr<RdmaQueuePair>>([&](Ptr<RdmaQueuePair>) { completed++; });
+        AutoLossHold autoHold(kSpines, hw->LossHoldParameters(), 2);
+        autoHold.AddLeaf(1);
+        SpineScores& hostHold = hw->HostScores(hw->LossHoldParameters());
+        auto holds = [&]() { return leafScope ? autoHold.Holds(1, 3) : hostHold.Holds(3); };
+        for (uint32_t i = 0; i < 20; ++i)
+        {
+            if (leafScope)
+            {
+                autoHold.CountSend(1, 3, 100 + i);
+                autoHold.CountLoss(1, 3, 200 + i);
+            }
+            else
+            {
+                hostHold.CountIntervalSend(3, 100 + i);
+                hostHold.CountIntervalLoss(3, 200 + i);
+            }
+        }
+        uint32_t timeouts = 0;
+        hw->TraceConnectWithoutContext(
+            "RetransmissionTimeout",
+            Callback<void, uint64_t, Ptr<RdmaQueuePair>, int32_t, bool, uint64_t>(
+                [&](uint64_t, Ptr<RdmaQueuePair>, int32_t, bool, uint64_t) { timeouts++; }));
+        uint32_t sends = 0;
+        uint32_t heldAtSend = 0;
+        uint32_t dataOnSpine3 = 0;
+        Ptr<RdmaQueuePair> qp;
+        uint64_t received = 0;
+        std::set<uint64_t> arrived;
+        std::function<void()> start;
+        auto answer = [&](Ptr<RdmaQueuePair> to, uint32_t seq, uint16_t identification) {
+            if (to != qp || to->IsFinished())
+            {
+                return;
+            }
+            arrived.insert(seq);
+            while (arrived.count(received) > 0)
+            {
+                received += kMtu;
+            }
+            sender.ReceiveAck(kTestReceiver, received, seq, identification);
+        };
+        std::function<void()> step = [&]() {
+            if (qp->IsFinished())
+            {
+                if (completed < kMessages)
+                {
+                    Simulator::Schedule(NanoSeconds(5 * kInterval), start);
+                }
+                return;
+            }
+            if (qp->snd_nxt >= qp->m_size && qp->RepairBytesLeft() == 0)
+            {
+                Simulator::Schedule(NanoSeconds(kStepNs), step);
+                return;
+            }
+            const size_t before = sender.emitted.size();
+            Ptr<Packet> packet = hw->GetNxtPacket(qp);
+            hw->ArmRetransmissionTimeout(qp);
+            CustomHeader live(CustomHeader::L2_Header | CustomHeader::L3_Header |
+                              CustomHeader::L4_Header);
+            packet->PeekHeader(live);
+            const bool held = holds();
+            sends++;
+            heldAtSend += held;
+            Ptr<RdmaQueuePair> to = qp;
+            if (RequestedSpine(live.ipid) == 3)
+            {
+                dataOnSpine3 += !qp->m_pathSelector->ChoseExploration();
+            }
+            else
+            {
+                const uint32_t seq = live.udp.seq;
+                const uint16_t ipid = live.ipid;
+                Simulator::Schedule(NanoSeconds(kRttNs),
+                                    [&, to, seq, ipid]() { answer(to, seq, ipid); });
+            }
+            if (sender.emitted.size() > before &&
+                RequestedSpine(sender.emitted.back().ipid) != 3)
+            {
+                const uint32_t seq = sender.emitted.back().udp.seq;
+                const uint16_t ipid = sender.emitted.back().ipid;
+                Simulator::Schedule(NanoSeconds(kRttNs),
+                                    [&, to, seq, ipid]() { answer(to, seq, ipid); });
+            }
+            Simulator::Schedule(NanoSeconds(kStepNs), step);
+        };
+        start = [&]() {
+            received = 0;
+            arrived.clear();
+            qp = sender.AddSender(kTestSender, kTestReceiver, uint64_t{kPackets} * kMtu);
+            qp->m_baseRtt = kRttNs;
+            qp->m_notifyAppFinish = Callback<void>([]() {});
+            if (leafScope && kind == PathSelectorKind::RepsHold)
+            {
+                qp->m_pathSelector = std::make_unique<RepsHoldSelector>(
+                    SelectorStream(), 8, 1000000, 20, kSpines, autoHold, 1);
+            }
+            else if (leafScope)
+            {
+                qp->m_pathSelector = std::make_unique<MrcHoldSelector>(
+                    SelectorStream(), kSpines, kRttNs, 10 * kRttNs, autoHold, 1);
+            }
+            step();
+        };
+        Simulator::Schedule(NanoSeconds(kInterval), start);
+        Simulator::Stop(Seconds(1));
+        Simulator::Run();
+        NS_TEST_EXPECT_MSG_EQ(completed, kMessages, which + "every message completes");
+        NS_TEST_EXPECT_MSG_EQ(heldAtSend, sends, which + "spine 3 is held at every send");
+        NS_TEST_EXPECT_MSG_EQ(dataOnSpine3, 0u, which + "no data send but an exploration send on 3");
+        NS_TEST_EXPECT_MSG_EQ(timeouts, 0u, which + "and no retransmission timeout fires");
+        Simulator::Destroy();
     }
 };
 
@@ -11794,6 +11976,7 @@ PointToPointTestSuite::PointToPointTestSuite()
     AddTestCase(new RepsHoldTrickleTest, TestCase::Duration::QUICK);
     AddTestCase(new RepsHoldDuplicateTest, TestCase::Duration::QUICK);
     AddTestCase(new RetransmissionTimeoutTraceTest, TestCase::Duration::QUICK);
+    AddTestCase(new HeldSpineLeakTest, TestCase::Duration::QUICK);
     AddTestCase(new SprayTailRecoveryTest, TestCase::Duration::QUICK);
     AddTestCase(new SprayPathSeqTest, TestCase::Duration::QUICK);
     AddTestCase(new SprayReceiverHoldTest, TestCase::Duration::QUICK);

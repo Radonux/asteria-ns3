@@ -207,10 +207,12 @@ double spray_hold_beta = 0.001;
 std::set<std::string> hold_test_keys_given;
 // Under reps_hold, reps_flow_hold and mrc_hold, how a held key is released.
 // sentinels: SPRAY_LOSS_HOLD_CLEAN_SENTINELS clean sends of the sentinels
-// sent one per SPRAY_HELD_SENTINEL_INTERVAL_NS. trickle: each queue pair
-// sends each spine its hold holds one in round(1 / SPRAY_HOLD_TRICKLE) of its
-// sends, by a counter per queue pair and not a draw, in place of the
-// sentinels; these trickle sends are what SPRAY_HELD_EXPLORATION sentinel
+// sent one per SPRAY_HELD_SENTINEL_INTERVAL_NS, a clean send being a send on
+// the held key acknowledged in a loss interval that declared no send on it
+// lost; a send still unanswered as its interval closes counts as none.
+// trickle: each queue pair sends each spine its hold holds one in
+// round(1 / SPRAY_HOLD_TRICKLE) of its sends, by a counter per queue pair
+// and not a draw, in place of the sentinels; these trickle sends are what SPRAY_HELD_EXPLORATION sentinel
 // names under trickle, and it is still required. At a hold's start its key
 // records p1, the lost fraction of the hold's evidence, the loss interval
 // that graded it 0 under count and the sends since the test's L was last

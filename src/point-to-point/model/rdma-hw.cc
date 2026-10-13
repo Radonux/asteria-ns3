@@ -1603,6 +1603,7 @@ SpineScores::Parameters RdmaHw::LossHoldParameters() const{
 	parameters.holdRelease = static_cast<HoldRelease>(m_sprayHoldRelease);
 	parameters.trickleFraction = m_sprayHoldTrickle;
 	parameters.sentinelMode = static_cast<SentinelMode>(m_spraySentinelMode);
+	parameters.cleanOnAnswers = true;
 	if (parameters.holdRule == HoldRule::Llr || IsTrickleRelease())
 		parameters.likelihood = Likelihood();
 	return parameters;

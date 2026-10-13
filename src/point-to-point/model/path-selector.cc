@@ -249,7 +249,7 @@ SpineScores::SpineScores(uint32_t spines, const Parameters &parameters)
 	  m_decay(std::llround(parameters.gamma * 65536)),
 	  m_accumulated(spines), m_reported(false), m_sequence(0),
 	  m_reportedNs(0), m_nextDecayNs(UINT64_MAX), m_pool(nullptr),
-	  m_poolWeight(0), m_sent(spines), m_lost(spines),
+	  m_poolWeight(0), m_sent(spines), m_lost(spines), m_answered(spines),
 	  m_lossIntervalNs(parameters.lossIntervalNs > 0
 		? parameters.lossIntervalNs : parameters.reportIntervalNs),
 	  m_lossIntervalEndNs(m_lossIntervalNs),
@@ -304,9 +304,10 @@ void SpineScores::OnReport(const SpineReport &report, uint64_t nowNs){
 		// keeps the report's.
 		for (uint32_t k = 0; k < m_scores.size(); k++)
 			combined.SetGrade(k, std::min(report.Grade(k),
-				HeldLossGrade(k, m_sent[k], m_lost[k])));
+				HeldLossGrade(k, m_sent[k], m_lost[k], m_answered[k])));
 		std::fill(m_sent.begin(), m_sent.end(), 0);
 		std::fill(m_lost.begin(), m_lost.end(), 0);
+		std::fill(m_answered.begin(), m_answered.end(), 0);
 	}
 	Take(combined, nowNs);
 	if (m_pool == nullptr)
@@ -360,6 +361,13 @@ void SpineScores::CountIntervalLoss(uint32_t spine, uint64_t nowNs){
 			m_likelihood[spine].WindowLost());
 }
 
+void SpineScores::CountIntervalAnswer(uint32_t spine, uint64_t nowNs){
+	if (!m_parameters.lossThresholds)
+		return;
+	AdvanceLossInterval(nowNs);
+	m_answered[spine]++;
+}
+
 void SpineScores::StartLossHold(uint32_t spine, uint32_t sent, uint32_t lost){
 	m_lossHeld[spine] = true;
 	m_lossClean[spine] = 0;
@@ -384,6 +392,7 @@ void SpineScores::TrickleAnswer(uint32_t spine, bool lost, uint64_t nowNs){
 	m_likelihood[spine].Reset();
 	m_sent[spine] = 0;
 	m_lost[spine] = 0;
+	m_answered[spine] = 0;
 }
 
 SentinelMode SpineScores::Sentinels() const{
@@ -410,7 +419,7 @@ uint8_t SpineScores::LossGrade(uint32_t sent, uint32_t lost) const{
 }
 
 uint8_t SpineScores::HeldLossGrade(uint32_t spine, uint32_t sent,
-		uint32_t lost){
+		uint32_t lost, uint32_t answered){
 	const uint8_t grade = LossGrade(sent, lost);
 	const uint32_t clean = m_parameters.lossHoldCleanSentinels;
 	const bool trickle = m_parameters.holdRelease == HoldRelease::Trickle;
@@ -429,7 +438,7 @@ uint8_t SpineScores::HeldLossGrade(uint32_t spine, uint32_t sent,
 		m_lossClean[spine] = 0;
 		return 0;
 	}
-	m_lossClean[spine] += sent;
+	m_lossClean[spine] += m_parameters.cleanOnAnswers ? answered : sent;
 	if (m_lossClean[spine] < clean)
 		return 0;
 	m_lossHeld[spine] = false;
@@ -446,7 +455,7 @@ void SpineScores::AdvanceLossInterval(uint64_t nowNs){
 	const bool lastCounted = nowNs - m_lossIntervalEndNs < m_lossIntervalNs;
 	std::vector<uint8_t> closed(m_scores.size());
 	for (uint32_t k = 0; k < m_scores.size(); k++)
-		closed[k] = HeldLossGrade(k, m_sent[k], m_lost[k]);
+		closed[k] = HeldLossGrade(k, m_sent[k], m_lost[k], m_answered[k]);
 	if (m_onLossInterval)
 		m_onLossInterval(m_lossIntervalEndNs, m_sent, m_lost, closed);
 	// The intervals after it counted nothing, which leaves a spine in loss
@@ -458,6 +467,7 @@ void SpineScores::AdvanceLossInterval(uint64_t nowNs){
 			m_lossGrades[k] = m_lossHeld[k] ? 0 : SpineReport::kTopGrade;
 	std::fill(m_sent.begin(), m_sent.end(), 0);
 	std::fill(m_lost.begin(), m_lost.end(), 0);
+	std::fill(m_answered.begin(), m_answered.end(), 0);
 	m_lossIntervalEndNs += m_lossIntervalNs *
 		(1 + (nowNs - m_lossIntervalEndNs) / m_lossIntervalNs);
 }
@@ -959,7 +969,7 @@ void RepsSelector::OnTimeout(uint64_t nowNs){
 
 AutoLossHold::Leaf::Leaf(uint32_t spines,
 		const LossLikelihoodRatio::Parameters &likelihood)
-	: sent(spines), lost(spines), held(spines), clean(spines),
+	: sent(spines), lost(spines), answered(spines), held(spines), clean(spines),
 	  sentinelNs(spines), likelihood(spines, LossLikelihoodRatio(likelihood)),
 	  trickle(spines, TrickleRelease(likelihood))
 {
@@ -972,6 +982,7 @@ AutoLossHold::AutoLossHold(uint32_t spines,
 		? parameters.lossIntervalNs : parameters.reportIntervalNs),
 	  m_lossIntervalEndNs(m_lossIntervalNs),
 	  m_cleanSends(parameters.lossHoldCleanSentinels),
+	  m_cleanOnAnswers(parameters.cleanOnAnswers),
 	  m_sentinelIntervalNs(parameters.sentinelIntervalNs > 0
 		? parameters.sentinelIntervalNs : parameters.reportIntervalNs),
 	  m_autoLeaves(autoLeaves), m_holdRule(parameters.holdRule),
@@ -1025,6 +1036,12 @@ void AutoLossHold::CountLoss(uint32_t leaf, uint32_t spine, uint64_t nowNs){
 			counts.likelihood[spine].WindowLost()));
 }
 
+void AutoLossHold::CountAnswer(uint32_t leaf, uint32_t spine, uint64_t nowNs){
+	NS_ASSERT_MSG(spine < m_spines, "an answer is on a held spine's range");
+	AdvanceLossInterval(nowNs);
+	m_leaves.at(leaf).answered[spine]++;
+}
+
 void AutoLossHold::Hold(Leaf &counts, uint32_t spine, double rate){
 	if (m_lossLeaves[spine].size() >= m_autoLeaves)
 		HoldHost(spine, rate);
@@ -1059,6 +1076,7 @@ void AutoLossHold::TrickleAnswer(uint32_t leaf, uint32_t spine, bool lost,
 		for (auto &[other, counts] : m_leaves){
 			counts.sent[spine] = 0;
 			counts.lost[spine] = 0;
+			counts.answered[spine] = 0;
 		}
 		return;
 	}
@@ -1070,6 +1088,7 @@ void AutoLossHold::TrickleAnswer(uint32_t leaf, uint32_t spine, bool lost,
 	counts.likelihood[spine].Reset();
 	counts.sent[spine] = 0;
 	counts.lost[spine] = 0;
+	counts.answered[spine] = 0;
 	if (!LeafHolds(spine))
 		m_lossLeaves[spine].clear();
 }
@@ -1158,16 +1177,19 @@ void AutoLossHold::CloseLossInterval(){
 		if (m_hostHeld[k]){
 			uint32_t sent = 0;
 			uint32_t lost = 0;
+			uint32_t answered = 0;
 			for (const auto &[leaf, counts] : m_leaves){
 				sent += counts.sent[k];
 				lost += counts.lost[k];
+				answered += counts.answered[k];
 			}
 			uint8_t grade = 0;
 			// Under trickle only the trickle sends' answers release it.
 			if (Trickle()){
 			}else if (lost > 0)
 				m_hostClean[k] = 0;
-			else if ((m_hostClean[k] += sent) >= m_cleanSends){
+			else if ((m_hostClean[k] += m_cleanOnAnswers ? answered : sent) >=
+					m_cleanSends){
 				m_hostHeld[k] = false;
 				m_hostClean[k] = 0;
 				m_lossLeaves[k].clear();
@@ -1190,7 +1212,8 @@ void AutoLossHold::CloseLossInterval(){
 				else if (counts.lost[k] > 0){
 					counts.clean[k] = 0;
 					grade = 0;
-				} else if ((counts.clean[k] += counts.sent[k]) < m_cleanSends){
+				} else if ((counts.clean[k] += m_cleanOnAnswers
+						? counts.answered[k] : counts.sent[k]) < m_cleanSends){
 					grade = 0;
 				} else {
 					counts.held[k] = false;
@@ -1216,6 +1239,7 @@ void AutoLossHold::CloseLossInterval(){
 				grades[leaf]);
 		std::fill(counts.sent.begin(), counts.sent.end(), 0);
 		std::fill(counts.lost.begin(), counts.lost.end(), 0);
+		std::fill(counts.answered.begin(), counts.answered.end(), 0);
 	}
 }
 
@@ -1322,6 +1346,13 @@ bool LossHoldExploration::TakeCopy(uint8_t &spine, bool &trickle){
 	return m_copy.Take(spine, trickle);
 }
 
+void LossHoldExploration::OnAck(uint32_t spine, uint64_t nowNs){
+	if (m_autoHold)
+		m_autoHold->CountAnswer(m_leaf, spine, nowNs);
+	else
+		m_scores->CountIntervalAnswer(spine, nowNs);
+}
+
 void LossHoldExploration::OnLoss(uint32_t spine, uint64_t nowNs){
 	if (m_autoHold)
 		m_autoHold->CountLoss(m_leaf, spine, nowNs);
@@ -1398,6 +1429,11 @@ uint16_t RepsHoldSelector::Choose(uint64_t nowNs){
 	const uint8_t spine = m_exploration.Choose(nowNs,
 		[this, nowNs]{ return static_cast<uint8_t>(RepsSelector::Choose(nowNs)); });
 	return SpineIdentification(spine, spine);
+}
+
+void RepsHoldSelector::OnAck(uint16_t path, bool marked, uint64_t nowNs){
+	RepsSelector::OnAck(path, marked, nowNs);
+	m_exploration.OnAck(path, nowNs);
 }
 
 void RepsHoldSelector::OnLoss(uint16_t path, uint64_t nowNs){
@@ -1687,6 +1723,11 @@ uint16_t MrcHoldSelector::Choose(uint64_t nowNs){
 	const uint8_t spine = m_exploration.Choose(nowNs,
 		[this, nowNs]{ return static_cast<uint8_t>(MrcSelector::Choose(nowNs)); });
 	return SpineIdentification(spine, spine);
+}
+
+void MrcHoldSelector::OnAck(uint16_t path, bool marked, uint64_t nowNs){
+	MrcSelector::OnAck(path, marked, nowNs);
+	m_exploration.OnAck(path, nowNs);
 }
 
 void MrcHoldSelector::OnLoss(uint16_t path, uint64_t nowNs){

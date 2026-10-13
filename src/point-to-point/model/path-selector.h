@@ -418,6 +418,13 @@ public:
 		double trickleFraction = 0.01;
 		// What the selectors sending through the hold send a held spine.
 		SentinelMode sentinelMode = SentinelMode::Data;
+		// Scores used as a loss hold by the selectors that send through it
+		// (LossHoldExploration): the clean sends that end a loss hold are
+		// the sends on the spine acknowledged in the loss intervals
+		// (CountIntervalAnswer) instead of the sends counted, so that a send
+		// whose answer is still due when its interval closes counts as no
+		// clean send.
+		bool cleanOnAnswers = false;
 	};
 	SpineScores(uint32_t spines, const Parameters &parameters);
 	void OnReport(const SpineReport &report, uint64_t nowNs);
@@ -444,6 +451,10 @@ public:
 	// 0. A loss hold's release restarts spine's test.
 	void CountIntervalSend(uint32_t spine, uint64_t nowNs);
 	void CountIntervalLoss(uint32_t spine, uint64_t nowNs);
+	// With loss thresholds set, the acknowledgement of a send on spine,
+	// counted in the loss interval in progress once those ended by now are
+	// closed; under cleanOnAnswers these are a loss hold's clean sends.
+	void CountIntervalAnswer(uint32_t spine, uint64_t nowNs);
 	// Under HoldRule::Llr, spine's L.
 	double LossRatio(uint32_t spine) const;
 	// Under HoldRelease::Trickle, a held spine is sent no sentinel: each
@@ -534,7 +545,8 @@ private:
 	// The loss grade of a period in which spine had sent sends and lost
 	// declared lost, through the loss hold; the top grade for a spine not
 	// sent on and not in loss hold.
-	uint8_t HeldLossGrade(uint32_t spine, uint32_t sent, uint32_t lost);
+	uint8_t HeldLossGrade(uint32_t spine, uint32_t sent, uint32_t lost,
+		uint32_t answered);
 	// As a pool: close the loss intervals ended by now, grading the spines by
 	// the last of them, before a send or loss is counted or a grade read.
 	void AdvanceLossInterval(uint64_t nowNs);
@@ -555,6 +567,8 @@ private:
 	// Per spine, the sends and the losses counted since the counts restarted.
 	std::vector<uint32_t> m_sent;
 	std::vector<uint32_t> m_lost;
+	// Per spine, the acknowledgements counted since the counts restarted.
+	std::vector<uint32_t> m_answered;
 	// As a pool: the loss interval, the end of the one in progress, and the
 	// grades the last one that ended earned.
 	uint64_t m_lossIntervalNs;
@@ -723,6 +737,9 @@ public:
 	// interval in progress once those ended by now are closed.
 	void CountSend(uint32_t leaf, uint32_t spine, uint64_t nowNs);
 	void CountLoss(uint32_t leaf, uint32_t spine, uint64_t nowNs);
+	// The acknowledgement of a send toward leaf on spine, counted likewise;
+	// under cleanOnAnswers these are a hold's clean sends.
+	void CountAnswer(uint32_t leaf, uint32_t spine, uint64_t nowNs);
 	// Close the loss intervals ended by now and whether a sentinel toward
 	// leaf is due on a spine held for it, and which; the lowest such spine is
 	// taken, and the sentinel interval of the hold it has restarts now.
@@ -755,6 +772,7 @@ private:
 		// test under HoldRule::Llr.
 		std::vector<uint32_t> sent;
 		std::vector<uint32_t> lost;
+		std::vector<uint32_t> answered;
 		std::vector<bool> held;
 		std::vector<uint32_t> clean;
 		std::vector<uint64_t> sentinelNs;
@@ -781,6 +799,7 @@ private:
 	uint64_t m_lossIntervalNs;
 	uint64_t m_lossIntervalEndNs;
 	uint32_t m_cleanSends;
+	bool m_cleanOnAnswers;
 	uint64_t m_sentinelIntervalNs;
 	uint32_t m_autoLeaves;
 	HoldRule m_holdRule;
@@ -823,6 +842,9 @@ public:
 	bool ChoseTrickle() const;
 	bool ChoseExploration() const;
 	bool TakeCopy(uint8_t &spine, bool &trickle);
+	// The acknowledgement of a send on spine, data or copy, and a send on
+	// spine declared lost.
+	void OnAck(uint32_t spine, uint64_t nowNs);
 	void OnLoss(uint32_t spine, uint64_t nowNs);
 	void OnTrickleAnswer(uint32_t spine, bool lost, uint64_t nowNs);
 	// Under SprayReceiverHold: the spines the receivers hold toward leaf, in
@@ -874,6 +896,8 @@ public:
 		uint64_t freezingTimeoutNs, uint32_t explorePackets, uint32_t spines,
 		AutoLossHold &hold, uint32_t leaf);
 	uint16_t Choose(uint64_t nowNs) override;
+	// REPS's own answer, and the acknowledgement counted in the hold.
+	void OnAck(uint16_t path, bool marked, uint64_t nowNs) override;
 	void OnLoss(uint16_t path, uint64_t nowNs) override;
 	bool ChoseTrickle() const override;
 	bool ChoseExploration() const override;
@@ -1060,6 +1084,8 @@ public:
 		uint64_t skipNs, uint64_t probeIntervalNs, AutoLossHold &hold,
 		uint32_t leaf);
 	uint16_t Choose(uint64_t nowNs) override;
+	// MRC's own answer, and the acknowledgement counted in the hold.
+	void OnAck(uint16_t path, bool marked, uint64_t nowNs) override;
 	void OnLoss(uint16_t path, uint64_t nowNs) override;
 	bool TakeProbe(uint64_t nowNs, uint16_t &path) override;
 	bool ChoseTrickle() const override;
