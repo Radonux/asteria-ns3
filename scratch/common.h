@@ -253,11 +253,17 @@ bool spray_hold_trickle_given = false;
 // receiver keeps per queue pair and per path, the requested and the carrying
 // spine, the path sequence it expects next; an arrival ahead of it by g shows
 // g packets missing on the carrying spine, and an arrival behind it is late
-// and counts nothing. A trimmed header, which keeps the path sequence, moves
-// the expected sequence on as an arrival does, so a trim is not a missing
-// packet and only the packets missing before it count. A packet a
-// source leaf moved to another spine is charged to the spine that carried
-// it. Off, the default, leaves the data header as it is.
+// and counts nothing. Only data arrivals, which are ordered within a path,
+// count gaps. A trimmed header, which keeps the path sequence, travels in the
+// switches' high-priority queue and can overtake earlier data of its path: it
+// marks its path sequence as accounted and neither moves the expected
+// sequence on nor counts anything. A data arrival ahead of the expected
+// sequence counts as missing only the sequences it passes that are not
+// accounted, so a trim is not a missing packet. A path keeps the accounted
+// sequences from the expected one up to 4096 ahead of it, and drops each as
+// the expected sequence passes it. A packet a source leaf moved to another
+// spine is charged to the spine that carried it. Off, the default, leaves the
+// data header as it is.
 std::string spray_path_seq = "off";
 bool spray_path_seq_given = false;
 // Under LOAD_BALANCING spray_uniform, with any PATH_SELECTOR,
@@ -275,7 +281,8 @@ bool spray_path_seq_given = false;
 // or of its trimmed header, compares each spine's count with the path sequence
 // it expects next of that spine (the furthest of the paths requested up it) and
 // the packet's own spine with its path sequence, and at once asks for each run
-// of missing path sequences in a repair request carrying the spine, the first
+// of missing path sequences, the sequences its trimmed headers accounted left
+// out, in a repair request carrying the spine, the first
 // missing path sequence and their count, 5 bytes after receiver_hold in every
 // acknowledgement header; a run is asked once. The sender declares lost the
 // outstanding sends those path sequences name on that spine, as the per-path

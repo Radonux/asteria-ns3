@@ -51,13 +51,10 @@ void ReceiverHold::OnArrival(uint32_t leaf, uint32_t spine, uint32_t gaps,
 	}
 }
 
-void ReceiverHold::OnTrim(uint32_t leaf, uint32_t spine, uint32_t gaps,
-		uint64_t nowNs){
+void ReceiverHold::OnTrim(uint32_t leaf, uint32_t spine, uint64_t nowNs){
 	NS_ASSERT_MSG(spine < m_spines, "a trim is on a held spine's range");
 	AdvanceInterval(nowNs);
-	Leaf &counts = LeafCounts(leaf);
-	if (gaps > 0)
-		CountMissing(counts, leaf, spine, gaps);
+	LeafCounts(leaf);
 }
 
 void ReceiverHold::CountMissing(Leaf &counts, uint32_t leaf, uint32_t spine,

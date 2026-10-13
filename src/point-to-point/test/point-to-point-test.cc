@@ -9044,8 +9044,9 @@ class SprayPathSeqTrimTest : public TestCase
 {
   public:
     SprayPathSeqTrimTest()
-        : TestCase("Under SprayPathSeq a trimmed header moves the receiver's expected path "
-                   "sequence on without a missing packet, so trims alone hold no spine")
+        : TestCase("Under SprayPathSeq a trimmed header accounts its path sequence without "
+                   "moving the receiver's expected one on, so trims alone, also ahead of "
+                   "the data they overtake, hold no spine")
     {
     }
 
@@ -9059,6 +9060,8 @@ class SprayPathSeqTrimTest : public TestCase
         CustomHeader::ackCarriesPacketSeq = true;
         CustomHeader::udpCarriesPathSeq = true;
         CustomHeader::ackReceiverHoldBytes = 1;
+
+        Overtaking();
 
         // Trims on spines 2 and 3, no link loss.
         Outcome trimsOnly = Run(false);
@@ -9087,6 +9090,20 @@ class SprayPathSeqTrimTest : public TestCase
         }
         NS_TEST_EXPECT_MSG_EQ(lossy.lossLeaves[kLossy], 1u, "the link drops hold spine 3");
 
+        // The trimmed headers of path sequences 10 to 20 on spine 5 overtake
+        // the data of 5 to 9, as the switches' high-priority queue lets them.
+        Outcome overtaken = Run(false, true);
+        NS_TEST_EXPECT_MSG_EQ(overtaken.overtaking, 11u, "eleven trimmed headers overtake");
+        NS_TEST_EXPECT_MSG_EQ(overtaken.overtaken, 5u, "five data packets");
+        for (uint32_t spine = 0; spine < kSpines; ++spine)
+        {
+            NS_TEST_EXPECT_MSG_EQ(overtaken.gaps[spine], 0u, "no packet is missing");
+            NS_TEST_EXPECT_MSG_EQ(overtaken.lossLeaves[spine], 0u, "nor a loss of the hold");
+        }
+        NS_TEST_EXPECT_MSG_EQ(static_cast<uint32_t>(overtaken.bitmap),
+                              0u,
+                              "the overtaking trims hold no spine");
+
         CustomHeader::ackReceiverHoldBytes = savedHoldBytes;
         CustomHeader::udpCarriesPathSeq = savedPathSeq;
         CustomHeader::ackCarriesPacketSeq = savedPacketSeq;
@@ -9098,10 +9115,71 @@ class SprayPathSeqTrimTest : public TestCase
     static constexpr uint32_t kSpines = 8;
     static constexpr uint8_t kLossy = 3;
 
+    static constexpr uint8_t kOvertaken = 5;
+
+    // Trimmed headers of sequences 10 to 20 arrive before the data of 5 to 9
+    // on one path: nothing is missing, and the data arrive in order.
+    void Overtaking()
+    {
+        SpineSequenceReceiver receiver;
+        for (uint16_t seq = 0; seq < 5; ++seq)
+        {
+            NS_TEST_EXPECT_MSG_EQ(receiver.OnArrival(kOvertaken, kOvertaken, seq).gaps,
+                                  0u,
+                                  "the data before the trims in order");
+        }
+        for (uint16_t seq = 10; seq <= 20; ++seq)
+        {
+            receiver.OnTrim(kOvertaken, kOvertaken, seq);
+        }
+        for (uint16_t seq = 5; seq < 10; ++seq)
+        {
+            const SpineSequenceReceiver::Arrival arrival =
+                receiver.OnArrival(kOvertaken, kOvertaken, seq);
+            NS_TEST_EXPECT_MSG_EQ(arrival.gaps, 0u, "the overtaken data shows no gap");
+            NS_TEST_EXPECT_MSG_EQ(arrival.late, false, "and is consumed in order");
+        }
+        NS_TEST_EXPECT_MSG_EQ(receiver.OnArrival(kOvertaken, kOvertaken, 21).gaps,
+                              0u,
+                              "the trims accounted 10 to 20");
+        NS_TEST_EXPECT_MSG_EQ(receiver.Accounted(kOvertaken, 15),
+                              false,
+                              "and are dropped once passed");
+        NS_TEST_EXPECT_MSG_EQ(receiver.OnArrival(kOvertaken, kOvertaken, 23).gaps,
+                              1u,
+                              "a data packet lost after them is missing");
+        // A trimmed header behind the expected sequence, or too far ahead of
+        // it, is not accounted.
+        receiver.OnTrim(kOvertaken, kOvertaken, 2);
+        NS_TEST_EXPECT_MSG_EQ(receiver.Accounted(kOvertaken, 2), false, "behind");
+        receiver.OnTrim(kOvertaken,
+                        kOvertaken,
+                        24 + SpineSequenceReceiver::kAccountedWindow);
+        NS_TEST_EXPECT_MSG_EQ(receiver.Accounted(kOvertaken,
+                                                 24 + SpineSequenceReceiver::kAccountedWindow),
+                              false,
+                              "beyond the window");
+        receiver.OnTrim(kOvertaken,
+                        kOvertaken,
+                        23 + SpineSequenceReceiver::kAccountedWindow);
+        NS_TEST_EXPECT_MSG_EQ(receiver.Accounted(kOvertaken,
+                                                 23 + SpineSequenceReceiver::kAccountedWindow),
+                              true,
+                              "the window's last");
+        // A moved path's trims before its first data arrival.
+        receiver.OnTrim(2, 6, 30);
+        receiver.OnTrim(2, 6, 12);
+        NS_TEST_EXPECT_MSG_EQ(receiver.OnArrival(2, 6, 28).gaps, 0u, "a moved path starts");
+        NS_TEST_EXPECT_MSG_EQ(receiver.Accounted(2, 12), false, "the trims behind it dropped");
+        NS_TEST_EXPECT_MSG_EQ(receiver.OnArrival(2, 6, 31).gaps, 1u, "29 missing, 30 accounted");
+    }
+
     struct Outcome
     {
         uint32_t trims = 0;
         uint32_t drops = 0;
+        uint32_t overtaking = 0;
+        uint32_t overtaken = 0;
         std::vector<uint64_t> gaps;
         std::vector<uint32_t> lossLeaves;
         uint8_t bitmap = 0;
@@ -9124,7 +9202,10 @@ class SprayPathSeqTrimTest : public TestCase
         packet->AddHeader(ppp);
     }
 
-    Outcome Run(bool linkLoss)
+    // With overtake, no other trim or loss: spine kOvertaken's data packets
+    // of path sequences 5 to 9 are held back, its packets of 10 to 20 are
+    // trimmed and delivered at once, and the held ones follow the last trim.
+    Outcome Run(bool linkLoss, bool overtake = false)
     {
         IsolatedHost sender(LoadBalancingMode::SprayUniform, kTestReceiver, kSpines);
         IsolatedHost receiver(LoadBalancingMode::SprayUniform, kTestSender, kSpines);
@@ -9154,6 +9235,7 @@ class SprayPathSeqTrimTest : public TestCase
         Ptr<UniformRandomVariable> draw =
             CreateObjectWithAttributes<UniformRandomVariable>("Stream", IntegerValue(11));
         Outcome outcome;
+        std::vector<Ptr<Packet>> heldBack;
         for (uint32_t i = 0; i < kPackets; ++i)
         {
             Ptr<Packet> packet = sender.hw->GetNxtPacket(qp);
@@ -9167,7 +9249,17 @@ class SprayPathSeqTrimTest : public TestCase
                 ++outcome.drops;
                 continue;
             }
-            const bool trimmed = (spine == 2 && u < 0.3) || (spine == kLossy && u > 0.9);
+            const bool onOvertaken = overtake && spine == kOvertaken;
+            if (onOvertaken && sent.udp.path_seq >= 5 && sent.udp.path_seq <= 9)
+            {
+                heldBack.push_back(packet);
+                continue;
+            }
+            const bool overtaking =
+                onOvertaken && sent.udp.path_seq >= 10 && sent.udp.path_seq <= 20;
+            const bool trimmed = overtake
+                ? overtaking
+                : (spine == 2 && u < 0.3) || (spine == kLossy && u > 0.9);
             if (trimmed)
             {
                 Trim(packet);
@@ -9180,6 +9272,19 @@ class SprayPathSeqTrimTest : public TestCase
                                   sent.udp.path_seq,
                                   "the trimmed header keeps the path sequence");
             receiver.hw->Receive(packet, parsed);
+            outcome.overtaking += overtaking;
+            if (overtaking && sent.udp.path_seq == 20)
+            {
+                for (Ptr<Packet> held : heldBack)
+                {
+                    CustomHeader late(CustomHeader::L2_Header | CustomHeader::L3_Header |
+                                      CustomHeader::L4_Header);
+                    held->PeekHeader(late);
+                    receiver.hw->Receive(held, late);
+                    ++outcome.overtaken;
+                }
+                heldBack.clear();
+            }
         }
         Ptr<RdmaHw> hw = receiver.hw;
         outcome.gaps = hw->m_spineGaps;
@@ -9340,31 +9445,40 @@ class SprayTailRecoveryTest : public TestCase
         NS_TEST_EXPECT_MSG_EQ(sender.Count(5), 0u, "each spine counts apart");
 
         SpineSequenceReceiver receiver;
-        SpineSequenceReceiver::Missing missing = receiver.TakeMissing(1, 3);
+        // The single run TakeMissing returns, or an empty one.
+        auto take = [&](uint8_t spine, uint16_t owed) {
+            const std::vector<SpineSequenceReceiver::Missing> runs =
+                receiver.TakeMissing(spine, owed);
+            NS_TEST_EXPECT_MSG_LT(runs.size(), 2u, "one run at most without trims");
+            return runs.empty() ? SpineSequenceReceiver::Missing{0, 0} : runs.front();
+        };
+        SpineSequenceReceiver::Missing missing = take(1, 3);
         NS_TEST_EXPECT_MSG_EQ(missing.first, 0u, "nothing arrived: from 0");
         NS_TEST_EXPECT_MSG_EQ(missing.count, 3u, "three owed");
-        NS_TEST_EXPECT_MSG_EQ(receiver.TakeMissing(1, 3).count, 0u, "a run is taken once");
-        missing = receiver.TakeMissing(1, 5);
+        NS_TEST_EXPECT_MSG_EQ(take(1, 3).count, 0u, "a run is taken once");
+        missing = take(1, 5);
         NS_TEST_EXPECT_MSG_EQ(missing.first, 3u, "a later count takes the rest");
         NS_TEST_EXPECT_MSG_EQ(missing.count, 2u, "two more");
         receiver.OnArrival(2, 2, 0);
         receiver.OnArrival(2, 2, 1);
-        NS_TEST_EXPECT_MSG_EQ(receiver.TakeMissing(2, 2).count, 0u, "both arrived");
-        missing = receiver.TakeMissing(2, 4);
+        NS_TEST_EXPECT_MSG_EQ(take(2, 2).count, 0u, "both arrived");
+        missing = take(2, 4);
         NS_TEST_EXPECT_MSG_EQ(missing.first, 2u, "the tail after them");
         NS_TEST_EXPECT_MSG_EQ(missing.count, 2u, "is missing");
         // A packet requested up 4 that a source leaf moved onto 6 is
         // furthest on the path (4, 6).
         receiver.OnArrival(4, 4, 0);
         receiver.OnArrival(4, 6, 5);
-        missing = receiver.TakeMissing(4, 8);
+        missing = take(4, 8);
         NS_TEST_EXPECT_MSG_EQ(missing.first, 6u, "from the moved packet on");
         NS_TEST_EXPECT_MSG_EQ(missing.count, 2u, "two owed");
-        NS_TEST_EXPECT_MSG_EQ(receiver.TakeMissing(7, 0).count, 0u, "nothing owed");
+        NS_TEST_EXPECT_MSG_EQ(take(7, 0).count, 0u, "nothing owed");
         receiver.OnArrival(5, 6, 65534);
-        missing = receiver.TakeMissing(5, 1);
+        missing = take(5, 1);
         NS_TEST_EXPECT_MSG_EQ(missing.first, 65535u, "across the wrap");
         NS_TEST_EXPECT_MSG_EQ(missing.count, 2u, "65535 and 0");
+
+        TrimmedNotRequested();
 
         PendingTailRuns runs;
         NS_TEST_EXPECT_MSG_EQ(runs.NextDue(), PendingTailRuns::kNone, "nothing pending");
@@ -9391,6 +9505,52 @@ class SprayTailRecoveryTest : public TestCase
         runs.OnArrival(6, 8);
         NS_TEST_EXPECT_MSG_EQ(runs.TakeDue(200).size(), 0u, "all of it arrived");
         NS_TEST_EXPECT_MSG_EQ(runs.Empty(), true, "and is gone");
+    }
+
+    // A trimmed header accounts its path sequence: tail recovery treats it
+    // as present and does not request it, while the data behind it on a
+    // slower path is still owed.
+    void TrimmedNotRequested()
+    {
+        SpineSequenceReceiver receiver;
+        receiver.OnArrival(3, 3, 0);
+        receiver.OnArrival(3, 3, 1);
+        // The trimmed headers of 3 and 5 overtake the data of 2 and 4.
+        receiver.OnTrim(3, 3, 3);
+        receiver.OnTrim(3, 3, 5);
+        NS_TEST_EXPECT_MSG_EQ(receiver.Accounted(3, 3), true, "3 is accounted");
+        NS_TEST_EXPECT_MSG_EQ(receiver.Accounted(3, 2), false, "2 is not");
+        NS_TEST_EXPECT_MSG_EQ(receiver.Accounted(4, 3), false, "per requested spine");
+        std::vector<SpineSequenceReceiver::Missing> runs = receiver.TakeMissing(3, 7);
+        NS_TEST_EXPECT_MSG_EQ(runs.size(), 3u, "2, 4 and 6, the trims left out");
+        if (runs.size() == 3)
+        {
+            NS_TEST_EXPECT_MSG_EQ(runs[0].first, 2u, "2");
+            NS_TEST_EXPECT_MSG_EQ(runs[0].count, 1u, "alone");
+            NS_TEST_EXPECT_MSG_EQ(runs[1].first, 4u, "4");
+            NS_TEST_EXPECT_MSG_EQ(runs[1].count, 1u, "alone");
+            NS_TEST_EXPECT_MSG_EQ(runs[2].first, 6u, "6");
+            NS_TEST_EXPECT_MSG_EQ(runs[2].count, 1u, "alone");
+        }
+        NS_TEST_EXPECT_MSG_EQ(receiver.TakeMissing(3, 7).size(), 0u, "taken once");
+        // A trimmed sequence ahead of the expected one on a moved path is
+        // accounted for its requested spine too.
+        receiver.OnArrival(5, 5, 0);
+        receiver.OnArrival(5, 1, 8);
+        receiver.OnTrim(5, 1, 10);
+        runs = receiver.TakeMissing(5, 12);
+        NS_TEST_EXPECT_MSG_EQ(runs.size(), 2u, "9 and 11");
+        if (runs.size() == 2)
+        {
+            NS_TEST_EXPECT_MSG_EQ(runs[0].first, 9u, "9");
+            NS_TEST_EXPECT_MSG_EQ(runs[0].count, 1u, "alone");
+            NS_TEST_EXPECT_MSG_EQ(runs[1].first, 11u, "11");
+            NS_TEST_EXPECT_MSG_EQ(runs[1].count, 1u, "alone");
+        }
+        // Every owed sequence trimmed: nothing is requested.
+        receiver.OnTrim(6, 6, 0);
+        receiver.OnTrim(6, 6, 1);
+        NS_TEST_EXPECT_MSG_EQ(receiver.TakeMissing(6, 2).size(), 0u, "both trimmed");
     }
 
     void Refusals()

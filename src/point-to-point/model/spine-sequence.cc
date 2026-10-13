@@ -21,12 +21,21 @@ bool Ahead(uint16_t a, uint16_t b){
 }
 } // namespace
 
-SpineSequenceReceiver::Missing SpineSequenceReceiver::TakeMissing(
+void SpineSequenceReceiver::Prune(Path &path){
+	for (auto it = path.accounted.begin(); it != path.accounted.end();){
+		if (static_cast<uint16_t>(*it - path.next) >= kAccountedWindow)
+			it = path.accounted.erase(it);
+		else
+			++it;
+	}
+}
+
+std::vector<SpineSequenceReceiver::Missing> SpineSequenceReceiver::TakeMissing(
 		uint8_t requested, uint16_t owed){
 	// Nothing arrived up requested: the sender's counter starts at 0.
 	uint16_t from = 0;
 	bool any = false;
-	for (const auto &path : m_expected){
+	for (const auto &path : m_paths){
 		if (RequestedSpine(path.first) != requested || !path.second.started)
 			continue;
 		if (!any || Ahead(path.second.next, from))
@@ -36,28 +45,69 @@ SpineSequenceReceiver::Missing SpineSequenceReceiver::TakeMissing(
 	const auto taken = m_taken.find(requested);
 	if (taken != m_taken.end() && (!any || Ahead(taken->second, from)))
 		from = taken->second;
+	std::vector<Missing> runs;
 	if (!Ahead(owed, from))
-		return Missing{from, 0};
+		return runs;
 	m_taken[requested] = owed;
-	return Missing{from, static_cast<uint16_t>(owed - from)};
+	const uint16_t span = static_cast<uint16_t>(owed - from);
+	for (uint16_t k = 0; k < span; k++){
+		const uint16_t seq = static_cast<uint16_t>(from + k);
+		if (Accounted(requested, seq))
+			continue;
+		if (!runs.empty() && static_cast<uint16_t>(runs.back().first +
+				runs.back().count) == seq)
+			runs.back().count++;
+		else
+			runs.push_back(Missing{seq, 1});
+	}
+	return runs;
+}
+
+bool SpineSequenceReceiver::Accounted(uint8_t requested, uint16_t pathSeq) const{
+	for (const auto &path : m_paths)
+		if (RequestedSpine(path.first) == requested &&
+				path.second.accounted.count(pathSeq) > 0)
+			return true;
+	return false;
 }
 
 SpineSequenceReceiver::Arrival SpineSequenceReceiver::OnArrival(
 		uint8_t requested, uint8_t carrying, uint16_t pathSeq){
-	Expected &expected = m_expected.try_emplace(
-		SpineIdentification(requested, carrying),
-		Expected{0, requested == carrying}).first->second;
-	if (!expected.started){
-		expected.started = true;
-		expected.next = static_cast<uint16_t>(pathSeq + 1);
+	Path &path = m_paths.try_emplace(SpineIdentification(requested, carrying),
+		Path{0, requested == carrying, {}}).first->second;
+	if (!path.started){
+		path.started = true;
+		path.next = static_cast<uint16_t>(pathSeq + 1);
+		Prune(path);
 		return Arrival{0, false};
 	}
 	// Serial number arithmetic on 16 bits: a distance below 2^15 is ahead.
-	const uint16_t ahead = static_cast<uint16_t>(pathSeq - expected.next);
+	const uint16_t ahead = static_cast<uint16_t>(pathSeq - path.next);
 	if (ahead >= 0x8000)
 		return Arrival{0, true};
-	expected.next = static_cast<uint16_t>(pathSeq + 1);
-	return Arrival{ahead, false};
+	// The accounted sequences in [next, pathSeq) are not missing.
+	uint16_t accounted = 0;
+	for (const uint16_t seq : path.accounted)
+		if (static_cast<uint16_t>(seq - path.next) < ahead)
+			accounted++;
+	path.next = static_cast<uint16_t>(pathSeq + 1);
+	Prune(path);
+	return Arrival{static_cast<uint16_t>(ahead - accounted), false};
+}
+
+void SpineSequenceReceiver::OnTrim(uint8_t requested, uint8_t carrying,
+		uint16_t pathSeq){
+	Path &path = m_paths.try_emplace(SpineIdentification(requested, carrying),
+		Path{0, requested == carrying, {}}).first->second;
+	if (!path.started){
+		// The path's start is not known yet; its first data arrival drops
+		// those behind it.
+		if (path.accounted.size() < kAccountedWindow)
+			path.accounted.insert(pathSeq);
+		return;
+	}
+	if (static_cast<uint16_t>(pathSeq - path.next) < kAccountedWindow)
+		path.accounted.insert(pathSeq);
 }
 
 void PendingTailRuns::Add(uint8_t spine, uint16_t first, uint16_t count,

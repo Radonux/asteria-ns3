@@ -2375,7 +2375,9 @@ int RdmaHw::ReceiveTrim(Ptr<Packet> p, CustomHeader &ch){
 			? GetRxQp(ch.dip, ch.sip, ch.udp.dport, ch.udp.sport, ch.udp.pg, true)
 			: nullptr;
 		// The trimmed header keeps the path sequence: the trim keeps at least
-		// CustomHeader::GetUdpHeaderSize() bytes of IP payload.
+		// CustomHeader::GetUdpHeaderSize() bytes of IP payload. It only marks
+		// that sequence as accounted, since it can overtake earlier data of
+		// its path; it counts no gap.
 		if (m_sprayPathSeq)
 			CountPathSeq(q, ch, true);
 		if (IsGrading())

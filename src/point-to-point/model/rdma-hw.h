@@ -334,9 +334,11 @@ public:
 	std::vector<uint64_t> m_spineGaps;
 	bool ValidPathSeq() const;
 	// The path sequence of the data packet ch arriving at q, or with trimmed
-	// of its trimmed header, counted. A trimmed header moves the expected
-	// sequence on as an arrival does; only the packets missing before it
-	// count, and the receiver's hold takes it for no arrival.
+	// of its trimmed header, counted. Only data arrivals count gaps; a
+	// trimmed header, which can overtake earlier data of its path in the
+	// switches' high-priority queue, marks its sequence as accounted and
+	// neither moves the expected sequence on nor counts a gap, and the
+	// receiver's hold takes it for no arrival.
 	void CountPathSeq(Ptr<RdmaRxQueuePair> q, const CustomHeader &ch,
 		bool trimmed = false);
 	// SprayTailRecovery, under SprayPathSeq: every data packet a queue pair
@@ -346,8 +348,8 @@ public:
 	// each spine, CustomHeader::udpTailCounts of them. The receiver of such
 	// a packet compares each count with the furthest path sequence it
 	// expects of that requested spine, the arriving packet's own spine with
-	// its path sequence, and records the path sequences missing
-	// (SpineSequenceReceiver::TakeMissing). After TailRecoveryDelayNs() it
+	// its path sequence, and records the path sequences missing, those its
+	// trimmed headers accounted left out (SpineSequenceReceiver::TakeMissing). After TailRecoveryDelayNs() it
 	// requests what of them is still missing, packets that arrived meanwhile
 	// left out, in repair requests with qbbHeader::FLAG_TAIL_NACK, one per
 	// stretch of consecutive path sequences of a spine. The sender declares

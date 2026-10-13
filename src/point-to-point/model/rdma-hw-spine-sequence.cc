@@ -25,6 +25,15 @@ void RdmaHw::CountPathSeq(Ptr<RdmaRxQueuePair> q, const CustomHeader &ch,
 	// none: the data arrived or its trim is repaired as any trim.
 	if (m_sprayTailRecovery && !q->m_tailRuns.Empty())
 		q->m_tailRuns.OnArrival(requested, ch.udp.path_seq);
+	if (trimmed){
+		// A trimmed header can overtake earlier data of its path in the
+		// switches' high-priority queue: it only accounts its sequence.
+		q->m_pathSeqReceiver.OnTrim(requested, carrying, ch.udp.path_seq);
+		if (IsReceiverHold())
+			ReceiverHoldOf().OnTrim(m_switchQueues->LeafOf(ch.sip), carrying,
+				Simulator::Now().GetNanoSeconds());
+		return;
+	}
 	const SpineSequenceReceiver::Arrival arrival =
 		q->m_pathSeqReceiver.OnArrival(requested, carrying, ch.udp.path_seq);
 	if (carrying >= m_spineGaps.size())
@@ -32,13 +41,8 @@ void RdmaHw::CountPathSeq(Ptr<RdmaRxQueuePair> q, const CustomHeader &ch,
 	m_spineGaps[carrying] += arrival.gaps;
 	if (!IsReceiverHold())
 		return;
-	const uint32_t leaf = m_switchQueues->LeafOf(ch.sip);
-	const uint64_t now = Simulator::Now().GetNanoSeconds();
-	if (trimmed)
-		ReceiverHoldOf().OnTrim(leaf, carrying, arrival.gaps, now);
-	else
-		ReceiverHoldOf().OnArrival(leaf, carrying, arrival.gaps, arrival.late,
-			now);
+	ReceiverHoldOf().OnArrival(m_switchQueues->LeafOf(ch.sip), carrying,
+		arrival.gaps, arrival.late, Simulator::Now().GetNanoSeconds());
 }
 
 bool RdmaHw::ValidTailRecovery() const{
@@ -70,20 +74,24 @@ void RdmaHw::AskTailMissing(Ptr<RdmaRxQueuePair> q, const CustomHeader &ch){
 		// one, which its path sequence counts; it is counted next.
 		const uint16_t owed = spine == requested
 			? ch.udp.path_seq : ch.udp.tail_counts[k];
-		const SpineSequenceReceiver::Missing missing =
+		// Accounted (trimmed) sequences are left out: a trim is repaired as
+		// any trim.
+		const std::vector<SpineSequenceReceiver::Missing> runs =
 			q->m_pathSeqReceiver.TakeMissing(spine, owed);
-		if (missing.count == 0)
+		if (runs.empty())
 			continue;
 		const uint64_t delay = TailRecoveryDelayNs();
-		if (delay == 0){
-			SendTailNack(q, spine, missing.first, missing.count);
-			continue;
+		for (const SpineSequenceReceiver::Missing &missing : runs){
+			if (delay == 0){
+				SendTailNack(q, spine, missing.first, missing.count);
+				continue;
+			}
+			// Every run waits the same delay, so a run added later is never
+			// due before the timer already set.
+			q->m_tailRuns.Add(spine, missing.first, missing.count,
+				Simulator::Now().GetNanoSeconds() + delay);
 		}
-		// Every run waits the same delay, so a run added later is never due
-		// before the timer already set.
-		q->m_tailRuns.Add(spine, missing.first, missing.count,
-			Simulator::Now().GetNanoSeconds() + delay);
-		if (!q->m_tailTimer.IsPending())
+		if (delay > 0 && !q->m_tailTimer.IsPending())
 			q->m_tailTimer = Simulator::Schedule(NanoSeconds(delay),
 				&RdmaHw::RequestTailRuns, this, q);
 	}
