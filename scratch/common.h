@@ -282,6 +282,16 @@ bool spray_path_seq_given = false;
 // default, leaves both headers as they are.
 std::string spray_tail_recovery = "off";
 bool spray_tail_recovery_given = false;
+// Under SPRAY_TAIL_RECOVERY on, SPRAY_TAIL_RECOVERY_DELAY_NS <n>: the receiver
+// does not request a missing run at once. It records the run and, n ns
+// later, by one timer per queue pair, requests what of it is still missing;
+// a packet of the run that arrives meanwhile, late behind the packet that
+// showed it missing, is left out. A lost tail packet is then repaired at the
+// receiver about 1.5 base RTT + n after the message's end. Unset, n is the
+// fabric's largest base RTT between two hosts (maxRtt, as RdmaHw's
+// SprayBaseRttNs); 0 requests at once.
+uint64_t spray_tail_recovery_delay_ns = 0;
+bool spray_tail_recovery_delay_ns_given = false;
 bool tail_recovery() { return spray_tail_recovery == "on"; }
 // Under reps_hold, reps_flow_hold or mrc_hold with SPRAY_PATH_SEQ on,
 // SPRAY_RECEIVER_HOLD on: each receiving host counts, per sender leaf and spine, the data packets
@@ -2150,6 +2160,9 @@ bool ReadConf(string network_configuration) {
     } else if (key.compare("SPRAY_TAIL_RECOVERY") == 0) {
       conf >> spray_tail_recovery;
       spray_tail_recovery_given = true;
+    } else if (key.compare("SPRAY_TAIL_RECOVERY_DELAY_NS") == 0) {
+      conf >> spray_tail_recovery_delay_ns;
+      spray_tail_recovery_delay_ns_given = true;
     } else if (key.compare("SPRAY_RECEIVER_HOLD") == 0) {
       conf >> spray_receiver_hold;
       spray_receiver_hold_given = true;
@@ -2572,6 +2585,16 @@ bool ReadConf(string network_configuration) {
   }
   if (tail_recovery() && spray_path_seq != "on") {
     std::cerr << "SPRAY_TAIL_RECOVERY requires SPRAY_PATH_SEQ on\n";
+    return false;
+  }
+  if (spray_tail_recovery_delay_ns_given && !tail_recovery()) {
+    std::cerr << "SPRAY_TAIL_RECOVERY_DELAY_NS is read only with "
+                 "SPRAY_TAIL_RECOVERY on\n";
+    return false;
+  }
+  if (spray_tail_recovery_delay_ns_given &&
+      spray_tail_recovery_delay_ns == RdmaHw::kTailDelayBaseRtt) {
+    std::cerr << "SPRAY_TAIL_RECOVERY_DELAY_NS is out of range\n";
     return false;
   }
   if (spray_receiver_hold != "on" && spray_receiver_hold != "off") {
@@ -3155,6 +3178,10 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),
       rdmaHw->SetAttribute("SprayPathSeq",
                            BooleanValue(spray_path_seq == "on"));
       rdmaHw->SetAttribute("SprayTailRecovery", BooleanValue(tail_recovery()));
+      rdmaHw->SetAttribute("SprayTailRecoveryDelayNs",
+                           UintegerValue(spray_tail_recovery_delay_ns_given
+                                             ? spray_tail_recovery_delay_ns
+                                             : RdmaHw::kTailDelayBaseRtt));
       rdmaHw->SetAttribute("SprayReceiverHold", BooleanValue(receiver_hold()));
       rdmaHw->SetAttribute("SprayReceiverHoldClean",
                            UintegerValue(spray_receiver_hold_clean));
@@ -3328,7 +3355,7 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),
   printf("maxRtt=%lu maxBdp=%lu\n", maxRtt, maxBdp);
   // Known only now that every route is, and read from the first packet on.
   if (load_balancing == "spray_policy" || path_selector == "ack_redirect" ||
-      reps_oracle()) {
+      reps_oracle() || tail_recovery()) {
     for (uint32_t i = 0; i < node_num; i++)
       if (n.Get(i)->GetNodeType() == 0)
         n.Get(i)->GetObject<RdmaDriver>()->m_rdma->SetAttribute(

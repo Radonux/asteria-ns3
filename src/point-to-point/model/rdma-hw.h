@@ -344,14 +344,26 @@ public:
 	// each spine, CustomHeader::udpTailCounts of them. The receiver of such
 	// a packet compares each count with the furthest path sequence it
 	// expects of that requested spine, the arriving packet's own spine with
-	// its path sequence, and asks at once for the path sequences missing
-	// (SpineSequenceReceiver::TakeMissing) in a repair request with
-	// qbbHeader::FLAG_TAIL_NACK, one per spine. The sender declares lost
-	// the outstanding sends those path sequences name on that spine, as the
-	// per-path rule does, and repairs them; the retransmission timeout is
-	// left as it is.
+	// its path sequence, and records the path sequences missing
+	// (SpineSequenceReceiver::TakeMissing). After TailRecoveryDelayNs() it
+	// requests what of them is still missing, packets that arrived meanwhile
+	// left out, in repair requests with qbbHeader::FLAG_TAIL_NACK, one per
+	// stretch of consecutive path sequences of a spine. The sender declares
+	// lost the outstanding sends those path sequences name on that spine,
+	// as the per-path rule does, and repairs them; the retransmission
+	// timeout is left as it is. A lost tail packet whose spine's count
+	// arrives about half a base RTT after the message's end is repaired at
+	// the receiver about 1.5 base RTT + the delay after that end.
 	bool m_sprayTailRecovery;
+	// SprayTailRecoveryDelayNs: how long the receiver waits on a missing run
+	// before it requests it; kTailDelayBaseRtt, the default, is
+	// m_sprayBaseRttNs, and zero requests it at once.
+	static constexpr uint64_t kTailDelayBaseRtt = UINT64_MAX;
+	uint64_t m_sprayTailRecoveryDelayNs;
+	uint64_t TailRecoveryDelayNs() const;
 	bool ValidTailRecovery() const;
+	// The runs of q due by now, requested, and q's timer set for the next.
+	void RequestTailRuns(Ptr<RdmaRxQueuePair> q);
 	// The tail fields of the data packet of qp being sent, closing when the
 	// queue pair has no new data left.
 	void SetTailFields(Ptr<RdmaQueuePair> qp, SeqTsHeader &seqTs,
@@ -359,9 +371,9 @@ public:
 	// The tail repair requests the closing data packet or trimmed header ch
 	// arriving at q asks for, before ch's own path sequence is counted.
 	void AskTailMissing(Ptr<RdmaRxQueuePair> q, const CustomHeader &ch);
-	// The repair request for count path sequences from first on spine,
-	// answering the data packet or trimmed header ch.
-	void SendTailNack(const CustomHeader &ch, uint8_t spine, uint16_t first,
+	// The repair request of q's flow for count path sequences from first on
+	// spine.
+	void SendTailNack(Ptr<RdmaRxQueuePair> q, uint8_t spine, uint16_t first,
 		uint16_t count);
 	// The sender's handling of a tail repair request for qp.
 	void RecoverTail(Ptr<RdmaQueuePair> qp, const CustomHeader &ch);

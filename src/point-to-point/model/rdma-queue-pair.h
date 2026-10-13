@@ -380,6 +380,10 @@ public:
 	uint64_t m_folded_arrivals;
 	// Under SprayPathSeq, the path sequence expected next per path.
 	SpineSequenceReceiver m_pathSeqReceiver;
+	// Under SprayTailRecovery with a delay, the missing runs not yet
+	// requested, and the one timer that requests those due.
+	PendingTailRuns m_tailRuns;
+	EventId m_tailTimer;
 	// Whether the experiment layer may forgive this flow on this step, asked
 	// once when the queue pair is created. Every acknowledgement this queue
 	// pair emits carries it, and an acknowledgement carrying it without the

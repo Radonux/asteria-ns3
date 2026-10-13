@@ -76,6 +76,42 @@ private:
 	std::unordered_map<uint8_t, uint16_t> m_taken;
 };
 
+// The runs of missing path sequences a receiver under tail recovery waits on
+// before it requests them: per run its requested spine, its path sequences
+// and when its request is due. A packet of the run that arrives meanwhile is
+// taken out of it, so that only what is still missing when the run is due
+// is requested.
+class PendingTailRuns {
+public:
+	static constexpr uint64_t kNone = UINT64_MAX;
+	struct Request {
+		uint8_t spine;
+		uint16_t first;
+		uint16_t count;
+	};
+	void Add(uint8_t spine, uint16_t first, uint16_t count, uint64_t dueNs);
+	// An arrival, or a trimmed header, requested up spine with path
+	// sequence pathSeq.
+	void OnArrival(uint8_t spine, uint16_t pathSeq);
+	// Remove the runs due by nowNs and return what is still missing of them,
+	// one request per stretch of consecutive path sequences, in the order
+	// the runs were added.
+	std::vector<Request> TakeDue(uint64_t nowNs);
+	// When the earliest run is due, or kNone.
+	uint64_t NextDue() const;
+	bool Empty() const;
+
+private:
+	struct Run {
+		uint8_t spine;
+		uint16_t first;
+		uint64_t dueNs;
+		// Per path sequence from first, whether it is still missing.
+		std::vector<bool> missing;
+	};
+	std::vector<Run> m_runs;
+};
+
 } // namespace ns3
 
 #endif /* SPINE_SEQUENCE_H */

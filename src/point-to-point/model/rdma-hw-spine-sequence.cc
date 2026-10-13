@@ -21,6 +21,10 @@ void RdmaHw::CountPathSeq(Ptr<RdmaRxQueuePair> q, const CustomHeader &ch,
 		AskTailMissing(q, ch);
 	const uint8_t requested = RequestedSpine(ch.ipid);
 	const uint8_t carrying = CarryingSpine(ch.ipid);
+	// An arrival, or a trimmed header, whose request is not yet due needs
+	// none: the data arrived or its trim is repaired as any trim.
+	if (m_sprayTailRecovery && !q->m_tailRuns.Empty())
+		q->m_tailRuns.OnArrival(requested, ch.udp.path_seq);
 	const SpineSequenceReceiver::Arrival arrival =
 		q->m_pathSeqReceiver.OnArrival(requested, carrying, ch.udp.path_seq);
 	if (carrying >= m_spineGaps.size())
@@ -68,19 +72,51 @@ void RdmaHw::AskTailMissing(Ptr<RdmaRxQueuePair> q, const CustomHeader &ch){
 			? ch.udp.path_seq : ch.udp.tail_counts[k];
 		const SpineSequenceReceiver::Missing missing =
 			q->m_pathSeqReceiver.TakeMissing(spine, owed);
-		if (missing.count > 0)
-			SendTailNack(ch, spine, missing.first, missing.count);
+		if (missing.count == 0)
+			continue;
+		const uint64_t delay = TailRecoveryDelayNs();
+		if (delay == 0){
+			SendTailNack(q, spine, missing.first, missing.count);
+			continue;
+		}
+		// Every run waits the same delay, so a run added later is never due
+		// before the timer already set.
+		q->m_tailRuns.Add(spine, missing.first, missing.count,
+			Simulator::Now().GetNanoSeconds() + delay);
+		if (!q->m_tailTimer.IsPending())
+			q->m_tailTimer = Simulator::Schedule(NanoSeconds(delay),
+				&RdmaHw::RequestTailRuns, this, q);
 	}
 }
 
-void RdmaHw::SendTailNack(const CustomHeader &ch, uint8_t spine,
+uint64_t RdmaHw::TailRecoveryDelayNs() const{
+	if (m_sprayTailRecoveryDelayNs != kTailDelayBaseRtt)
+		return m_sprayTailRecoveryDelayNs;
+	NS_ABORT_MSG_IF(m_sprayBaseRttNs == 0, "SprayTailRecoveryDelayNs defaults "
+		"to SprayBaseRttNs, which is not set");
+	return m_sprayBaseRttNs;
+}
+
+void RdmaHw::RequestTailRuns(Ptr<RdmaRxQueuePair> q){
+	const uint64_t now = Simulator::Now().GetNanoSeconds();
+	for (const PendingTailRuns::Request &request : q->m_tailRuns.TakeDue(now))
+		SendTailNack(q, request.spine, request.first, request.count);
+	const uint64_t next = q->m_tailRuns.NextDue();
+	if (next != PendingTailRuns::kNone)
+		q->m_tailTimer = Simulator::Schedule(NanoSeconds(next - now),
+			&RdmaHw::RequestTailRuns, this, q);
+}
+
+void RdmaHw::SendTailNack(Ptr<RdmaRxQueuePair> q, uint8_t spine,
 		uint16_t first, uint16_t count){
+	// The receive queue pair's addresses and ports are the data's
+	// destination's first; its priority group is the one it was made with.
 	qbbHeader request;
-	request.SetPG(ch.udp.pg);
-	request.SetSport(ch.udp.dport);
-	request.SetDport(ch.udp.sport);
+	request.SetPG(q->m_ecn_source.qIndex);
+	request.SetSport(q->sport);
+	request.SetDport(q->dport);
 	request.SetTailNack(spine, first, count);
-	SendRepairRequest(request, ch.dip, ch.sip,
+	SendRepairRequest(request, q->sip, q->dip,
 		SpineIdentification(spine, spine));
 }
 

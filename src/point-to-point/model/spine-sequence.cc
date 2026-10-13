@@ -60,4 +60,53 @@ SpineSequenceReceiver::Arrival SpineSequenceReceiver::OnArrival(
 	return Arrival{ahead, false};
 }
 
+void PendingTailRuns::Add(uint8_t spine, uint16_t first, uint16_t count,
+		uint64_t dueNs){
+	if (count > 0)
+		m_runs.push_back(Run{spine, first, dueNs,
+			std::vector<bool>(count, true)});
+}
+
+void PendingTailRuns::OnArrival(uint8_t spine, uint16_t pathSeq){
+	for (Run &run : m_runs){
+		const uint16_t offset = static_cast<uint16_t>(pathSeq - run.first);
+		if (run.spine == spine && offset < run.missing.size())
+			run.missing[offset] = false;
+	}
+}
+
+std::vector<PendingTailRuns::Request> PendingTailRuns::TakeDue(uint64_t nowNs){
+	std::vector<Request> requests;
+	std::vector<Run> kept;
+	for (Run &run : m_runs){
+		if (run.dueNs > nowNs){
+			kept.push_back(std::move(run));
+			continue;
+		}
+		for (uint32_t k = 0; k < run.missing.size(); k++){
+			if (!run.missing[k])
+				continue;
+			if (k > 0 && run.missing[k - 1])
+				requests.back().count++;
+			else
+				requests.push_back(Request{run.spine,
+					static_cast<uint16_t>(run.first + k), 1});
+		}
+	}
+	m_runs.swap(kept);
+	return requests;
+}
+
+uint64_t PendingTailRuns::NextDue() const{
+	uint64_t due = kNone;
+	for (const Run &run : m_runs)
+		if (run.dueNs < due)
+			due = run.dueNs;
+	return due;
+}
+
+bool PendingTailRuns::Empty() const{
+	return m_runs.empty();
+}
+
 } // namespace ns3

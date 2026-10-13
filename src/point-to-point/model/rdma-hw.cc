@@ -281,7 +281,8 @@ TypeId RdmaHw::GetTypeId (void)
 					static_cast<uint32_t>(GradeScope::PerConnection)))
 		.AddAttribute("SprayBaseRttNs",
 				"Under LoadBalancing 3 and PathSelector 5, the base RTT the "
-				"attributes count time in. Zero, the default, is refused at the "
+				"attributes count time in, and under SprayTailRecovery the "
+				"default of SprayTailRecoveryDelayNs. Zero, the default, is refused at the "
 				"first use.",
 				UintegerValue(0),
 				MakeUintegerAccessor(&RdmaHw::m_sprayBaseRttNs),
@@ -652,6 +653,15 @@ TypeId RdmaHw::GetTypeId (void)
 				BooleanValue(false),
 				MakeBooleanAccessor(&RdmaHw::m_sprayTailRecovery),
 				MakeBooleanChecker())
+		.AddAttribute("SprayTailRecoveryDelayNs",
+				"Under SprayTailRecovery, how long a receiver waits on the "
+				"path sequences a closing packet shows missing before it "
+				"requests those still missing; zero requests them at once. "
+				"Default RdmaHw::kTailDelayBaseRtt: SprayBaseRttNs, which is "
+				"then needed.",
+				UintegerValue(RdmaHw::kTailDelayBaseRtt),
+				MakeUintegerAccessor(&RdmaHw::m_sprayTailRecoveryDelayNs),
+				MakeUintegerChecker<uint64_t>())
 		.AddAttribute("SprayReceiverHold",
 				"Under PathSelector 6, 7 and 9 with SprayPathSeq, whether the "
 				"receiver holds spines by the packets missing on them per "

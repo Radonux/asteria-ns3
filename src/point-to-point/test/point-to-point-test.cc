@@ -9200,8 +9200,8 @@ class SprayTailRecoveryTest : public TestCase
     SprayTailRecoveryTest()
         : TestCase("Under SprayTailRecovery the packets a queue pair sends once it has no new "
                    "data left close their spines and carry each spine's count, the receiver asks "
-                   "at once for the path sequences it misses, and the sender repairs a lost tail "
-                   "without a retransmission timeout")
+                   "for the path sequences still missing after its delay, and the sender repairs "
+                   "a lost tail without a retransmission timeout")
     {
     }
 
@@ -9220,6 +9220,7 @@ class SprayTailRecoveryTest : public TestCase
         Refusals();
         TailLoss();
         LostClosingPacket();
+        OvertakenClosingPacket();
 
         CustomHeader::ackTailNackBytes = savedNack;
         CustomHeader::udpTailCounts = savedCounts;
@@ -9237,6 +9238,10 @@ class SprayTailRecoveryTest : public TestCase
     static constexpr uint64_t kBaseRttNs = 2 * kOneWayNs;
     static constexpr uint64_t kStepNs = 100;
     static constexpr uint64_t kTimeoutNs = 20000;
+    // The receiver's delay, the base RTT by default.
+    static constexpr uint64_t kDelayNs = kBaseRttNs;
+    // How long after the last packet a slower spine delivers its own last.
+    static constexpr uint64_t kOvertakeNs = kDelayNs / 2;
     // The new data packets up spine 3 among the message's last ones that a
     // tail loss drops.
     static constexpr uint32_t kTailPackets = 16;
@@ -9360,6 +9365,32 @@ class SprayTailRecoveryTest : public TestCase
         missing = receiver.TakeMissing(5, 1);
         NS_TEST_EXPECT_MSG_EQ(missing.first, 65535u, "across the wrap");
         NS_TEST_EXPECT_MSG_EQ(missing.count, 2u, "65535 and 0");
+
+        PendingTailRuns runs;
+        NS_TEST_EXPECT_MSG_EQ(runs.NextDue(), PendingTailRuns::kNone, "nothing pending");
+        runs.Add(3, 10, 4, 100);
+        runs.Add(5, 0, 1, 100);
+        runs.Add(6, 7, 2, 200);
+        runs.OnArrival(3, 11);
+        runs.OnArrival(5, 0);
+        runs.OnArrival(4, 12);
+        NS_TEST_EXPECT_MSG_EQ(runs.NextDue(), 100u, "the earliest due");
+        NS_TEST_EXPECT_MSG_EQ(runs.TakeDue(99).size(), 0u, "nothing due before it");
+        const std::vector<PendingTailRuns::Request> due = runs.TakeDue(100);
+        NS_TEST_EXPECT_MSG_EQ(due.size(), 2u, "spine 3's run split by its arrival, 5's gone");
+        if (due.size() == 2)
+        {
+            NS_TEST_EXPECT_MSG_EQ(static_cast<uint32_t>(due[0].spine), 3u, "spine 3");
+            NS_TEST_EXPECT_MSG_EQ(due[0].first, 10u, "10 alone");
+            NS_TEST_EXPECT_MSG_EQ(due[0].count, 1u, "11 arrived");
+            NS_TEST_EXPECT_MSG_EQ(due[1].first, 12u, "12 and 13");
+            NS_TEST_EXPECT_MSG_EQ(due[1].count, 2u, "an arrival on spine 4 takes nothing");
+        }
+        NS_TEST_EXPECT_MSG_EQ(runs.NextDue(), 200u, "spine 6's run waits");
+        runs.OnArrival(6, 7);
+        runs.OnArrival(6, 8);
+        NS_TEST_EXPECT_MSG_EQ(runs.TakeDue(200).size(), 0u, "all of it arrived");
+        NS_TEST_EXPECT_MSG_EQ(runs.Empty(), true, "and is gone");
     }
 
     void Refusals()
@@ -9367,6 +9398,14 @@ class SprayTailRecoveryTest : public TestCase
         NS_TEST_EXPECT_MSG_EQ(CreateObject<RdmaHw>()->m_sprayTailRecovery,
                               false,
                               "SprayTailRecovery is off by default");
+        Ptr<RdmaHw> delayed = CreateObject<RdmaHw>();
+        NS_TEST_EXPECT_MSG_EQ(delayed->m_sprayTailRecoveryDelayNs,
+                              RdmaHw::kTailDelayBaseRtt,
+                              "the delay is the base RTT by default");
+        delayed->m_sprayBaseRttNs = 1234;
+        NS_TEST_EXPECT_MSG_EQ(delayed->TailRecoveryDelayNs(), 1234u, "SprayBaseRttNs");
+        delayed->m_sprayTailRecoveryDelayNs = 0;
+        NS_TEST_EXPECT_MSG_EQ(delayed->TailRecoveryDelayNs(), 0u, "or as set");
         SetHeaders(false);
         NS_TEST_EXPECT_MSG_EQ(CreateObject<RdmaHw>()->ValidTailRecovery(),
                               true,
@@ -9428,6 +9467,9 @@ class SprayTailRecoveryTest : public TestCase
         // The newest new data packet still in flight when the last one is
         // sent, on a spine other than the last one's.
         ClosingPacket,
+        // The same packet delayed instead, to arrive kOvertakeNs after the
+        // last one.
+        Overtaken,
     };
 
     struct Nack
@@ -9456,10 +9498,17 @@ class SprayTailRecoveryTest : public TestCase
         uint32_t closingSends = 0;
         std::vector<Nack> nacks;
         std::vector<uint32_t> lossesTraced = std::vector<uint32_t>(kSpines, 0);
+        uint32_t declaredLost = 0;
+        uint64_t overtakenNs = 0;
     };
 
-    static void Configure(Ptr<RdmaHw> hw, bool tailRecovery, PathSelectorKind kind)
+    static void Configure(Ptr<RdmaHw> hw,
+                          bool tailRecovery,
+                          PathSelectorKind kind,
+                          uint64_t delayNs)
     {
+        hw->m_sprayBaseRttNs = kBaseRttNs;
+        hw->m_sprayTailRecoveryDelayNs = delayNs;
         hw->m_sprayPathSeq = true;
         hw->m_sprayTailRecovery = tailRecovery;
         hw->m_pathSelectorKind = static_cast<uint32_t>(kind);
@@ -9477,15 +9526,19 @@ class SprayTailRecoveryTest : public TestCase
 
     // One queue pair of packets data packets, one send per kStepNs, to a
     // receiver kOneWayNs away each way, with loss.
-    Outcome Flow(bool tailRecovery, Loss loss, PathSelectorKind kind, uint32_t packets)
+    Outcome Flow(bool tailRecovery,
+                 Loss loss,
+                 PathSelectorKind kind,
+                 uint32_t packets,
+                 uint64_t delayNs = RdmaHw::kTailDelayBaseRtt)
     {
         SetHeaders(tailRecovery);
         Outcome outcome;
         {
             IsolatedHost sender(LoadBalancingMode::SprayUniform, kTestReceiver, kSpines);
             IsolatedHost receiver(LoadBalancingMode::SprayUniform, kTestSender, kSpines);
-            Configure(sender.hw, tailRecovery, kind);
-            Configure(receiver.hw, tailRecovery, kind);
+            Configure(sender.hw, tailRecovery, kind, delayNs);
+            Configure(receiver.hw, tailRecovery, kind, delayNs);
             Ptr<RdmaHw> hw = sender.hw;
             hw->m_retransmission_timeout_ns = kTimeoutNs;
             NS_TEST_EXPECT_MSG_EQ(hw->ValidTailRecovery(), true, "a valid configuration");
@@ -9560,6 +9613,7 @@ class SprayTailRecoveryTest : public TestCase
             std::vector<EventId> inFlight(kSpines);
             std::vector<uint16_t> inFlightPathSeq(kSpines, 0);
             std::vector<uint64_t> inFlightSentNs(kSpines, 0);
+            std::vector<Ptr<Packet>> inFlightPacket(kSpines);
             std::function<void()> step = [&]() {
                 if (outcome.completed)
                 {
@@ -9588,7 +9642,7 @@ class SprayTailRecoveryTest : public TestCase
                         drop = draw->GetValue() < 0.01 || tail;
                         outcome.tailDrops += tail;
                     }
-                    if (last && loss == Loss::ClosingPacket)
+                    if (last && loss != Loss::TailOnSpine3)
                     {
                         // The newest packet in flight on another spine is its
                         // spine's last before the end.
@@ -9605,9 +9659,21 @@ class SprayTailRecoveryTest : public TestCase
                         if (newest >= 0)
                         {
                             Simulator::Cancel(inFlight[newest]);
-                            outcome.drops++;
                             outcome.droppedSpine = static_cast<uint8_t>(newest);
                             outcome.droppedPathSeq = inFlightPathSeq[newest];
+                            if (loss == Loss::ClosingPacket)
+                            {
+                                outcome.drops++;
+                            }
+                            else
+                            {
+                                // Still undelivered, so its delivery moves
+                                // behind the last packet's.
+                                const Ptr<Packet> late = inFlightPacket[newest];
+                                outcome.overtakenNs = kOneWayNs + kOvertakeNs;
+                                Simulator::Schedule(NanoSeconds(kOneWayNs + kOvertakeNs),
+                                                    [&deliver, late]() { deliver(late); });
+                            }
                         }
                     }
                     if (drop)
@@ -9625,6 +9691,7 @@ class SprayTailRecoveryTest : public TestCase
                             inFlight[spine] = arrival;
                             inFlightPathSeq[spine] = header.udp.path_seq;
                             inFlightSentNs[spine] = now;
+                            inFlightPacket[spine] = packet;
                         }
                     }
                 }
@@ -9643,6 +9710,7 @@ class SprayTailRecoveryTest : public TestCase
             outcome.qpTimeouts = qp->m_timeouts;
             outcome.tailDeclared = qp->m_tail_declared_lost;
             outcome.tailIgnored = qp->m_tail_nacks_ignored;
+            outcome.declaredLost = qp->m_recovery_events;
             Simulator::Destroy();
         }
         return outcome;
@@ -9674,8 +9742,9 @@ class SprayTailRecoveryTest : public TestCase
         NS_TEST_EXPECT_MSG_LT_OR_EQ(on.tailDeclared, on.drops, "and nothing that arrived");
         NS_TEST_EXPECT_MSG_GT(on.receivedNs, on.endNs, "received after the end");
         NS_TEST_EXPECT_MSG_LT_OR_EQ(on.receivedNs - on.endNs,
-                                    kBaseRttNs * 3 / 2 + (on.tailDeclared + 1) * kStepNs,
-                                    "within 1.5 base RTT of the end, and the repairs' sends");
+                                    kBaseRttNs * 3 / 2 + kDelayNs + (on.tailDeclared + 1) * kStepNs,
+                                    "within 1.5 base RTT and the delay of the end, and the "
+                                    "repairs' sends");
 
         const Outcome off = Flow(false, Loss::TailOnSpine3, PathSelectorKind::Ops, kPackets);
         NS_TEST_EXPECT_MSG_EQ(off.tailDrops, on.tailDrops, "off: the same tail losses");
@@ -9711,12 +9780,38 @@ class SprayTailRecoveryTest : public TestCase
                               1u,
                               "the hold's loss trace counts it on its spine");
         NS_TEST_EXPECT_MSG_LT_OR_EQ(on.receivedNs - on.endNs,
-                                    kBaseRttNs * 3 / 2 + kStepNs,
-                                    "within 1.5 base RTT of the end");
+                                    kBaseRttNs * 3 / 2 + kDelayNs + kStepNs,
+                                    "within 1.5 base RTT and the delay of the end");
+        NS_TEST_EXPECT_MSG_GT(on.receivedNs - on.endNs,
+                              kBaseRttNs * 3 / 2 + kDelayNs - kStepNs,
+                              "the request waits out the delay");
 
         const Outcome off = Flow(false, Loss::ClosingPacket, PathSelectorKind::RepsHold, kPackets);
         NS_TEST_EXPECT_MSG_EQ(off.completed, true, "off: the flow completes");
         NS_TEST_EXPECT_MSG_GT(off.timeouts, 0u, "off: the loss waits out the timeout");
+    }
+
+    // The last packet overtakes the last one of a slower spine by less than
+    // the delay: nothing is requested and nothing declared lost.
+    void OvertakenClosingPacket()
+    {
+        constexpr uint32_t kPackets = 400;
+        const Outcome on = Flow(true, Loss::Overtaken, PathSelectorKind::RepsHold, kPackets);
+        NS_TEST_EXPECT_MSG_GT(on.overtakenNs, 0u, "a packet is overtaken");
+        NS_TEST_EXPECT_MSG_LT(kOvertakeNs, kDelayNs, "by less than the delay");
+        NS_TEST_EXPECT_MSG_EQ(on.completed, true, "the flow completes");
+        NS_TEST_EXPECT_MSG_EQ(on.drops, 0u, "nothing is lost");
+        NS_TEST_EXPECT_MSG_EQ(on.nacks.size(), 0u, "no tail repair request");
+        NS_TEST_EXPECT_MSG_EQ(on.tailDeclared, 0u, "no send declared lost by one");
+        NS_TEST_EXPECT_MSG_EQ(on.declaredLost, 0u, "nor at all");
+        NS_TEST_EXPECT_MSG_EQ(on.lossesTraced[on.droppedSpine], 0u, "nor traced as a loss");
+        NS_TEST_EXPECT_MSG_EQ(on.timeouts, 0u, "and no retransmission timeout");
+
+        // Requested at once, the same packet is asked for before it arrives.
+        const Outcome atOnce = Flow(true, Loss::Overtaken, PathSelectorKind::RepsHold, kPackets, 0);
+        NS_TEST_EXPECT_MSG_EQ(atOnce.completed, true, "at once: the flow completes");
+        NS_TEST_EXPECT_MSG_EQ(atOnce.nacks.size(), 1u, "at once: the packet is requested");
+        NS_TEST_EXPECT_MSG_EQ(atOnce.tailDeclared, 1u, "and declared lost");
     }
 };
 
