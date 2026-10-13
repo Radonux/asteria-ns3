@@ -263,6 +263,8 @@ public:
 	// queue pair to that leaf and read once per base RTT.
 	bool IsRepsOracle() const;
 	bool ValidRepsOracle() const;
+	// PathSelector RepsSpine: REPS over spines under LoadBalancing 2.
+	bool IsRepsSpine() const;
 	std::unordered_map<uint32_t, FaultedSpines> m_faultedSpines;
 	FaultedSpines &FaultedSpinesTo(uint32_t leaf);
 	SpineScores &LeafHold(uint32_t leaf);

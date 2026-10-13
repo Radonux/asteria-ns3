@@ -183,12 +183,13 @@ TypeId RdmaHw::GetTypeId (void)
 				"is REPS over spines leaving out for good the spines "
 				"SwitchQueueState shows a fault on toward the destination's "
 				"leaf, which needs SprayGradeCostSource 1, and 9 is MRC over "
-				"spines leaving out the spines 6's loss hold holds.",
+				"spines leaving out the spines 6's loss hold holds, and 10 is "
+				"REPS over spines leaving out none.",
 				UintegerValue(static_cast<uint32_t>(PathSelectorKind::Ops)),
 				MakeUintegerAccessor(&RdmaHw::m_pathSelectorKind),
 				MakeUintegerChecker<uint32_t>(
 					static_cast<uint32_t>(PathSelectorKind::Ops),
-					static_cast<uint32_t>(PathSelectorKind::MrcHold)))
+					static_cast<uint32_t>(PathSelectorKind::RepsSpine)))
 		.AddAttribute("RepsBufferSize",
 				"REPS: the entries of the circular buffer of entropy values to "
 				"reuse. Default 8, REPS section 3.1.",
@@ -1092,10 +1093,13 @@ void RdmaHw::Setup(QpCompleteCallback cb, QpFailureCallback failure_cb){
 				static_cast<uint32_t>(PathSelectorKind::Ops) &&
 			m_pathSelectorKind !=
 				static_cast<uint32_t>(PathSelectorKind::AckRedirect) &&
-			!IsRepsHold() && !IsRepsOracle() &&
+			!IsRepsHold() && !IsRepsOracle() && !IsRepsSpine() &&
 			m_loadBalancing !=
 				static_cast<uint32_t>(LoadBalancingMode::EntropyHash),
 		"PathSelector 1 to 4 choose entropy values and need LoadBalancing 1");
+	NS_ABORT_MSG_IF(IsRepsSpine() && m_loadBalancing !=
+				static_cast<uint32_t>(LoadBalancingMode::SprayUniform),
+		"PathSelector 10 names spines and needs LoadBalancing 2");
 	NS_ABORT_MSG_IF(m_pathSelectorKind ==
 				static_cast<uint32_t>(PathSelectorKind::AckRedirect) &&
 			m_loadBalancing !=
@@ -1516,6 +1520,11 @@ LossLikelihoodRatio::Parameters RdmaHw::Likelihood() const{
 bool RdmaHw::IsRepsOracle() const{
 	return m_pathSelectorKind ==
 		static_cast<uint32_t>(PathSelectorKind::RepsOracle);
+}
+
+bool RdmaHw::IsRepsSpine() const{
+	return m_pathSelectorKind ==
+		static_cast<uint32_t>(PathSelectorKind::RepsSpine);
 }
 
 bool RdmaHw::ValidRepsOracle() const{
@@ -2855,6 +2864,12 @@ void RdmaHw::StartPathSelection(Ptr<RdmaQueuePair> qp, uint64_t bdpBytes,
 			m_repsBufferSize, m_repsFreezingTimeoutNs, bdpBytes / m_mtu,
 			m_spineCount,
 			std::make_unique<SpineScores>(m_spineCount, LossHoldParameters()));
+		return;
+	}
+	if (IsRepsSpine()){
+		qp->m_pathSelector = std::make_unique<RepsSpineSelector>(m_pathRandom,
+			m_repsBufferSize, m_repsFreezingTimeoutNs, bdpBytes / m_mtu,
+			m_spineCount);
 		return;
 	}
 	if (IsRepsOracle()){

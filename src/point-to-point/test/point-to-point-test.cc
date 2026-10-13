@@ -11043,6 +11043,55 @@ class RepsOracleTest : public TestCase
     }
 };
 
+class RepsSpineTest : public TestCase
+{
+  public:
+    RepsSpineTest()
+        : TestCase("Under reps_spine REPS draws spine indices, reuses each unmarked "
+                   "acknowledgement's spine once and caches no marked one")
+    {
+    }
+
+    void DoRun() override
+    {
+        constexpr uint32_t kSpines = 4;
+        Ptr<RdmaHw> hw = CreateObject<RdmaHw>();
+        hw->SetAttribute("Mtu", UintegerValue(1000));
+        hw->SetAttribute("PathRandomVariable", PointerValue(SelectorStream()));
+        hw->m_spineCount = kSpines;
+        hw->m_loadBalancing = static_cast<uint32_t>(LoadBalancingMode::SprayUniform);
+        hw->m_pathSelectorKind = static_cast<uint32_t>(PathSelectorKind::RepsSpine);
+        NS_TEST_EXPECT_MSG_EQ(hw->IsRepsHold(), false, "no loss hold");
+        NS_TEST_EXPECT_MSG_EQ(hw->CountsSprayLoss(), false, "no loss counted");
+        Ptr<RdmaQueuePair> qp =
+            CreateObject<RdmaQueuePair>(3, kTestSender, kTestReceiver, 10000, 100);
+        hw->StartPathSelection(qp, 0, 0);
+        PathSelector& reps = *qp->m_pathSelector;
+        // A uniform spine draw on the same stream: what a fresh draw is.
+        UniformSpineSelector fresh(SelectorStream(), kSpines);
+        const auto freshSends = [&reps, &fresh](uint32_t sends) {
+            uint32_t drawn = 0;
+            for (uint32_t i = 0; i < sends; ++i)
+            {
+                const uint16_t identification = reps.Choose(0);
+                drawn += identification == fresh.Choose(0) &&
+                         RequestedSpine(identification) < kSpines &&
+                         RequestedSpine(identification) == CarryingSpine(identification);
+            }
+            return drawn;
+        };
+        NS_TEST_EXPECT_MSG_EQ(freshSends(50), 50u, "fresh draws are spine indices");
+
+        reps.OnAck(2, false, 0);
+        const uint16_t reused = reps.Choose(0);
+        NS_TEST_EXPECT_MSG_EQ(reused, SpineIdentification(2, 2), "an unmarked spine is reused");
+        NS_TEST_EXPECT_MSG_EQ(freshSends(20), 20u, "and only once");
+        reps.OnAck(3, true, 0);
+        NS_TEST_EXPECT_MSG_EQ(freshSends(20), 20u, "a marked spine is not cached");
+        Simulator::Destroy();
+    }
+};
+
 class SwitchQueueGradeTest : public TestCase
 {
   public:
@@ -11602,6 +11651,7 @@ PointToPointTestSuite::PointToPointTestSuite()
     AddTestCase(new SwitchQueueStateTest, TestCase::Duration::QUICK);
     AddTestCase(new SwitchQueueGradeTest, TestCase::Duration::QUICK);
     AddTestCase(new RepsOracleTest, TestCase::Duration::QUICK);
+    AddTestCase(new RepsSpineTest, TestCase::Duration::QUICK);
 }
 
 static PointToPointTestSuite g_pointToPointTestSuite; //!< The testsuite

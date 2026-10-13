@@ -189,6 +189,8 @@ enum class PathSelectorKind : uint32_t {
 	// Under SprayUniform: MRC over spines, leaving out the spines RepsHold's
 	// loss hold holds.
 	MrcHold,
+	// Under SprayUniform: REPS over spines, leaving out none.
+	RepsSpine,
 };
 
 // The queue pair's sends per trickle send onto one held spine that receives
@@ -910,6 +912,16 @@ private:
 	uint64_t m_nextReadNs;
 	std::vector<bool> m_faulted;
 	bool m_excluding;
+};
+
+// REPS (RepsSelector) over spines under SprayUniform: the cached values and
+// the fresh draws are spine indices, each sent as SpineIdentification(k, k).
+// Nothing is excluded, no sentinel is sent and no loss is counted.
+class RepsSpineSelector : public RepsSelector {
+public:
+	RepsSpineSelector(Ptr<UniformRandomVariable> random, uint32_t bufferSize,
+		uint64_t freezingTimeoutNs, uint32_t explorePackets, uint32_t spines);
+	uint16_t Choose(uint64_t nowNs) override;
 };
 
 // REPS (RepsSelector) over spines under SprayUniform, leaving out the spines

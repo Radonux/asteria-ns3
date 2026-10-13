@@ -1460,6 +1460,19 @@ bool FaultedSpines::Excludes(uint32_t spine) const{
 	return m_excluding && m_faulted[spine];
 }
 
+RepsSpineSelector::RepsSpineSelector(Ptr<UniformRandomVariable> random,
+		uint32_t bufferSize, uint64_t freezingTimeoutNs, uint32_t explorePackets,
+		uint32_t spines)
+	: RepsSelector(random, bufferSize, freezingTimeoutNs, explorePackets,
+		spines)
+{
+}
+
+uint16_t RepsSpineSelector::Choose(uint64_t nowNs){
+	const uint8_t spine = RepsSelector::Choose(nowNs);
+	return SpineIdentification(spine, spine);
+}
+
 RepsOracleSelector::RepsOracleSelector(Ptr<UniformRandomVariable> random,
 		uint32_t bufferSize, uint64_t freezingTimeoutNs, uint32_t explorePackets,
 		uint32_t spines, FaultedSpines &faulted)
