@@ -49,7 +49,7 @@ void OutstandingPackets::Reserve(uint64_t packet){
 }
 
 void OutstandingPackets::Add(uint64_t seq, uint32_t size, uint16_t path,
-		uint64_t sentNs){
+		uint64_t sentNs, bool trickle){
 	NS_ASSERT_MSG(m_packet_size != 0 && seq % m_packet_size == 0,
 		"a send record is indexed by its packet number");
 	const uint64_t packet = seq / m_packet_size;
@@ -63,7 +63,7 @@ void OutstandingPackets::Add(uint64_t seq, uint32_t size, uint16_t path,
 	const uint64_t olderOnPath = newestOnPath == m_newest_on_path.end()
 		? kNone : newestOnPath->second;
 	const bool resendsLost = m_lost.erase(packet) > 0;
-	record = {sentNs, size, path, true, resendsLost, m_newest, kNone,
+	record = {sentNs, size, path, true, resendsLost, trickle, m_newest, kNone,
 		olderOnPath, kNone};
 	if (m_newest != kNone)
 		At(m_newest).newer = packet;
@@ -115,6 +115,10 @@ uint16_t OutstandingPackets::Path(uint64_t packet) const{
 
 bool OutstandingPackets::ResendsLost(uint64_t packet) const{
 	return At(packet).resends_lost;
+}
+
+bool OutstandingPackets::Trickle(uint64_t packet) const{
+	return At(packet).trickle;
 }
 
 void OutstandingPackets::Remove(uint64_t packet){
@@ -399,6 +403,11 @@ uint64_t RdmaQueuePair::AcknowledgePacket(uint64_t seq, uint16_t path){
 			older != OutstandingPackets::kNone;
 			older = m_outstanding.OlderOnPath(packet))
 		lost += DeclareLost(older);
+	// The answer of a resend may be that of the send declared lost before
+	// it, so only a first send's answer is told as a trickle send's.
+	if (m_outstanding.Trickle(packet) && !m_outstanding.ResendsLost(packet))
+		m_pathSelector->OnTrickleAnswer(m_outstanding.Path(packet), false,
+			Simulator::Now().GetNanoSeconds());
 	m_outstanding.Remove(packet);
 	return lost;
 }
@@ -426,6 +435,9 @@ uint32_t RdmaQueuePair::DeclareLost(uint64_t packet){
 	const uint32_t size = m_outstanding.Size(packet);
 	m_pathSelector->OnLoss(m_outstanding.Path(packet),
 		Simulator::Now().GetNanoSeconds());
+	if (m_outstanding.Trickle(packet))
+		m_pathSelector->OnTrickleAnswer(m_outstanding.Path(packet), true,
+			Simulator::Now().GetNanoSeconds());
 	AddRepairRange(seq, seq + size);
 	m_outstanding.RemoveLost(packet);
 	m_recovery_events++;

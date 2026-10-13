@@ -599,6 +599,25 @@ TypeId RdmaHw::GetTypeId (void)
 				DoubleValue(0.001),
 				MakeDoubleAccessor(&RdmaHw::m_sprayHoldBeta),
 				MakeDoubleChecker<double>(0, 0.5))
+		.AddAttribute("SprayHoldRelease",
+				"Under PathSelector 6 and 7, how a spine leaves loss hold: "
+				"0=SprayLossHoldCleanSentinels clean sends of its sentinels, "
+				"one per SprayHeldSentinelIntervalNs; 1=its trickle sends, "
+				"SprayHoldTrickle of each queue pair's sends, whose clean "
+				"acknowledgements move the hold key's TrickleRelease to "
+				"ln(1 / SprayHoldAlpha). Default 0.",
+				UintegerValue(static_cast<uint32_t>(HoldRelease::Sentinels)),
+				MakeUintegerAccessor(&RdmaHw::m_sprayHoldRelease),
+				MakeUintegerChecker<uint32_t>(
+					static_cast<uint32_t>(HoldRelease::Sentinels),
+					static_cast<uint32_t>(HoldRelease::Trickle)))
+		.AddAttribute("SprayHoldTrickle",
+				"Under SprayHoldRelease 1, the fraction of each queue pair's "
+				"sends a held spine receives, one in its inverse rounded, in "
+				"(0, 0.5]. Default 0.01.",
+				DoubleValue(0.01),
+				MakeDoubleAccessor(&RdmaHw::m_sprayHoldTrickle),
+				MakeDoubleChecker<double>(0, 0.5))
 		.AddAttribute("SprayCandidates",
 				"Under LoadBalancing 3, the candidates drawn per packet, of which "
 				"the highest-scored is sent on. Default 1.",
@@ -935,14 +954,19 @@ void RdmaHw::Setup(QpCompleteCallback cb, QpFailureCallback failure_cb){
 		"for arrivals");
 	NS_ABORT_MSG_IF(!ValidRepsHold(),
 		"PathSelector 6 and 7 hold spines by their loss and need LoadBalancing 2, "
-		"SprayLossThreshold1-3, SprayLossIntervalNs and "
-		"SprayLossHoldCleanSentinels above zero and SprayHeldExploration "
-		"sentinel, and PathSelector 6 under SprayHoldScope 1 or 2 needs "
-		"SwitchQueueState for the hosts' leaves");
+		"SprayLossThreshold1-3, SprayLossIntervalNs above zero, "
+		"SprayLossHoldCleanSentinels above zero unless SprayHoldRelease is 1, "
+		"and SprayHeldExploration sentinel, and PathSelector 6 under "
+		"SprayHoldScope 1 or 2 needs SwitchQueueState for the hosts' leaves");
 	NS_ABORT_MSG_IF(!ValidHoldRule(),
 		"SprayHoldRule 1 is read only under PathSelector 6 and 7 and needs "
 		"0 <= SprayLossP0 < SprayLossP1 < 1 and SprayHoldAlpha and "
 		"SprayHoldBeta in (0, 0.5)");
+	NS_ABORT_MSG_IF(!ValidHoldRelease(),
+		"SprayHoldRelease 1 is read only under PathSelector 6 and 7, reads "
+		"neither SprayLossHoldCleanSentinels nor SprayHeldSentinelIntervalNs, "
+		"and needs SprayHoldTrickle in (0, 0.5], 0 <= SprayLossP0 < "
+		"SprayLossP1 < 1 and SprayHoldAlpha in (0, 0.5)");
 	NS_ABORT_MSG_IF(!ValidRepsOracle(),
 		"PathSelector 8 reads the spines' faults from SwitchQueueState and "
 		"needs LoadBalancing 2 and SprayGradeCostSource 1");
@@ -1358,7 +1382,7 @@ bool RdmaHw::ValidRepsHold() const{
 		(m_loadBalancing ==
 				static_cast<uint32_t>(LoadBalancingMode::SprayUniform) &&
 			m_sprayLossThreshold1 > 0 && m_sprayLossIntervalNs > 0 &&
-			m_sprayLossHoldCleanSentinels > 0 &&
+			(m_sprayLossHoldCleanSentinels > 0 || IsTrickleRelease()) &&
 			m_sprayHeldExploration == SpineScores::HeldExploration::Sentinel &&
 			((!IsLeafHold() && !IsAutoHold()) || m_switchQueues));
 }
@@ -1366,6 +1390,18 @@ bool RdmaHw::ValidRepsHold() const{
 bool RdmaHw::ValidHoldRule() const{
 	return m_sprayHoldRule == static_cast<uint32_t>(HoldRule::Count) ||
 		(IsRepsHold() && LossLikelihoodRatio::Valid(Likelihood()));
+}
+
+bool RdmaHw::IsTrickleRelease() const{
+	return m_sprayHoldRelease == static_cast<uint32_t>(HoldRelease::Trickle);
+}
+
+bool RdmaHw::ValidHoldRelease() const{
+	return !IsTrickleRelease() ||
+		(IsRepsHold() && m_sprayLossHoldCleanSentinels == 0 &&
+			m_sprayHeldSentinelIntervalNs == 0 && m_sprayHoldTrickle > 0 &&
+			m_sprayHoldTrickle <= 0.5 &&
+			LossLikelihoodRatio::Valid(Likelihood()));
 }
 
 LossLikelihoodRatio::Parameters RdmaHw::Likelihood() const{
@@ -1451,7 +1487,9 @@ SpineScores::Parameters RdmaHw::LossHoldParameters() const{
 	parameters.heldExploration = m_sprayHeldExploration;
 	parameters.sentinelIntervalNs = m_sprayHeldSentinelIntervalNs;
 	parameters.holdRule = static_cast<HoldRule>(m_sprayHoldRule);
-	if (parameters.holdRule == HoldRule::Llr)
+	parameters.holdRelease = static_cast<HoldRelease>(m_sprayHoldRelease);
+	parameters.trickleFraction = m_sprayHoldTrickle;
+	if (parameters.holdRule == HoldRule::Llr || IsTrickleRelease())
 		parameters.likelihood = Likelihood();
 	return parameters;
 }
@@ -2550,7 +2588,8 @@ Ptr<Packet> RdmaHw::GetNxtPacket(Ptr<RdmaQueuePair> qp){
 		ipHeader.SetIdentification(identification);
 		qp->m_outstanding.Add(seq, payload_size,
 			PathOf(static_cast<LoadBalancingMode>(m_loadBalancing), identification),
-			Simulator::Now().GetNanoSeconds());
+			Simulator::Now().GetNanoSeconds(),
+			qp->m_pathSelector->ChoseTrickle());
 		if (is_repair && qp->m_outstanding.RepairsAgain(seq))
 			qp->m_duplicate_repairs++;
 	}else{

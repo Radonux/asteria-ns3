@@ -7698,6 +7698,237 @@ class RepsHoldLlrTest : public TestCase
     }
 };
 
+class RepsHoldTrickleTest : public TestCase
+{
+  public:
+    RepsHoldTrickleTest()
+        : TestCase("Under SprayHoldRelease trickle a held spine receives one in round(1 / "
+                   "SprayHoldTrickle) of a flow's sends, the answers to them reach the hold "
+                   "through the send records, a lost one restarts R, and the expected number of "
+                   "clean acknowledgements releases the spine")
+    {
+    }
+
+    void DoRun() override
+    {
+        Validation();
+        Release();
+        AutoScope();
+        Simulator::Destroy();
+    }
+
+  private:
+    static constexpr uint32_t kSpines = LossHoldFixture::kSpines;
+    static constexpr uint64_t kInterval = LossHoldFixture::kInterval;
+    static constexpr uint32_t kSize = 1000;
+
+    // Count rule with thresholds that grade a lost fraction of 0.04 0, and
+    // the trickle release in place of the clean sentinels.
+    static Ptr<RdmaHw> Hw()
+    {
+        Ptr<RdmaHw> hw = LossHoldFixture::Hw();
+        hw->m_sprayLossThreshold1 = 0.01;
+        hw->m_sprayLossThreshold2 = 0.02;
+        hw->m_sprayLossThreshold3 = 0.04;
+        hw->m_sprayLossHoldCleanSentinels = 0;
+        hw->m_sprayHoldRelease = static_cast<uint32_t>(HoldRelease::Trickle);
+        return hw;
+    }
+
+    // ceil(ln(1 / alpha) / -ln(1 - p1)) with p0 zero and alpha 0.001.
+    static uint32_t ExpectedAcks(double p1)
+    {
+        return static_cast<uint32_t>(std::ceil(std::log(1000.0) / -std::log(1 - p1)));
+    }
+
+    // Twenty sends on spine 3 in interval 0, one of them declared lost: the
+    // interval's lost fraction 0.05 grades it 0.
+    template <typename Count, typename Lose>
+    static void Onset(Count count, Lose lose)
+    {
+        for (uint32_t i = 0; i < 20; ++i)
+        {
+            count(100 + i);
+        }
+        lose(200);
+    }
+
+    void Validation()
+    {
+        Ptr<RdmaHw> unset = CreateObject<RdmaHw>();
+        UintegerValue release;
+        unset->GetAttribute("SprayHoldRelease", release);
+        NS_TEST_EXPECT_MSG_EQ(release.Get(),
+                              static_cast<uint32_t>(HoldRelease::Sentinels),
+                              "SprayHoldRelease is sentinels by default");
+        DoubleValue trickle;
+        unset->GetAttribute("SprayHoldTrickle", trickle);
+        NS_TEST_EXPECT_MSG_EQ(trickle.Get(), 0.01, "SprayHoldTrickle is 0.01 by default");
+        NS_TEST_EXPECT_MSG_EQ(unset->ValidHoldRelease(), true, "sentinels need nothing");
+        NS_TEST_EXPECT_MSG_EQ(Hw()->ValidHoldRelease(), true, "trickle under reps_hold");
+        NS_TEST_EXPECT_MSG_EQ(Hw()->ValidRepsHold(), true, "without clean sentinels");
+        NS_TEST_EXPECT_MSG_EQ(TrickleEvery(0.01), 100u, "one in 100 sends");
+        const std::vector<std::pair<std::function<void(RdmaHw&)>, std::string>> refused = {
+            {[](RdmaHw& hw) {
+                 hw.m_pathSelectorKind = static_cast<uint32_t>(PathSelectorKind::Reps);
+             },
+             "not reps_hold"},
+            {[](RdmaHw& hw) { hw.m_sprayLossHoldCleanSentinels = 3; }, "clean sentinels set"},
+            {[](RdmaHw& hw) { hw.m_sprayHeldSentinelIntervalNs = 1000; },
+             "sentinel interval set"},
+            {[](RdmaHw& hw) { hw.m_sprayHoldTrickle = 0; }, "no trickle"},
+            {[](RdmaHw& hw) { hw.m_sprayLossP0 = hw.m_sprayLossP1; }, "p0 not below p1"},
+        };
+        for (const auto& [set, message] : refused)
+        {
+            Ptr<RdmaHw> hw = Hw();
+            set(*hw);
+            NS_TEST_EXPECT_MSG_EQ(hw->ValidHoldRelease(), false, "refused: " + message);
+        }
+        Ptr<RdmaHw> sentinels = Hw();
+        sentinels->m_sprayHoldRelease = static_cast<uint32_t>(HoldRelease::Sentinels);
+        NS_TEST_EXPECT_MSG_EQ(sentinels->ValidRepsHold(),
+                              false,
+                              "the sentinels' release needs clean sentinels");
+    }
+
+    // One flow of the host through its send records.
+    void Release()
+    {
+        Ptr<RdmaHw> hw = Hw();
+        SpineScores hold(kSpines, hw->LossHoldParameters());
+        Ptr<RdmaQueuePair> qp = CreateObject<RdmaQueuePair>(
+            3, Ipv4Address("11.0.1.1"), Ipv4Address("11.0.2.1"), 10000, 100);
+        qp->m_outstanding.SetPacketSize(kSize);
+        qp->m_pathSelector = std::make_unique<RepsHoldSelector>(SelectorStream(),
+                                                                8,
+                                                                1000000,
+                                                                20,
+                                                                kSpines,
+                                                                hold);
+        Onset([&](uint64_t now) { hold.CountIntervalSend(3, now); },
+              [&](uint64_t now) { hold.CountIntervalLoss(3, now); });
+
+        uint64_t now = kInterval;
+        uint64_t seq = 0;
+        // One send at now, answered at once: acknowledged, or declared lost.
+        auto send = [&](bool lose) {
+            const uint16_t identification = qp->m_pathSelector->Choose(now);
+            const uint8_t spine = RequestedSpine(identification);
+            const bool trickle = qp->m_pathSelector->ChoseTrickle();
+            qp->m_outstanding.Add(seq, kSize, spine, now, trickle);
+            if (lose)
+            {
+                qp->DeclareLostSentBy(now);
+            }
+            else
+            {
+                qp->m_pathSelector->OnAck(spine, false, now);
+                qp->AcknowledgePacket(seq, spine);
+            }
+            seq += kSize;
+            qp->m_outstanding.RemoveBelow(seq);
+            now += 10;
+            NS_TEST_EXPECT_MSG_EQ((!trickle || spine == 3), true, "a trickle send is on 3");
+            return std::make_pair(spine, trickle);
+        };
+
+        // 1000 sends: spine 3 is held from the first, and is sent exactly
+        // the 100th, 200th, ... of them, each a trickle send.
+        uint32_t onSpine3 = 0;
+        bool everyHundredth = true;
+        for (uint32_t i = 1; i <= 1000; ++i)
+        {
+            const auto [spine, trickle] = send(false);
+            if (spine == 3)
+            {
+                onSpine3++;
+                everyHundredth &= trickle && i % 100 == 0;
+            }
+        }
+        NS_TEST_EXPECT_MSG_EQ(hold.Holds(3), true, "the interval's losses hold spine 3");
+        NS_TEST_EXPECT_MSG_EQ(onSpine3, 10u, "one in 100 of the flow's sends");
+        NS_TEST_EXPECT_MSG_EQ(everyHundredth, true, "every 100th, each a trickle send");
+        const double p1 = 0.05;
+        const double step = -std::log(1 - p1);
+        NS_TEST_EXPECT_MSG_EQ_TOL(hold.ReleaseP1(3), p1, 1e-12, "p1 is the interval's 1 / 20");
+        NS_TEST_EXPECT_MSG_EQ_TOL(hold.ReleaseValue(3),
+                                  10 * step,
+                                  1e-9,
+                                  "ten clean trickle acknowledgements");
+
+        // The next trickle send, the 1100th, is lost: R restarts.
+        for (uint32_t i = 1001; i < 1100; ++i)
+        {
+            send(false);
+        }
+        const auto [lostSpine, lostTrickle] = send(true);
+        NS_TEST_EXPECT_MSG_EQ(static_cast<uint32_t>(lostSpine), 3u, "the 1100th is on 3");
+        NS_TEST_EXPECT_MSG_EQ(lostTrickle, true, "a trickle send");
+        NS_TEST_EXPECT_MSG_EQ(hold.ReleaseValue(3), 0.0, "whose loss restarts R");
+        NS_TEST_EXPECT_MSG_EQ(hold.Holds(3), true, "and keeps the hold");
+
+        // ceil(ln(1000) / -ln(0.95)) = 135 clean trickle acknowledgements
+        // release it.
+        const uint32_t expected = ExpectedAcks(p1);
+        NS_TEST_EXPECT_MSG_EQ(expected, 135u, "135 clean trickle acknowledgements");
+        uint32_t acks = 0;
+        while (hold.Holds(3) && acks <= expected)
+        {
+            if (send(false).second)
+            {
+                acks++;
+            }
+        }
+        NS_TEST_EXPECT_MSG_EQ(acks, expected, "released at the expected acknowledgement");
+        NS_TEST_EXPECT_MSG_EQ(hold.Holds(3), false, "spine 3 is released");
+        NS_TEST_EXPECT_MSG_GT_OR_EQ(hold.ReleaseValue(3), std::log(1000.0), "R reached ln(1000)");
+        uint32_t chosen = 0;
+        for (uint32_t i = 0; i < 400; ++i)
+        {
+            const auto [spine, trickle] = send(false);
+            chosen += spine == 3 && !trickle;
+        }
+        NS_TEST_EXPECT_MSG_GT(chosen, 0u, "REPS chooses spine 3 again");
+    }
+
+    // Under auto a leaf-scope hold records its interval's rate and releases
+    // by the same count; a host-scope hold that ends it records the larger.
+    void AutoScope()
+    {
+        Ptr<RdmaHw> hw = Hw();
+        AutoLossHold hold(kSpines, hw->LossHoldParameters(), 2);
+        hold.AddLeaf(0);
+        hold.AddLeaf(1);
+        NS_TEST_EXPECT_MSG_EQ(hold.TrickleEvery(), 100u, "one in 100 sends");
+        Onset([&](uint64_t now) { hold.CountSend(0, 3, now); },
+              [&](uint64_t now) { hold.CountLoss(0, 3, now); });
+        uint8_t spine;
+        NS_TEST_EXPECT_MSG_EQ(hold.TakeSentinel(0, kInterval, spine), false, "no sentinel");
+        NS_TEST_EXPECT_MSG_EQ(hold.Holds(0, 3), true, "held toward leaf 0");
+        NS_TEST_EXPECT_MSG_EQ_TOL(hold.ReleaseP1(0, 3), 0.05, 1e-12, "on the interval's rate");
+        const uint32_t expected = ExpectedAcks(0.05);
+        for (uint32_t i = 1; i < expected; ++i)
+        {
+            hold.TrickleAnswer(0, 3, false, kInterval + i);
+        }
+        NS_TEST_EXPECT_MSG_EQ(hold.Holds(0, 3), true, "one acknowledgement short");
+        hold.TrickleAnswer(0, 3, false, 2 * kInterval - 1);
+        NS_TEST_EXPECT_MSG_EQ(hold.Holds(0, 3), false, "released");
+        NS_TEST_EXPECT_MSG_EQ(hold.LossLeaves(3), 0u, "clearing its leaves");
+
+        // Held again toward leaf 0 at 0.05; a loss toward leaf 1 widens it.
+        Onset([&](uint64_t now) { hold.CountSend(0, 3, 2 * kInterval + now); },
+              [&](uint64_t now) { hold.CountLoss(0, 3, 2 * kInterval + now); });
+        hold.TakeSentinel(0, 3 * kInterval, spine);
+        NS_TEST_EXPECT_MSG_EQ(hold.Holds(0, 3), true, "held toward leaf 0 again");
+        hold.CountSend(1, 3, 3 * kInterval + 10);
+        hold.CountLoss(1, 3, 3 * kInterval + 20);
+        NS_TEST_EXPECT_MSG_EQ(hold.HostHolds(3), true, "widened");
+        NS_TEST_EXPECT_MSG_EQ_TOL(hold.ReleaseP1(1, 3), 0.05, 1e-12, "keeping leaf 0's p1");
+    }
+};
+
 class SprayPolicyTransportTest : public TestCase
 {
   public:
@@ -9463,6 +9694,7 @@ PointToPointTestSuite::PointToPointTestSuite()
     AddTestCase(new RepsHoldScopeTest, TestCase::Duration::QUICK);
     AddTestCase(new RepsHoldAutoScopeTest, TestCase::Duration::QUICK);
     AddTestCase(new RepsHoldLlrTest, TestCase::Duration::QUICK);
+    AddTestCase(new RepsHoldTrickleTest, TestCase::Duration::QUICK);
     AddTestCase(new SprayPolicyTransportTest, TestCase::Duration::QUICK);
     AddTestCase(new NsccReceiverPenaltyTest, TestCase::Duration::QUICK);
     AddTestCase(new SprayPolicyDefaultsTest, TestCase::Duration::QUICK);

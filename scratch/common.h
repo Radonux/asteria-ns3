@@ -167,9 +167,10 @@ bool spray_hold_auto_leaves_given = false;
 // count holds it, and a send adds 0. Under llr SPRAY_LOSS_THRESHOLDS grade
 // the intervals SPINE_LOSS_OUTPUT_FILE writes but hold nothing, and the
 // release is unchanged. Under auto the leaves with a loss on a spine still
-// choose the scope of the hold the test starts. The test's keys are read
-// only under llr; 0 <= SPRAY_LOSS_P0 < SPRAY_LOSS_P1 < 1, and SPRAY_HOLD_ALPHA
-// and SPRAY_HOLD_BETA are in (0, 0.5).
+// choose the scope of the hold the test starts. SPRAY_HOLD_BETA is read only
+// under llr, and SPRAY_LOSS_P0, SPRAY_LOSS_P1 and SPRAY_HOLD_ALPHA only under
+// llr or SPRAY_HOLD_RELEASE trickle; 0 <= SPRAY_LOSS_P0 < SPRAY_LOSS_P1 < 1,
+// and SPRAY_HOLD_ALPHA and SPRAY_HOLD_BETA are in (0, 0.5).
 std::string spray_hold_rule = "count";
 bool spray_hold_rule_given = false;
 double spray_loss_p0 = 0;
@@ -177,6 +178,27 @@ double spray_loss_p1 = 0.001;
 double spray_hold_alpha = 0.001;
 double spray_hold_beta = 0.001;
 std::set<std::string> hold_test_keys_given;
+// Under reps_hold and reps_flow_hold, how a held key is released.
+// sentinels: SPRAY_LOSS_HOLD_CLEAN_SENTINELS clean sends of the sentinels
+// sent one per SPRAY_HELD_SENTINEL_INTERVAL_NS. trickle: each queue pair
+// sends each spine its hold holds one in round(1 / SPRAY_HOLD_TRICKLE) of its
+// sends, by a counter per queue pair and not a draw, in place of the
+// sentinels; these trickle sends are what SPRAY_HELD_EXPLORATION sentinel
+// names under trickle, and it is still required. At a hold's start its key
+// records p1, the lost fraction of the hold's evidence, the loss interval
+// that graded it 0 under count and the sends since the test's L was last
+// clamped at 0 under llr, at least SPRAY_LOSS_P1. A release statistic R per
+// hold key starts at 0, each trickle send acknowledged adds
+// ln((1 - p0) / (1 - p1)), -ln(1 - p1) with SPRAY_LOSS_P0 0, a trickle send
+// declared lost restarts it at 0, and the key is released once R reaches
+// ln(1 / SPRAY_HOLD_ALPHA). Under auto a host-scope hold records the larger
+// of its evidence's p1 and that of the leaf-scope holds it ends. Under
+// trickle SPRAY_LOSS_HOLD_CLEAN_SENTINELS and SPRAY_HELD_SENTINEL_INTERVAL_NS
+// are refused, and SPRAY_HOLD_TRICKLE, in (0, 0.5], is read only under it.
+std::string spray_hold_release = "sentinels";
+bool spray_hold_release_given = false;
+double spray_hold_trickle = 0.01;
+bool spray_hold_trickle_given = false;
 uint32_t reps_buffer_size = 8;
 uint64_t reps_freezing_timeout_ns = 10000000;
 uint32_t ue_ev_set_size = 256;
@@ -818,6 +840,14 @@ uint32_t spray_hold_rule_value() {
     return static_cast<uint32_t>(HoldRule::Count);
   if (spray_hold_rule == "llr")
     return static_cast<uint32_t>(HoldRule::Llr);
+  return std::numeric_limits<uint32_t>::max();
+}
+
+uint32_t spray_hold_release_value() {
+  if (spray_hold_release == "sentinels")
+    return static_cast<uint32_t>(HoldRelease::Sentinels);
+  if (spray_hold_release == "trickle")
+    return static_cast<uint32_t>(HoldRelease::Trickle);
   return std::numeric_limits<uint32_t>::max();
 }
 
@@ -1594,12 +1624,32 @@ bool valid_ack_redirect() {
 // within the ranges its RdmaHw attributes take, and the sentinels that end
 // a hold sent.
 bool valid_loss_hold() {
+  // Under trickle the trickle sends' answers release a hold, and the
+  // sentinels' keys are read by nothing.
+  const bool trickle = spray_hold_release == "trickle";
+  if (trickle) {
+    for (const char *key : {"SPRAY_LOSS_HOLD_CLEAN_SENTINELS",
+                            "SPRAY_HELD_SENTINEL_INTERVAL_NS"}) {
+      if (spray_policy_keys_given.count(key) > 0) {
+        std::cerr << key << " is read only under SPRAY_HOLD_RELEASE "
+                            "sentinels\n";
+        return false;
+      }
+    }
+  }
   for (const std::string &key : loss_hold_required_keys) {
+    if (trickle && key == "SPRAY_LOSS_HOLD_CLEAN_SENTINELS")
+      continue;
     if (spray_policy_keys_given.count(key) == 0) {
       std::cerr << "PATH_SELECTOR " << path_selector
-                << " requires SPRAY_LOSS_THRESHOLDS, SPRAY_LOSS_INTERVAL_NS, "
-                   "SPRAY_LOSS_HOLD_CLEAN_SENTINELS and "
-                   "SPRAY_HELD_EXPLORATION\n";
+                << (trickle
+                        ? " requires SPRAY_LOSS_THRESHOLDS, "
+                          "SPRAY_LOSS_INTERVAL_NS and SPRAY_HELD_EXPLORATION "
+                          "under SPRAY_HOLD_RELEASE trickle\n"
+                        : " requires SPRAY_LOSS_THRESHOLDS, "
+                          "SPRAY_LOSS_INTERVAL_NS, "
+                          "SPRAY_LOSS_HOLD_CLEAN_SENTINELS and "
+                          "SPRAY_HELD_EXPLORATION\n");
       return false;
     }
   }
@@ -1613,14 +1663,14 @@ bool valid_loss_hold() {
               << path_selector << "\n";
     return false;
   }
-  if (spray_loss_hold_clean_sentinels == 0) {
+  if (!trickle && spray_loss_hold_clean_sentinels == 0) {
     std::cerr << "SPRAY_LOSS_HOLD_CLEAN_SENTINELS must be positive under "
                  "PATH_SELECTOR "
               << path_selector << "\n";
     return false;
   }
   // A held spine is left out of every choice, so only its sentinels' clean
-  // sends can end the hold.
+  // sends, or under trickle its trickle sends' answers, can end the hold.
   if (spray_held_exploration != "sentinel") {
     std::cerr << "PATH_SELECTOR " << path_selector
               << " requires SPRAY_HELD_EXPLORATION sentinel\n";
@@ -1642,13 +1692,38 @@ bool valid_hold_rule() {
     std::cerr << "SPRAY_HOLD_RULE must be count or llr\n";
     return false;
   }
+  if (spray_hold_release_given && !reps_hold()) {
+    std::cerr << "SPRAY_HOLD_RELEASE is read only under PATH_SELECTOR "
+                 "reps_hold or reps_flow_hold\n";
+    return false;
+  }
+  if (spray_hold_release_value() == std::numeric_limits<uint32_t>::max()) {
+    std::cerr << "SPRAY_HOLD_RELEASE must be sentinels or trickle\n";
+    return false;
+  }
+  const bool llr = reps_hold() && spray_hold_rule == "llr";
+  const bool trickle = reps_hold() && spray_hold_release == "trickle";
+  if (spray_hold_trickle_given && !trickle) {
+    std::cerr << "SPRAY_HOLD_TRICKLE is read only under SPRAY_HOLD_RELEASE "
+                 "trickle\n";
+    return false;
+  }
+  if (trickle && !(spray_hold_trickle > 0 && spray_hold_trickle <= 0.5)) {
+    std::cerr << "SPRAY_HOLD_TRICKLE must be in (0, 0.5]\n";
+    return false;
+  }
   for (const std::string &key : hold_test_keys_given) {
-    if (!reps_hold() || spray_hold_rule != "llr") {
+    if (key == "SPRAY_HOLD_BETA" && !llr) {
       std::cerr << key << " is read only under SPRAY_HOLD_RULE llr\n";
       return false;
     }
+    if (!llr && !trickle) {
+      std::cerr << key << " is read only under SPRAY_HOLD_RULE llr or "
+                          "SPRAY_HOLD_RELEASE trickle\n";
+      return false;
+    }
   }
-  if (spray_hold_rule != "llr")
+  if (!llr && !trickle)
     return true;
   if (!(spray_loss_p1 < 1)) {
     std::cerr << "SPRAY_LOSS_P1 must be below 1\n";
@@ -1662,7 +1737,7 @@ bool valid_hold_rule() {
     std::cerr << "SPRAY_HOLD_ALPHA must be in (0, 0.5)\n";
     return false;
   }
-  if (!(spray_hold_beta > 0 && spray_hold_beta < 0.5)) {
+  if (llr && !(spray_hold_beta > 0 && spray_hold_beta < 0.5)) {
     std::cerr << "SPRAY_HOLD_BETA must be in (0, 0.5)\n";
     return false;
   }
@@ -1897,6 +1972,12 @@ bool ReadConf(string network_configuration) {
     } else if (key.compare("SPRAY_HOLD_RULE") == 0) {
       conf >> spray_hold_rule;
       spray_hold_rule_given = true;
+    } else if (key.compare("SPRAY_HOLD_RELEASE") == 0) {
+      conf >> spray_hold_release;
+      spray_hold_release_given = true;
+    } else if (key.compare("SPRAY_HOLD_TRICKLE") == 0) {
+      conf >> spray_hold_trickle;
+      spray_hold_trickle_given = true;
     } else if (key.compare("SPRAY_LOSS_P0") == 0) {
       conf >> spray_loss_p0;
       hold_test_keys_given.insert(key);
@@ -2827,6 +2908,9 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),
       rdmaHw->SetAttribute("SprayLossP1", DoubleValue(spray_loss_p1));
       rdmaHw->SetAttribute("SprayHoldAlpha", DoubleValue(spray_hold_alpha));
       rdmaHw->SetAttribute("SprayHoldBeta", DoubleValue(spray_hold_beta));
+      rdmaHw->SetAttribute("SprayHoldRelease",
+                           UintegerValue(spray_hold_release_value()));
+      rdmaHw->SetAttribute("SprayHoldTrickle", DoubleValue(spray_hold_trickle));
       rdmaHw->SetAttribute("UeEvSetSize", UintegerValue(ue_ev_set_size));
       rdmaHw->SetAttribute("UeSaturationFraction",
                            DoubleValue(ue_saturation_fraction));

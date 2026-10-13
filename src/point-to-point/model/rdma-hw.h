@@ -230,6 +230,14 @@ public:
 	double m_sprayLossP0, m_sprayLossP1, m_sprayHoldAlpha, m_sprayHoldBeta;
 	bool ValidHoldRule() const;
 	LossLikelihoodRatio::Parameters Likelihood() const;
+	// HoldRelease of PathSelector RepsHold and RepsFlowHold and its trickle
+	// fraction; whether Trickle is set only under them, without the keys of
+	// the sentinels' release, with a fraction in (0, 0.5] and the p0, p1 and
+	// alpha TrickleRelease reads valid.
+	uint32_t m_sprayHoldRelease;
+	double m_sprayHoldTrickle;
+	bool IsTrickleRelease() const;
+	bool ValidHoldRelease() const;
 	// HoldScope of PathSelector RepsHold. Under Leaf the queue pairs to the
 	// hosts of one leaf, which m_switchQueues names, share that leaf's loss
 	// hold in m_leafHolds, made at the first of them; under Host every queue

@@ -37,8 +37,11 @@ public:
 	void SetPacketSize(uint32_t size);
 	bool IsKept() const;
 	// Every sequence is a multiple of the packet size, and a packet is resent
-	// only after its previous send has been removed.
-	void Add(uint64_t seq, uint32_t size, uint16_t path, uint64_t sentNs);
+	// only after its previous send has been removed. trickle marks a trickle
+	// send of a loss hold (PathSelector::ChoseTrickle), whose answer is told
+	// to PathSelector::OnTrickleAnswer.
+	void Add(uint64_t seq, uint32_t size, uint16_t path, uint64_t sentNs,
+		bool trickle = false);
 	// The packet number of the outstanding send of seq along path, or kNone.
 	uint64_t Find(uint64_t seq, uint16_t path) const;
 	uint64_t Oldest() const;
@@ -51,6 +54,7 @@ public:
 	// lost. A send declared lost may still arrive, and the answer to it would
 	// name the resend's record.
 	bool ResendsLost(uint64_t packet) const;
+	bool Trickle(uint64_t packet) const;
 	void Remove(uint64_t packet);
 	// Remove the record of a send declared lost.
 	void RemoveLost(uint64_t packet);
@@ -68,6 +72,7 @@ private:
 		uint16_t path;
 		bool outstanding;
 		bool resends_lost;
+		bool trickle;
 		// Neighbouring outstanding sends as packet numbers, kNone at either
 		// end: across every path, then along this record's path.
 		uint64_t older, newer;
