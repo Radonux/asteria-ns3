@@ -42,6 +42,9 @@ enum class PathSelectorKind : uint32_t {
 	// Under SprayUniform: REPS over spines, leaving out the spines the
 	// switches' state shows a fault on toward the destination's leaf.
 	RepsOracle,
+	// Under SprayUniform: MRC over spines, leaving out the spines RepsHold's
+	// loss hold holds.
+	MrcHold,
 };
 
 // A queue pair's choice of the path each of its data packets takes, and what
@@ -707,6 +710,11 @@ public:
 	bool TakeProbe(uint64_t nowNs, uint16_t &path) override;
 	void OnProbeAnswer(uint16_t path, bool marked, uint64_t nowNs) override;
 
+protected:
+	// A value Excluded names is passed over as if it were not in the set: its
+	// state is neither read nor moved. Excluded must leave some value in.
+	virtual bool Excluded(uint16_t path) const;
+
 private:
 	enum class State : uint8_t { Good, Skip, AssumedBad };
 	struct Entropy {
@@ -725,6 +733,40 @@ private:
 	std::deque<std::pair<uint16_t, uint64_t>> m_probes;
 	uint64_t m_skipNs;
 	uint64_t m_probeIntervalNs;
+};
+
+// MRC (MrcSelector) over spines under SprayUniform, its set the spine
+// indices, with RepsHold's loss hold: the spines the hold holds toward the
+// queue pair's destination are left out of MRC's choices unless it holds
+// every spine, its sentinels are sent in place of MRC's choice, and every
+// send and every send declared lost is counted in it, as RepsHoldSelector
+// and RepsAutoHoldSelector do. The hold is SpineScores, the host's or the
+// destination leaf's, or the host's AutoLossHold toward the destination leaf.
+// A declared loss moves MRC's state too, and MRC's probes name spines.
+class MrcHoldSelector : public MrcSelector {
+public:
+	MrcHoldSelector(Ptr<UniformRandomVariable> random, uint32_t spines,
+		uint64_t skipNs, uint64_t probeIntervalNs, SpineScores &hold);
+	MrcHoldSelector(Ptr<UniformRandomVariable> random, uint32_t spines,
+		uint64_t skipNs, uint64_t probeIntervalNs, AutoLossHold &hold,
+		uint32_t leaf);
+	uint16_t Choose(uint64_t nowNs) override;
+	void OnLoss(uint16_t path, uint64_t nowNs) override;
+	bool TakeProbe(uint64_t nowNs, uint16_t &path) override;
+
+protected:
+	bool Excluded(uint16_t path) const override;
+
+private:
+	bool Holds(uint32_t spine) const;
+	bool HoldsEvery() const;
+
+	// One of the two is set.
+	SpineScores *m_hold;
+	AutoLossHold *m_autoHold;
+	uint32_t m_leaf;
+	// Whether the hold leaves a spine out, set before each choice.
+	bool m_excluding;
 };
 
 } /* namespace ns3 */

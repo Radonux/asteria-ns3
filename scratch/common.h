@@ -126,14 +126,21 @@ std::string load_balancing = "ecmp";
 // spines the host's loss hold holds; reps_flow_hold keeps a loss hold per
 // queue pair instead. reps_oracle is REPS over spines leaving out for good
 // the spines the switches' state shows a fault on toward the destination's
-// leaf, read under SPRAY_GRADE_COST_SOURCE switch_queue.
+// leaf, read under SPRAY_GRADE_COST_SOURCE switch_queue. mrc_hold is MRC over
+// spines, leaving out the spines reps_hold's loss hold holds, at the same
+// SPRAY_HOLD_SCOPE; reps_hold() holds for it too.
 std::string path_selector = "ops";
 bool reps_hold() {
-  return path_selector == "reps_hold" || path_selector == "reps_flow_hold";
+  return path_selector == "reps_hold" || path_selector == "reps_flow_hold" ||
+         path_selector == "mrc_hold";
 }
-// Under reps_hold, what one loss hold is kept for: host, every destination of
-// the host, leaf, the destinations on one leaf, or auto, per spine either of
-// the two. Under auto the host counts each spine's sends and losses per
+// Whether SPRAY_HOLD_SCOPE is read: reps_hold and mrc_hold.
+bool hold_scope_read() {
+  return path_selector == "reps_hold" || path_selector == "mrc_hold";
+}
+// Under reps_hold and mrc_hold, what one loss hold is kept for: host, every
+// destination of the host, leaf, the destinations on one leaf, or auto, per
+// spine either of the two. Under auto the host counts each spine's sends and losses per
 // destination leaf and keeps the destination leaves with a loss on it since
 // it was last released. A spine graded 0 toward a leaf is held for every
 // destination when at least SPRAY_HOLD_AUTO_LEAVES leaves have a loss on it,
@@ -171,8 +178,8 @@ const std::map<std::string, std::set<std::string>> path_selector_parameter_owner
     {"UE_EV_SET_SIZE", {"ue_oblivious", "ue_aware"}},
     {"UE_SATURATION_FRACTION", {"ue_aware"}},
     {"MRC_EV_SET_SIZE", {"mrc"}},
-    {"MRC_SKIP_BASE_RTTS", {"mrc"}},
-    {"MRC_PROBE_TIMEOUTS", {"mrc"}},
+    {"MRC_SKIP_BASE_RTTS", {"mrc", "mrc_hold"}},
+    {"MRC_PROBE_TIMEOUTS", {"mrc", "mrc_hold"}},
     {"ACK_REDIRECT_OMEGA", {"ack_redirect"}},
     {"ACK_REDIRECT_FLAG", {"ack_redirect"}},
     {"ACK_REDIRECT_VALIDITY_BASE_RTTS", {"ack_redirect"}},
@@ -763,6 +770,8 @@ uint32_t path_selector_value() {
     return static_cast<uint32_t>(PathSelectorKind::RepsFlowHold);
   if (path_selector == "reps_oracle")
     return static_cast<uint32_t>(PathSelectorKind::RepsOracle);
+  if (path_selector == "mrc_hold")
+    return static_cast<uint32_t>(PathSelectorKind::MrcHold);
   return std::numeric_limits<uint32_t>::max();
 }
 
@@ -796,10 +805,10 @@ uint32_t spray_hold_scope_value() {
   return std::numeric_limits<uint32_t>::max();
 }
 
-// Under reps_hold, whether a loss hold is kept per destination leaf, under
-// leaf or auto, which needs the hosts' leaves.
+// Under reps_hold and mrc_hold, whether a loss hold is kept per destination
+// leaf, under leaf or auto, which needs the hosts' leaves.
 bool leaf_hold() {
-  return path_selector == "reps_hold" &&
+  return hold_scope_read() &&
          (spray_hold_scope == "leaf" || spray_hold_scope == "auto");
 }
 
@@ -1555,9 +1564,9 @@ bool valid_ack_redirect() {
   return true;
 }
 
-// The loss hold of PATH_SELECTOR reps_hold: every key it requires given,
-// within the ranges its RdmaHw attributes take, and the sentinels that end
-// a hold sent.
+// The loss hold of PATH_SELECTOR reps_hold and mrc_hold: every key it
+// requires given, within the ranges its RdmaHw attributes take, and the
+// sentinels that end a hold sent.
 bool valid_loss_hold() {
   for (const std::string &key : loss_hold_required_keys) {
     if (spray_policy_keys_given.count(key) == 0) {
@@ -2147,9 +2156,10 @@ bool ReadConf(string network_configuration) {
                     : key == "SPRAY_GRADE_COST_SOURCE"
                         ? " or PATH_SELECTOR reps_oracle\n"
                     : key == "SPINE_LOSS_OUTPUT_FILE"
-                        ? " or PATH_SELECTOR reps_hold\n"
+                        ? " or PATH_SELECTOR reps_hold or mrc_hold\n"
                     : loss_hold_keys.count(key) > 0
-                        ? " or PATH_SELECTOR reps_hold or reps_flow_hold\n"
+                        ? " or PATH_SELECTOR reps_hold, reps_flow_hold or "
+                          "mrc_hold\n"
                         : "\n");
       return false;
     }
@@ -2162,7 +2172,8 @@ bool ReadConf(string network_configuration) {
     return false;
   if (path_selector_value() == std::numeric_limits<uint32_t>::max()) {
     std::cerr << "PATH_SELECTOR must be ops, reps, ue_oblivious, ue_aware, mrc, "
-                 "ack_redirect, reps_hold, reps_flow_hold or reps_oracle\n";
+                 "ack_redirect, reps_hold, reps_flow_hold, reps_oracle or "
+                 "mrc_hold\n";
     return false;
   }
   if (reps_hold()) {
@@ -2186,9 +2197,9 @@ bool ReadConf(string network_configuration) {
       return false;
     }
   }
-  if (spray_hold_scope_given && path_selector != "reps_hold") {
+  if (spray_hold_scope_given && !hold_scope_read()) {
     std::cerr << "SPRAY_HOLD_SCOPE is read only under PATH_SELECTOR "
-                 "reps_hold\n";
+                 "reps_hold or mrc_hold\n";
     return false;
   }
   if (spray_hold_scope_value() == std::numeric_limits<uint32_t>::max()) {
@@ -2196,9 +2207,9 @@ bool ReadConf(string network_configuration) {
     return false;
   }
   if (spray_hold_auto_leaves_given &&
-      (path_selector != "reps_hold" || spray_hold_scope != "auto")) {
+      (!hold_scope_read() || spray_hold_scope != "auto")) {
     std::cerr << "SPRAY_HOLD_AUTO_LEAVES is read only under PATH_SELECTOR "
-                 "reps_hold with SPRAY_HOLD_SCOPE auto\n";
+                 "reps_hold or mrc_hold with SPRAY_HOLD_SCOPE auto\n";
     return false;
   }
   if (spray_hold_auto_leaves < 2) {
