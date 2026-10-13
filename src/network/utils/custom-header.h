@@ -176,6 +176,10 @@ public:
 		  // none. On the wire, after the report, only while ackRedirectBytes
 		  // is not zero.
 		  uint8_t redirect;
+		  // The spines the receiving host holds for the sender's leaf, bit k
+		  // for spine k. On the wire, after the redirect field, only while
+		  // ackReceiverHoldBytes is not zero.
+		  uint8_t receiver_hold;
 		  IntHeader ih;
 	  } ack;
 	  // PauseHeader
@@ -199,6 +203,9 @@ public:
   // Whether data headers carry udp.path_seq. Process-wide for the same
   // reason.
   static bool udpCarriesPathSeq;
+  // How many bytes the receiver_hold field takes, zero or one. Process-wide
+  // for the same reason.
+  static uint32_t ackReceiverHoldBytes;
 
   uint8_t GetIpv4EcnBits (void) const;
   uint8_t GetIpv4Dscp (void) const;

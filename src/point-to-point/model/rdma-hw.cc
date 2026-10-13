@@ -571,6 +571,23 @@ TypeId RdmaHw::GetTypeId (void)
 				BooleanValue(false),
 				MakeBooleanAccessor(&RdmaHw::m_sprayPathSeq),
 				MakeBooleanChecker())
+		.AddAttribute("SprayReceiverHold",
+				"Under PathSelector 6 and 7 with SprayPathSeq, whether the "
+				"receiver holds spines by the packets missing on them per "
+				"sender leaf (ReceiverHold) and reports them in every "
+				"acknowledgement, whose senders hold them toward its leaf. "
+				"Needs SwitchQueueState for the hosts' leaves, at most 8 "
+				"spines and CustomHeader::ackReceiverHoldBytes 1. Default "
+				"false.",
+				BooleanValue(false),
+				MakeBooleanAccessor(&RdmaHw::m_sprayReceiverHold),
+				MakeBooleanChecker())
+		.AddAttribute("SprayReceiverHoldClean",
+				"Under SprayReceiverHold, the consecutive arrivals without a "
+				"missing packet on a held spine that release it. Default 1024.",
+				UintegerValue(1024),
+				MakeUintegerAccessor(&RdmaHw::m_sprayReceiverHoldClean),
+				MakeUintegerChecker<uint32_t>(1))
 		.AddAttribute("SprayCandidates",
 				"Under LoadBalancing 3, the candidates drawn per packet, of which "
 				"the highest-scored is sent on. Default 1.",
@@ -915,6 +932,11 @@ void RdmaHw::Setup(QpCompleteCallback cb, QpFailureCallback failure_cb){
 		"SprayPathSeq is read only under PathSelector 6 and 7, and data "
 		"headers carry the path sequence exactly when it is set "
 		"(CustomHeader::udpCarriesPathSeq)");
+	NS_ABORT_MSG_IF(!ValidReceiverHold(),
+		"SprayReceiverHold needs SprayPathSeq, PathSelector 6 or 7, "
+		"SwitchQueueState for the hosts' leaves and at most 8 spines, and "
+		"acknowledgements carry the receiver_hold field exactly when it is "
+		"set (CustomHeader::ackReceiverHoldBytes)");
 	NS_ABORT_MSG_IF(!ValidRepsOracle(),
 		"PathSelector 8 reads the spines' faults from SwitchQueueState and "
 		"needs LoadBalancing 2 and SprayGradeCostSource 1");
@@ -1033,6 +1055,8 @@ void RdmaHw::AddQueuePair(uint32_t src, uint32_t dest, uint64_t tag, uint64_t si
 	m_qpMap[key] = qp;
 	if (IsPathPerPacket())
 		StartPathSelection(qp, win, baseRtt);
+	if (IsReceiverHold())
+		AttachReceiverHold(qp);
 	// The liveness invariant starts at birth: an unfinished QP always has a
 	// pending timer, even if its first send never gets scheduled.
 	ArmRetransmissionTimeout(qp);
@@ -1585,6 +1609,7 @@ void RdmaHw::SendAck(Ptr<RdmaRxQueuePair> q, uint32_t sourceIp,
 	if (IsSprayPolicy())
 		seqh.SetSpineReport(ReportFor(q, destinationIp));
 	seqh.SetRedirect(redirect);
+	seqh.SetReceiverHold(ReceiverHoldBitmap(destinationIp));
 	// The grant is this flag without the report above. A receiver that may not
 	// forgive this flow, or a step that is critical, never sets it, so those
 	// senders obey their controller throughout.
@@ -1690,6 +1715,9 @@ int RdmaHw::ReceiveAck(Ptr<Packet> p, CustomHeader &ch){
 			const uint64_t now = Simulator::Now().GetNanoSeconds();
 			if (IsSprayPolicy())
 				qp->m_pathSelector->OnReport(ReportOf(ch), now);
+			if (IsReceiverHold())
+				qp->m_pathSelector->OnReceiverHold(ch.sip, ch.ack.receiver_hold,
+					now);
 			if ((ch.ack.flags >> qbbHeader::FLAG_PROBE_ANSWER) & 1){
 				qp->m_pathSelector->OnProbeAnswer(path, cnp, now);
 			}else{

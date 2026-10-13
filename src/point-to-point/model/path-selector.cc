@@ -33,6 +33,9 @@ void PathSelector::OnReport(const SpineReport &, uint64_t){
 void PathSelector::OnRedirect(uint8_t, uint8_t, uint64_t){
 }
 
+void PathSelector::OnReceiverHold(uint32_t, uint8_t, uint64_t){
+}
+
 UniformSpineSelector::UniformSpineSelector(Ptr<UniformRandomVariable> random,
 		uint32_t spines)
 	: m_random(random), m_spines(spines)
@@ -739,8 +742,12 @@ RepsHoldSelector::RepsHoldSelector(Ptr<UniformRandomVariable> random,
 
 uint16_t RepsHoldSelector::Choose(uint64_t nowNs){
 	uint8_t spine;
-	if (!m_hold.TakeHoldSentinel(nowNs, spine)){
-		m_excluding = !m_hold.HoldsEvery();
+	const auto local = [this](uint32_t k){ return m_hold.Holds(k); };
+	if (!m_hold.TakeHoldSentinel(nowNs, spine) &&
+			!(m_receiverHold.Active() &&
+				m_receiverHold.TakeSentinel(nowNs, local, spine))){
+		m_excluding = m_receiverHold.Active()
+			? !m_receiverHold.HoldsEvery(local) : !m_hold.HoldsEvery();
 		spine = RepsSelector::Choose(nowNs);
 	}
 	m_hold.CountIntervalSend(spine, nowNs);
@@ -752,7 +759,17 @@ void RepsHoldSelector::OnLoss(uint16_t path, uint64_t nowNs){
 }
 
 bool RepsHoldSelector::Excluded(uint16_t path) const{
-	return m_excluding && m_hold.Holds(path);
+	return m_excluding && (m_hold.Holds(path) || m_receiverHold.Holds(path));
+}
+
+void RepsHoldSelector::SetReceiverHold(
+		std::shared_ptr<ReceiverHoldMarks> marks, uint32_t leaf){
+	m_receiverHold.Set(std::move(marks), leaf);
+}
+
+void RepsHoldSelector::OnReceiverHold(uint32_t receiver, uint8_t bitmap,
+		uint64_t){
+	m_receiverHold.OnBitmap(receiver, bitmap);
 }
 
 AutoLossHold::Leaf::Leaf(uint32_t spines)
@@ -966,8 +983,12 @@ RepsAutoHoldSelector::RepsAutoHoldSelector(Ptr<UniformRandomVariable> random,
 
 uint16_t RepsAutoHoldSelector::Choose(uint64_t nowNs){
 	uint8_t spine;
-	if (!m_hold.TakeSentinel(m_leaf, nowNs, spine)){
-		m_excluding = !m_hold.HoldsEvery(m_leaf);
+	const auto local = [this](uint32_t k){ return m_hold.Holds(m_leaf, k); };
+	if (!m_hold.TakeSentinel(m_leaf, nowNs, spine) &&
+			!(m_receiverHold.Active() &&
+				m_receiverHold.TakeSentinel(nowNs, local, spine))){
+		m_excluding = m_receiverHold.Active()
+			? !m_receiverHold.HoldsEvery(local) : !m_hold.HoldsEvery(m_leaf);
 		spine = RepsSelector::Choose(nowNs);
 	}
 	m_hold.CountSend(m_leaf, spine, nowNs);
@@ -979,7 +1000,18 @@ void RepsAutoHoldSelector::OnLoss(uint16_t path, uint64_t nowNs){
 }
 
 bool RepsAutoHoldSelector::Excluded(uint16_t path) const{
-	return m_excluding && m_hold.Holds(m_leaf, path);
+	return m_excluding &&
+		(m_hold.Holds(m_leaf, path) || m_receiverHold.Holds(path));
+}
+
+void RepsAutoHoldSelector::SetReceiverHold(
+		std::shared_ptr<ReceiverHoldMarks> marks, uint32_t leaf){
+	m_receiverHold.Set(std::move(marks), leaf);
+}
+
+void RepsAutoHoldSelector::OnReceiverHold(uint32_t receiver, uint8_t bitmap,
+		uint64_t){
+	m_receiverHold.OnBitmap(receiver, bitmap);
 }
 
 FaultedSpines::FaultedSpines(uint32_t spines, uint64_t readIntervalNs,

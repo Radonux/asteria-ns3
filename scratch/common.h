@@ -161,6 +161,27 @@ bool spray_hold_auto_leaves_given = false;
 // it. Off, the default, leaves the data header as it is.
 std::string spray_path_seq = "off";
 bool spray_path_seq_given = false;
+// Under reps_hold or reps_flow_hold with SPRAY_PATH_SEQ on, SPRAY_RECEIVER_HOLD
+// on: each receiving host counts, per sender leaf and spine, the data packets
+// that arrived and the packets the path sequences show missing. A missing
+// packet on spine k from sender leaf a holds k for a alone, or for every
+// sender leaf once SPRAY_HOLD_AUTO_LEAVES sender leaves have a missing packet
+// on it; SPRAY_RECEIVER_HOLD_CLEAN consecutive arrivals on k without a missing
+// packet, from a or from any leaf as the hold's scope is, release it, and a
+// missing packet restarts the count. Every acknowledgement carries a 1-byte
+// receiver_hold bitmap, bit k set when the receiver holds k for the leaf of
+// the acknowledgement's destination; at most 8 spines. A sender holds spine k
+// toward the receiver's leaf while the latest acknowledgement of any receiver
+// on that leaf sets bit k, with the loss hold's exclusion and sentinels
+// (SPRAY_HELD_SENTINEL_INTERVAL_NS), shared by the host's queue pairs, or under
+// reps_flow_hold the queue pair's own; the sender's clean sends do not release
+// it. The hosts' leaves come from the switches' state. Off, the default,
+// leaves the acknowledgement header as it is.
+std::string spray_receiver_hold = "off";
+bool spray_receiver_hold_given = false;
+uint32_t spray_receiver_hold_clean = 1024;
+bool spray_receiver_hold_clean_given = false;
+bool receiver_hold() { return spray_receiver_hold == "on"; }
 uint32_t reps_buffer_size = 8;
 uint64_t reps_freezing_timeout_ns = 10000000;
 uint32_t ue_ev_set_size = 256;
@@ -1833,6 +1854,12 @@ bool ReadConf(string network_configuration) {
     } else if (key.compare("SPRAY_PATH_SEQ") == 0) {
       conf >> spray_path_seq;
       spray_path_seq_given = true;
+    } else if (key.compare("SPRAY_RECEIVER_HOLD") == 0) {
+      conf >> spray_receiver_hold;
+      spray_receiver_hold_given = true;
+    } else if (key.compare("SPRAY_RECEIVER_HOLD_CLEAN") == 0) {
+      conf >> spray_receiver_hold_clean;
+      spray_receiver_hold_clean_given = true;
     } else if (key.compare("SPRAY_HELD_EXPLORATION") == 0) {
       conf >> spray_held_exploration;
     } else if (key.compare("SPRAY_HELD_SENTINEL_INTERVAL_NS") == 0) {
@@ -2210,9 +2237,11 @@ bool ReadConf(string network_configuration) {
     return false;
   }
   if (spray_hold_auto_leaves_given &&
-      (path_selector != "reps_hold" || spray_hold_scope != "auto")) {
+      (path_selector != "reps_hold" || spray_hold_scope != "auto") &&
+      !(reps_hold() && receiver_hold())) {
     std::cerr << "SPRAY_HOLD_AUTO_LEAVES is read only under PATH_SELECTOR "
-                 "reps_hold with SPRAY_HOLD_SCOPE auto\n";
+                 "reps_hold with SPRAY_HOLD_SCOPE auto, or with "
+                 "SPRAY_RECEIVER_HOLD on\n";
     return false;
   }
   if (spray_hold_auto_leaves < 2) {
@@ -2227,6 +2256,29 @@ bool ReadConf(string network_configuration) {
     std::cerr << "SPRAY_PATH_SEQ is read only under LOAD_BALANCING "
                  "spray_uniform with PATH_SELECTOR reps_hold or "
                  "reps_flow_hold\n";
+    return false;
+  }
+  if (spray_receiver_hold != "on" && spray_receiver_hold != "off") {
+    std::cerr << "SPRAY_RECEIVER_HOLD must be on or off\n";
+    return false;
+  }
+  if (spray_receiver_hold_given && !reps_hold()) {
+    std::cerr << "SPRAY_RECEIVER_HOLD is read only under LOAD_BALANCING "
+                 "spray_uniform with PATH_SELECTOR reps_hold or "
+                 "reps_flow_hold\n";
+    return false;
+  }
+  if (receiver_hold() && spray_path_seq != "on") {
+    std::cerr << "SPRAY_RECEIVER_HOLD requires SPRAY_PATH_SEQ on\n";
+    return false;
+  }
+  if (spray_receiver_hold_clean_given && !receiver_hold()) {
+    std::cerr << "SPRAY_RECEIVER_HOLD_CLEAN is read only with "
+                 "SPRAY_RECEIVER_HOLD on\n";
+    return false;
+  }
+  if (spray_receiver_hold_clean == 0) {
+    std::cerr << "SPRAY_RECEIVER_HOLD_CLEAN must be above zero\n";
     return false;
   }
   if (path_selector == "ack_redirect") {
@@ -2343,6 +2395,7 @@ void SetConfig() {
       load_balancing_value() != static_cast<uint32_t>(LoadBalancingMode::Ecmp);
   CustomHeader::ackRedirectBytes = path_selector == "ack_redirect" ? 1 : 0;
   CustomHeader::udpCarriesPathSeq = spray_path_seq == "on";
+  CustomHeader::ackReceiverHoldBytes = receiver_hold() ? 1 : 0;
 
   // Set Pint
   if (cc_mode == 10) {
@@ -2679,9 +2732,15 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),
               << SpineReport::kMaxSpines << " spines\n";
     return false;
   }
-  // The switches' state, which leaf_hold reads only for the hosts' leaves.
+  if (receiver_hold() && spine_count > kReceiverHoldSpines) {
+    std::cerr << "SPRAY_RECEIVER_HOLD holds at most " << kReceiverHoldSpines
+              << " spines\n";
+    return false;
+  }
+  // The switches' state, which leaf_hold and receiver_hold read only for the
+  // hosts' leaves.
   const Ptr<SwitchQueueState> switch_queues =
-      switch_queue_cost() || leaf_hold() || reps_oracle()
+      switch_queue_cost() || leaf_hold() || reps_oracle() || receiver_hold()
           ? BuildSwitchQueueState(n)
           : nullptr;
   // One variable for every host, so the draw consumes a single fixed stream.
@@ -2756,6 +2815,9 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),
                            UintegerValue(spray_hold_auto_leaves));
       rdmaHw->SetAttribute("SprayPathSeq",
                            BooleanValue(spray_path_seq == "on"));
+      rdmaHw->SetAttribute("SprayReceiverHold", BooleanValue(receiver_hold()));
+      rdmaHw->SetAttribute("SprayReceiverHoldClean",
+                           UintegerValue(spray_receiver_hold_clean));
       rdmaHw->SetAttribute("UeEvSetSize", UintegerValue(ue_ev_set_size));
       rdmaHw->SetAttribute("UeSaturationFraction",
                            DoubleValue(ue_saturation_fraction));

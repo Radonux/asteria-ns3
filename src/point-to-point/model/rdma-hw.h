@@ -10,6 +10,7 @@
 #include "qbb-net-device.h"
 #include "load-balancing.h"
 #include "nscc-window.h"
+#include "receiver-hold.h"
 #include "spine-grader.h"
 #include "spine-redirect.h"
 #include "switch-queue-state.h"
@@ -300,6 +301,26 @@ public:
 	bool ValidPathSeq() const;
 	// The path sequence of the data packet ch arriving at q, counted.
 	void CountPathSeq(Ptr<RdmaRxQueuePair> q, const CustomHeader &ch);
+	// SprayReceiverHold, under SprayPathSeq: the host's ReceiverHold, made at
+	// its first arrival, counts the arrivals and the missing packets per
+	// sender leaf, which m_switchQueues names, holds spines by them with
+	// SprayHoldAutoLeaves as its autoLeaves and m_sprayReceiverHoldClean as
+	// its clean arrivals, and every acknowledgement carries the bitmap of
+	// the spines it holds for its destination's leaf. As a sender, every
+	// queue pair's selector holds the spines the bitmaps hold toward its
+	// destination's leaf, in m_receiverHoldMarks, shared by the host's queue
+	// pairs, or under PathSelector 7 in marks of its own.
+	bool m_sprayReceiverHold;
+	uint32_t m_sprayReceiverHoldClean;
+	std::unique_ptr<ReceiverHold> m_receiverHold;
+	std::shared_ptr<ReceiverHoldMarks> m_receiverHoldMarks;
+	bool IsReceiverHold() const;
+	bool ValidReceiverHold() const;
+	ReceiverHold &ReceiverHoldOf();
+	// The receiver_hold field of an answer to the host at senderIp.
+	uint8_t ReceiverHoldBitmap(uint32_t senderIp) const;
+	// Give qp's selector the marks it holds by.
+	void AttachReceiverHold(Ptr<RdmaQueuePair> qp);
 	bool m_var_win, m_fast_react;
 	bool m_rateBound;
 	uint32_t m_total_pause_times; 
