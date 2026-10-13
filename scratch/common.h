@@ -78,8 +78,16 @@ std::string spine_report_output_file;
 // Each host's pooled loss intervals under SPRAY_LOSS_THRESHOLDS: one row per
 // host, closed interval and spine. Empty writes none.
 std::string spine_loss_output_file;
+// Under SPRAY_RECEIVER_HOLD on, each receiving host's hold: one row per host,
+// closed SPRAY_LOSS_INTERVAL_NS interval, sender leaf and spine, with the
+// arrivals and the missing packets counted in it and the scope the spine is
+// held at as it closed, none, leaf or host. A file of its own, as the rows of
+// SPINE_LOSS_OUTPUT_FILE have other columns under each SPRAY_HOLD_SCOPE.
+// Empty writes none.
+std::string receiver_hold_output_file;
 FILE *port_counter_file = nullptr, *spine_arrival_file = nullptr;
 FILE *spine_report_file = nullptr, *spine_loss_file = nullptr;
+FILE *receiver_hold_file = nullptr;
 
 double alpha_resume_interval = 55, rp_timer, ewma_gain = 1 / 16;
 double rate_decrease_interval = 4;
@@ -1258,7 +1266,7 @@ void write_fabric_counters() {
     }
   }
   for (FILE *file : {port_counter_file, spine_arrival_file, spine_report_file,
-                     spine_loss_file})
+                     spine_loss_file, receiver_hold_file})
     if (file != nullptr)
       fflush(file);
 }
@@ -1334,6 +1342,21 @@ void write_leaf_spine_loss_interval(uint32_t rank, uint32_t leaf,
     fprintf(spine_loss_file, "%lu,%u,%u,%u,%u,%u,%u\n",
             static_cast<unsigned long>(end_ns), rank, leaf, spine, sent[spine],
             lost[spine], grades[spine]);
+}
+
+// An interval a receiving host's hold closed under SPRAY_RECEIVER_HOLD: one row
+// per spine for the sender leaf, with the arrivals and missing packets counted
+// in it and the scope of the spine's hold.
+void write_receiver_hold_interval(uint32_t rank, uint32_t leaf,
+                                  uint64_t end_ns,
+                                  const std::vector<uint32_t> &arrivals,
+                                  const std::vector<uint32_t> &lost,
+                                  const std::vector<uint8_t> &holds) {
+  static const char *const scopes[] = {"none", "leaf", "host"};
+  for (uint32_t spine = 0; spine < arrivals.size(); spine++)
+    fprintf(receiver_hold_file, "%lu,%u,%u,%u,%u,%u,%s\n",
+            static_cast<unsigned long>(end_ns), rank, leaf, spine,
+            arrivals[spine], lost[spine], scopes[holds[spine]]);
 }
 
 // The link events' applier, which keeps what a restore puts back.
@@ -1934,6 +1957,8 @@ bool ReadConf(string network_configuration) {
       conf >> spine_report_output_file;
     } else if (key.compare("SPINE_LOSS_OUTPUT_FILE") == 0) {
       conf >> spine_loss_output_file;
+    } else if (key.compare("RECEIVER_HOLD_OUTPUT_FILE") == 0) {
+      conf >> receiver_hold_output_file;
     } else if (key.compare("LINK_DOWN") == 0) {
       conf >> link_down_time >> link_down_A >> link_down_B;
     } else if (key.compare("LINK_FAILURE") == 0) {
@@ -2279,6 +2304,11 @@ bool ReadConf(string network_configuration) {
   }
   if (spray_receiver_hold_clean == 0) {
     std::cerr << "SPRAY_RECEIVER_HOLD_CLEAN must be above zero\n";
+    return false;
+  }
+  if (!receiver_hold_output_file.empty() && !receiver_hold()) {
+    std::cerr << "RECEIVER_HOLD_OUTPUT_FILE is read only with "
+                 "SPRAY_RECEIVER_HOLD on\n";
     return false;
   }
   if (path_selector == "ack_redirect") {
@@ -3129,6 +3159,20 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),
               "SpineLossInterval",
               MakeBoundCallback(&write_spine_loss_interval, i));
       }
+  }
+  if (!receiver_hold_output_file.empty()) {
+    receiver_hold_file = fopen(receiver_hold_output_file.c_str(), "w");
+    if (receiver_hold_file == nullptr) {
+      std::cerr << "Error: cannot open " << receiver_hold_output_file << "\n";
+      return false;
+    }
+    fprintf(receiver_hold_file,
+            "time_ns,rank,sender_leaf,spine,arrivals,lost,hold\n");
+    for (uint32_t i = 0; i < node_num; i++)
+      if (n.Get(i)->GetNodeType() == 0)
+        n.Get(i)->GetObject<RdmaDriver>()->m_rdma->TraceConnectWithoutContext(
+            "ReceiverHoldInterval",
+            MakeBoundCallback(&write_receiver_hold_interval, i));
   }
   std::set<uint64_t> event_times;
   for (const LinkEvent &event : link_events) {

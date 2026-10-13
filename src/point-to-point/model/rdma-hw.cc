@@ -676,6 +676,14 @@ TypeId RdmaHw::GetTypeId (void)
 				"passes.",
 				MakeTraceSourceAccessor(&RdmaHw::m_traceLeafSpineLossInterval),
 				"ns3::RdmaHw::LeafSpineLossIntervalTracedCallback")
+		.AddTraceSource("ReceiverHoldInterval",
+				"Under SprayReceiverHold, the receiving host's hold closed an "
+				"interval of SprayLossIntervalNs, once per sender leaf: the "
+				"leaf, the time it ended at and, per spine, the arrivals and "
+				"the missing packets counted in it and the scope of its hold, "
+				"0=none, 1=leaf, 2=host.",
+				MakeTraceSourceAccessor(&RdmaHw::m_traceReceiverHoldInterval),
+				"ns3::RdmaHw::ReceiverHoldIntervalTracedCallback")
 		.AddAttribute("EwmaGain",
 				"Control gain parameter which determines the level of rate decrease",
 				DoubleValue(1.0 / 16),

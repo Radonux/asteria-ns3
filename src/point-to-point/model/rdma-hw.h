@@ -321,6 +321,15 @@ public:
 	uint8_t ReceiverHoldBitmap(uint32_t senderIp) const;
 	// Give qp's selector the marks it holds by.
 	void AttachReceiverHold(Ptr<RdmaQueuePair> qp);
+	// The ReceiverHoldInterval trace source: the host's ReceiverHold closed an
+	// interval of SprayLossIntervalNs, once per sender leaf
+	// (ReceiverHold::IntervalCallback), with each spine's ReceiverHold::Scope.
+	typedef void (*ReceiverHoldIntervalTracedCallback)(uint32_t leaf,
+		uint64_t endNs, const std::vector<uint32_t> &arrivals,
+		const std::vector<uint32_t> &lost, const std::vector<uint8_t> &holds);
+	TracedCallback<uint32_t, uint64_t, const std::vector<uint32_t> &,
+		const std::vector<uint32_t> &, const std::vector<uint8_t> &>
+		m_traceReceiverHoldInterval;
 	bool m_var_win, m_fast_react;
 	bool m_rateBound;
 	uint32_t m_total_pause_times; 

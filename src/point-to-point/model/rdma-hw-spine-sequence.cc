@@ -39,10 +39,20 @@ bool RdmaHw::ValidReceiverHold() const{
 }
 
 ReceiverHold &RdmaHw::ReceiverHoldOf(){
-	if (!m_receiverHold)
-		m_receiverHold = std::make_unique<ReceiverHold>(m_spineCount,
-			m_sprayHoldAutoLeaves, m_sprayReceiverHoldClean,
-			m_sprayLossIntervalNs);
+	if (m_receiverHold)
+		return *m_receiverHold;
+	m_receiverHold = std::make_unique<ReceiverHold>(m_spineCount,
+		m_sprayHoldAutoLeaves, m_sprayReceiverHoldClean, m_sprayLossIntervalNs);
+	m_receiverHold->SetIntervalCallback(
+		[this](uint32_t leaf, uint64_t endNs,
+				const std::vector<uint32_t> &arrivals,
+				const std::vector<uint32_t> &lost,
+				const std::vector<ReceiverHold::Scope> &holds){
+			std::vector<uint8_t> scopes(holds.size());
+			for (uint32_t k = 0; k < holds.size(); k++)
+				scopes[k] = static_cast<uint8_t>(holds[k]);
+			m_traceReceiverHoldInterval(leaf, endNs, arrivals, lost, scopes);
+		});
 	return *m_receiverHold;
 }
 

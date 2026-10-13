@@ -7993,6 +7993,81 @@ class SprayReceiverHoldTest : public TestCase
     static constexpr uint32_t kFlowHold = 99;
 };
 
+class SprayReceiverHoldTraceTest : public TestCase
+{
+  public:
+    SprayReceiverHoldTraceTest()
+        : TestCase("Under SprayReceiverHold the receiving host traces each closed interval per "
+                   "sender leaf with the arrivals, the missing packets and each spine's hold")
+    {
+    }
+
+    void DoRun() override
+    {
+        Ptr<RdmaHw> hw = CreateObject<RdmaHw>();
+        hw->m_spineCount = 8;
+        hw->m_loadBalancing = static_cast<uint32_t>(LoadBalancingMode::SprayUniform);
+        hw->m_pathSelectorKind = static_cast<uint32_t>(PathSelectorKind::RepsHold);
+        hw->m_sprayLossIntervalNs = 1000;
+        hw->m_sprayHoldAutoLeaves = 2;
+        hw->m_sprayReceiverHoldClean = 3;
+        hw->m_sprayPathSeq = true;
+        hw->m_sprayReceiverHold = true;
+        struct Row
+        {
+            uint32_t leaf;
+            uint64_t endNs;
+            std::vector<uint32_t> arrivals;
+            std::vector<uint32_t> lost;
+            std::vector<uint8_t> holds;
+        };
+        std::vector<Row> rows;
+        hw->TraceConnectWithoutContext(
+            "ReceiverHoldInterval",
+            Callback<void,
+                     uint32_t,
+                     uint64_t,
+                     const std::vector<uint32_t>&,
+                     const std::vector<uint32_t>&,
+                     const std::vector<uint8_t>&>(
+                [&](uint32_t leaf,
+                    uint64_t endNs,
+                    const std::vector<uint32_t>& arrivals,
+                    const std::vector<uint32_t>& lost,
+                    const std::vector<uint8_t>& holds) {
+                    rows.push_back(Row{leaf, endNs, arrivals, lost, holds});
+                }));
+        ReceiverHold& hold = hw->ReceiverHoldOf();
+        hold.OnArrival(0, 3, 2, false, 100);
+        hold.OnArrival(1, 2, 0, false, 500);
+        NS_TEST_EXPECT_MSG_EQ(rows.size(), 0u, "nothing is traced before the interval ends");
+        hold.OnArrival(1, 3, 1, false, 2500);
+        NS_TEST_ASSERT_MSG_EQ(rows.size(), 2u, "one row set per sender leaf seen");
+        NS_TEST_EXPECT_MSG_EQ(rows[0].leaf, 0u, "in leaf order");
+        NS_TEST_EXPECT_MSG_EQ(rows[0].endNs, 1000u, "at the end of the interval counted");
+        NS_TEST_EXPECT_MSG_EQ(rows[0].arrivals[3], 1u, "leaf 0's arrival on spine 3");
+        NS_TEST_EXPECT_MSG_EQ(rows[0].lost[3], 2u, "and its missing packets");
+        NS_TEST_EXPECT_MSG_EQ(rows[0].holds[3],
+                              static_cast<uint8_t>(ReceiverHold::Scope::Leaf),
+                              "spine 3 held for leaf 0");
+        NS_TEST_EXPECT_MSG_EQ(rows[1].arrivals[2], 1u, "leaf 1's arrival on spine 2");
+        NS_TEST_EXPECT_MSG_EQ(rows[1].holds[3],
+                              static_cast<uint8_t>(ReceiverHold::Scope::None),
+                              "and spine 3 not held for leaf 1");
+        hold.OnArrival(0, 1, 0, false, 3100);
+        NS_TEST_ASSERT_MSG_EQ(rows.size(), 4u, "the next interval closes");
+        NS_TEST_EXPECT_MSG_EQ(rows[2].endNs, 3000u, "the empty interval between is skipped");
+        NS_TEST_EXPECT_MSG_EQ(rows[3].lost[3], 1u, "leaf 1's missing packet");
+        NS_TEST_EXPECT_MSG_EQ(rows[3].holds[3],
+                              static_cast<uint8_t>(ReceiverHold::Scope::Host),
+                              "widened spine 3 to every sender leaf");
+        NS_TEST_EXPECT_MSG_EQ(rows[2].holds[3],
+                              static_cast<uint8_t>(ReceiverHold::Scope::Host),
+                              "for leaf 0 too");
+        Simulator::Destroy();
+    }
+};
+
 class SprayPolicyTransportTest : public TestCase
 {
   public:
@@ -9759,6 +9834,7 @@ PointToPointTestSuite::PointToPointTestSuite()
     AddTestCase(new RepsHoldAutoScopeTest, TestCase::Duration::QUICK);
     AddTestCase(new SprayPathSeqTest, TestCase::Duration::QUICK);
     AddTestCase(new SprayReceiverHoldTest, TestCase::Duration::QUICK);
+    AddTestCase(new SprayReceiverHoldTraceTest, TestCase::Duration::QUICK);
     AddTestCase(new SprayPolicyTransportTest, TestCase::Duration::QUICK);
     AddTestCase(new NsccReceiverPenaltyTest, TestCase::Duration::QUICK);
     AddTestCase(new SprayPolicyDefaultsTest, TestCase::Duration::QUICK);
