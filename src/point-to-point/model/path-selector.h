@@ -7,8 +7,10 @@
 #include <array>
 #include <deque>
 #include <functional>
+#include <map>
 #include <memory>
 #include <optional>
+#include <set>
 #include <stdint.h>
 #include <utility>
 #include <vector>
@@ -16,10 +18,12 @@
 namespace ns3 {
 
 // What the host-wide loss hold of RepsHold is kept for: the host's every
-// destination, or each destination leaf apart.
+// destination, each destination leaf apart, or per spine either of the two
+// by the destination leaves it loses toward (AutoLossHold).
 enum class HoldScope : uint32_t {
 	Host = 0,
 	Leaf,
+	Auto,
 };
 
 // Which design chooses a data packet's entropy value under EntropyHash.
@@ -477,6 +481,114 @@ private:
 	// Declared before m_hold, which refers to it when it is set.
 	std::unique_ptr<SpineScores> m_ownHold;
 	SpineScores &m_hold;
+	// Whether the hold leaves a spine out, set before each choice.
+	bool m_excluding;
+};
+
+// The host-wide loss hold of RepsHold under HoldScope::Auto. Per destination
+// leaf and spine it counts the sends and the sends declared lost over each
+// loss interval, one interval clock for the host, and per spine it keeps the
+// destination leaves with at least one loss on it since that spine was last
+// released, or since the start. When a closed interval's lost fraction
+// toward leaf d grades spine k 0 through the loss thresholds and k is not
+// held for d, k is held for every destination (host scope) if at least
+// autoLeaves leaves have a loss on k, else for d alone (leaf scope). A spine
+// held in leaf scope widens to host scope once a loss on it brings its leaves
+// to autoLeaves. A hold ends by the loss hold's rule at the scope it has: a
+// closed interval with a loss on k, toward d in leaf scope or toward any leaf
+// in host scope, restarts its clean sends, and otherwise the sends counted on
+// k there add to them, until they reach the clean sends. A host-scope release
+// clears k's leaves, as does the release of the last leaf-scope hold on k.
+// Each held (spine, scope) is sent one sentinel per sentinel interval for the
+// host: a host-scope hold by the first queue pair to choose once one is due,
+// a leaf-scope hold by the first queue pair to its leaf.
+class AutoLossHold {
+public:
+	// Called as each loss interval is closed, once per leaf seen, with the
+	// leaf and what SpineScores::LossIntervalCallback passes; a spine's grade
+	// is that of the hold at its scope, 0 while held.
+	using LeafLossIntervalCallback = std::function<void(uint32_t leaf,
+		uint64_t endNs, const std::vector<uint32_t> &sent,
+		const std::vector<uint32_t> &lost, const std::vector<uint8_t> &grades)>;
+	// The loss thresholds, loss interval, clean sends and sentinel interval
+	// of parameters, as SpineScores reads them; autoLeaves is at least 2.
+	AutoLossHold(uint32_t spines, const SpineScores::Parameters &parameters,
+		uint32_t autoLeaves);
+	// Make leaf's counts, if they are not yet made.
+	void AddLeaf(uint32_t leaf);
+	// A send toward leaf on spine, and one declared lost, counted in the loss
+	// interval in progress once those ended by now are closed.
+	void CountSend(uint32_t leaf, uint32_t spine, uint64_t nowNs);
+	void CountLoss(uint32_t leaf, uint32_t spine, uint64_t nowNs);
+	// Close the loss intervals ended by now and whether a sentinel toward
+	// leaf is due on a spine held for it, and which; the lowest such spine is
+	// taken, and the sentinel interval of the hold it has restarts now.
+	bool TakeSentinel(uint32_t leaf, uint64_t nowNs, uint8_t &spine);
+	// Whether spine is held toward leaf, at either scope, and whether every
+	// spine is.
+	bool Holds(uint32_t leaf, uint32_t spine) const;
+	bool HoldsEvery(uint32_t leaf) const;
+	// Whether spine is held in host scope, and the leaves with a loss on it.
+	bool HostHolds(uint32_t spine) const;
+	uint32_t LossLeaves(uint32_t spine) const;
+	void SetLossIntervalCallback(LeafLossIntervalCallback callback);
+
+private:
+	struct Leaf {
+		explicit Leaf(uint32_t spines);
+		// The interval's counts; whether a spine is held in leaf scope, its
+		// clean sends, and when its last leaf-scope sentinel was sent.
+		std::vector<uint32_t> sent;
+		std::vector<uint32_t> lost;
+		std::vector<bool> held;
+		std::vector<uint32_t> clean;
+		std::vector<uint64_t> sentinelNs;
+	};
+	void AdvanceLossInterval(uint64_t nowNs);
+	void CloseLossInterval();
+	uint8_t LossGrade(uint32_t sent, uint32_t lost) const;
+	// Hold spine in host scope, ending its leaf-scope holds.
+	void HoldHost(uint32_t spine);
+	bool LeafHolds(uint32_t spine) const;
+	bool SentinelDue(uint64_t &lastNs, uint64_t nowNs) const;
+
+	uint32_t m_spines;
+	std::array<double, 3> m_lossThresholds;
+	uint64_t m_lossIntervalNs;
+	uint64_t m_lossIntervalEndNs;
+	uint32_t m_cleanSends;
+	uint64_t m_sentinelIntervalNs;
+	uint32_t m_autoLeaves;
+	// Ordered, so that the intervals are passed in leaf order.
+	std::map<uint32_t, Leaf> m_leaves;
+	std::vector<std::set<uint32_t>> m_lossLeaves;
+	std::vector<bool> m_hostHeld;
+	std::vector<uint32_t> m_hostClean;
+	std::vector<uint64_t> m_hostSentinelNs;
+	LeafLossIntervalCallback m_onLossInterval;
+};
+
+// REPS (RepsSelector) over spines under SprayUniform toward one destination
+// leaf, with the host's AutoLossHold in place of RepsHoldSelector's loss
+// hold: the spines it holds toward the leaf are left out of REPS's choices
+// unless it holds every spine toward it, its sentinels toward the leaf are
+// sent in place of REPS's choice, and every send and every send declared
+// lost is counted in it toward the leaf.
+class RepsAutoHoldSelector : public RepsSelector {
+public:
+	RepsAutoHoldSelector(Ptr<UniformRandomVariable> random,
+		uint32_t bufferSize, uint64_t freezingTimeoutNs,
+		uint32_t explorePackets, uint32_t spines, AutoLossHold &hold,
+		uint32_t leaf);
+	uint16_t Choose(uint64_t nowNs) override;
+	void OnLoss(uint16_t path, uint64_t nowNs) override;
+
+protected:
+	bool Excluded(uint16_t path) const override;
+
+private:
+	AutoLossHold &m_hold;
+	uint32_t m_leaf;
 	// Whether the hold leaves a spine out, set before each choice.
 	bool m_excluding;
 };

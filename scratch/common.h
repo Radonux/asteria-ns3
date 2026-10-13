@@ -132,9 +132,24 @@ bool reps_hold() {
   return path_selector == "reps_hold" || path_selector == "reps_flow_hold";
 }
 // Under reps_hold, what one loss hold is kept for: host, every destination of
-// the host, or leaf, the destinations on one leaf.
-std::string spray_hold_scope = "leaf";
+// the host, leaf, the destinations on one leaf, or auto, per spine either of
+// the two. Under auto the host counts each spine's sends and losses per
+// destination leaf and keeps the destination leaves with a loss on it since
+// it was last released. A spine graded 0 toward a leaf is held for every
+// destination when at least SPRAY_HOLD_AUTO_LEAVES leaves have a loss on it,
+// else for that leaf alone; a leaf-scope hold widens to every destination
+// once a loss on the spine brings its leaves to SPRAY_HOLD_AUTO_LEAVES. A
+// hold ends by the clean sends at the scope it has, counted over every leaf
+// for a host-scope hold, whose release clears the spine's leaves. Each held
+// (spine, scope) is sent one sentinel per sentinel interval for the host.
+// SPINE_LOSS_OUTPUT_FILE writes one row per destination leaf and spine, as
+// leaf writes it, with the grade of the scope the spine is held at.
+std::string spray_hold_scope = "auto";
 bool spray_hold_scope_given = false;
+// Under SPRAY_HOLD_SCOPE auto, the destination leaves with a loss on a spine
+// from which its hold is kept for every destination; at least 2.
+uint32_t spray_hold_auto_leaves = 2;
+bool spray_hold_auto_leaves_given = false;
 uint32_t reps_buffer_size = 8;
 uint64_t reps_freezing_timeout_ns = 10000000;
 uint32_t ue_ev_set_size = 256;
@@ -776,13 +791,16 @@ uint32_t spray_hold_scope_value() {
     return static_cast<uint32_t>(HoldScope::Host);
   if (spray_hold_scope == "leaf")
     return static_cast<uint32_t>(HoldScope::Leaf);
+  if (spray_hold_scope == "auto")
+    return static_cast<uint32_t>(HoldScope::Auto);
   return std::numeric_limits<uint32_t>::max();
 }
 
-// Under reps_hold, whether a loss hold is kept per destination leaf, which
-// needs the hosts' leaves.
+// Under reps_hold, whether a loss hold is kept per destination leaf, under
+// leaf or auto, which needs the hosts' leaves.
 bool leaf_hold() {
-  return path_selector == "reps_hold" && spray_hold_scope == "leaf";
+  return path_selector == "reps_hold" &&
+         (spray_hold_scope == "leaf" || spray_hold_scope == "auto");
 }
 
 uint32_t spray_candidate_draw_value() {
@@ -1272,8 +1290,9 @@ void write_spine_loss_interval(uint32_t rank, uint64_t end_ns,
             lost[spine], grades[spine]);
 }
 
-// A loss interval a destination leaf's loss hold closed under reps_hold, as
-// write_spine_loss_interval writes it with the leaf.
+// A loss interval a destination leaf's loss hold closed under reps_hold, or
+// under auto the host's toward that leaf, as write_spine_loss_interval writes
+// it with the leaf.
 void write_leaf_spine_loss_interval(uint32_t rank, uint32_t leaf,
                                     uint64_t end_ns,
                                     const std::vector<uint32_t> &sent,
@@ -1797,6 +1816,9 @@ bool ReadConf(string network_configuration) {
     } else if (key.compare("SPRAY_HOLD_SCOPE") == 0) {
       conf >> spray_hold_scope;
       spray_hold_scope_given = true;
+    } else if (key.compare("SPRAY_HOLD_AUTO_LEAVES") == 0) {
+      conf >> spray_hold_auto_leaves;
+      spray_hold_auto_leaves_given = true;
     } else if (key.compare("SPRAY_HELD_EXPLORATION") == 0) {
       conf >> spray_held_exploration;
     } else if (key.compare("SPRAY_HELD_SENTINEL_INTERVAL_NS") == 0) {
@@ -2170,7 +2192,17 @@ bool ReadConf(string network_configuration) {
     return false;
   }
   if (spray_hold_scope_value() == std::numeric_limits<uint32_t>::max()) {
-    std::cerr << "SPRAY_HOLD_SCOPE must be host or leaf\n";
+    std::cerr << "SPRAY_HOLD_SCOPE must be host, leaf or auto\n";
+    return false;
+  }
+  if (spray_hold_auto_leaves_given &&
+      (path_selector != "reps_hold" || spray_hold_scope != "auto")) {
+    std::cerr << "SPRAY_HOLD_AUTO_LEAVES is read only under PATH_SELECTOR "
+                 "reps_hold with SPRAY_HOLD_SCOPE auto\n";
+    return false;
+  }
+  if (spray_hold_auto_leaves < 2) {
+    std::cerr << "SPRAY_HOLD_AUTO_LEAVES must be at least 2\n";
     return false;
   }
   if (path_selector == "ack_redirect") {
@@ -2695,6 +2727,8 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),
                            UintegerValue(reps_freezing_timeout_ns));
       rdmaHw->SetAttribute("SprayHoldScope",
                            UintegerValue(spray_hold_scope_value()));
+      rdmaHw->SetAttribute("SprayHoldAutoLeaves",
+                           UintegerValue(spray_hold_auto_leaves));
       rdmaHw->SetAttribute("UeEvSetSize", UintegerValue(ue_ev_set_size));
       rdmaHw->SetAttribute("UeSaturationFraction",
                            DoubleValue(ue_saturation_fraction));

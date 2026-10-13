@@ -7333,8 +7333,8 @@ class RepsHoldScopeTest : public TestCase
         UintegerValue scope;
         unset->GetAttribute("SprayHoldScope", scope);
         NS_TEST_EXPECT_MSG_EQ(scope.Get(),
-                              static_cast<uint32_t>(HoldScope::Leaf),
-                              "SprayHoldScope is leaf by default");
+                              static_cast<uint32_t>(HoldScope::Auto),
+                              "SprayHoldScope is auto by default");
 
         Ptr<RdmaHw> hw = LossHoldFixture::Hw();
         hw->m_sprayHoldScope = static_cast<uint32_t>(HoldScope::Leaf);
@@ -7388,6 +7388,133 @@ class RepsHoldScopeTest : public TestCase
 
   private:
     static constexpr uint64_t kInterval = LossHoldFixture::kInterval;
+};
+
+class RepsHoldAutoScopeTest : public TestCase
+{
+  public:
+    RepsHoldAutoScopeTest()
+        : TestCase("Under reps_hold with SprayHoldScope auto a spine lost on toward one leaf is "
+                   "held for that leaf alone, widens to every destination at a loss toward a "
+                   "second leaf, is sent one sentinel per interval for the host, and returns "
+                   "after the clean sentinels")
+    {
+    }
+
+    void DoRun() override
+    {
+        Ptr<RdmaHw> unset = CreateObject<RdmaHw>();
+        UintegerValue leaves;
+        unset->GetAttribute("SprayHoldAutoLeaves", leaves);
+        NS_TEST_EXPECT_MSG_EQ(leaves.Get(), 2u, "SprayHoldAutoLeaves is 2 by default");
+
+        Ptr<RdmaHw> hw = LossHoldFixture::Hw();
+        hw->m_sprayHoldScope = static_cast<uint32_t>(HoldScope::Auto);
+        hw->m_sprayHoldAutoLeaves = 2;
+        hw->SetAttribute("Mtu", UintegerValue(1000));
+        hw->SetAttribute("PathRandomVariable", PointerValue(SelectorStream()));
+        NS_TEST_EXPECT_MSG_EQ(hw->ValidRepsHold(), false, "refused without the hosts' leaves");
+        hw->m_switchQueues = Create<SwitchQueueState>(2, LossHoldFixture::kSpines);
+        hw->m_switchQueues->SetLeafOf(Ipv4Address("11.0.2.1").Get(), 0);
+        hw->m_switchQueues->SetLeafOf(Ipv4Address("11.0.4.1").Get(), 1);
+        NS_TEST_EXPECT_MSG_EQ(hw->ValidRepsHold(), true, "accepted with them");
+        std::map<uint32_t, uint32_t> intervals;
+        std::map<uint32_t, uint32_t> hostHeldRows;
+        hw->TraceConnectWithoutContext(
+            "LeafSpineLossInterval",
+            Callback<void,
+                     uint32_t,
+                     uint64_t,
+                     const std::vector<uint32_t>&,
+                     const std::vector<uint32_t>&,
+                     const std::vector<uint8_t>&>(
+                [&](uint32_t leaf,
+                    uint64_t,
+                    const std::vector<uint32_t>&,
+                    const std::vector<uint32_t>&,
+                    const std::vector<uint8_t>& grades) {
+                    intervals[leaf]++;
+                    hostHeldRows[leaf] += hw->m_autoHold->HostHolds(3) && grades[3] == 0;
+                }));
+        // One destination on leaf 0, lossy on spine 3 over interval 0, and
+        // one on leaf 1, whose first send on spine 3 in interval 2 is lost.
+        std::vector<Ptr<RdmaQueuePair>> qps;
+        for (const char* destination : {"11.0.2.1", "11.0.4.1"})
+        {
+            qps.push_back(CreateObject<RdmaQueuePair>(
+                3, Ipv4Address("11.0.1.1"), Ipv4Address(destination), 10000, 100));
+            hw->StartPathSelection(qps.back(), 0, 0);
+        }
+        NS_TEST_EXPECT_MSG_NE(hw->m_autoHold.get(), nullptr, "one hold for the host");
+        NS_TEST_EXPECT_MSG_EQ(hw->m_leafHolds.size(), 0u, "and no leaf's own");
+        AutoLossHold& hold = *hw->m_autoHold;
+
+        uint32_t step = 0;
+        bool loseToLeaf1 = false;
+        std::vector<std::vector<uint32_t>> on3(2, std::vector<uint32_t>(kIntervals));
+        for (uint32_t interval = 0; interval < kIntervals; ++interval)
+        {
+            loseToLeaf1 = interval == 2;
+            for (uint32_t i = 0; i < 300; ++i, ++step)
+            {
+                const uint32_t flow = step % 2;
+                const uint64_t now = interval * kInterval + 30 * i;
+                const bool lossy = flow == 0 ? interval == 0 : loseToLeaf1;
+                const uint8_t spine = LossHoldFixture::Send(
+                    *qps[flow]->m_pathSelector,
+                    now,
+                    step / 2,
+                    lossy ? std::set<uint8_t>{3} : std::set<uint8_t>{});
+                on3[flow][interval] += spine == 3;
+                if (flow == 1 && spine == 3 && loseToLeaf1)
+                {
+                    loseToLeaf1 = false;
+                    NS_TEST_EXPECT_MSG_EQ(hold.HostHolds(3),
+                                          true,
+                                          "the loss toward leaf 1 widens the hold at once");
+                }
+            }
+            if (interval == 1)
+            {
+                NS_TEST_EXPECT_MSG_EQ(hold.Holds(0, 3), true, "spine 3 is held toward leaf 0");
+                NS_TEST_EXPECT_MSG_EQ(hold.Holds(1, 3), false, "and not toward leaf 1");
+                NS_TEST_EXPECT_MSG_EQ(hold.HostHolds(3), false, "nor for the host");
+                NS_TEST_EXPECT_MSG_EQ(hold.LossLeaves(3), 1u, "one leaf has a loss on it");
+            }
+            if (interval == 4)
+            {
+                NS_TEST_EXPECT_MSG_EQ(hold.Holds(0, 3), true, "held toward leaf 0");
+                NS_TEST_EXPECT_MSG_EQ(hold.Holds(1, 3), true, "and toward leaf 1");
+                NS_TEST_EXPECT_MSG_EQ(hold.LossLeaves(3), 2u, "two leaves have a loss on it");
+            }
+        }
+        NS_TEST_EXPECT_MSG_GT(on3[0][0], 0u, "the flow to leaf 0 loses on spine 3");
+        NS_TEST_EXPECT_MSG_EQ(on3[0][1], 1u, "leaf 0 sends spine 3 one sentinel");
+        NS_TEST_EXPECT_MSG_GT(on3[1][1], 1u, "leaf 1 keeps spine 3");
+        NS_TEST_EXPECT_MSG_GT(on3[1][2], 0u, "leaf 1 sends on spine 3 and loses");
+        for (uint32_t interval = 3; interval < 6; ++interval)
+        {
+            NS_TEST_EXPECT_MSG_EQ(on3[0][interval] + on3[1][interval],
+                                  1u,
+                                  "the host sends spine 3 one sentinel");
+        }
+        // Interval 2 saw a loss; the sentinels of 3 to 5 are the clean sends,
+        // and interval 5's close releases spine 3 everywhere.
+        NS_TEST_EXPECT_MSG_EQ(hold.HostHolds(3), false, "the clean sentinels release it");
+        NS_TEST_EXPECT_MSG_EQ(hold.Holds(0, 3), false, "toward leaf 0");
+        NS_TEST_EXPECT_MSG_EQ(hold.Holds(1, 3), false, "and toward leaf 1");
+        NS_TEST_EXPECT_MSG_EQ(hold.LossLeaves(3), 0u, "and clears its leaves");
+        NS_TEST_EXPECT_MSG_GT(on3[0][6], 1u, "leaf 0 chooses spine 3 again");
+        NS_TEST_EXPECT_MSG_GT(on3[1][6], 1u, "and so does leaf 1");
+        NS_TEST_EXPECT_MSG_GT(intervals[0], 0u, "leaf 0's intervals are traced");
+        NS_TEST_EXPECT_MSG_EQ(intervals[0], intervals[1], "as many as leaf 1's");
+        NS_TEST_EXPECT_MSG_GT(hostHeldRows[1], 0u, "leaf 1's rows grade the host hold 0");
+        Simulator::Destroy();
+    }
+
+  private:
+    static constexpr uint64_t kInterval = LossHoldFixture::kInterval;
+    static constexpr uint32_t kIntervals = 7;
 };
 
 class SprayPolicyTransportTest : public TestCase
@@ -9153,6 +9280,7 @@ PointToPointTestSuite::PointToPointTestSuite()
     AddTestCase(new RepsHoldTest, TestCase::Duration::QUICK);
     AddTestCase(new RepsFlowHoldTest, TestCase::Duration::QUICK);
     AddTestCase(new RepsHoldScopeTest, TestCase::Duration::QUICK);
+    AddTestCase(new RepsHoldAutoScopeTest, TestCase::Duration::QUICK);
     AddTestCase(new SprayPolicyTransportTest, TestCase::Duration::QUICK);
     AddTestCase(new NsccReceiverPenaltyTest, TestCase::Duration::QUICK);
     AddTestCase(new SprayPolicyDefaultsTest, TestCase::Duration::QUICK);

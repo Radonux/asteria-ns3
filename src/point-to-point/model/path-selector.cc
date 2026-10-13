@@ -755,6 +755,233 @@ bool RepsHoldSelector::Excluded(uint16_t path) const{
 	return m_excluding && m_hold.Holds(path);
 }
 
+AutoLossHold::Leaf::Leaf(uint32_t spines)
+	: sent(spines), lost(spines), held(spines), clean(spines),
+	  sentinelNs(spines)
+{
+}
+
+AutoLossHold::AutoLossHold(uint32_t spines,
+		const SpineScores::Parameters &parameters, uint32_t autoLeaves)
+	: m_spines(spines),
+	  m_lossIntervalNs(parameters.lossIntervalNs > 0
+		? parameters.lossIntervalNs : parameters.reportIntervalNs),
+	  m_lossIntervalEndNs(m_lossIntervalNs),
+	  m_cleanSends(parameters.lossHoldCleanSentinels),
+	  m_sentinelIntervalNs(parameters.sentinelIntervalNs > 0
+		? parameters.sentinelIntervalNs : parameters.reportIntervalNs),
+	  m_autoLeaves(autoLeaves), m_lossLeaves(spines), m_hostHeld(spines),
+	  m_hostClean(spines), m_hostSentinelNs(spines)
+{
+	NS_ASSERT_MSG(spines > 0 && spines <= SpineReport::kMaxSpines,
+		"a hold names at most SpineReport::kMaxSpines spines");
+	NS_ASSERT_MSG(parameters.lossThresholds, "a hold grades loss");
+	m_lossThresholds = *parameters.lossThresholds;
+	NS_ASSERT_MSG(m_lossIntervalNs > 0, "a hold grades loss per interval");
+	NS_ASSERT_MSG(m_cleanSends > 0, "a hold ends by clean sends");
+	NS_ASSERT_MSG(m_sentinelIntervalNs > 0,
+		"a held spine's sentinels are an interval apart");
+	NS_ASSERT_MSG(autoLeaves >= 2, "host scope takes at least two leaves");
+}
+
+void AutoLossHold::AddLeaf(uint32_t leaf){
+	m_leaves.try_emplace(leaf, m_spines);
+}
+
+void AutoLossHold::CountSend(uint32_t leaf, uint32_t spine, uint64_t nowNs){
+	NS_ASSERT_MSG(spine < m_spines, "a send is on a held spine's range");
+	AdvanceLossInterval(nowNs);
+	m_leaves.at(leaf).sent[spine]++;
+}
+
+void AutoLossHold::CountLoss(uint32_t leaf, uint32_t spine, uint64_t nowNs){
+	NS_ASSERT_MSG(spine < m_spines, "a loss is on a held spine's range");
+	AdvanceLossInterval(nowNs);
+	m_leaves.at(leaf).lost[spine]++;
+	m_lossLeaves[spine].insert(leaf);
+	if (!m_hostHeld[spine] && LeafHolds(spine) &&
+			m_lossLeaves[spine].size() >= m_autoLeaves)
+		HoldHost(spine);
+}
+
+bool AutoLossHold::TakeSentinel(uint32_t leaf, uint64_t nowNs,
+		uint8_t &spine){
+	AdvanceLossInterval(nowNs);
+	Leaf &counts = m_leaves.at(leaf);
+	for (uint32_t k = 0; k < m_spines; k++){
+		const bool due = m_hostHeld[k]
+			? SentinelDue(m_hostSentinelNs[k], nowNs)
+			: counts.held[k] && SentinelDue(counts.sentinelNs[k], nowNs);
+		if (due){
+			spine = k;
+			return true;
+		}
+	}
+	return false;
+}
+
+bool AutoLossHold::Holds(uint32_t leaf, uint32_t spine) const{
+	return m_hostHeld[spine] || m_leaves.at(leaf).held[spine];
+}
+
+bool AutoLossHold::HoldsEvery(uint32_t leaf) const{
+	for (uint32_t k = 0; k < m_spines; k++){
+		if (!Holds(leaf, k))
+			return false;
+	}
+	return true;
+}
+
+bool AutoLossHold::HostHolds(uint32_t spine) const{
+	return m_hostHeld[spine];
+}
+
+uint32_t AutoLossHold::LossLeaves(uint32_t spine) const{
+	return m_lossLeaves[spine].size();
+}
+
+void AutoLossHold::SetLossIntervalCallback(LeafLossIntervalCallback callback){
+	m_onLossInterval = std::move(callback);
+}
+
+void AutoLossHold::AdvanceLossInterval(uint64_t nowNs){
+	if (nowNs < m_lossIntervalEndNs)
+		return;
+	// The counts are those of the interval that ended at m_lossIntervalEndNs;
+	// any later interval that ended by now counted nothing, which leaves
+	// every hold as it is.
+	CloseLossInterval();
+	m_lossIntervalEndNs += m_lossIntervalNs *
+		(1 + (nowNs - m_lossIntervalEndNs) / m_lossIntervalNs);
+}
+
+void AutoLossHold::CloseLossInterval(){
+	std::map<uint32_t, std::vector<uint8_t>> grades;
+	for (const auto &[leaf, counts] : m_leaves)
+		grades[leaf].assign(m_spines, SpineReport::kTopGrade);
+	for (uint32_t k = 0; k < m_spines; k++){
+		if (m_hostHeld[k]){
+			uint32_t sent = 0;
+			uint32_t lost = 0;
+			for (const auto &[leaf, counts] : m_leaves){
+				sent += counts.sent[k];
+				lost += counts.lost[k];
+			}
+			uint8_t grade = 0;
+			if (lost > 0)
+				m_hostClean[k] = 0;
+			else if ((m_hostClean[k] += sent) >= m_cleanSends){
+				m_hostHeld[k] = false;
+				m_hostClean[k] = 0;
+				m_lossLeaves[k].clear();
+				grade = SpineReport::kTopGrade;
+			}
+			for (auto &[leaf, leafGrades] : grades)
+				leafGrades[k] = grade;
+			continue;
+		}
+		bool released = false;
+		for (auto &[leaf, counts] : m_leaves){
+			if (m_hostHeld[k])
+				break;
+			uint8_t &grade = grades[leaf][k];
+			grade = LossGrade(counts.sent[k], counts.lost[k]);
+			if (counts.held[k]){
+				if (counts.lost[k] > 0){
+					counts.clean[k] = 0;
+					grade = 0;
+				} else if ((counts.clean[k] += counts.sent[k]) < m_cleanSends){
+					grade = 0;
+				} else {
+					counts.held[k] = false;
+					counts.clean[k] = 0;
+					grade = SpineReport::kTopGrade;
+					released = true;
+				}
+			} else if (grade == 0){
+				if (m_lossLeaves[k].size() >= m_autoLeaves)
+					HoldHost(k);
+				else {
+					counts.held[k] = true;
+					counts.clean[k] = 0;
+				}
+			}
+		}
+		if (m_hostHeld[k]){
+			for (auto &[leaf, leafGrades] : grades)
+				leafGrades[k] = 0;
+		} else if (released && !LeafHolds(k))
+			m_lossLeaves[k].clear();
+	}
+	for (auto &[leaf, counts] : m_leaves){
+		if (m_onLossInterval)
+			m_onLossInterval(leaf, m_lossIntervalEndNs, counts.sent, counts.lost,
+				grades[leaf]);
+		std::fill(counts.sent.begin(), counts.sent.end(), 0);
+		std::fill(counts.lost.begin(), counts.lost.end(), 0);
+	}
+}
+
+uint8_t AutoLossHold::LossGrade(uint32_t sent, uint32_t lost) const{
+	if (sent == 0)
+		return SpineReport::kTopGrade;
+	return QuantizeGrade(std::min(1.0, static_cast<double>(lost) / sent),
+		m_lossThresholds);
+}
+
+void AutoLossHold::HoldHost(uint32_t spine){
+	m_hostHeld[spine] = true;
+	m_hostClean[spine] = 0;
+	for (auto &[leaf, counts] : m_leaves){
+		counts.held[spine] = false;
+		counts.clean[spine] = 0;
+	}
+}
+
+bool AutoLossHold::LeafHolds(uint32_t spine) const{
+	for (const auto &[leaf, counts] : m_leaves){
+		if (counts.held[spine])
+			return true;
+	}
+	return false;
+}
+
+bool AutoLossHold::SentinelDue(uint64_t &lastNs, uint64_t nowNs) const{
+	if (nowNs < lastNs + m_sentinelIntervalNs)
+		return false;
+	lastNs = nowNs;
+	return true;
+}
+
+RepsAutoHoldSelector::RepsAutoHoldSelector(Ptr<UniformRandomVariable> random,
+		uint32_t bufferSize, uint64_t freezingTimeoutNs,
+		uint32_t explorePackets, uint32_t spines, AutoLossHold &hold,
+		uint32_t leaf)
+	: RepsSelector(random, bufferSize, freezingTimeoutNs, explorePackets,
+		spines),
+	  m_hold(hold), m_leaf(leaf), m_excluding(false)
+{
+	m_hold.AddLeaf(leaf);
+}
+
+uint16_t RepsAutoHoldSelector::Choose(uint64_t nowNs){
+	uint8_t spine;
+	if (!m_hold.TakeSentinel(m_leaf, nowNs, spine)){
+		m_excluding = !m_hold.HoldsEvery(m_leaf);
+		spine = RepsSelector::Choose(nowNs);
+	}
+	m_hold.CountSend(m_leaf, spine, nowNs);
+	return SpineIdentification(spine, spine);
+}
+
+void RepsAutoHoldSelector::OnLoss(uint16_t path, uint64_t nowNs){
+	m_hold.CountLoss(m_leaf, path, nowNs);
+}
+
+bool RepsAutoHoldSelector::Excluded(uint16_t path) const{
+	return m_excluding && m_hold.Holds(m_leaf, path);
+}
+
 FaultedSpines::FaultedSpines(uint32_t spines, uint64_t readIntervalNs,
 		Reader reader)
 	: m_reader(std::move(reader)), m_readIntervalNs(readIntervalNs),

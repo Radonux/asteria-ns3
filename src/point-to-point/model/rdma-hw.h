@@ -226,10 +226,17 @@ public:
 	// HoldScope of PathSelector RepsHold. Under Leaf the queue pairs to the
 	// hosts of one leaf, which m_switchQueues names, share that leaf's loss
 	// hold in m_leafHolds, made at the first of them; under Host every queue
-	// pair shares m_senderSpineScores.
+	// pair shares m_senderSpineScores. Under Auto every queue pair shares
+	// m_autoHold, made at the first of them, toward its destination's leaf,
+	// which m_switchQueues names; m_sprayHoldAutoLeaves is its
+	// AutoLossHold autoLeaves.
 	uint32_t m_sprayHoldScope;
+	uint32_t m_sprayHoldAutoLeaves;
 	std::unordered_map<uint32_t, SpineScores> m_leafHolds;
+	std::unique_ptr<AutoLossHold> m_autoHold;
 	bool IsLeafHold() const;
+	bool IsAutoHold() const;
+	AutoLossHold &AutoHold();
 	// PathSelector RepsOracle, whether it has the switches' state to read,
 	// and per destination leaf the spines it excludes, made at the first
 	// queue pair to that leaf and read once per base RTT.
@@ -239,7 +246,8 @@ public:
 	FaultedSpines &FaultedSpinesTo(uint32_t leaf);
 	SpineScores &LeafHold(uint32_t leaf);
 	// The LeafSpineLossInterval trace source: a destination leaf's loss hold
-	// closed a loss interval, as SpineLossInterval passes it.
+	// closed a loss interval, or under Auto the host's did toward one
+	// destination leaf, as SpineLossInterval passes it.
 	typedef void (*LeafSpineLossIntervalTracedCallback)(uint32_t leaf,
 		uint64_t endNs, const std::vector<uint32_t> &sent,
 		const std::vector<uint32_t> &lost, const std::vector<uint8_t> &grades);

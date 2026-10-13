@@ -545,13 +545,23 @@ TypeId RdmaHw::GetTypeId (void)
 				"Under PathSelector 6, what one loss hold is kept for: 0=every "
 				"destination of the host, 1=the destinations on one leaf, each "
 				"leaf's hold counting the sends and losses of the queue pairs "
-				"to it and holding a spine for them alone. Default 1. Leaf "
-				"needs the hosts' leaves, from SwitchQueueState.",
-				UintegerValue(static_cast<uint32_t>(HoldScope::Leaf)),
+				"to it and holding a spine for them alone, 2=per spine either, "
+				"the host's every destination once SprayHoldAutoLeaves "
+				"destination leaves have a loss on it, else the destination "
+				"leaf it is graded 0 toward (AutoLossHold). Default 2. Leaf "
+				"and auto need the hosts' leaves, from SwitchQueueState.",
+				UintegerValue(static_cast<uint32_t>(HoldScope::Auto)),
 				MakeUintegerAccessor(&RdmaHw::m_sprayHoldScope),
 				MakeUintegerChecker<uint32_t>(
 					static_cast<uint32_t>(HoldScope::Host),
-					static_cast<uint32_t>(HoldScope::Leaf)))
+					static_cast<uint32_t>(HoldScope::Auto)))
+		.AddAttribute("SprayHoldAutoLeaves",
+				"Under PathSelector 6 with SprayHoldScope 2, the destination "
+				"leaves with a loss on a spine from which its hold is kept "
+				"for every destination. Default 2.",
+				UintegerValue(2),
+				MakeUintegerAccessor(&RdmaHw::m_sprayHoldAutoLeaves),
+				MakeUintegerChecker<uint32_t>(2))
 		.AddAttribute("SprayCandidates",
 				"Under LoadBalancing 3, the candidates drawn per packet, of which "
 				"the highest-scored is sent on. Default 1.",
@@ -634,8 +644,10 @@ TypeId RdmaHw::GetTypeId (void)
 				"ns3::RdmaHw::SpineLossIntervalTracedCallback")
 		.AddTraceSource("LeafSpineLossInterval",
 				"Under PathSelector 6 with SprayHoldScope 1, the loss hold of "
-				"one destination leaf closed a loss interval: the leaf, and "
-				"what SpineLossInterval passes.",
+				"one destination leaf closed a loss interval, and with "
+				"SprayHoldScope 2 the host's loss hold did, once per "
+				"destination leaf: the leaf, and what SpineLossInterval "
+				"passes.",
 				MakeTraceSourceAccessor(&RdmaHw::m_traceLeafSpineLossInterval),
 				"ns3::RdmaHw::LeafSpineLossIntervalTracedCallback")
 		.AddAttribute("EwmaGain",
@@ -888,7 +900,7 @@ void RdmaHw::Setup(QpCompleteCallback cb, QpFailureCallback failure_cb){
 		"PathSelector 6 and 7 hold spines by their loss and need LoadBalancing 2, "
 		"SprayLossThreshold1-3, SprayLossIntervalNs and "
 		"SprayLossHoldCleanSentinels above zero and SprayHeldExploration "
-		"sentinel, and PathSelector 6 under SprayHoldScope 1 needs "
+		"sentinel, and PathSelector 6 under SprayHoldScope 1 or 2 needs "
 		"SwitchQueueState for the hosts' leaves");
 	NS_ABORT_MSG_IF(!ValidRepsOracle(),
 		"PathSelector 8 reads the spines' faults from SwitchQueueState and "
@@ -1307,7 +1319,7 @@ bool RdmaHw::ValidRepsHold() const{
 			m_sprayLossThreshold1 > 0 && m_sprayLossIntervalNs > 0 &&
 			m_sprayLossHoldCleanSentinels > 0 &&
 			m_sprayHeldExploration == SpineScores::HeldExploration::Sentinel &&
-			(!IsLeafHold() || m_switchQueues));
+			((!IsLeafHold() && !IsAutoHold()) || m_switchQueues));
 }
 
 bool RdmaHw::IsRepsOracle() const{
@@ -1340,6 +1352,26 @@ bool RdmaHw::IsLeafHold() const{
 	return m_pathSelectorKind ==
 			static_cast<uint32_t>(PathSelectorKind::RepsHold) &&
 		m_sprayHoldScope == static_cast<uint32_t>(HoldScope::Leaf);
+}
+
+bool RdmaHw::IsAutoHold() const{
+	return m_pathSelectorKind ==
+			static_cast<uint32_t>(PathSelectorKind::RepsHold) &&
+		m_sprayHoldScope == static_cast<uint32_t>(HoldScope::Auto);
+}
+
+AutoLossHold &RdmaHw::AutoHold(){
+	if (m_autoHold)
+		return *m_autoHold;
+	m_autoHold = std::make_unique<AutoLossHold>(m_spineCount,
+		LossHoldParameters(), m_sprayHoldAutoLeaves);
+	m_autoHold->SetLossIntervalCallback(
+		[this](uint32_t leaf, uint64_t endNs, const std::vector<uint32_t> &sent,
+				const std::vector<uint32_t> &lost,
+				const std::vector<uint8_t> &grades){
+			m_traceLeafSpineLossInterval(leaf, endNs, sent, lost, grades);
+		});
+	return *m_autoHold;
 }
 
 SpineScores &RdmaHw::LeafHold(uint32_t leaf){
@@ -2546,6 +2578,13 @@ void RdmaHw::StartPathSelection(Ptr<RdmaQueuePair> qp, uint64_t bdpBytes,
 			m_repsBufferSize, m_repsFreezingTimeoutNs, bdpBytes / m_mtu,
 			m_spineCount,
 			FaultedSpinesTo(m_switchQueues->LeafOf(qp->dip.Get())));
+		return;
+	}
+	if (IsAutoHold()){
+		qp->m_pathSelector = std::make_unique<RepsAutoHoldSelector>(
+			m_pathRandom, m_repsBufferSize, m_repsFreezingTimeoutNs,
+			bdpBytes / m_mtu, m_spineCount, AutoHold(),
+			m_switchQueues->LeafOf(qp->dip.Get()));
 		return;
 	}
 	if (IsRepsHold()){
