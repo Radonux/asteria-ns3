@@ -7234,6 +7234,135 @@ class RepsHoldTest : public TestCase
     }
 };
 
+class MrcHoldTest : public TestCase
+{
+  public:
+    MrcHoldTest()
+        : TestCase("Under mrc_hold a spine whose losses grade it 0 leaves every flow's MRC "
+                   "choices, is sent one sentinel per interval for the host, and returns after "
+                   "the clean sentinels; the policy is refused without its loss hold")
+    {
+    }
+
+    void DoRun() override
+    {
+        Validation();
+        Hold();
+        Simulator::Destroy();
+    }
+
+  private:
+    static constexpr uint32_t kSpines = LossHoldFixture::kSpines;
+    static constexpr uint64_t kInterval = LossHoldFixture::kInterval;
+
+    static Ptr<RdmaHw> Hw()
+    {
+        Ptr<RdmaHw> hw = LossHoldFixture::Hw();
+        hw->m_pathSelectorKind = static_cast<uint32_t>(PathSelectorKind::MrcHold);
+        return hw;
+    }
+
+    void Validation()
+    {
+        Ptr<RdmaHw> full = Hw();
+        NS_TEST_EXPECT_MSG_EQ(full->ValidRepsHold(), true, "a full loss hold");
+        NS_TEST_EXPECT_MSG_EQ(full->IsRepsHold(), true, "mrc_hold keeps reps_hold's loss hold");
+        NS_TEST_EXPECT_MSG_EQ(full->CountsSprayLoss(), true, "and counts the sender's losses");
+        const std::vector<std::pair<std::function<void(RdmaHw&)>, std::string>> missing = {
+            {[](RdmaHw& hw) {
+                 hw.m_loadBalancing = static_cast<uint32_t>(LoadBalancingMode::EntropyHash);
+             },
+             "entropy values name no spine"},
+            {[](RdmaHw& hw) { hw.m_sprayLossThreshold1 = 0; }, "no loss thresholds"},
+            {[](RdmaHw& hw) { hw.m_sprayLossIntervalNs = 0; }, "no loss interval"},
+            {[](RdmaHw& hw) { hw.m_sprayLossHoldCleanSentinels = 0; }, "no loss hold"},
+            {[](RdmaHw& hw) { hw.m_sprayHeldExploration = SpineScores::HeldExploration::Epsilon; },
+             "no sentinels"},
+            {[](RdmaHw& hw) { hw.m_sprayHoldScope = static_cast<uint32_t>(HoldScope::Leaf); },
+             "leaf scope without the hosts' leaves"},
+            {[](RdmaHw& hw) { hw.m_sprayHoldScope = static_cast<uint32_t>(HoldScope::Auto); },
+             "auto scope without the hosts' leaves"},
+        };
+        for (const auto& [unset, message] : missing)
+        {
+            Ptr<RdmaHw> hw = Hw();
+            unset(*hw);
+            NS_TEST_EXPECT_MSG_EQ(hw->ValidRepsHold(), false, "refused: " + message);
+        }
+    }
+
+    // Two flows of one host share the host's hold, made by StartPathSelection.
+    // Over the first interval every send on spine 3, data or probe, is lost,
+    // which also takes spine 3 out of MRC's service; from the second on
+    // spine 3's probes are answered, which returns it to MRC, but the hold
+    // keeps it out of every choice but its sentinel, one per interval for the
+    // host, until three clean sentinels release it.
+    void Hold()
+    {
+        Ptr<RdmaHw> hw = Hw();
+        hw->SetAttribute("Mtu", UintegerValue(1000));
+        hw->SetAttribute("PathRandomVariable", PointerValue(SelectorStream()));
+        hw->m_retransmission_timeout_ns = 2000;
+        std::vector<Ptr<RdmaQueuePair>> qps;
+        for (const char* destination : {"11.0.2.1", "11.0.3.1"})
+        {
+            qps.push_back(CreateObject<RdmaQueuePair>(
+                3, Ipv4Address("11.0.1.1"), Ipv4Address(destination), 10000, 100));
+            hw->StartPathSelection(qps.back(), 0, 1000);
+            NS_TEST_EXPECT_MSG_NE(dynamic_cast<MrcHoldSelector*>(qps.back()->m_pathSelector.get()),
+                                  nullptr,
+                                  "MRC over spines with the hold");
+        }
+        NS_TEST_EXPECT_MSG_NE(hw->m_senderSpineScores.get(), nullptr, "one hold for the host");
+        SpineScores& hold = *hw->m_senderSpineScores;
+        uint32_t step = 0;
+        std::vector<uint32_t> onSpine3(5);
+        std::vector<uint32_t> sentinelsByFlow(2);
+        uint32_t probesAnswered = 0;
+        bool probesNameSpines = true;
+        for (uint32_t interval = 0; interval < 5; ++interval)
+        {
+            for (uint32_t i = 0; i < 100; ++i, ++step)
+            {
+                const uint64_t now = interval * kInterval + 100 * i;
+                PathSelector& flow = *qps[step % 2]->m_pathSelector;
+                uint16_t probed;
+                if (flow.TakeProbe(now, probed))
+                {
+                    const uint8_t spine = RequestedSpine(probed);
+                    probesNameSpines = probesNameSpines && spine < kSpines &&
+                                       CarryingSpine(probed) == spine;
+                    if (interval > 0)
+                    {
+                        flow.OnProbeAnswer(spine, false, now);
+                        probesAnswered += spine == 3;
+                    }
+                }
+                const std::set<uint8_t> lossy =
+                    interval == 0 ? std::set<uint8_t>{3} : std::set<uint8_t>{};
+                const uint8_t spine = LossHoldFixture::Send(flow, now, step / 2, lossy);
+                onSpine3[interval] += spine == 3;
+                if (interval >= 1 && interval <= 3 && spine == 3)
+                {
+                    sentinelsByFlow[step % 2]++;
+                }
+            }
+            if (interval == 0)
+            {
+                NS_TEST_EXPECT_MSG_GT(onSpine3[0], 0u, "spine 3 is sent on, and loses");
+            }
+        }
+        NS_TEST_EXPECT_MSG_EQ(probesNameSpines, true, "a probe names the spine it probes");
+        NS_TEST_EXPECT_MSG_GT(probesAnswered, 0u, "spine 3's probes are answered while held");
+        NS_TEST_EXPECT_MSG_EQ(onSpine3[1], 1u, "held: one sentinel in the first interval");
+        NS_TEST_EXPECT_MSG_EQ(onSpine3[2], 1u, "and in the second");
+        NS_TEST_EXPECT_MSG_EQ(onSpine3[3], 1u, "and in the third, for the whole host");
+        NS_TEST_EXPECT_MSG_EQ(sentinelsByFlow[0] + sentinelsByFlow[1], 3u, "taken by either flow");
+        NS_TEST_EXPECT_MSG_EQ(hold.Holds(3), false, "three clean sentinels release the spine");
+        NS_TEST_EXPECT_MSG_GT(onSpine3[4], 1u, "and MRC chooses it again");
+    }
+};
+
 class RepsFlowHoldTest : public TestCase
 {
   public:
@@ -10647,6 +10776,7 @@ PointToPointTestSuite::PointToPointTestSuite()
     AddTestCase(new SpineHeldExplorationTest, TestCase::Duration::QUICK);
     AddTestCase(new SpinePoolHoldPropagationTest, TestCase::Duration::QUICK);
     AddTestCase(new RepsHoldTest, TestCase::Duration::QUICK);
+    AddTestCase(new MrcHoldTest, TestCase::Duration::QUICK);
     AddTestCase(new RepsFlowHoldTest, TestCase::Duration::QUICK);
     AddTestCase(new RepsHoldScopeTest, TestCase::Duration::QUICK);
     AddTestCase(new RepsHoldAutoScopeTest, TestCase::Duration::QUICK);

@@ -182,12 +182,13 @@ TypeId RdmaHw::GetTypeId (void)
 				"loss hold holds, 7 as 6 with a loss hold per queue pair, and 8 "
 				"is REPS over spines leaving out for good the spines "
 				"SwitchQueueState shows a fault on toward the destination's "
-				"leaf, which needs SprayGradeCostSource 1.",
+				"leaf, which needs SprayGradeCostSource 1, and 9 is MRC over "
+				"spines leaving out the spines 6's loss hold holds.",
 				UintegerValue(static_cast<uint32_t>(PathSelectorKind::Ops)),
 				MakeUintegerAccessor(&RdmaHw::m_pathSelectorKind),
 				MakeUintegerChecker<uint32_t>(
 					static_cast<uint32_t>(PathSelectorKind::Ops),
-					static_cast<uint32_t>(PathSelectorKind::RepsOracle)))
+					static_cast<uint32_t>(PathSelectorKind::MrcHold)))
 		.AddAttribute("RepsBufferSize",
 				"REPS: the entries of the circular buffer of entropy values to "
 				"reuse. Default 8, REPS section 3.1.",
@@ -542,7 +543,7 @@ TypeId RdmaHw::GetTypeId (void)
 				MakeUintegerAccessor(&RdmaHw::m_sprayHeldSentinelIntervalNs),
 				MakeUintegerChecker<uint64_t>())
 		.AddAttribute("SprayHoldScope",
-				"Under PathSelector 6, what one loss hold is kept for: 0=every "
+				"Under PathSelector 6 and 9, what one loss hold is kept for: 0=every "
 				"destination of the host, 1=the destinations on one leaf, each "
 				"leaf's hold counting the sends and losses of the queue pairs "
 				"to it and holding a spine for them alone, 2=per spine either, "
@@ -556,7 +557,7 @@ TypeId RdmaHw::GetTypeId (void)
 					static_cast<uint32_t>(HoldScope::Host),
 					static_cast<uint32_t>(HoldScope::Auto)))
 		.AddAttribute("SprayHoldAutoLeaves",
-				"Under PathSelector 6 with SprayHoldScope 2, the destination "
+				"Under PathSelector 6 and 9 with SprayHoldScope 2, the destination "
 				"leaves with a loss on a spine from which its hold is kept "
 				"for every destination. Default 2.",
 				UintegerValue(2),
@@ -729,7 +730,7 @@ TypeId RdmaHw::GetTypeId (void)
 		.AddTraceSource("SpineLossInterval",
 				"Under LoadBalancing 3 with SprayLossThreshold1 set and "
 				"SpraySenderPoolWeight above zero, the host's pooled scores "
-				"closed a loss interval, and under PathSelector 6 with "
+				"closed a loss interval, and under PathSelector 6 or 9 with "
 				"SprayHoldScope 0 the host's loss hold did: the time it ended "
 				"at and, per spine, the sends and losses counted in it and the "
 				"grade its lost fraction earns.",
@@ -744,7 +745,7 @@ TypeId RdmaHw::GetTypeId (void)
 				MakeTraceSourceAccessor(&RdmaHw::m_traceRetransmissionTimeout),
 				"ns3::RdmaHw::RetransmissionTimeoutTracedCallback")
 		.AddTraceSource("LeafSpineLossInterval",
-				"Under PathSelector 6 with SprayHoldScope 1, the loss hold of "
+				"Under PathSelector 6 or 9 with SprayHoldScope 1, the loss hold of "
 				"one destination leaf closed a loss interval, and with "
 				"SprayHoldScope 2 the host's loss hold did, once per "
 				"destination leaf: the leaf, and what SpineLossInterval "
@@ -1006,11 +1007,11 @@ void RdmaHw::Setup(QpCompleteCallback cb, QpFailureCallback failure_cb){
 		"is sent nothing, and the receiver's estimate releases a hold only "
 		"for arrivals");
 	NS_ABORT_MSG_IF(!ValidRepsHold(),
-		"PathSelector 6 and 7 hold spines by their loss and need LoadBalancing 2, "
+		"PathSelector 6, 7 and 9 hold spines by their loss and need LoadBalancing 2, "
 		"SprayLossThreshold1-3, SprayLossIntervalNs above zero, "
 		"SprayLossHoldCleanSentinels above zero unless SprayHoldRelease is 1, "
-		"and SprayHeldExploration sentinel, and PathSelector 6 under "
-		"SprayHoldScope 1 or 2 needs SwitchQueueState for the hosts' leaves");
+		"and SprayHeldExploration sentinel, and PathSelector 6 and 9 under "
+		"SprayHoldScope 1 or 2 need SwitchQueueState for the hosts' leaves");
 	NS_ABORT_MSG_IF(!ValidHoldRule(),
 		"SprayHoldRule 1 is read only under PathSelector 6 and 7 and needs "
 		"0 <= SprayLossP0 < SprayLossP1 < 1 and SprayHoldAlpha and "
@@ -1080,8 +1081,8 @@ void RdmaHw::Setup(QpCompleteCallback cb, QpFailureCallback failure_cb){
 	NS_ABORT_MSG_IF(CustomHeader::ackRedirectBytes != (IsAckRedirect() ? 1 : 0),
 		"PathSelector 5 and only it carries the redirect field in every "
 		"acknowledgement");
-	NS_ABORT_MSG_IF(m_pathSelectorKind ==
-				static_cast<uint32_t>(PathSelectorKind::Mrc) &&
+	NS_ABORT_MSG_IF((m_pathSelectorKind ==
+				static_cast<uint32_t>(PathSelectorKind::Mrc) || IsMrcHold()) &&
 			m_retransmission_timeout_ns == 0,
 		"MRC probes at multiples of RetransmissionTimeoutNs");
 	NS_ABORT_MSG_IF(IsPathPerPacket() && !CustomHeader::ackCarriesPacketSeq,
@@ -1443,7 +1444,13 @@ bool RdmaHw::IsRepsHold() const{
 	return m_pathSelectorKind ==
 			static_cast<uint32_t>(PathSelectorKind::RepsHold) ||
 		m_pathSelectorKind ==
-			static_cast<uint32_t>(PathSelectorKind::RepsFlowHold);
+			static_cast<uint32_t>(PathSelectorKind::RepsFlowHold) ||
+		IsMrcHold();
+}
+
+bool RdmaHw::IsMrcHold() const{
+	return m_pathSelectorKind ==
+		static_cast<uint32_t>(PathSelectorKind::MrcHold);
 }
 
 bool RdmaHw::ValidRepsHold() const{
@@ -1505,14 +1512,14 @@ FaultedSpines &RdmaHw::FaultedSpinesTo(uint32_t leaf){
 }
 
 bool RdmaHw::IsLeafHold() const{
-	return m_pathSelectorKind ==
-			static_cast<uint32_t>(PathSelectorKind::RepsHold) &&
+	return (m_pathSelectorKind ==
+			static_cast<uint32_t>(PathSelectorKind::RepsHold) || IsMrcHold()) &&
 		m_sprayHoldScope == static_cast<uint32_t>(HoldScope::Leaf);
 }
 
 bool RdmaHw::IsAutoHold() const{
-	return m_pathSelectorKind ==
-			static_cast<uint32_t>(PathSelectorKind::RepsHold) &&
+	return (m_pathSelectorKind ==
+			static_cast<uint32_t>(PathSelectorKind::RepsHold) || IsMrcHold()) &&
 		m_sprayHoldScope == static_cast<uint32_t>(HoldScope::Auto);
 }
 
@@ -2796,6 +2803,22 @@ void RdmaHw::StartPathSelection(Ptr<RdmaQueuePair> qp, uint64_t bdpBytes,
 			m_repsBufferSize, m_repsFreezingTimeoutNs, bdpBytes / m_mtu,
 			m_spineCount,
 			FaultedSpinesTo(m_switchQueues->LeafOf(qp->dip.Get())));
+		return;
+	}
+	if (IsMrcHold()){
+		const uint64_t skipNs =
+			static_cast<uint64_t>(m_mrcSkipBaseRtts * baseRttNs);
+		const uint64_t probeNs = static_cast<uint64_t>(
+			m_mrcProbeTimeouts * m_retransmission_timeout_ns);
+		if (IsAutoHold())
+			qp->m_pathSelector = std::make_unique<MrcHoldSelector>(m_pathRandom,
+				m_spineCount, skipNs, probeNs, AutoHold(),
+				m_switchQueues->LeafOf(qp->dip.Get()));
+		else
+			qp->m_pathSelector = std::make_unique<MrcHoldSelector>(m_pathRandom,
+				m_spineCount, skipNs, probeNs, IsLeafHold()
+					? LeafHold(m_switchQueues->LeafOf(qp->dip.Get()))
+					: HostScores(LossHoldParameters()));
 		return;
 	}
 	if (IsAutoHold()){

@@ -210,17 +210,18 @@ public:
 	// whether it is set only with a pool to propagate from.
 	bool m_sprayPoolHoldPropagates;
 	bool ValidPoolHoldPropagates() const;
-	// The host's pooled scores, or under PathSelector RepsHold its loss hold;
-	// null until the first queue pair that uses them.
+	// The host's pooled scores, or under PathSelector RepsHold or MrcHold its
+	// loss hold; null until the first queue pair that uses them.
 	std::unique_ptr<SpineScores> m_senderSpineScores;
 	// m_senderSpineScores, made with parameters if it is null, its loss
 	// intervals traced to SpineLossInterval when they are graded.
 	SpineScores &HostScores(const SpineScores::Parameters &parameters);
-	// PathSelector RepsHold or RepsFlowHold, and whether its loss hold has
-	// what it needs:
+	// PathSelector RepsHold, RepsFlowHold or MrcHold, and whether its loss
+	// hold has what it needs:
 	// spines named per packet, the loss thresholds, a loss interval, a loss
 	// hold and the sentinels that release it.
 	bool IsRepsHold() const;
+	bool IsMrcHold() const;
 	bool ValidRepsHold() const;
 	// The parameters of scores used as a loss hold alone.
 	SpineScores::Parameters LossHoldParameters() const;
@@ -241,7 +242,7 @@ public:
 	bool ValidHoldRelease() const;
 	// SentinelMode of PathSelector RepsHold and RepsFlowHold.
 	uint32_t m_spraySentinelMode;
-	// HoldScope of PathSelector RepsHold. Under Leaf the queue pairs to the
+	// HoldScope of PathSelector RepsHold and MrcHold. Under Leaf the queue pairs to the
 	// hosts of one leaf, which m_switchQueues names, share that leaf's loss
 	// hold in m_leafHolds, made at the first of them; under Host every queue
 	// pair shares m_senderSpineScores. Under Auto every queue pair shares

@@ -1555,6 +1555,8 @@ uint16_t MrcSelector::Choose(uint64_t nowNs){
 	// into, so the value this send resets is reached again.
 	for (uint32_t visited = 0; visited < 2 * m_rotation.Size(); visited++){
 		const uint16_t ev = m_rotation.Next();
+		if (Excluded(ev))
+			continue;
 		Entropy &entropy = m_entropies[ev];
 		if (entropy.state == State::Skip && nowNs >= entropy.skipUntilNs)
 			entropy.state = State::Good;
@@ -1616,6 +1618,10 @@ void MrcSelector::OnProbeAnswer(uint16_t path, bool marked, uint64_t nowNs){
 		Skip(path, nowNs);
 }
 
+bool MrcSelector::Excluded(uint16_t) const{
+	return false;
+}
+
 MrcSelector::Entropy &MrcSelector::At(uint16_t ev){
 	NS_ASSERT_MSG(ev < m_entropies.size(), "every send takes a value of the set");
 	return m_entropies[ev];
@@ -1628,6 +1634,68 @@ void MrcSelector::Skip(uint16_t ev, uint64_t nowNs){
 		return;
 	entropy.state = State::Skip;
 	entropy.skipUntilNs = nowNs + m_skipNs;
+}
+
+MrcHoldSelector::MrcHoldSelector(Ptr<UniformRandomVariable> random,
+		uint32_t spines, uint64_t skipNs, uint64_t probeIntervalNs,
+		SpineScores &hold)
+	: MrcSelector(random, spines, skipNs, probeIntervalNs), m_hold(&hold),
+	  m_autoHold(nullptr), m_leaf(0), m_excluding(false)
+{
+}
+
+MrcHoldSelector::MrcHoldSelector(Ptr<UniformRandomVariable> random,
+		uint32_t spines, uint64_t skipNs, uint64_t probeIntervalNs,
+		AutoLossHold &hold, uint32_t leaf)
+	: MrcSelector(random, spines, skipNs, probeIntervalNs), m_hold(nullptr),
+	  m_autoHold(&hold), m_leaf(leaf), m_excluding(false)
+{
+	m_autoHold->AddLeaf(leaf);
+}
+
+uint16_t MrcHoldSelector::Choose(uint64_t nowNs){
+	uint8_t spine;
+	const bool sentinel = m_autoHold
+		? m_autoHold->TakeSentinel(m_leaf, nowNs, spine)
+		: m_hold->TakeHoldSentinel(nowNs, spine);
+	if (!sentinel){
+		m_excluding = !HoldsEvery();
+		spine = MrcSelector::Choose(nowNs);
+	}
+	if (m_autoHold)
+		m_autoHold->CountSend(m_leaf, spine, nowNs);
+	else
+		m_hold->CountIntervalSend(spine, nowNs);
+	return SpineIdentification(spine, spine);
+}
+
+void MrcHoldSelector::OnLoss(uint16_t path, uint64_t nowNs){
+	if (m_autoHold)
+		m_autoHold->CountLoss(m_leaf, path, nowNs);
+	else
+		m_hold->CountIntervalLoss(path, nowNs);
+	MrcSelector::OnLoss(path, nowNs);
+}
+
+// A probe is sent up the spine it probes, which its answer names back.
+bool MrcHoldSelector::TakeProbe(uint64_t nowNs, uint16_t &path){
+	uint16_t spine;
+	if (!MrcSelector::TakeProbe(nowNs, spine))
+		return false;
+	path = SpineIdentification(spine, spine);
+	return true;
+}
+
+bool MrcHoldSelector::Excluded(uint16_t path) const{
+	return m_excluding && Holds(path);
+}
+
+bool MrcHoldSelector::Holds(uint32_t spine) const{
+	return m_autoHold ? m_autoHold->Holds(m_leaf, spine) : m_hold->Holds(spine);
+}
+
+bool MrcHoldSelector::HoldsEvery() const{
+	return m_autoHold ? m_autoHold->HoldsEvery(m_leaf) : m_hold->HoldsEvery();
 }
 
 } /* namespace ns3 */
