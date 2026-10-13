@@ -2196,9 +2196,14 @@ int RdmaHw::ReceiveTrim(Ptr<Packet> p, CustomHeader &ch){
 		const bool lastHop = ch.GetIpv4Dscp() == kUetDscpTrimmedLastHop;
 		// A trim can reach a flow before any of its data does; the receive
 		// state it makes is what that data would have made.
-		const Ptr<RdmaRxQueuePair> q = IsPerConnectionGrading() || IsAckRedirect()
+		const Ptr<RdmaRxQueuePair> q =
+				IsPerConnectionGrading() || IsAckRedirect() || m_sprayPathSeq
 			? GetRxQp(ch.dip, ch.sip, ch.udp.dport, ch.udp.sport, ch.udp.pg, true)
 			: nullptr;
+		// The trimmed header keeps the path sequence: the trim keeps at least
+		// CustomHeader::GetUdpHeaderSize() bytes of IP payload.
+		if (m_sprayPathSeq)
+			CountPathSeq(q, ch, true);
 		if (IsGrading())
 			GradeTrim(q, ch, lastHop);
 		// A last-hop trim says nothing of the spine it crossed, and the repair

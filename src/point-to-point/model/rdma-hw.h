@@ -299,8 +299,12 @@ public:
 	bool m_sprayPathSeq;
 	std::vector<uint64_t> m_spineGaps;
 	bool ValidPathSeq() const;
-	// The path sequence of the data packet ch arriving at q, counted.
-	void CountPathSeq(Ptr<RdmaRxQueuePair> q, const CustomHeader &ch);
+	// The path sequence of the data packet ch arriving at q, or with trimmed
+	// of its trimmed header, counted. A trimmed header moves the expected
+	// sequence on as an arrival does; only the packets missing before it
+	// count, and the receiver's hold takes it for no arrival.
+	void CountPathSeq(Ptr<RdmaRxQueuePair> q, const CustomHeader &ch,
+		bool trimmed = false);
 	// SprayReceiverHold, under SprayPathSeq: the host's ReceiverHold, made at
 	// its first arrival, counts the arrivals and the missing packets per
 	// sender leaf, which m_switchQueues names, holds spines by them with

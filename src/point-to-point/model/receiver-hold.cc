@@ -33,16 +33,7 @@ void ReceiverHold::OnArrival(uint32_t leaf, uint32_t spine, uint32_t gaps,
 	Leaf &counts = LeafCounts(leaf);
 	counts.arrivals[spine]++;
 	if (gaps > 0){
-		counts.lost[spine] += gaps;
-		m_lossLeaves[spine].insert(leaf);
-		if (m_hostHeld[spine])
-			m_hostClean[spine] = 0;
-		else if (m_lossLeaves[spine].size() >= m_autoLeaves)
-			HoldHost(spine);
-		else {
-			counts.held[spine] = true;
-			counts.clean[spine] = 0;
-		}
+		CountMissing(counts, leaf, spine, gaps);
 		return;
 	}
 	if (late)
@@ -57,6 +48,29 @@ void ReceiverHold::OnArrival(uint32_t leaf, uint32_t spine, uint32_t gaps,
 		counts.held[spine] = false;
 		counts.clean[spine] = 0;
 		m_lossLeaves[spine].erase(leaf);
+	}
+}
+
+void ReceiverHold::OnTrim(uint32_t leaf, uint32_t spine, uint32_t gaps,
+		uint64_t nowNs){
+	NS_ASSERT_MSG(spine < m_spines, "a trim is on a held spine's range");
+	AdvanceInterval(nowNs);
+	Leaf &counts = LeafCounts(leaf);
+	if (gaps > 0)
+		CountMissing(counts, leaf, spine, gaps);
+}
+
+void ReceiverHold::CountMissing(Leaf &counts, uint32_t leaf, uint32_t spine,
+		uint32_t gaps){
+	counts.lost[spine] += gaps;
+	m_lossLeaves[spine].insert(leaf);
+	if (m_hostHeld[spine])
+		m_hostClean[spine] = 0;
+	else if (m_lossLeaves[spine].size() >= m_autoLeaves)
+		HoldHost(spine);
+	else {
+		counts.held[spine] = true;
+		counts.clean[spine] = 0;
 	}
 }
 

@@ -163,8 +163,10 @@ bool spray_hold_auto_leaves_given = false;
 // count of the data packets sent before it up its requested spine. The
 // receiver keeps per queue pair and per path, the requested and the carrying
 // spine, the path sequence it expects next; an arrival ahead of it by g shows
-// g packets missing on the carrying spine (a packet trimmed on the way is one
-// of them), and an arrival behind it is late and counts nothing. A packet a
+// g packets missing on the carrying spine, and an arrival behind it is late
+// and counts nothing. A trimmed header, which keeps the path sequence, moves
+// the expected sequence on as an arrival does, so a trim is not a missing
+// packet and only the packets missing before it count. A packet a
 // source leaf moved to another spine is charged to the spine that carried
 // it. Off, the default, leaves the data header as it is.
 std::string spray_path_seq = "off";

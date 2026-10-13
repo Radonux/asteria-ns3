@@ -54,6 +54,11 @@ public:
 	// showed gaps packets missing before it, or arrived late.
 	void OnArrival(uint32_t leaf, uint32_t spine, uint32_t gaps, bool late,
 		uint64_t nowNs);
+	// The trimmed header of a data packet from sender leaf leaf carried by
+	// spine at nowNs, which showed gaps packets missing before it. A trim is
+	// not a missing packet: it is counted neither as an arrival nor as a clean
+	// one, and only the packets missing before it count.
+	void OnTrim(uint32_t leaf, uint32_t spine, uint32_t gaps, uint64_t nowNs);
 	// Whether spine is held for sender leaf leaf, at either scope; and the
 	// bitmap of the spines held for it, bit k for spine k.
 	bool Holds(uint32_t leaf, uint32_t spine) const;
@@ -75,6 +80,9 @@ private:
 		std::vector<uint32_t> clean;
 	};
 	Leaf &LeafCounts(uint32_t leaf);
+	// gaps packets missing on spine from leaf, which counts holds.
+	void CountMissing(Leaf &counts, uint32_t leaf, uint32_t spine,
+		uint32_t gaps);
 	void HoldHost(uint32_t spine);
 	void AdvanceInterval(uint64_t nowNs);
 

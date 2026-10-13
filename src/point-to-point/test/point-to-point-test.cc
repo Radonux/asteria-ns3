@@ -8068,6 +8068,160 @@ class SprayReceiverHoldTraceTest : public TestCase
     }
 };
 
+class SprayPathSeqTrimTest : public TestCase
+{
+  public:
+    SprayPathSeqTrimTest()
+        : TestCase("Under SprayPathSeq a trimmed header moves the receiver's expected path "
+                   "sequence on without a missing packet, so trims alone hold no spine")
+    {
+    }
+
+    void DoRun() override
+    {
+        const IntHeader::Mode savedIntMode = IntHeader::mode;
+        const bool savedPathSeq = CustomHeader::udpCarriesPathSeq;
+        const bool savedPacketSeq = CustomHeader::ackCarriesPacketSeq;
+        const uint32_t savedHoldBytes = CustomHeader::ackReceiverHoldBytes;
+        IntHeader::mode = IntHeader::NONE;
+        CustomHeader::ackCarriesPacketSeq = true;
+        CustomHeader::udpCarriesPathSeq = true;
+        CustomHeader::ackReceiverHoldBytes = 1;
+
+        // Trims on spines 2 and 3, no link loss.
+        Outcome trimsOnly = Run(false);
+        NS_TEST_EXPECT_MSG_GT(trimsOnly.trims, 100u, "the congested spines trim");
+        for (uint32_t spine = 0; spine < kSpines; ++spine)
+        {
+            NS_TEST_EXPECT_MSG_EQ(trimsOnly.gaps[spine], 0u, "a trim is not a missing packet");
+            NS_TEST_EXPECT_MSG_EQ(trimsOnly.lossLeaves[spine], 0u, "nor a loss of the hold");
+        }
+        NS_TEST_EXPECT_MSG_EQ(static_cast<uint32_t>(trimsOnly.bitmap),
+                              0u,
+                              "trims alone hold no spine");
+
+        // The same trims and a 1% link loss on spine 3.
+        Outcome lossy = Run(true);
+        NS_TEST_EXPECT_MSG_GT(lossy.drops, 10u, "spine 3 drops packets");
+        NS_TEST_EXPECT_MSG_EQ(lossy.gaps[kLossy],
+                              lossy.drops,
+                              "the missing packets on spine 3 are its link drops");
+        for (uint32_t spine = 0; spine < kSpines; ++spine)
+        {
+            if (spine != kLossy)
+            {
+                NS_TEST_EXPECT_MSG_EQ(lossy.gaps[spine], 0u, "no other spine misses a packet");
+            }
+        }
+        NS_TEST_EXPECT_MSG_EQ(lossy.lossLeaves[kLossy], 1u, "the link drops hold spine 3");
+
+        CustomHeader::ackReceiverHoldBytes = savedHoldBytes;
+        CustomHeader::udpCarriesPathSeq = savedPathSeq;
+        CustomHeader::ackCarriesPacketSeq = savedPacketSeq;
+        IntHeader::mode = savedIntMode;
+        Simulator::Destroy();
+    }
+
+  private:
+    static constexpr uint32_t kSpines = 8;
+    static constexpr uint8_t kLossy = 3;
+
+    struct Outcome
+    {
+        uint32_t trims = 0;
+        uint32_t drops = 0;
+        std::vector<uint64_t> gaps;
+        std::vector<uint32_t> lossLeaves;
+        uint8_t bitmap = 0;
+    };
+
+    // Trim packet as SwitchNode::TrimInPlace does with MIN_TRIM_SIZE 24: keep
+    // the larger of it and the data headers of IP payload, and mark it.
+    static void Trim(Ptr<Packet> packet)
+    {
+        const uint32_t kept = std::max<uint32_t>(std::max<uint32_t>(24, CustomHeader::GetUdpHeaderSize()),
+                                                 60 - 14 - 20);
+        packet->RemoveAtEnd(packet->GetSize() - PppHeader::GetStaticSize() - 20 - kept);
+        PppHeader ppp;
+        Ipv4Header ip;
+        packet->RemoveHeader(ppp);
+        packet->RemoveHeader(ip);
+        ip.SetDscp(static_cast<Ipv4Header::DscpType>(kUetDscpTrimmed));
+        ip.SetPayloadSize(kept);
+        packet->AddHeader(ip);
+        packet->AddHeader(ppp);
+    }
+
+    Outcome Run(bool linkLoss)
+    {
+        IsolatedHost sender(LoadBalancingMode::SprayUniform, kTestReceiver, kSpines);
+        IsolatedHost receiver(LoadBalancingMode::SprayUniform, kTestSender, kSpines);
+        Ptr<SwitchQueueState> leaves = Create<SwitchQueueState>(2, kSpines);
+        leaves->SetLeafOf(kTestSender.Get(), 0);
+        leaves->SetLeafOf(kTestReceiver.Get(), 1);
+        for (IsolatedHost* host : {&sender, &receiver})
+        {
+            Ptr<RdmaHw> hw = host->hw;
+            hw->m_retransmission_timeout_ns = 0;
+            hw->m_pathSelectorKind = static_cast<uint32_t>(PathSelectorKind::RepsHold);
+            hw->m_sprayHoldScope = static_cast<uint32_t>(HoldScope::Host);
+            hw->m_sprayLossThreshold1 = 0.1;
+            hw->m_sprayLossThreshold2 = 0.25;
+            hw->m_sprayLossThreshold3 = 0.5;
+            hw->m_sprayLossIntervalNs = 10000;
+            hw->m_sprayLossHoldCleanSentinels = 3;
+            hw->m_sprayHeldExploration = SpineScores::HeldExploration::Sentinel;
+            hw->m_sprayPathSeq = true;
+            hw->m_sprayReceiverHold = true;
+            hw->m_sprayHoldAutoLeaves = 2;
+            hw->m_switchQueues = leaves;
+        }
+        constexpr uint32_t kPackets = 20000;
+        Ptr<RdmaQueuePair> qp = sender.AddSender(kTestSender, kTestReceiver,
+                                                 static_cast<uint64_t>(kPackets) * IsolatedHost::kMtu);
+        Ptr<UniformRandomVariable> draw =
+            CreateObjectWithAttributes<UniformRandomVariable>("Stream", IntegerValue(11));
+        Outcome outcome;
+        for (uint32_t i = 0; i < kPackets; ++i)
+        {
+            Ptr<Packet> packet = sender.hw->GetNxtPacket(qp);
+            CustomHeader sent(CustomHeader::L2_Header | CustomHeader::L3_Header |
+                              CustomHeader::L4_Header);
+            packet->PeekHeader(sent);
+            const uint8_t spine = RequestedSpine(sent.ipid);
+            const double u = draw->GetValue();
+            if (linkLoss && spine == kLossy && u < 0.01)
+            {
+                ++outcome.drops;
+                continue;
+            }
+            const bool trimmed = (spine == 2 && u < 0.3) || (spine == kLossy && u > 0.9);
+            if (trimmed)
+            {
+                Trim(packet);
+                ++outcome.trims;
+            }
+            CustomHeader parsed(CustomHeader::L2_Header | CustomHeader::L3_Header |
+                                CustomHeader::L4_Header);
+            packet->PeekHeader(parsed);
+            NS_TEST_EXPECT_MSG_EQ(parsed.udp.path_seq,
+                                  sent.udp.path_seq,
+                                  "the trimmed header keeps the path sequence");
+            receiver.hw->Receive(packet, parsed);
+        }
+        Ptr<RdmaHw> hw = receiver.hw;
+        outcome.gaps = hw->m_spineGaps;
+        outcome.gaps.resize(kSpines, 0);
+        ReceiverHold& hold = hw->ReceiverHoldOf();
+        for (uint32_t spine = 0; spine < kSpines; ++spine)
+        {
+            outcome.lossLeaves.push_back(hold.LossLeaves(spine));
+        }
+        outcome.bitmap = hold.Bitmap(0);
+        return outcome;
+    }
+};
+
 class SprayPolicyTransportTest : public TestCase
 {
   public:
@@ -9835,6 +9989,7 @@ PointToPointTestSuite::PointToPointTestSuite()
     AddTestCase(new SprayPathSeqTest, TestCase::Duration::QUICK);
     AddTestCase(new SprayReceiverHoldTest, TestCase::Duration::QUICK);
     AddTestCase(new SprayReceiverHoldTraceTest, TestCase::Duration::QUICK);
+    AddTestCase(new SprayPathSeqTrimTest, TestCase::Duration::QUICK);
     AddTestCase(new SprayPolicyTransportTest, TestCase::Duration::QUICK);
     AddTestCase(new NsccReceiverPenaltyTest, TestCase::Duration::QUICK);
     AddTestCase(new SprayPolicyDefaultsTest, TestCase::Duration::QUICK);

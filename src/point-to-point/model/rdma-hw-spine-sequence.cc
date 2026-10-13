@@ -14,7 +14,8 @@ bool RdmaHw::ValidPathSeq() const{
 		(!m_sprayPathSeq || IsRepsHold());
 }
 
-void RdmaHw::CountPathSeq(Ptr<RdmaRxQueuePair> q, const CustomHeader &ch){
+void RdmaHw::CountPathSeq(Ptr<RdmaRxQueuePair> q, const CustomHeader &ch,
+		bool trimmed){
 	const uint8_t requested = RequestedSpine(ch.ipid);
 	const uint8_t carrying = CarryingSpine(ch.ipid);
 	const SpineSequenceReceiver::Arrival arrival =
@@ -22,9 +23,15 @@ void RdmaHw::CountPathSeq(Ptr<RdmaRxQueuePair> q, const CustomHeader &ch){
 	if (carrying >= m_spineGaps.size())
 		m_spineGaps.resize(carrying + 1, 0);
 	m_spineGaps[carrying] += arrival.gaps;
-	if (IsReceiverHold())
-		ReceiverHoldOf().OnArrival(m_switchQueues->LeafOf(ch.sip), carrying,
-			arrival.gaps, arrival.late, Simulator::Now().GetNanoSeconds());
+	if (!IsReceiverHold())
+		return;
+	const uint32_t leaf = m_switchQueues->LeafOf(ch.sip);
+	const uint64_t now = Simulator::Now().GetNanoSeconds();
+	if (trimmed)
+		ReceiverHoldOf().OnTrim(leaf, carrying, arrival.gaps, now);
+	else
+		ReceiverHoldOf().OnArrival(leaf, carrying, arrival.gaps, arrival.late,
+			now);
 }
 
 bool RdmaHw::IsReceiverHold() const{
