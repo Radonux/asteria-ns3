@@ -37,9 +37,11 @@ build_lib(
     model/qbb-remote-channel.cc
     model/rdma-driver.cc
     model/rdma-hw.cc
+    model/rdma-hw-spine-sequence.cc
     model/rdma-queue-pair.cc
     model/spine-grader.cc
     model/spine-redirect.cc
+    model/spine-sequence.cc
     model/switch-mmu.cc
     model/switch-node.cc
     model/switch-queue-state.cc
@@ -68,6 +70,7 @@ build_lib(
     model/rdma-queue-pair.h
     model/spine-grader.h
     model/spine-redirect.h
+    model/spine-sequence.h
     model/spine-report.h
     model/switch-mmu.h
     model/switch-node.h

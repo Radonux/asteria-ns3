@@ -150,6 +150,17 @@ bool spray_hold_scope_given = false;
 // from which its hold is kept for every destination; at least 2.
 uint32_t spray_hold_auto_leaves = 2;
 bool spray_hold_auto_leaves_given = false;
+// Under reps_hold or reps_flow_hold, SPRAY_PATH_SEQ on: every data packet
+// carries, in a 2-byte path_seq field after the INT header, its queue pair's
+// count of the data packets sent before it up its requested spine. The
+// receiver keeps per queue pair and per path, the requested and the carrying
+// spine, the path sequence it expects next; an arrival ahead of it by g shows
+// g packets missing on the carrying spine (a packet trimmed on the way is one
+// of them), and an arrival behind it is late and counts nothing. A packet a
+// source leaf moved to another spine is charged to the spine that carried
+// it. Off, the default, leaves the data header as it is.
+std::string spray_path_seq = "off";
+bool spray_path_seq_given = false;
 uint32_t reps_buffer_size = 8;
 uint64_t reps_freezing_timeout_ns = 10000000;
 uint32_t ue_ev_set_size = 256;
@@ -1819,6 +1830,9 @@ bool ReadConf(string network_configuration) {
     } else if (key.compare("SPRAY_HOLD_AUTO_LEAVES") == 0) {
       conf >> spray_hold_auto_leaves;
       spray_hold_auto_leaves_given = true;
+    } else if (key.compare("SPRAY_PATH_SEQ") == 0) {
+      conf >> spray_path_seq;
+      spray_path_seq_given = true;
     } else if (key.compare("SPRAY_HELD_EXPLORATION") == 0) {
       conf >> spray_held_exploration;
     } else if (key.compare("SPRAY_HELD_SENTINEL_INTERVAL_NS") == 0) {
@@ -2205,6 +2219,16 @@ bool ReadConf(string network_configuration) {
     std::cerr << "SPRAY_HOLD_AUTO_LEAVES must be at least 2\n";
     return false;
   }
+  if (spray_path_seq != "on" && spray_path_seq != "off") {
+    std::cerr << "SPRAY_PATH_SEQ must be on or off\n";
+    return false;
+  }
+  if (spray_path_seq_given && !reps_hold()) {
+    std::cerr << "SPRAY_PATH_SEQ is read only under LOAD_BALANCING "
+                 "spray_uniform with PATH_SELECTOR reps_hold or "
+                 "reps_flow_hold\n";
+    return false;
+  }
   if (path_selector == "ack_redirect") {
     if (load_balancing != "spray_uniform") {
       std::cerr << "PATH_SELECTOR ack_redirect names spines and requires "
@@ -2318,6 +2342,7 @@ void SetConfig() {
   CustomHeader::ackCarriesPacketSeq =
       load_balancing_value() != static_cast<uint32_t>(LoadBalancingMode::Ecmp);
   CustomHeader::ackRedirectBytes = path_selector == "ack_redirect" ? 1 : 0;
+  CustomHeader::udpCarriesPathSeq = spray_path_seq == "on";
 
   // Set Pint
   if (cc_mode == 10) {
@@ -2729,6 +2754,8 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),
                            UintegerValue(spray_hold_scope_value()));
       rdmaHw->SetAttribute("SprayHoldAutoLeaves",
                            UintegerValue(spray_hold_auto_leaves));
+      rdmaHw->SetAttribute("SprayPathSeq",
+                           BooleanValue(spray_path_seq == "on"));
       rdmaHw->SetAttribute("UeEvSetSize", UintegerValue(ue_ev_set_size));
       rdmaHw->SetAttribute("UeSaturationFraction",
                            DoubleValue(ue_saturation_fraction));

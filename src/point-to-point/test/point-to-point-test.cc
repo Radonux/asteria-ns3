@@ -55,6 +55,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <deque>
 #include <functional>
 #include <map>
 #include <memory>
@@ -7517,6 +7518,184 @@ class RepsHoldAutoScopeTest : public TestCase
     static constexpr uint32_t kIntervals = 7;
 };
 
+class SprayPathSeqTest : public TestCase
+{
+  public:
+    SprayPathSeqTest()
+        : TestCase("Under SprayPathSeq every data packet carries its path sequence and the "
+                   "receiver counts the packets missing per carrying spine")
+    {
+    }
+
+    void DoRun() override
+    {
+        const IntHeader::Mode savedIntMode = IntHeader::mode;
+        const bool savedPathSeq = CustomHeader::udpCarriesPathSeq;
+        const bool savedPacketSeq = CustomHeader::ackCarriesPacketSeq;
+        IntHeader::mode = IntHeader::NONE;
+        CustomHeader::ackCarriesPacketSeq = true;
+
+        CustomHeader::udpCarriesPathSeq = false;
+        const uint32_t without = CustomHeader::GetUdpHeaderSize();
+        NS_TEST_EXPECT_MSG_EQ(SeqTsHeader().GetSerializedSize(),
+                              6u,
+                              "without the path sequence the data header keeps its size");
+        CustomHeader::udpCarriesPathSeq = true;
+        NS_TEST_EXPECT_MSG_EQ(CustomHeader::GetUdpHeaderSize(),
+                              without + 2,
+                              "the path sequence adds two bytes");
+        NS_TEST_EXPECT_MSG_EQ(SeqTsHeader().GetSerializedSize(),
+                              8u,
+                              "the writer agrees on the size");
+        Unit();
+        Transport();
+
+        CustomHeader::udpCarriesPathSeq = savedPathSeq;
+        CustomHeader::ackCarriesPacketSeq = savedPacketSeq;
+        IntHeader::mode = savedIntMode;
+        Simulator::Destroy();
+    }
+
+  private:
+    static constexpr uint32_t kSpines = 8;
+    static constexpr uint8_t kLossy = 3;
+
+    void Unit()
+    {
+        SpineSequenceSender sender;
+        NS_TEST_EXPECT_MSG_EQ(sender.Next(2), 0u, "a spine's first packet carries 0");
+        NS_TEST_EXPECT_MSG_EQ(sender.Next(2), 1u, "and the next 1");
+        NS_TEST_EXPECT_MSG_EQ(sender.Next(5), 0u, "each spine counts apart");
+
+        SpineSequenceReceiver receiver;
+        auto arrive = [&](uint8_t requested, uint8_t carrying, uint16_t seq) {
+            return receiver.OnArrival(requested, carrying, seq);
+        };
+        NS_TEST_EXPECT_MSG_EQ(arrive(1, 1, 0).gaps, 0u, "in order");
+        NS_TEST_EXPECT_MSG_EQ(arrive(1, 1, 3).gaps, 2u, "1 and 2 are missing");
+        const SpineSequenceReceiver::Arrival late = arrive(1, 1, 2);
+        NS_TEST_EXPECT_MSG_EQ(late.late, true, "2 arrives late");
+        NS_TEST_EXPECT_MSG_EQ(late.gaps, 0u, "and counts nothing");
+        NS_TEST_EXPECT_MSG_EQ(arrive(1, 1, 4).gaps, 0u, "4 follows 3");
+        NS_TEST_EXPECT_MSG_EQ(arrive(4, 4, 1).gaps, 1u, "a spine's first packet is expected");
+        // A swap of two packets on one spine shows one missing, then one late.
+        NS_TEST_EXPECT_MSG_EQ(arrive(6, 6, 1).gaps, 1u, "the second of a swap shows a gap");
+        NS_TEST_EXPECT_MSG_EQ(arrive(6, 6, 0).late, true, "the first is late");
+        // Moved from spine 2 to spine 7 by a source leaf: tracked apart from
+        // spine 7's own packets, from its first arrival.
+        NS_TEST_EXPECT_MSG_EQ(arrive(7, 7, 0).gaps, 0u, "spine 7's own packet");
+        NS_TEST_EXPECT_MSG_EQ(arrive(2, 7, 40).gaps, 0u, "a moved path starts at its first arrival");
+        NS_TEST_EXPECT_MSG_EQ(arrive(2, 7, 41).gaps, 0u, "and follows on");
+        NS_TEST_EXPECT_MSG_EQ(arrive(7, 7, 1).gaps, 0u, "spine 7's own count is not disturbed");
+        // The counter wraps at 2^16.
+        for (uint32_t seq = 2; seq <= 0xFFFF; ++seq)
+        {
+            arrive(7, 7, static_cast<uint16_t>(seq));
+        }
+        NS_TEST_EXPECT_MSG_EQ(arrive(7, 7, 0).gaps, 0u, "the sequence wraps");
+        NS_TEST_EXPECT_MSG_EQ(arrive(7, 7, 2).gaps, 1u, "and counts across the wrap");
+    }
+
+    // A queue pair under reps_hold sends through a fabric that drops 1% of
+    // the packets up spine 3 and delays every packet up spine 1 behind the
+    // next few, to a receiver that counts the gaps.
+    void Transport()
+    {
+        IsolatedHost sender(LoadBalancingMode::SprayUniform, kTestReceiver, kSpines);
+        IsolatedHost receiver(LoadBalancingMode::SprayUniform, kTestSender, kSpines);
+        for (IsolatedHost* host : {&sender, &receiver})
+        {
+            Ptr<RdmaHw> hw = host->hw;
+            hw->m_pathSelectorKind = static_cast<uint32_t>(PathSelectorKind::RepsHold);
+            hw->m_sprayHoldScope = static_cast<uint32_t>(HoldScope::Host);
+            hw->m_sprayLossThreshold1 = 0.1;
+            hw->m_sprayLossThreshold2 = 0.25;
+            hw->m_sprayLossThreshold3 = 0.5;
+            hw->m_sprayLossIntervalNs = 10000;
+            hw->m_sprayLossHoldCleanSentinels = 3;
+            hw->m_sprayHeldExploration = SpineScores::HeldExploration::Sentinel;
+            hw->m_sprayPathSeq = true;
+            NS_TEST_EXPECT_MSG_EQ(hw->ValidPathSeq(), true, "accepted under reps_hold");
+        }
+        Ptr<RdmaHw> off = CreateObject<RdmaHw>();
+        NS_TEST_EXPECT_MSG_EQ(off->m_sprayPathSeq, false, "SprayPathSeq is off by default");
+        off->m_sprayPathSeq = true;
+        NS_TEST_EXPECT_MSG_EQ(off->ValidPathSeq(), false, "refused outside reps_hold");
+        CustomHeader::udpCarriesPathSeq = false;
+        NS_TEST_EXPECT_MSG_EQ(sender.hw->ValidPathSeq(),
+                              false,
+                              "refused unless the data header carries it");
+        CustomHeader::udpCarriesPathSeq = true;
+
+        constexpr uint32_t kPackets = 20000;
+        Ptr<RdmaQueuePair> qp = sender.AddSender(kTestSender, kTestReceiver,
+                                                 static_cast<uint64_t>(kPackets) * IsolatedHost::kMtu);
+        Ptr<UniformRandomVariable> loss =
+            CreateObjectWithAttributes<UniformRandomVariable>("Stream", IntegerValue(7));
+        std::vector<uint32_t> sent(kSpines, 0);
+        std::vector<uint16_t> lastSeq(kSpines, 0);
+        uint32_t dropped = 0;
+        std::deque<Ptr<Packet>> delayed;
+        auto deliver = [&](Ptr<Packet> packet) {
+            CustomHeader parsed(CustomHeader::L2_Header | CustomHeader::L3_Header |
+                                CustomHeader::L4_Header);
+            packet->PeekHeader(parsed);
+            receiver.hw->Receive(packet, parsed);
+        };
+        for (uint32_t i = 0; i < kPackets; ++i)
+        {
+            Ptr<Packet> packet = sender.hw->GetNxtPacket(qp);
+            CustomHeader parsed(CustomHeader::L2_Header | CustomHeader::L3_Header |
+                                CustomHeader::L4_Header);
+            packet->PeekHeader(parsed);
+            const uint8_t spine = RequestedSpine(parsed.ipid);
+            NS_TEST_ASSERT_MSG_EQ(parsed.udp.path_seq,
+                                  static_cast<uint16_t>(sent[spine]),
+                                  "each spine's packets carry its count");
+            NS_TEST_ASSERT_MSG_EQ(parsed.udp.seq,
+                                  i * IsolatedHost::kMtu,
+                                  "the sequence keeps its place");
+            ++sent[spine];
+            if (spine == kLossy && loss->GetValue() < 0.01)
+            {
+                ++dropped;
+                continue;
+            }
+            if (spine == 1)
+            {
+                delayed.push_back(packet);
+                continue;
+            }
+            deliver(packet);
+            if (delayed.size() > 4)
+            {
+                deliver(delayed.front());
+                delayed.pop_front();
+            }
+        }
+        while (!delayed.empty())
+        {
+            deliver(delayed.front());
+            delayed.pop_front();
+        }
+        NS_TEST_EXPECT_MSG_GT(dropped, 10u, "some packets up spine 3 are dropped");
+        NS_TEST_ASSERT_MSG_EQ(receiver.hw->m_spineGaps.size(), kSpines, "every spine arrived");
+        NS_TEST_EXPECT_MSG_EQ(receiver.hw->m_spineGaps[kLossy],
+                              dropped,
+                              "the gaps on spine 3 are its dropped packets");
+        for (uint32_t spine = 0; spine < kSpines; ++spine)
+        {
+            NS_TEST_EXPECT_MSG_GT(sent[spine], 0u, "every spine is sent on");
+            if (spine != kLossy)
+            {
+                NS_TEST_EXPECT_MSG_EQ(receiver.hw->m_spineGaps[spine],
+                                      0u,
+                                      "no other spine shows a gap");
+            }
+        }
+    }
+};
+
 class SprayPolicyTransportTest : public TestCase
 {
   public:
@@ -9281,6 +9460,7 @@ PointToPointTestSuite::PointToPointTestSuite()
     AddTestCase(new RepsFlowHoldTest, TestCase::Duration::QUICK);
     AddTestCase(new RepsHoldScopeTest, TestCase::Duration::QUICK);
     AddTestCase(new RepsHoldAutoScopeTest, TestCase::Duration::QUICK);
+    AddTestCase(new SprayPathSeqTest, TestCase::Duration::QUICK);
     AddTestCase(new SprayPolicyTransportTest, TestCase::Duration::QUICK);
     AddTestCase(new NsccReceiverPenaltyTest, TestCase::Duration::QUICK);
     AddTestCase(new SprayPolicyDefaultsTest, TestCase::Duration::QUICK);

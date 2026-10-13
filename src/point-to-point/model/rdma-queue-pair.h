@@ -12,6 +12,7 @@
 #include "path-selector.h"
 #include "spine-grader.h"
 #include "spine-redirect.h"
+#include "spine-sequence.h"
 #include <map>
 #include <memory>
 #include <set>
@@ -162,6 +163,8 @@ public:
 	OutstandingPackets m_outstanding;
 	// What draws those paths, set together with the send records.
 	std::unique_ptr<PathSelector> m_pathSelector;
+	// Under SprayPathSeq, the path sequence each data packet carries.
+	SpineSequenceSender m_pathSeqSender;
 	EventId m_retransmissionTimer;
 	uint16_t m_pg;
 	uint16_t m_ipid;
@@ -309,6 +312,8 @@ public:
 	// leaf carried on a spine other than the one requested.
 	uint64_t m_data_arrivals;
 	uint64_t m_folded_arrivals;
+	// Under SprayPathSeq, the path sequence expected next per path.
+	SpineSequenceReceiver m_pathSeqReceiver;
 	// Whether the experiment layer may forgive this flow on this step, asked
 	// once when the queue pair is created. Every acknowledgement this queue
 	// pair emits carries it, and an acknowledgement carrying it without the

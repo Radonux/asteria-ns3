@@ -562,6 +562,15 @@ TypeId RdmaHw::GetTypeId (void)
 				UintegerValue(2),
 				MakeUintegerAccessor(&RdmaHw::m_sprayHoldAutoLeaves),
 				MakeUintegerChecker<uint32_t>(2))
+		.AddAttribute("SprayPathSeq",
+				"Under PathSelector 6 and 7, whether every data packet carries "
+				"its queue pair's count of the data packets sent before it up "
+				"its requested spine, from which the receiver counts the "
+				"packets missing per carrying spine. Needs "
+				"CustomHeader::udpCarriesPathSeq. Default false.",
+				BooleanValue(false),
+				MakeBooleanAccessor(&RdmaHw::m_sprayPathSeq),
+				MakeBooleanChecker())
 		.AddAttribute("SprayCandidates",
 				"Under LoadBalancing 3, the candidates drawn per packet, of which "
 				"the highest-scored is sent on. Default 1.",
@@ -902,6 +911,10 @@ void RdmaHw::Setup(QpCompleteCallback cb, QpFailureCallback failure_cb){
 		"SprayLossHoldCleanSentinels above zero and SprayHeldExploration "
 		"sentinel, and PathSelector 6 under SprayHoldScope 1 or 2 needs "
 		"SwitchQueueState for the hosts' leaves");
+	NS_ABORT_MSG_IF(!ValidPathSeq(),
+		"SprayPathSeq is read only under PathSelector 6 and 7, and data "
+		"headers carry the path sequence exactly when it is set "
+		"(CustomHeader::udpCarriesPathSeq)");
 	NS_ABORT_MSG_IF(!ValidRepsOracle(),
 		"PathSelector 8 reads the spines' faults from SwitchQueueState and "
 		"needs LoadBalancing 2 and SprayGradeCostSource 1");
@@ -1146,6 +1159,8 @@ int RdmaHw::ReceiveUdp(Ptr<Packet> p, CustomHeader &ch){
 	}
 	rxQp->m_ecn_source.total++;
 	CountArrival(rxQp, ch.ipid, payload_size);
+	if (m_sprayPathSeq)
+		CountPathSeq(rxQp, ch);
 	if (IsGrading())
 		GradeArrival(rxQp, ch, ecnbits != 0);
 	rxQp->m_milestone_rx = m_ack_interval;
@@ -2458,10 +2473,24 @@ Ptr<Packet> RdmaHw::GetNxtPacket(Ptr<RdmaQueuePair> qp){
 		payload_size = tail > m_mtu ? m_mtu : static_cast<uint32_t>(tail);
 	}
 	Ptr<Packet> p = Create<Packet> (payload_size);
+	// Drawn before the headers are written, so that the path sequence of
+	// the spine it names goes into the SeqTsHeader.
+	uint16_t identification = qp->m_ipid;
+	if (IsPathPerPacket()){
+		const uint64_t now = Simulator::Now().GetNanoSeconds();
+		// A probe the selector has due leaves the NIC right after this packet.
+		uint16_t probed;
+		if (qp->m_pathSelector->TakeProbe(now, probed))
+			SendPathProbe(qp, probed);
+		identification = qp->m_pathSelector->Choose(now);
+	}
 	// add SeqTsHeader
 	SeqTsHeader seqTs;
 	seqTs.SetSeq (seq);
 	seqTs.SetPG (qp->m_pg);
+	if (m_sprayPathSeq)
+		seqTs.SetPathSeq(
+			qp->m_pathSeqSender.Next(RequestedSpine(identification)));
 	p->AddHeader (seqTs);
 	// add udp header
 	UdpHeader udpHeader;
@@ -2487,12 +2516,6 @@ Ptr<Packet> RdmaHw::GetNxtPacket(Ptr<RdmaQueuePair> qp){
 	ipHeader.SetTos (0);
 	ipHeader.SetDscp (static_cast<Ipv4Header::DscpType>(kUetDscpTrimmable));
 	if (IsPathPerPacket()){
-		const uint64_t now = Simulator::Now().GetNanoSeconds();
-		// A probe the selector has due leaves the NIC right after this packet.
-		uint16_t probed;
-		if (qp->m_pathSelector->TakeProbe(now, probed))
-			SendPathProbe(qp, probed);
-		const uint16_t identification = qp->m_pathSelector->Choose(now);
 		ipHeader.SetIdentification(identification);
 		qp->m_outstanding.Add(seq, payload_size,
 			PathOf(static_cast<LoadBalancingMode>(m_loadBalancing), identification),
