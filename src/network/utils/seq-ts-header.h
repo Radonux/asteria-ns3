@@ -62,6 +62,10 @@ class SeqTsHeader : public Header
 
     void SetPG (uint16_t pg);
     uint16_t GetPG () const;
+    // The path sequence, serialized after the INT header only while
+    // CustomHeader::udpCarriesPathSeq is set.
+    void SetPathSeq (uint16_t pathSeq);
+    uint16_t GetPathSeq () const;
 
     /**
      * \brief Get the type ID.
@@ -80,6 +84,7 @@ class SeqTsHeader : public Header
     uint32_t m_seq; //!< Sequence number
     uint64_t m_ts;  //!< Timestamp
     uint16_t m_pg;
+    uint16_t m_pathSeq;
   public:
     IntHeader ih;
 };

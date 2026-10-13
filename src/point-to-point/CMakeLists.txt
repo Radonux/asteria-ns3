@@ -35,11 +35,14 @@ build_lib(
     model/qbb-header.cc
     model/qbb-net-device.cc
     model/qbb-remote-channel.cc
+    model/receiver-hold.cc
     model/rdma-driver.cc
     model/rdma-hw.cc
+    model/rdma-hw-spine-sequence.cc
     model/rdma-queue-pair.cc
     model/spine-grader.cc
     model/spine-redirect.cc
+    model/spine-sequence.cc
     model/switch-mmu.cc
     model/switch-node.cc
     model/switch-queue-state.cc
@@ -63,11 +66,13 @@ build_lib(
     model/qbb-header.h
     model/qbb-net-device.h
     model/qbb-remote-channel.h
+    model/receiver-hold.h
     model/rdma-driver.h
     model/rdma-hw.h
     model/rdma-queue-pair.h
     model/spine-grader.h
     model/spine-redirect.h
+    model/spine-sequence.h
     model/spine-report.h
     model/switch-mmu.h
     model/switch-node.h

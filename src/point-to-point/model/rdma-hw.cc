@@ -629,6 +629,32 @@ TypeId RdmaHw::GetTypeId (void)
 				MakeUintegerChecker<uint32_t>(
 					static_cast<uint32_t>(SentinelMode::Data),
 					static_cast<uint32_t>(SentinelMode::Duplicate)))
+		.AddAttribute("SprayPathSeq",
+				"Under PathSelector 6 and 7, whether every data packet carries "
+				"its queue pair's count of the data packets sent before it up "
+				"its requested spine, from which the receiver counts the "
+				"packets missing per carrying spine. Needs "
+				"CustomHeader::udpCarriesPathSeq. Default false.",
+				BooleanValue(false),
+				MakeBooleanAccessor(&RdmaHw::m_sprayPathSeq),
+				MakeBooleanChecker())
+		.AddAttribute("SprayReceiverHold",
+				"Under PathSelector 6 and 7 with SprayPathSeq, whether the "
+				"receiver holds spines by the packets missing on them per "
+				"sender leaf (ReceiverHold) and reports them in every "
+				"acknowledgement, whose senders hold them toward its leaf. "
+				"Needs SwitchQueueState for the hosts' leaves, at most 8 "
+				"spines and CustomHeader::ackReceiverHoldBytes 1. Default "
+				"false.",
+				BooleanValue(false),
+				MakeBooleanAccessor(&RdmaHw::m_sprayReceiverHold),
+				MakeBooleanChecker())
+		.AddAttribute("SprayReceiverHoldClean",
+				"Under SprayReceiverHold, the consecutive arrivals without a "
+				"missing packet on a held spine that release it. Default 1024.",
+				UintegerValue(1024),
+				MakeUintegerAccessor(&RdmaHw::m_sprayReceiverHoldClean),
+				MakeUintegerChecker<uint32_t>(1))
 		.AddAttribute("SprayCandidates",
 				"Under LoadBalancing 3, the candidates drawn per packet, of which "
 				"the highest-scored is sent on. Default 1.",
@@ -725,6 +751,14 @@ TypeId RdmaHw::GetTypeId (void)
 				"passes.",
 				MakeTraceSourceAccessor(&RdmaHw::m_traceLeafSpineLossInterval),
 				"ns3::RdmaHw::LeafSpineLossIntervalTracedCallback")
+		.AddTraceSource("ReceiverHoldInterval",
+				"Under SprayReceiverHold, the receiving host's hold closed an "
+				"interval of SprayLossIntervalNs, once per sender leaf: the "
+				"leaf, the time it ended at and, per spine, the arrivals and "
+				"the missing packets counted in it and the scope of its hold, "
+				"0=none, 1=leaf, 2=host.",
+				MakeTraceSourceAccessor(&RdmaHw::m_traceReceiverHoldInterval),
+				"ns3::RdmaHw::ReceiverHoldIntervalTracedCallback")
 		.AddAttribute("EwmaGain",
 				"Control gain parameter which determines the level of rate decrease",
 				DoubleValue(1.0 / 16),
@@ -989,6 +1023,15 @@ void RdmaHw::Setup(QpCompleteCallback cb, QpFailureCallback failure_cb){
 	NS_ABORT_MSG_IF(m_spraySentinelMode !=
 				static_cast<uint32_t>(SentinelMode::Data) && !IsRepsHold(),
 		"SpraySentinelMode 1 is read only under PathSelector 6 and 7");
+	NS_ABORT_MSG_IF(!ValidPathSeq(),
+		"SprayPathSeq is read only under PathSelector 6 and 7, and data "
+		"headers carry the path sequence exactly when it is set "
+		"(CustomHeader::udpCarriesPathSeq)");
+	NS_ABORT_MSG_IF(!ValidReceiverHold(),
+		"SprayReceiverHold needs SprayPathSeq, PathSelector 6 or 7, "
+		"SwitchQueueState for the hosts' leaves and at most 8 spines, and "
+		"acknowledgements carry the receiver_hold field exactly when it is "
+		"set (CustomHeader::ackReceiverHoldBytes)");
 	NS_ABORT_MSG_IF(!ValidRepsOracle(),
 		"PathSelector 8 reads the spines' faults from SwitchQueueState and "
 		"needs LoadBalancing 2 and SprayGradeCostSource 1");
@@ -1107,6 +1150,8 @@ void RdmaHw::AddQueuePair(uint32_t src, uint32_t dest, uint64_t tag, uint64_t si
 	m_qpMap[key] = qp;
 	if (IsPathPerPacket())
 		StartPathSelection(qp, win, baseRtt);
+	if (IsReceiverHold())
+		AttachReceiverHold(qp);
 	// The liveness invariant starts at birth: an unfinished QP always has a
 	// pending timer, even if its first send never gets scheduled.
 	ArmRetransmissionTimeout(qp);
@@ -1233,6 +1278,8 @@ int RdmaHw::ReceiveUdp(Ptr<Packet> p, CustomHeader &ch){
 	}
 	rxQp->m_ecn_source.total++;
 	CountArrival(rxQp, ch.ipid, payload_size);
+	if (m_sprayPathSeq)
+		CountPathSeq(rxQp, ch);
 	if (IsGrading())
 		GradeArrival(rxQp, ch, ecnbits != 0);
 	rxQp->m_milestone_rx = m_ack_interval;
@@ -1685,6 +1732,7 @@ void RdmaHw::SendAck(Ptr<RdmaRxQueuePair> q, uint32_t sourceIp,
 	if (IsSprayPolicy())
 		seqh.SetSpineReport(ReportFor(q, destinationIp));
 	seqh.SetRedirect(redirect);
+	seqh.SetReceiverHold(ReceiverHoldBitmap(destinationIp));
 	// The grant is this flag without the report above. A receiver that may not
 	// forgive this flow, or a step that is critical, never sets it, so those
 	// senders obey their controller throughout.
@@ -1790,6 +1838,9 @@ int RdmaHw::ReceiveAck(Ptr<Packet> p, CustomHeader &ch){
 			const uint64_t now = Simulator::Now().GetNanoSeconds();
 			if (IsSprayPolicy())
 				qp->m_pathSelector->OnReport(ReportOf(ch), now);
+			if (IsReceiverHold())
+				qp->m_pathSelector->OnReceiverHold(ch.sip, ch.ack.receiver_hold,
+					now);
 			uint64_t copyLost = 0;
 			if ((ch.ack.flags >> qbbHeader::FLAG_PROBE_ANSWER) & 1){
 				qp->m_pathSelector->OnProbeAnswer(path, cnp, now);
@@ -2270,9 +2321,14 @@ int RdmaHw::ReceiveTrim(Ptr<Packet> p, CustomHeader &ch){
 		const bool lastHop = ch.GetIpv4Dscp() == kUetDscpTrimmedLastHop;
 		// A trim can reach a flow before any of its data does; the receive
 		// state it makes is what that data would have made.
-		const Ptr<RdmaRxQueuePair> q = IsPerConnectionGrading() || IsAckRedirect()
+		const Ptr<RdmaRxQueuePair> q =
+				IsPerConnectionGrading() || IsAckRedirect() || m_sprayPathSeq
 			? GetRxQp(ch.dip, ch.sip, ch.udp.dport, ch.udp.sport, ch.udp.pg, true)
 			: nullptr;
+		// The trimmed header keeps the path sequence: the trim keeps at least
+		// CustomHeader::GetUdpHeaderSize() bytes of IP payload.
+		if (m_sprayPathSeq)
+			CountPathSeq(q, ch, true);
 		if (IsGrading())
 			GradeTrim(q, ch, lastHop);
 		// A last-hop trim says nothing of the spine it crossed, and the repair
@@ -2595,10 +2651,24 @@ Ptr<Packet> RdmaHw::GetNxtPacket(Ptr<RdmaQueuePair> qp){
 		payload_size = tail > m_mtu ? m_mtu : static_cast<uint32_t>(tail);
 	}
 	Ptr<Packet> p = Create<Packet> (payload_size);
+	// Drawn before the headers are written, so that the path sequence of
+	// the spine it names goes into the SeqTsHeader.
+	uint16_t identification = qp->m_ipid;
+	if (IsPathPerPacket()){
+		const uint64_t now = Simulator::Now().GetNanoSeconds();
+		// A probe the selector has due leaves the NIC right after this packet.
+		uint16_t probed;
+		if (qp->m_pathSelector->TakeProbe(now, probed))
+			SendPathProbe(qp, probed);
+		identification = qp->m_pathSelector->Choose(now);
+	}
 	// add SeqTsHeader
 	SeqTsHeader seqTs;
 	seqTs.SetSeq (seq);
 	seqTs.SetPG (qp->m_pg);
+	if (m_sprayPathSeq)
+		seqTs.SetPathSeq(
+			qp->m_pathSeqSender.Next(RequestedSpine(identification)));
 	p->AddHeader (seqTs);
 	// add udp header
 	UdpHeader udpHeader;
@@ -2624,12 +2694,6 @@ Ptr<Packet> RdmaHw::GetNxtPacket(Ptr<RdmaQueuePair> qp){
 	ipHeader.SetTos (0);
 	ipHeader.SetDscp (static_cast<Ipv4Header::DscpType>(kUetDscpTrimmable));
 	if (IsPathPerPacket()){
-		const uint64_t now = Simulator::Now().GetNanoSeconds();
-		// A probe the selector has due leaves the NIC right after this packet.
-		uint16_t probed;
-		if (qp->m_pathSelector->TakeProbe(now, probed))
-			SendPathProbe(qp, probed);
-		const uint16_t identification = qp->m_pathSelector->Choose(now);
 		ipHeader.SetIdentification(identification);
 		qp->m_outstanding.Add(seq, payload_size,
 			PathOf(static_cast<LoadBalancingMode>(m_loadBalancing), identification),

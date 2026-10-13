@@ -72,6 +72,10 @@ public:
   // The spine the receiver asks the sender to move to, 255 for none, the
   // default; serialized only while CustomHeader::ackRedirectBytes is not zero.
   void SetRedirect(uint8_t spine);
+  // The spines the receiving host holds for the sender's leaf, bit k for
+  // spine k, zero by default; serialized only while
+  // CustomHeader::ackReceiverHoldBytes is not zero.
+  void SetReceiverHold(uint8_t bitmap);
   void SetIntHeader(const IntHeader &_ih);
 
 //Getters
@@ -91,6 +95,7 @@ public:
   uint32_t GetPacketSeq() const;
   const SpineReport &GetSpineReport() const;
   uint8_t GetRedirect() const;
+  uint8_t GetReceiverHold() const;
 
   static TypeId GetTypeId (void);
   virtual TypeId GetInstanceTypeId (void) const;
@@ -109,6 +114,7 @@ private:
   uint32_t m_packetSeq;
   SpineReport m_spineReport;
   uint8_t m_redirect;
+  uint8_t m_receiverHold;
   IntHeader ih;
   
 };

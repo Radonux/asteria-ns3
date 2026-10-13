@@ -145,6 +145,10 @@ public:
 		  uint16_t pg;
 		  uint32_t seq;
 		  IntHeader ih;
+		  // The sender's count of the data packets of this queue pair sent
+		  // before this one up the spine it requested. On the wire after the
+		  // INT header, only while udpCarriesPathSeq is set.
+		  uint16_t path_seq;
 	  } udp;
 	  // CnHeader
 	  struct {
@@ -172,6 +176,10 @@ public:
 		  // none. On the wire, after the report, only while ackRedirectBytes
 		  // is not zero.
 		  uint8_t redirect;
+		  // The spines the receiving host holds for the sender's leaf, bit k
+		  // for spine k. On the wire, after the redirect field, only while
+		  // ackReceiverHoldBytes is not zero.
+		  uint8_t receiver_hold;
 		  IntHeader ih;
 	  } ack;
 	  // PauseHeader
@@ -192,6 +200,12 @@ public:
   // How many bytes the redirect field takes, zero or one. Process-wide for
   // the same reason.
   static uint32_t ackRedirectBytes;
+  // Whether data headers carry udp.path_seq. Process-wide for the same
+  // reason.
+  static bool udpCarriesPathSeq;
+  // How many bytes the receiver_hold field takes, zero or one. Process-wide
+  // for the same reason.
+  static uint32_t ackReceiverHoldBytes;
 
   uint8_t GetIpv4EcnBits (void) const;
   uint8_t GetIpv4Dscp (void) const;

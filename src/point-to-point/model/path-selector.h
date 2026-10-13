@@ -3,6 +3,7 @@
 
 #include <ns3/ptr.h>
 #include <ns3/random-variable-stream.h>
+#include "receiver-hold.h"
 #include "spine-report.h"
 #include <array>
 #include <deque>
@@ -239,6 +240,10 @@ public:
 	// to send on or kNoRedirect, and the carrying spine of the send it
 	// answers, before the answer itself is told.
 	virtual void OnRedirect(uint8_t spine, uint8_t carrying, uint64_t nowNs);
+	// An acknowledgement's receiver_hold bitmap from receiver, before the
+	// answer itself is told.
+	virtual void OnReceiverHold(uint32_t receiver, uint8_t bitmap,
+		uint64_t nowNs);
 };
 
 // A spine drawn uniformly per packet, named as both the requested and the
@@ -681,6 +686,13 @@ public:
 	bool ChoseExploration() const override;
 	void OnTrickleAnswer(uint16_t path, bool lost, uint64_t nowNs) override;
 	bool TakeCopy(uint8_t &spine, bool &trickle) override;
+	// Under SprayReceiverHold: the spines the receivers hold toward leaf, in
+	// marks, are held as the loss hold holds them, and sent marks'
+	// sentinels where the loss hold does not hold them.
+	void SetReceiverHold(std::shared_ptr<ReceiverHoldMarks> marks,
+		uint32_t leaf);
+	void OnReceiverHold(uint32_t receiver, uint8_t bitmap,
+		uint64_t nowNs) override;
 
 protected:
 	bool Excluded(uint16_t path) const override;
@@ -695,6 +707,7 @@ private:
 	bool m_choseTrickle;
 	bool m_choseExploration;
 	PendingCopy m_copy;
+	ReceiverHoldView m_receiverHold;
 };
 
 // The host-wide loss hold of RepsHold under HoldScope::Auto. Per destination
@@ -843,6 +856,11 @@ public:
 	bool ChoseExploration() const override;
 	void OnTrickleAnswer(uint16_t path, bool lost, uint64_t nowNs) override;
 	bool TakeCopy(uint8_t &spine, bool &trickle) override;
+	// As RepsHoldSelector's, toward this selector's leaf.
+	void SetReceiverHold(std::shared_ptr<ReceiverHoldMarks> marks,
+		uint32_t leaf);
+	void OnReceiverHold(uint32_t receiver, uint8_t bitmap,
+		uint64_t nowNs) override;
 
 protected:
 	bool Excluded(uint16_t path) const override;
@@ -856,6 +874,7 @@ private:
 	bool m_choseTrickle;
 	bool m_choseExploration;
 	PendingCopy m_copy;
+	ReceiverHoldView m_receiverHold;
 };
 
 // Simulation only: the spines toward one destination leaf that a reader of

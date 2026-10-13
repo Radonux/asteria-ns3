@@ -10,6 +10,7 @@
 #include "qbb-net-device.h"
 #include "load-balancing.h"
 #include "nscc-window.h"
+#include "receiver-hold.h"
 #include "spine-grader.h"
 #include "spine-redirect.h"
 #include "switch-queue-state.h"
@@ -319,6 +320,48 @@ public:
 	void GradeTrim(Ptr<RdmaRxQueuePair> q, const CustomHeader &ch, bool lastHop);
 	// Indexed by carrying spine; kept where the identification names one.
 	std::vector<SpineArrivals> m_spineArrivals;
+	// SprayPathSeq, under PathSelector RepsHold or RepsFlowHold: every data
+	// packet carries its queue pair's path sequence on its requested spine,
+	// and the receiver counts the packets the gaps in it show missing, per
+	// carrying spine, in m_spineGaps (SpineSequenceReceiver).
+	bool m_sprayPathSeq;
+	std::vector<uint64_t> m_spineGaps;
+	bool ValidPathSeq() const;
+	// The path sequence of the data packet ch arriving at q, or with trimmed
+	// of its trimmed header, counted. A trimmed header moves the expected
+	// sequence on as an arrival does; only the packets missing before it
+	// count, and the receiver's hold takes it for no arrival.
+	void CountPathSeq(Ptr<RdmaRxQueuePair> q, const CustomHeader &ch,
+		bool trimmed = false);
+	// SprayReceiverHold, under SprayPathSeq: the host's ReceiverHold, made at
+	// its first arrival, counts the arrivals and the missing packets per
+	// sender leaf, which m_switchQueues names, holds spines by them with
+	// SprayHoldAutoLeaves as its autoLeaves and m_sprayReceiverHoldClean as
+	// its clean arrivals, and every acknowledgement carries the bitmap of
+	// the spines it holds for its destination's leaf. As a sender, every
+	// queue pair's selector holds the spines the bitmaps hold toward its
+	// destination's leaf, in m_receiverHoldMarks, shared by the host's queue
+	// pairs, or under PathSelector 7 in marks of its own.
+	bool m_sprayReceiverHold;
+	uint32_t m_sprayReceiverHoldClean;
+	std::unique_ptr<ReceiverHold> m_receiverHold;
+	std::shared_ptr<ReceiverHoldMarks> m_receiverHoldMarks;
+	bool IsReceiverHold() const;
+	bool ValidReceiverHold() const;
+	ReceiverHold &ReceiverHoldOf();
+	// The receiver_hold field of an answer to the host at senderIp.
+	uint8_t ReceiverHoldBitmap(uint32_t senderIp) const;
+	// Give qp's selector the marks it holds by.
+	void AttachReceiverHold(Ptr<RdmaQueuePair> qp);
+	// The ReceiverHoldInterval trace source: the host's ReceiverHold closed an
+	// interval of SprayLossIntervalNs, once per sender leaf
+	// (ReceiverHold::IntervalCallback), with each spine's ReceiverHold::Scope.
+	typedef void (*ReceiverHoldIntervalTracedCallback)(uint32_t leaf,
+		uint64_t endNs, const std::vector<uint32_t> &arrivals,
+		const std::vector<uint32_t> &lost, const std::vector<uint8_t> &holds);
+	TracedCallback<uint32_t, uint64_t, const std::vector<uint32_t> &,
+		const std::vector<uint32_t> &, const std::vector<uint8_t> &>
+		m_traceReceiverHoldInterval;
 	bool m_var_win, m_fast_react;
 	bool m_rateBound;
 	uint32_t m_total_pause_times; 

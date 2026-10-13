@@ -14,13 +14,15 @@ namespace ns3 {
 
 	qbbHeader::qbbHeader(uint16_t pg)
 		: sport(0), dport(0), flags(0), m_pg(pg), m_seq(0),
-		  m_trimPayloadSize(0), m_packetSeq(0), m_redirect(0xff)
+		  m_trimPayloadSize(0), m_packetSeq(0), m_redirect(0xff),
+		  m_receiverHold(0)
 	{
 	}
 
 	qbbHeader::qbbHeader()
 		: sport(0), dport(0), flags(0), m_pg(0), m_seq(0),
-		  m_trimPayloadSize(0), m_packetSeq(0), m_redirect(0xff)
+		  m_trimPayloadSize(0), m_packetSeq(0), m_redirect(0xff),
+		  m_receiverHold(0)
 	{}
 
 	qbbHeader::~qbbHeader()
@@ -87,6 +89,9 @@ namespace ns3 {
 	void qbbHeader::SetRedirect(uint8_t spine){
 		m_redirect = spine;
 	}
+	void qbbHeader::SetReceiverHold(uint8_t bitmap){
+		m_receiverHold = bitmap;
+	}
 	void qbbHeader::SetIntHeader(const IntHeader &_ih){
 		ih = _ih;
 	}
@@ -133,6 +138,9 @@ namespace ns3 {
 	uint8_t qbbHeader::GetRedirect() const{
 		return m_redirect;
 	}
+	uint8_t qbbHeader::GetReceiverHold() const{
+		return m_receiverHold;
+	}
 
 	TypeId
 		qbbHeader::GetTypeId(void)
@@ -160,7 +168,8 @@ namespace ns3 {
 		qbbHeader tmp;
 		return sizeof(tmp.sport) + sizeof(tmp.dport) + sizeof(tmp.flags) + sizeof(tmp.m_pg) + sizeof(tmp.m_seq) + sizeof(tmp.m_trimPayloadSize) +
 			(CustomHeader::ackCarriesPacketSeq ? sizeof(tmp.m_packetSeq) : 0) +
-			CustomHeader::ackReportBytes + CustomHeader::ackRedirectBytes;
+			CustomHeader::ackReportBytes + CustomHeader::ackRedirectBytes +
+			CustomHeader::ackReceiverHoldBytes;
 	}
 	void qbbHeader::Serialize(Buffer::Iterator start)  const
 	{
@@ -179,6 +188,8 @@ namespace ns3 {
 		}
 		if (CustomHeader::ackRedirectBytes > 0)
 			i.WriteU8(m_redirect);
+		if (CustomHeader::ackReceiverHoldBytes > 0)
+			i.WriteU8(m_receiverHold);
 
 		// write IntHeader
 		ih.Serialize(i);
@@ -202,6 +213,8 @@ namespace ns3 {
 		}
 		if (CustomHeader::ackRedirectBytes > 0)
 			m_redirect = i.ReadU8();
+		if (CustomHeader::ackReceiverHoldBytes > 0)
+			m_receiverHold = i.ReadU8();
 
 		// read IntHeader
 		ih.Deserialize(i);

@@ -18,6 +18,7 @@
  */
 
 #include "seq-ts-header.h"
+#include "custom-header.h"
 
 #include "ns3/assert.h"
 #include "ns3/header.h"
@@ -33,7 +34,8 @@ NS_OBJECT_ENSURE_REGISTERED(SeqTsHeader);
 
 SeqTsHeader::SeqTsHeader()
     : m_seq(0),
-      m_ts(Simulator::Now().GetTimeStep())
+      m_ts(Simulator::Now().GetTimeStep()),
+      m_pathSeq(0)
 {
     NS_LOG_FUNCTION(this);
     if (IntHeader::mode == 1)
@@ -73,6 +75,18 @@ SeqTsHeader::GetPG (void) const
 	return m_pg;
 }
 
+void
+SeqTsHeader::SetPathSeq (uint16_t pathSeq)
+{
+	m_pathSeq = pathSeq;
+}
+
+uint16_t
+SeqTsHeader::GetPathSeq (void) const
+{
+	return m_pathSeq;
+}
+
 TypeId
 SeqTsHeader::GetTypeId()
 {
@@ -104,7 +118,8 @@ SeqTsHeader::GetSerializedSize() const
 }
 
 uint32_t SeqTsHeader::GetHeaderSize(void){
-	return 6 + IntHeader::GetStaticSize();
+	return 6 + IntHeader::GetStaticSize() +
+		(CustomHeader::udpCarriesPathSeq ? sizeof(uint16_t) : 0);
 }
 
 void
@@ -117,6 +132,11 @@ SeqTsHeader::Serialize(Buffer::Iterator start) const
 
     // write IntHeader
     ih.Serialize(i);
+    if (CustomHeader::udpCarriesPathSeq)
+    {
+        i.Next(IntHeader::GetStaticSize());
+        i.WriteHtonU16(m_pathSeq);
+    }
 }
 
 uint32_t
@@ -129,6 +149,11 @@ SeqTsHeader::Deserialize(Buffer::Iterator start)
 
     // read IntHeader
     ih.Deserialize(i);
+    if (CustomHeader::udpCarriesPathSeq)
+    {
+        i.Next(IntHeader::GetStaticSize());
+        m_pathSeq = i.ReadNtohU16();
+    }
     return GetSerializedSize ();
 }
 
