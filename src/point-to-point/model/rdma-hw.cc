@@ -639,6 +639,19 @@ TypeId RdmaHw::GetTypeId (void)
 				BooleanValue(false),
 				MakeBooleanAccessor(&RdmaHw::m_sprayPathSeq),
 				MakeBooleanChecker())
+		.AddAttribute("SprayTailRecovery",
+				"Under SprayPathSeq, whether every data packet a queue pair "
+				"sends once it has no new data left closes its spine and "
+				"carries the count of the data packets sent up each spine, "
+				"from which the receiver asks at once for the path sequences "
+				"it misses and the sender repairs them without waiting for "
+				"the retransmission timeout. Needs SelectiveRetransmission, "
+				"SpineCount at most 8, CustomHeader::udpTailCounts equal to "
+				"SpineCount and CustomHeader::ackTailNackBytes 5. Default "
+				"false.",
+				BooleanValue(false),
+				MakeBooleanAccessor(&RdmaHw::m_sprayTailRecovery),
+				MakeBooleanChecker())
 		.AddAttribute("SprayReceiverHold",
 				"Under PathSelector 6, 7 and 9 with SprayPathSeq, whether the "
 				"receiver holds spines by the packets missing on them per "
@@ -1028,6 +1041,11 @@ void RdmaHw::Setup(QpCompleteCallback cb, QpFailureCallback failure_cb){
 		"SprayPathSeq is read only under LoadBalancing 2, and data "
 		"headers carry the path sequence exactly when it is set "
 		"(CustomHeader::udpCarriesPathSeq)");
+	NS_ABORT_MSG_IF(!ValidTailRecovery(),
+		"SprayTailRecovery needs SprayPathSeq, SelectiveRetransmission and "
+		"at most 8 spines, and data headers carry a count per spine and "
+		"repair requests the tail fields exactly when it is set "
+		"(CustomHeader::udpTailCounts, CustomHeader::ackTailNackBytes)");
 	NS_ABORT_MSG_IF(!ValidReceiverHold(),
 		"SprayReceiverHold needs SprayPathSeq, PathSelector 6, 7 or 9, "
 		"SwitchQueueState for the hosts' leaves and at most 8 spines, and "
@@ -1999,9 +2017,14 @@ void RdmaHw::SendTrimNack(Ptr<RdmaRxQueuePair> q, const CustomHeader &ch,
 	repair.SetForgivenessEligible(eligible);
 	if (IsSprayPolicy())
 		repair.SetSpineReport(ReportFor(q, destinationIp));
+	SendRepairRequest(repair, sourceIp, destinationIp, ch.ipid);
+}
+
+void RdmaHw::SendRepairRequest(const qbbHeader &header, uint32_t sourceIp,
+		uint32_t destinationIp, uint16_t identification){
 	Ptr<Packet> packet = Create<Packet>(
-		std::max(60 - 14 - 20 - static_cast<int>(repair.GetSerializedSize()), 0));
-	packet->AddHeader(repair);
+		std::max(60 - 14 - 20 - static_cast<int>(header.GetSerializedSize()), 0));
+	packet->AddHeader(header);
 
 	Ipv4Header ipHeader;
 	ipHeader.SetSource(Ipv4Address(sourceIp));
@@ -2010,7 +2033,7 @@ void RdmaHw::SendTrimNack(Ptr<RdmaRxQueuePair> q, const CustomHeader &ch,
 	ipHeader.SetDscp(static_cast<Ipv4Header::DscpType>(kUetDscpControl));
 	ipHeader.SetPayloadSize(packet->GetSize());
 	ipHeader.SetTtl(64);
-	ipHeader.SetIdentification(ch.ipid);
+	ipHeader.SetIdentification(identification);
 	packet->AddHeader(ipHeader);
 	AddHeader(packet, 0x800);
 
@@ -2359,6 +2382,11 @@ int RdmaHw::ReceiveTrim(Ptr<Packet> p, CustomHeader &ch){
 	if (!qp || qp->IsFailed()) {
 		return 0;
 	}
+	if (m_sprayTailRecovery &&
+			((ch.ack.flags >> qbbHeader::FLAG_TAIL_NACK) & 1)){
+		RecoverTail(qp, ch);
+		return 0;
+	}
 	RecoverTrimmedQueue(qp, ch);
 	return 0;
 }
@@ -2678,15 +2706,25 @@ Ptr<Packet> RdmaHw::GetNxtPacket(Ptr<RdmaQueuePair> qp){
 	SeqTsHeader seqTs;
 	seqTs.SetSeq (seq);
 	seqTs.SetPG (qp->m_pg);
-	if (m_sprayPathSeq)
-		seqTs.SetPathSeq(
-			qp->m_pathSeqSender.Next(RequestedSpine(identification)));
-	p->AddHeader (seqTs);
 	// A copy is a packet up its own spine, so it carries that spine's path
 	// sequence, or the receiver would count it against the data's spine.
+	// Both path sequences are taken before either header is written, so that
+	// the tail counts the two packets carry include both.
+	uint16_t pathSeq = 0;
+	uint16_t copyPathSeq = 0;
+	if (m_sprayPathSeq){
+		pathSeq = qp->m_pathSeqSender.Next(RequestedSpine(identification));
+		if (copy)
+			copyPathSeq = qp->m_pathSeqSender.Next(copySpine);
+		seqTs.SetPathSeq(pathSeq);
+	}
+	if (m_sprayTailRecovery)
+		SetTailFields(qp, seqTs,
+			(is_repair ? qp->snd_nxt : seq + payload_size) >= qp->m_size);
+	p->AddHeader (seqTs);
 	if (copy){
 		if (m_sprayPathSeq)
-			seqTs.SetPathSeq(qp->m_pathSeqSender.Next(copySpine));
+			seqTs.SetPathSeq(copyPathSeq);
 		copy->AddHeader(seqTs);
 	}
 	// add udp header
@@ -2720,7 +2758,7 @@ Ptr<Packet> RdmaHw::GetNxtPacket(Ptr<RdmaQueuePair> qp){
 			PathOf(static_cast<LoadBalancingMode>(m_loadBalancing), identification),
 			Simulator::Now().GetNanoSeconds(),
 			qp->m_pathSelector->ChoseTrickle(),
-			qp->m_pathSelector->ChoseExploration());
+			qp->m_pathSelector->ChoseExploration(), pathSeq);
 		if (copy){
 			// The copy leaves ahead of the data packet, through the NIC's
 			// high-priority queue, outside the queue pair's pacing; switches

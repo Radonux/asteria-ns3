@@ -6,6 +6,8 @@
 #include <ns3/node.h>
 #include <ns3/custom-header.h>
 #include <ns3/random-variable-stream.h>
+#include <ns3/seq-ts-header.h>
+#include "qbb-header.h"
 #include <ns3/traced-callback.h>
 #include "qbb-net-device.h"
 #include "load-balancing.h"
@@ -335,6 +337,34 @@ public:
 	// count, and the receiver's hold takes it for no arrival.
 	void CountPathSeq(Ptr<RdmaRxQueuePair> q, const CustomHeader &ch,
 		bool trimmed = false);
+	// SprayTailRecovery, under SprayPathSeq: every data packet a queue pair
+	// sends once it has no new data left (the last packet of its data and
+	// every repair after it) is marked as closing its requested spine
+	// (kTailCloses) and carries the count of the data packets sent so far up
+	// each spine, CustomHeader::udpTailCounts of them. The receiver of such
+	// a packet compares each count with the furthest path sequence it
+	// expects of that requested spine, the arriving packet's own spine with
+	// its path sequence, and asks at once for the path sequences missing
+	// (SpineSequenceReceiver::TakeMissing) in a repair request with
+	// qbbHeader::FLAG_TAIL_NACK, one per spine. The sender declares lost
+	// the outstanding sends those path sequences name on that spine, as the
+	// per-path rule does, and repairs them; the retransmission timeout is
+	// left as it is.
+	bool m_sprayTailRecovery;
+	bool ValidTailRecovery() const;
+	// The tail fields of the data packet of qp being sent, closing when the
+	// queue pair has no new data left.
+	void SetTailFields(Ptr<RdmaQueuePair> qp, SeqTsHeader &seqTs,
+		bool closing) const;
+	// The tail repair requests the closing data packet or trimmed header ch
+	// arriving at q asks for, before ch's own path sequence is counted.
+	void AskTailMissing(Ptr<RdmaRxQueuePair> q, const CustomHeader &ch);
+	// The repair request for count path sequences from first on spine,
+	// answering the data packet or trimmed header ch.
+	void SendTailNack(const CustomHeader &ch, uint8_t spine, uint16_t first,
+		uint16_t count);
+	// The sender's handling of a tail repair request for qp.
+	void RecoverTail(Ptr<RdmaQueuePair> qp, const CustomHeader &ch);
 	// SprayReceiverHold, under SprayPathSeq: the host's ReceiverHold, made at
 	// its first arrival, counts the arrivals and the missing packets per
 	// sender leaf, which m_switchQueues names, holds spines by them with
@@ -480,6 +510,10 @@ public:
 		uint32_t sourceIp, uint32_t destinationIp, uint16_t sport,
 		uint16_t dport, uint16_t pg, uint32_t seq, uint32_t payloadSize,
 		bool lastHop, bool spent, bool eligible);
+	// A repair request carrying header, to destinationIp, with the IPv4
+	// identification identification.
+	void SendRepairRequest(const qbbHeader &header, uint32_t sourceIp,
+		uint32_t destinationIp, uint16_t identification);
 	// packetSeq and identification describe the data packet answered, or with
 	// probeAnswer the probe; redirect is the redirect field, kNoRedirect
 	// outside AckRedirect.

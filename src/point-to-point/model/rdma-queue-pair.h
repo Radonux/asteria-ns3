@@ -42,8 +42,9 @@ public:
 	// send of a loss hold (PathSelector::ChoseTrickle), whose answer is told
 	// to PathSelector::OnTrickleAnswer; exploration marks any exploration
 	// send onto a held spine (PathSelector::ChoseExploration).
+	// pathSeq is the send's path sequence under SprayPathSeq.
 	void Add(uint64_t seq, uint32_t size, uint16_t path, uint64_t sentNs,
-		bool trickle = false, bool exploration = false);
+		bool trickle = false, bool exploration = false, uint16_t pathSeq = 0);
 	// The packet number of the outstanding send of seq along path, or kNone.
 	uint64_t Find(uint64_t seq, uint16_t path) const;
 	uint64_t Oldest() const;
@@ -52,6 +53,7 @@ public:
 	uint32_t Size(uint64_t packet) const;
 	uint64_t SentNs(uint64_t packet) const;
 	uint16_t Path(uint64_t packet) const;
+	uint16_t PathSeq(uint64_t packet) const;
 	// Whether the send resends a packet whose previous send was declared
 	// lost. A send declared lost may still arrive, and the answer to it would
 	// name the resend's record.
@@ -75,6 +77,7 @@ private:
 		uint64_t sent_ns;
 		uint32_t size;
 		uint16_t path;
+		uint16_t path_seq;
 		bool outstanding;
 		bool resends_lost;
 		bool trickle;
@@ -299,6 +302,18 @@ public:
 	// Declare lost every outstanding send made at or before sentNs and queue
 	// its range for repair. Returns the bytes declared lost.
 	uint64_t DeclareLostSentBy(uint64_t sentNs);
+	// Under SprayTailRecovery, a tail repair request: declare lost every
+	// outstanding send along path whose path sequence is one of the count
+	// from first, and queue its range for repair. A send already
+	// acknowledged or declared lost is no longer outstanding and is left
+	// alone, as is a later send of the same packet, which carries a path
+	// sequence of its own. Returns the bytes declared lost.
+	uint64_t DeclareLostOnPathSeqs(uint16_t path, uint16_t first,
+		uint16_t count);
+	// Sends declared lost by tail repair requests, and the requests that
+	// found no outstanding send.
+	uint32_t m_tail_declared_lost;
+	uint32_t m_tail_nacks_ignored;
 
 	uint64_t GetBytesLeft();
 	uint64_t GetInitialSize();

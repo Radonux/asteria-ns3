@@ -16,6 +16,9 @@ public:
 	// The path sequence of the next data packet requested up spine, after
 	// which the counter of spine moves on by one, wrapping at 2^16.
 	uint16_t Next(uint8_t spine);
+	// The data packets sent up spine so far, modulo 2^16: the path sequence
+	// the next of them will carry.
+	uint16_t Count(uint8_t spine) const;
 
 private:
 	std::vector<uint16_t> m_next;
@@ -48,6 +51,19 @@ public:
 	// An arrival with path sequence pathSeq, requested up requested and
 	// carried by carrying.
 	Arrival OnArrival(uint8_t requested, uint8_t carrying, uint16_t pathSeq);
+	// A run of path sequences of one requested spine: count of them from
+	// first.
+	struct Missing {
+		uint16_t first;
+		uint16_t count;
+	};
+	// The path sequences missing of the owed packets the sender reports it
+	// sent up requested: from the furthest expected sequence among the
+	// paths requested up requested, or from the end of the last run taken
+	// where that is further, up to owed. A run taken is not taken again,
+	// and an owed count not ahead of that start in 16-bit serial order
+	// takes nothing.
+	Missing TakeMissing(uint8_t requested, uint16_t owed);
 
 private:
 	struct Expected {
@@ -56,6 +72,8 @@ private:
 	};
 	// Keyed by the identification that names the path.
 	std::unordered_map<uint16_t, Expected> m_expected;
+	// Per requested spine, the end of the runs TakeMissing has taken.
+	std::unordered_map<uint8_t, uint16_t> m_taken;
 };
 
 } // namespace ns3

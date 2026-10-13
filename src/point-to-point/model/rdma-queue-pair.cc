@@ -50,7 +50,7 @@ void OutstandingPackets::Reserve(uint64_t packet){
 }
 
 void OutstandingPackets::Add(uint64_t seq, uint32_t size, uint16_t path,
-		uint64_t sentNs, bool trickle, bool exploration){
+		uint64_t sentNs, bool trickle, bool exploration, uint16_t pathSeq){
 	NS_ASSERT_MSG(m_packet_size != 0 && seq % m_packet_size == 0,
 		"a send record is indexed by its packet number");
 	const uint64_t packet = seq / m_packet_size;
@@ -64,7 +64,7 @@ void OutstandingPackets::Add(uint64_t seq, uint32_t size, uint16_t path,
 	const uint64_t olderOnPath = newestOnPath == m_newest_on_path.end()
 		? kNone : newestOnPath->second;
 	const bool resendsLost = m_lost.erase(packet) > 0;
-	record = {sentNs, size, path, true, resendsLost, trickle,
+	record = {sentNs, size, path, pathSeq, true, resendsLost, trickle,
 		trickle || exploration, m_newest, kNone, olderOnPath, kNone};
 	if (m_newest != kNone)
 		At(m_newest).newer = packet;
@@ -112,6 +112,10 @@ uint64_t OutstandingPackets::SentNs(uint64_t packet) const{
 
 uint16_t OutstandingPackets::Path(uint64_t packet) const{
 	return At(packet).path;
+}
+
+uint16_t OutstandingPackets::PathSeq(uint64_t packet) const{
+	return At(packet).path_seq;
 }
 
 bool OutstandingPackets::ResendsLost(uint64_t packet) const{
@@ -212,6 +216,8 @@ RdmaQueuePair::RdmaQueuePair(uint16_t pg, Ipv4Address _sip, Ipv4Address _dip, ui
 	m_stale_trim_notifications = 0;
 	m_recovery_retries = 0;
 	m_duplicate_repairs = 0;
+	m_tail_declared_lost = 0;
+	m_tail_nacks_ignored = 0;
 	m_exploration_copies = 0;
 	m_exploration_copies_lost = 0;
 	m_timeouts = 0;
@@ -511,6 +517,27 @@ uint64_t RdmaQueuePair::DeclareLostSentBy(uint64_t sentNs){
 				m_outstanding.SentNs(oldest) <= sentNs;
 			oldest = m_outstanding.Oldest())
 		lost += DeclareLost(oldest);
+	return lost;
+}
+
+uint64_t RdmaQueuePair::DeclareLostOnPathSeqs(uint16_t path, uint16_t first,
+		uint16_t count){
+	std::vector<uint64_t> named;
+	for (uint64_t send = m_outstanding.NewestOnPath(path);
+			send != OutstandingPackets::kNone;
+			send = m_outstanding.OlderOnPath(send)){
+		const uint16_t offset =
+			static_cast<uint16_t>(m_outstanding.PathSeq(send) - first);
+		if (offset < count)
+			named.push_back(send);
+	}
+	uint64_t lost = 0;
+	// Oldest first, as the per-path rule declares them.
+	for (auto send = named.rbegin(); send != named.rend(); ++send)
+		lost += DeclareLost(*send);
+	m_tail_declared_lost += named.size();
+	if (named.empty())
+		m_tail_nacks_ignored++;
 	return lost;
 }
 

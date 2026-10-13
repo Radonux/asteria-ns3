@@ -9194,6 +9194,532 @@ class SprayPathSeqTrimTest : public TestCase
     }
 };
 
+class SprayTailRecoveryTest : public TestCase
+{
+  public:
+    SprayTailRecoveryTest()
+        : TestCase("Under SprayTailRecovery the packets a queue pair sends once it has no new "
+                   "data left close their spines and carry each spine's count, the receiver asks "
+                   "at once for the path sequences it misses, and the sender repairs a lost tail "
+                   "without a retransmission timeout")
+    {
+    }
+
+    void DoRun() override
+    {
+        const IntHeader::Mode savedIntMode = IntHeader::mode;
+        const bool savedPathSeq = CustomHeader::udpCarriesPathSeq;
+        const bool savedPacketSeq = CustomHeader::ackCarriesPacketSeq;
+        const uint32_t savedCounts = CustomHeader::udpTailCounts;
+        const uint32_t savedNack = CustomHeader::ackTailNackBytes;
+        IntHeader::mode = IntHeader::NONE;
+        CustomHeader::ackCarriesPacketSeq = true;
+        CustomHeader::udpCarriesPathSeq = true;
+
+        Unit();
+        Refusals();
+        TailLoss();
+        LostClosingPacket();
+
+        CustomHeader::ackTailNackBytes = savedNack;
+        CustomHeader::udpTailCounts = savedCounts;
+        CustomHeader::udpCarriesPathSeq = savedPathSeq;
+        CustomHeader::ackCarriesPacketSeq = savedPacketSeq;
+        IntHeader::mode = savedIntMode;
+        Simulator::Destroy();
+    }
+
+  private:
+    static constexpr uint32_t kSpines = 8;
+    static constexpr uint8_t kLossy = 3;
+    static constexpr uint32_t kMtu = IsolatedHost::kMtu;
+    static constexpr uint64_t kOneWayNs = 1000;
+    static constexpr uint64_t kBaseRttNs = 2 * kOneWayNs;
+    static constexpr uint64_t kStepNs = 100;
+    static constexpr uint64_t kTimeoutNs = 20000;
+    // The new data packets up spine 3 among the message's last ones that a
+    // tail loss drops.
+    static constexpr uint32_t kTailPackets = 16;
+
+    static void SetHeaders(bool on)
+    {
+        CustomHeader::udpTailCounts = on ? kSpines : 0;
+        CustomHeader::ackTailNackBytes = on ? 5 : 0;
+    }
+
+    static CustomHeader Parse(Ptr<const Packet> packet)
+    {
+        CustomHeader parsed(CustomHeader::L2_Header | CustomHeader::L3_Header |
+                            CustomHeader::L4_Header);
+        packet->PeekHeader(parsed);
+        return parsed;
+    }
+
+    void Unit()
+    {
+        SetHeaders(false);
+        const uint32_t udp = CustomHeader::GetUdpHeaderSize();
+        const uint32_t ack = CustomHeader::GetAckSerializedSize();
+        const uint32_t qbb = qbbHeader().GetSerializedSize();
+        SetHeaders(true);
+        NS_TEST_EXPECT_MSG_EQ(CustomHeader::GetUdpHeaderSize(),
+                              udp + 1 + 2 * kSpines,
+                              "the data header grows by a flag byte and a count per spine");
+        NS_TEST_EXPECT_MSG_EQ(SeqTsHeader().GetSerializedSize(),
+                              8u + 1 + 2 * kSpines,
+                              "the writer agrees on the size");
+        NS_TEST_EXPECT_MSG_EQ(CustomHeader::GetAckSerializedSize(),
+                              ack + 5,
+                              "the acknowledgement header grows by the spine, sequence and count");
+        NS_TEST_EXPECT_MSG_EQ(qbbHeader().GetSerializedSize(), qbb + 5, "the writer agrees");
+
+        // A data header's tail fields, written and parsed.
+        uint16_t counts[kSpines] = {1, 2, 3, 65535, 0, 7, 8, 9};
+        SeqTsHeader seqTs;
+        seqTs.SetSeq(5000);
+        seqTs.SetPG(IsolatedHost::kPriorityGroup);
+        seqTs.SetPathSeq(41);
+        seqTs.SetTail(kTailCloses, counts, kSpines);
+        Ptr<Packet> data = Create<Packet>(kMtu);
+        data->AddHeader(seqTs);
+        UdpHeader udpHeader;
+        udpHeader.ForcePayloadSize(CustomHeader::GetUdpHeaderSize() + kMtu);
+        data->AddHeader(udpHeader);
+        Ipv4Header ip;
+        ip.SetProtocol(0x11);
+        ip.SetPayloadSize(data->GetSize());
+        data->AddHeader(ip);
+        PppHeader ppp;
+        ppp.SetProtocol(0x0021);
+        data->AddHeader(ppp);
+        const CustomHeader parsed = Parse(data);
+        NS_TEST_EXPECT_MSG_EQ(parsed.udp.path_seq, 41u, "the path sequence before the fields");
+        NS_TEST_EXPECT_MSG_EQ(static_cast<uint32_t>(parsed.udp.tail_flags),
+                              static_cast<uint32_t>(kTailCloses),
+                              "the closing flag");
+        for (uint32_t k = 0; k < kSpines; ++k)
+        {
+            NS_TEST_EXPECT_MSG_EQ(parsed.udp.tail_counts[k], counts[k], "each spine's count");
+        }
+        NS_TEST_EXPECT_MSG_EQ(data->GetSize() - parsed.GetSerializedSize(),
+                              kMtu,
+                              "the payload follows the fields");
+
+        // A tail repair request, written and parsed.
+        qbbHeader request;
+        request.SetTailNack(kLossy, 65530, 7);
+        NS_TEST_EXPECT_MSG_EQ(request.IsTailNack(), true, "the flag is set");
+        Ptr<Packet> nack = Create<Packet>();
+        nack->AddHeader(request);
+        Ipv4Header nackIp;
+        nackIp.SetProtocol(kUecTrimRepairProtocol);
+        nackIp.SetPayloadSize(nack->GetSize());
+        nack->AddHeader(nackIp);
+        nack->AddHeader(ppp);
+        const CustomHeader parsedNack = Parse(nack);
+        NS_TEST_EXPECT_MSG_EQ(((parsedNack.ack.flags >> qbbHeader::FLAG_TAIL_NACK) & 1), 1,
+                              "the parser reads the flag");
+        NS_TEST_EXPECT_MSG_EQ(static_cast<uint32_t>(parsedNack.ack.tail_spine), 3u, "the spine");
+        NS_TEST_EXPECT_MSG_EQ(parsedNack.ack.tail_seq, 65530u, "the first missing sequence");
+        NS_TEST_EXPECT_MSG_EQ(parsedNack.ack.tail_count, 7u, "and the count");
+        NS_TEST_EXPECT_MSG_EQ(((qbbHeader().GetSerializedSize() > 0) &&
+                               !qbbHeader().IsTailNack()),
+                              true,
+                              "an acknowledgement is no tail repair request");
+
+        SpineSequenceSender sender;
+        NS_TEST_EXPECT_MSG_EQ(sender.Count(2), 0u, "nothing sent up spine 2");
+        sender.Next(2);
+        sender.Next(2);
+        NS_TEST_EXPECT_MSG_EQ(sender.Count(2), 2u, "two sent up spine 2");
+        NS_TEST_EXPECT_MSG_EQ(sender.Count(5), 0u, "each spine counts apart");
+
+        SpineSequenceReceiver receiver;
+        SpineSequenceReceiver::Missing missing = receiver.TakeMissing(1, 3);
+        NS_TEST_EXPECT_MSG_EQ(missing.first, 0u, "nothing arrived: from 0");
+        NS_TEST_EXPECT_MSG_EQ(missing.count, 3u, "three owed");
+        NS_TEST_EXPECT_MSG_EQ(receiver.TakeMissing(1, 3).count, 0u, "a run is taken once");
+        missing = receiver.TakeMissing(1, 5);
+        NS_TEST_EXPECT_MSG_EQ(missing.first, 3u, "a later count takes the rest");
+        NS_TEST_EXPECT_MSG_EQ(missing.count, 2u, "two more");
+        receiver.OnArrival(2, 2, 0);
+        receiver.OnArrival(2, 2, 1);
+        NS_TEST_EXPECT_MSG_EQ(receiver.TakeMissing(2, 2).count, 0u, "both arrived");
+        missing = receiver.TakeMissing(2, 4);
+        NS_TEST_EXPECT_MSG_EQ(missing.first, 2u, "the tail after them");
+        NS_TEST_EXPECT_MSG_EQ(missing.count, 2u, "is missing");
+        // A packet requested up 4 that a source leaf moved onto 6 is
+        // furthest on the path (4, 6).
+        receiver.OnArrival(4, 4, 0);
+        receiver.OnArrival(4, 6, 5);
+        missing = receiver.TakeMissing(4, 8);
+        NS_TEST_EXPECT_MSG_EQ(missing.first, 6u, "from the moved packet on");
+        NS_TEST_EXPECT_MSG_EQ(missing.count, 2u, "two owed");
+        NS_TEST_EXPECT_MSG_EQ(receiver.TakeMissing(7, 0).count, 0u, "nothing owed");
+        receiver.OnArrival(5, 6, 65534);
+        missing = receiver.TakeMissing(5, 1);
+        NS_TEST_EXPECT_MSG_EQ(missing.first, 65535u, "across the wrap");
+        NS_TEST_EXPECT_MSG_EQ(missing.count, 2u, "65535 and 0");
+    }
+
+    void Refusals()
+    {
+        NS_TEST_EXPECT_MSG_EQ(CreateObject<RdmaHw>()->m_sprayTailRecovery,
+                              false,
+                              "SprayTailRecovery is off by default");
+        SetHeaders(false);
+        NS_TEST_EXPECT_MSG_EQ(CreateObject<RdmaHw>()->ValidTailRecovery(),
+                              true,
+                              "off, with the headers as they are");
+        Ptr<RdmaHw> hw = CreateObject<RdmaHw>();
+        hw->m_loadBalancing = static_cast<uint32_t>(LoadBalancingMode::SprayUniform);
+        hw->m_spineCount = kSpines;
+        hw->m_selective_retransmission = true;
+        hw->m_sprayPathSeq = true;
+        hw->m_sprayTailRecovery = true;
+        NS_TEST_EXPECT_MSG_EQ(hw->ValidTailRecovery(), false, "refused unless the headers grow");
+        SetHeaders(true);
+        for (PathSelectorKind kind : {PathSelectorKind::Ops,
+                                      PathSelectorKind::Reps,
+                                      PathSelectorKind::AckRedirect,
+                                      PathSelectorKind::RepsHold,
+                                      PathSelectorKind::RepsFlowHold,
+                                      PathSelectorKind::RepsOracle,
+                                      PathSelectorKind::MrcHold})
+        {
+            hw->m_pathSelectorKind = static_cast<uint32_t>(kind);
+            NS_TEST_EXPECT_MSG_EQ(hw->ValidTailRecovery(),
+                                  true,
+                                  "accepted under every selector of spray_uniform");
+        }
+        hw->m_sprayPathSeq = false;
+        NS_TEST_EXPECT_MSG_EQ(hw->ValidTailRecovery(), false, "refused without SprayPathSeq");
+        hw->m_sprayPathSeq = true;
+        hw->m_selective_retransmission = false;
+        NS_TEST_EXPECT_MSG_EQ(hw->ValidTailRecovery(),
+                              false,
+                              "refused without SelectiveRetransmission");
+        hw->m_selective_retransmission = true;
+        hw->m_spineCount = kMaxTailCounts + 1;
+        CustomHeader::udpTailCounts = kMaxTailCounts + 1;
+        NS_TEST_EXPECT_MSG_EQ(hw->ValidTailRecovery(), false, "refused above 8 spines");
+        hw->m_spineCount = kSpines;
+        CustomHeader::udpTailCounts = kSpines - 1;
+        NS_TEST_EXPECT_MSG_EQ(hw->ValidTailRecovery(),
+                              false,
+                              "refused unless the data header counts every spine");
+        CustomHeader::udpTailCounts = kSpines;
+        CustomHeader::ackTailNackBytes = 0;
+        NS_TEST_EXPECT_MSG_EQ(hw->ValidTailRecovery(),
+                              false,
+                              "refused unless the repair request carries the fields");
+        CustomHeader::ackTailNackBytes = 5;
+        hw->m_sprayTailRecovery = false;
+        NS_TEST_EXPECT_MSG_EQ(hw->ValidTailRecovery(), false, "off, the headers do not grow");
+        hw->m_sprayTailRecovery = true;
+        NS_TEST_EXPECT_MSG_EQ(hw->ValidTailRecovery(), true, "accepted again");
+    }
+
+    enum class Loss
+    {
+        // 1% of the new data packets up spine 3 and every one among the
+        // message's last kTailPackets, the last packet itself excepted.
+        TailOnSpine3,
+        // The newest new data packet still in flight when the last one is
+        // sent, on a spine other than the last one's.
+        ClosingPacket,
+    };
+
+    struct Nack
+    {
+        uint8_t spine;
+        uint16_t first;
+        uint16_t count;
+    };
+
+    struct Outcome
+    {
+        bool completed = false;
+        uint32_t timeouts = 0;
+        uint32_t qpTimeouts = 0;
+        // When the message's last new data packet was sent, and up which
+        // spine, and when the receiver held every byte.
+        uint64_t endNs = 0;
+        uint8_t lastSpine = 0;
+        uint64_t receivedNs = 0;
+        uint32_t drops = 0;
+        uint32_t tailDrops = 0;
+        uint8_t droppedSpine = 0;
+        uint16_t droppedPathSeq = 0;
+        uint32_t tailDeclared = 0;
+        uint32_t tailIgnored = 0;
+        uint32_t closingSends = 0;
+        std::vector<Nack> nacks;
+        std::vector<uint32_t> lossesTraced = std::vector<uint32_t>(kSpines, 0);
+    };
+
+    static void Configure(Ptr<RdmaHw> hw, bool tailRecovery, PathSelectorKind kind)
+    {
+        hw->m_sprayPathSeq = true;
+        hw->m_sprayTailRecovery = tailRecovery;
+        hw->m_pathSelectorKind = static_cast<uint32_t>(kind);
+        if (kind == PathSelectorKind::RepsHold)
+        {
+            hw->m_sprayHoldScope = static_cast<uint32_t>(HoldScope::Host);
+            hw->m_sprayLossThreshold1 = 0.1;
+            hw->m_sprayLossThreshold2 = 0.25;
+            hw->m_sprayLossThreshold3 = 0.5;
+            hw->m_sprayLossIntervalNs = 10000;
+            hw->m_sprayLossHoldCleanSentinels = 3;
+            hw->m_sprayHeldExploration = SpineScores::HeldExploration::Sentinel;
+        }
+    }
+
+    // One queue pair of packets data packets, one send per kStepNs, to a
+    // receiver kOneWayNs away each way, with loss.
+    Outcome Flow(bool tailRecovery, Loss loss, PathSelectorKind kind, uint32_t packets)
+    {
+        SetHeaders(tailRecovery);
+        Outcome outcome;
+        {
+            IsolatedHost sender(LoadBalancingMode::SprayUniform, kTestReceiver, kSpines);
+            IsolatedHost receiver(LoadBalancingMode::SprayUniform, kTestSender, kSpines);
+            Configure(sender.hw, tailRecovery, kind);
+            Configure(receiver.hw, tailRecovery, kind);
+            Ptr<RdmaHw> hw = sender.hw;
+            hw->m_retransmission_timeout_ns = kTimeoutNs;
+            NS_TEST_EXPECT_MSG_EQ(hw->ValidTailRecovery(), true, "a valid configuration");
+            NS_TEST_EXPECT_MSG_EQ(hw->ValidPathSeq(), true, "with path sequences");
+            hw->m_qpCompleteCallback = Callback<void, Ptr<RdmaQueuePair>>(
+                [&](Ptr<RdmaQueuePair>) { outcome.completed = true; });
+            hw->TraceConnectWithoutContext(
+                "RetransmissionTimeout",
+                Callback<void, uint64_t, Ptr<RdmaQueuePair>, int32_t, bool, uint64_t>(
+                    [&](uint64_t, Ptr<RdmaQueuePair>, int32_t, bool, uint64_t) {
+                        outcome.timeouts++;
+                    }));
+            const uint64_t size = uint64_t{packets} * kMtu;
+            Ptr<RdmaQueuePair> qp = sender.AddSender(kTestSender, kTestReceiver, size);
+            qp->m_baseRtt = kBaseRttNs;
+            qp->m_notifyAppFinish = Callback<void>([]() {});
+            if (kind == PathSelectorKind::RepsHold)
+            {
+                hw->TraceConnectWithoutContext(
+                    "SpineLossInterval",
+                    Callback<void,
+                             uint64_t,
+                             const std::vector<uint32_t>&,
+                             const std::vector<uint32_t>&,
+                             const std::vector<uint8_t>&>(
+                        [&](uint64_t,
+                            const std::vector<uint32_t>&,
+                            const std::vector<uint32_t>& lost,
+                            const std::vector<uint8_t>&) {
+                            for (uint32_t k = 0; k < kSpines && k < lost.size(); ++k)
+                            {
+                                outcome.lossesTraced[k] += lost[k];
+                            }
+                        }));
+            }
+
+            // The receiver's answers reach the sender kOneWayNs later.
+            receiver.hw->m_nic[0].dev->m_traceEnqueue.ConnectWithoutContext(
+                Callback<void, Ptr<const Packet>, uint32_t>([&](Ptr<const Packet> sent, uint32_t) {
+                    Ptr<Packet> packet = sent->Copy();
+                    const CustomHeader parsed = Parse(packet);
+                    if (parsed.l3Prot == kUecTrimRepairProtocol &&
+                        ((parsed.ack.flags >> qbbHeader::FLAG_TAIL_NACK) & 1))
+                    {
+                        outcome.nacks.push_back(
+                            Nack{parsed.ack.tail_spine, parsed.ack.tail_seq, parsed.ack.tail_count});
+                    }
+                    Simulator::Schedule(NanoSeconds(kOneWayNs), [&sender, packet]() {
+                        CustomHeader header = Parse(packet);
+                        sender.hw->Receive(packet, header);
+                    });
+                }));
+            auto deliver = [&](Ptr<Packet> packet) {
+                CustomHeader header = Parse(packet);
+                receiver.hw->Receive(packet, header);
+                const Ptr<RdmaRxQueuePair> rx =
+                    receiver.hw->GetRxQp(kTestReceiver.Get(),
+                                         kTestSender.Get(),
+                                         IsolatedHost::kReceiverPort,
+                                         IsolatedHost::kSenderPort,
+                                         IsolatedHost::kPriorityGroup,
+                                         false);
+                if (rx && outcome.receivedNs == 0 && rx->ReceiverNextExpectedSeq >= size)
+                {
+                    outcome.receivedNs = Simulator::Now().GetNanoSeconds();
+                }
+            };
+
+            Ptr<UniformRandomVariable> draw =
+                CreateObjectWithAttributes<UniformRandomVariable>("Stream", IntegerValue(23));
+            std::set<uint64_t> sent;
+            std::vector<EventId> inFlight(kSpines);
+            std::vector<uint16_t> inFlightPathSeq(kSpines, 0);
+            std::vector<uint64_t> inFlightSentNs(kSpines, 0);
+            std::function<void()> step = [&]() {
+                if (outcome.completed)
+                {
+                    return;
+                }
+                if (qp->GetBytesLeft() > 0)
+                {
+                    Ptr<Packet> packet = hw->GetNxtPacket(qp);
+                    hw->ArmRetransmissionTimeout(qp);
+                    const CustomHeader header = Parse(packet);
+                    const uint8_t spine = RequestedSpine(header.ipid);
+                    const uint64_t now = Simulator::Now().GetNanoSeconds();
+                    const bool fresh = sent.insert(header.udp.seq).second;
+                    const bool last = fresh && header.udp.seq + kMtu >= size;
+                    outcome.closingSends +=
+                        tailRecovery && (header.udp.tail_flags & kTailCloses) != 0;
+                    if (last)
+                    {
+                        outcome.endNs = now;
+                        outcome.lastSpine = spine;
+                    }
+                    bool drop = false;
+                    if (loss == Loss::TailOnSpine3 && fresh && !last && spine == kLossy)
+                    {
+                        const bool tail = header.udp.seq >= size - uint64_t{kTailPackets} * kMtu;
+                        drop = draw->GetValue() < 0.01 || tail;
+                        outcome.tailDrops += tail;
+                    }
+                    if (last && loss == Loss::ClosingPacket)
+                    {
+                        // The newest packet in flight on another spine is its
+                        // spine's last before the end.
+                        int32_t newest = -1;
+                        for (uint32_t k = 0; k < kSpines; ++k)
+                        {
+                            if (k != spine && inFlight[k].IsPending() &&
+                                (newest < 0 || inFlightSentNs[k] > inFlightSentNs[newest]))
+                            {
+                                newest = static_cast<int32_t>(k);
+                            }
+                        }
+                        NS_TEST_EXPECT_MSG_GT(newest, -1, "a packet is in flight on another spine");
+                        if (newest >= 0)
+                        {
+                            Simulator::Cancel(inFlight[newest]);
+                            outcome.drops++;
+                            outcome.droppedSpine = static_cast<uint8_t>(newest);
+                            outcome.droppedPathSeq = inFlightPathSeq[newest];
+                        }
+                    }
+                    if (drop)
+                    {
+                        outcome.drops++;
+                    }
+                    else
+                    {
+                        const EventId arrival =
+                            Simulator::Schedule(NanoSeconds(kOneWayNs), [&deliver, packet]() {
+                                deliver(packet);
+                            });
+                        if (fresh)
+                        {
+                            inFlight[spine] = arrival;
+                            inFlightPathSeq[spine] = header.udp.path_seq;
+                            inFlightSentNs[spine] = now;
+                        }
+                    }
+                }
+                Simulator::Schedule(NanoSeconds(kStepNs), step);
+            };
+            Simulator::Schedule(NanoSeconds(kStepNs), step);
+            Simulator::Stop(NanoSeconds(uint64_t{packets} * kStepNs + 10 * kTimeoutNs));
+            Simulator::Run();
+            if (kind == PathSelectorKind::RepsHold)
+            {
+                // A send long after closes the loss intervals counted.
+                hw->m_senderSpineScores->CountIntervalSend(
+                    0,
+                    Simulator::Now().GetNanoSeconds() + 100 * hw->m_sprayLossIntervalNs);
+            }
+            outcome.qpTimeouts = qp->m_timeouts;
+            outcome.tailDeclared = qp->m_tail_declared_lost;
+            outcome.tailIgnored = qp->m_tail_nacks_ignored;
+            Simulator::Destroy();
+        }
+        return outcome;
+    }
+
+    // Test (a): spine 3 loses 1% of its packets and every one among the
+    // message's last ones.
+    void TailLoss()
+    {
+        constexpr uint32_t kPackets = 4000;
+        const Outcome on = Flow(true, Loss::TailOnSpine3, PathSelectorKind::Ops, kPackets);
+        NS_TEST_EXPECT_MSG_EQ(on.completed, true, "on: the flow completes");
+        NS_TEST_EXPECT_MSG_NE(static_cast<uint32_t>(on.lastSpine),
+                              static_cast<uint32_t>(kLossy),
+                              "the last packet goes up another spine");
+        NS_TEST_EXPECT_MSG_GT(on.tailDrops, 0u, "spine 3 loses packets at the tail");
+        NS_TEST_EXPECT_MSG_GT(on.drops, on.tailDrops, "and before it");
+        NS_TEST_EXPECT_MSG_GT(on.closingSends, 0u, "closing packets are sent");
+        NS_TEST_EXPECT_MSG_EQ(on.timeouts, 0u, "on: no retransmission timeout is traced");
+        NS_TEST_EXPECT_MSG_EQ(on.qpTimeouts, 0u, "nor counted");
+        NS_TEST_EXPECT_MSG_GT(on.nacks.size(), 0u, "the receiver asks for the tail");
+        for (const Nack& nack : on.nacks)
+        {
+            NS_TEST_EXPECT_MSG_EQ(static_cast<uint32_t>(nack.spine),
+                                  static_cast<uint32_t>(kLossy),
+                                  "only spine 3 misses packets");
+        }
+        NS_TEST_EXPECT_MSG_GT_OR_EQ(on.tailDeclared, on.tailDrops, "every tail loss is repaired");
+        NS_TEST_EXPECT_MSG_LT_OR_EQ(on.tailDeclared, on.drops, "and nothing that arrived");
+        NS_TEST_EXPECT_MSG_GT(on.receivedNs, on.endNs, "received after the end");
+        NS_TEST_EXPECT_MSG_LT_OR_EQ(on.receivedNs - on.endNs,
+                                    kBaseRttNs * 3 / 2 + (on.tailDeclared + 1) * kStepNs,
+                                    "within 1.5 base RTT of the end, and the repairs' sends");
+
+        const Outcome off = Flow(false, Loss::TailOnSpine3, PathSelectorKind::Ops, kPackets);
+        NS_TEST_EXPECT_MSG_EQ(off.tailDrops, on.tailDrops, "off: the same tail losses");
+        NS_TEST_EXPECT_MSG_EQ(off.completed, true, "off: the flow completes");
+        NS_TEST_EXPECT_MSG_GT(off.timeouts, 0u, "off: a retransmission timeout is traced");
+        NS_TEST_EXPECT_MSG_EQ(off.qpTimeouts, off.timeouts, "and counted");
+        NS_TEST_EXPECT_MSG_EQ(off.nacks.size(), 0u, "off: no tail repair request");
+        NS_TEST_EXPECT_MSG_GT(off.receivedNs, off.endNs + kTimeoutNs - kTailPackets * kStepNs,
+                              "off: the tail waits out the timeout");
+    }
+
+    // Test (b): spine k's last packet before the end is lost, and only the
+    // last packet's counts show it.
+    void LostClosingPacket()
+    {
+        constexpr uint32_t kPackets = 400;
+        const Outcome on = Flow(true, Loss::ClosingPacket, PathSelectorKind::RepsHold, kPackets);
+        NS_TEST_EXPECT_MSG_EQ(on.completed, true, "on: the flow completes");
+        NS_TEST_EXPECT_MSG_EQ(on.drops, 1u, "one packet lost");
+        NS_TEST_EXPECT_MSG_EQ(on.timeouts, 0u, "on: no retransmission timeout");
+        NS_TEST_EXPECT_MSG_EQ(on.nacks.size(), 1u, "one tail repair request");
+        if (!on.nacks.empty())
+        {
+            NS_TEST_EXPECT_MSG_EQ(static_cast<uint32_t>(on.nacks[0].spine),
+                                  static_cast<uint32_t>(on.droppedSpine),
+                                  "for the spine that lost it");
+            NS_TEST_EXPECT_MSG_EQ(on.nacks[0].first, on.droppedPathSeq, "its path sequence");
+            NS_TEST_EXPECT_MSG_EQ(on.nacks[0].count, 1u, "alone");
+        }
+        NS_TEST_EXPECT_MSG_EQ(on.tailDeclared, 1u, "declared lost by the request");
+        NS_TEST_EXPECT_MSG_EQ(on.tailIgnored, 0u, "which names an outstanding send");
+        NS_TEST_EXPECT_MSG_EQ(on.lossesTraced[on.droppedSpine],
+                              1u,
+                              "the hold's loss trace counts it on its spine");
+        NS_TEST_EXPECT_MSG_LT_OR_EQ(on.receivedNs - on.endNs,
+                                    kBaseRttNs * 3 / 2 + kStepNs,
+                                    "within 1.5 base RTT of the end");
+
+        const Outcome off = Flow(false, Loss::ClosingPacket, PathSelectorKind::RepsHold, kPackets);
+        NS_TEST_EXPECT_MSG_EQ(off.completed, true, "off: the flow completes");
+        NS_TEST_EXPECT_MSG_GT(off.timeouts, 0u, "off: the loss waits out the timeout");
+    }
+};
+
 class SprayPolicyTransportTest : public TestCase
 {
   public:
@@ -10964,6 +11490,7 @@ PointToPointTestSuite::PointToPointTestSuite()
     AddTestCase(new RepsHoldTrickleTest, TestCase::Duration::QUICK);
     AddTestCase(new RepsHoldDuplicateTest, TestCase::Duration::QUICK);
     AddTestCase(new RetransmissionTimeoutTraceTest, TestCase::Duration::QUICK);
+    AddTestCase(new SprayTailRecoveryTest, TestCase::Duration::QUICK);
     AddTestCase(new SprayPathSeqTest, TestCase::Duration::QUICK);
     AddTestCase(new SprayReceiverHoldTest, TestCase::Duration::QUICK);
     AddTestCase(new SprayReceiverHoldTraceTest, TestCase::Duration::QUICK);

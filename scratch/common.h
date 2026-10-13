@@ -256,6 +256,33 @@ bool spray_hold_trickle_given = false;
 // it. Off, the default, leaves the data header as it is.
 std::string spray_path_seq = "off";
 bool spray_path_seq_given = false;
+// Under LOAD_BALANCING spray_uniform, with any PATH_SELECTOR,
+// SPRAY_TAIL_RECOVERY on, which requires SPRAY_PATH_SEQ on and at most 8
+// spines: a queue pair's message is its flow's data, and it ends with the send
+// of its last new data packet. That packet and every repair the queue pair
+// sends after it is the newest send up its requested spine, is marked in the
+// data header as closing that spine, and carries after path_seq the count of
+// the data packets the queue pair has sent so far up each spine. The data
+// header of every data packet, closing or not, grows by 1 + 2 x the spine count
+// bytes: a 1-byte flag field and a 16-bit count per spine. The last packet up
+// each other spine left before the message ended, when the selector had not yet
+// drawn the spines of the packets after it, so it carries no mark; the counts
+// tell the receiver it is owed, lost or not. The receiver of a closing packet,
+// or of its trimmed header, compares each spine's count with the path sequence
+// it expects next of that spine (the furthest of the paths requested up it) and
+// the packet's own spine with its path sequence, and at once asks for each run
+// of missing path sequences in a repair request carrying the spine, the first
+// missing path sequence and their count, 5 bytes after receiver_hold in every
+// acknowledgement header; a run is asked once. The sender declares lost the
+// outstanding sends those path sequences name on that spine, as the per-path
+// rule does, so the loss holds and the loss trace see each, and repairs them at
+// once; a request for a send already acknowledged or declared lost is ignored.
+// The retransmission timeout is unchanged and still recovers what no closing
+// packet that arrives reports, such as the loss of the last of them. Off, the
+// default, leaves both headers as they are.
+std::string spray_tail_recovery = "off";
+bool spray_tail_recovery_given = false;
+bool tail_recovery() { return spray_tail_recovery == "on"; }
 // Under reps_hold, reps_flow_hold or mrc_hold with SPRAY_PATH_SEQ on,
 // SPRAY_RECEIVER_HOLD on: each receiving host counts, per sender leaf and spine, the data packets
 // that arrived and the packets the path sequences show missing. A missing
@@ -2120,6 +2147,9 @@ bool ReadConf(string network_configuration) {
     } else if (key.compare("SPRAY_PATH_SEQ") == 0) {
       conf >> spray_path_seq;
       spray_path_seq_given = true;
+    } else if (key.compare("SPRAY_TAIL_RECOVERY") == 0) {
+      conf >> spray_tail_recovery;
+      spray_tail_recovery_given = true;
     } else if (key.compare("SPRAY_RECEIVER_HOLD") == 0) {
       conf >> spray_receiver_hold;
       spray_receiver_hold_given = true;
@@ -2531,6 +2561,19 @@ bool ReadConf(string network_configuration) {
                  "spray_uniform\n";
     return false;
   }
+  if (spray_tail_recovery != "on" && spray_tail_recovery != "off") {
+    std::cerr << "SPRAY_TAIL_RECOVERY must be on or off\n";
+    return false;
+  }
+  if (spray_tail_recovery_given && load_balancing != "spray_uniform") {
+    std::cerr << "SPRAY_TAIL_RECOVERY is read only under LOAD_BALANCING "
+                 "spray_uniform\n";
+    return false;
+  }
+  if (tail_recovery() && spray_path_seq != "on") {
+    std::cerr << "SPRAY_TAIL_RECOVERY requires SPRAY_PATH_SEQ on\n";
+    return false;
+  }
   if (spray_receiver_hold != "on" && spray_receiver_hold != "off") {
     std::cerr << "SPRAY_RECEIVER_HOLD must be on or off\n";
     return false;
@@ -2674,6 +2717,7 @@ void SetConfig() {
   CustomHeader::ackRedirectBytes = path_selector == "ack_redirect" ? 1 : 0;
   CustomHeader::udpCarriesPathSeq = spray_path_seq == "on";
   CustomHeader::ackReceiverHoldBytes = receiver_hold() ? 1 : 0;
+  CustomHeader::ackTailNackBytes = tail_recovery() ? 5 : 0;
 
   // Set Pint
   if (cc_mode == 10) {
@@ -3010,6 +3054,12 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),
               << SpineReport::kMaxSpines << " spines\n";
     return false;
   }
+  if (tail_recovery() && spine_count > kMaxTailCounts) {
+    std::cerr << "SPRAY_TAIL_RECOVERY counts at most " << kMaxTailCounts
+              << " spines\n";
+    return false;
+  }
+  CustomHeader::udpTailCounts = tail_recovery() ? spine_count : 0;
   if (receiver_hold() && spine_count > kReceiverHoldSpines) {
     std::cerr << "SPRAY_RECEIVER_HOLD holds at most " << kReceiverHoldSpines
               << " spines\n";
@@ -3104,6 +3154,7 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),
                            UintegerValue(spray_sentinel_mode_value()));
       rdmaHw->SetAttribute("SprayPathSeq",
                            BooleanValue(spray_path_seq == "on"));
+      rdmaHw->SetAttribute("SprayTailRecovery", BooleanValue(tail_recovery()));
       rdmaHw->SetAttribute("SprayReceiverHold", BooleanValue(receiver_hold()));
       rdmaHw->SetAttribute("SprayReceiverHoldClean",
                            UintegerValue(spray_receiver_hold_clean));
