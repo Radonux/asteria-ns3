@@ -7517,6 +7517,187 @@ class RepsHoldAutoScopeTest : public TestCase
     static constexpr uint32_t kIntervals = 7;
 };
 
+class RepsHoldLlrTest : public TestCase
+{
+  public:
+    RepsHoldLlrTest()
+        : TestCase("Under SprayHoldRule llr a hold key's likelihood ratio holds a spine at the "
+                   "loss that reaches its threshold: with SprayLossP0 zero at the first loss, "
+                   "with it above zero after enough losses close together, and a clean stretch "
+                   "decays the ratio to zero; the auto scope's leaves still choose the scope")
+    {
+    }
+
+    void DoRun() override
+    {
+        Validation();
+        FirstLoss();
+        Threshold();
+        AutoScope();
+        Simulator::Destroy();
+    }
+
+  private:
+    static constexpr uint32_t kSpines = LossHoldFixture::kSpines;
+    static constexpr uint64_t kInterval = LossHoldFixture::kInterval;
+
+    static Ptr<RdmaHw> Hw(double p0, double p1)
+    {
+        Ptr<RdmaHw> hw = LossHoldFixture::Hw();
+        hw->m_sprayHoldRule = static_cast<uint32_t>(HoldRule::Llr);
+        hw->m_sprayLossP0 = p0;
+        hw->m_sprayLossP1 = p1;
+        return hw;
+    }
+
+    void Validation()
+    {
+        Ptr<RdmaHw> unset = CreateObject<RdmaHw>();
+        UintegerValue rule;
+        unset->GetAttribute("SprayHoldRule", rule);
+        NS_TEST_EXPECT_MSG_EQ(rule.Get(),
+                              static_cast<uint32_t>(HoldRule::Count),
+                              "SprayHoldRule is count by default");
+        DoubleValue value;
+        unset->GetAttribute("SprayLossP0", value);
+        NS_TEST_EXPECT_MSG_EQ(value.Get(), 0.0, "SprayLossP0 is 0 by default");
+        unset->GetAttribute("SprayLossP1", value);
+        NS_TEST_EXPECT_MSG_EQ(value.Get(), 0.001, "SprayLossP1 is 0.001 by default");
+        unset->GetAttribute("SprayHoldAlpha", value);
+        NS_TEST_EXPECT_MSG_EQ(value.Get(), 0.001, "SprayHoldAlpha is 0.001 by default");
+        unset->GetAttribute("SprayHoldBeta", value);
+        NS_TEST_EXPECT_MSG_EQ(value.Get(), 0.001, "SprayHoldBeta is 0.001 by default");
+        NS_TEST_EXPECT_MSG_EQ(unset->ValidHoldRule(), true, "count needs nothing");
+        NS_TEST_EXPECT_MSG_EQ(Hw(0, 0.001)->ValidHoldRule(), true, "llr under reps_hold");
+        NS_TEST_EXPECT_MSG_EQ((Hw(0, 0.001)->LossHoldParameters().holdRule == HoldRule::Llr),
+                              true,
+                              "the hold's parameters carry the rule");
+        const std::vector<std::pair<std::function<void(RdmaHw&)>, std::string>> refused = {
+            {[](RdmaHw& hw) {
+                 hw.m_pathSelectorKind = static_cast<uint32_t>(PathSelectorKind::Reps);
+             },
+             "not reps_hold"},
+            {[](RdmaHw& hw) { hw.m_sprayLossP0 = hw.m_sprayLossP1; }, "p0 not below p1"},
+            {[](RdmaHw& hw) { hw.m_sprayLossP1 = 1; }, "p1 at 1"},
+            {[](RdmaHw& hw) { hw.m_sprayHoldAlpha = 0.5; }, "alpha at 0.5"},
+            {[](RdmaHw& hw) { hw.m_sprayHoldBeta = 0; }, "beta at 0"},
+        };
+        for (const auto& [set, message] : refused)
+        {
+            Ptr<RdmaHw> hw = Hw(0, 0.001);
+            set(*hw);
+            NS_TEST_EXPECT_MSG_EQ(hw->ValidHoldRule(), false, "refused: " + message);
+        }
+    }
+
+    // With p0 zero a loss adds +infinity: the first loss holds the spine at
+    // once, a send adds nothing, and the clean sentinels release it as under
+    // count, restarting the test.
+    void FirstLoss()
+    {
+        Ptr<RdmaHw> hw = Hw(0, 0.001);
+        SpineScores hold(kSpines, hw->LossHoldParameters());
+        for (uint32_t i = 0; i < 50; ++i)
+        {
+            hold.CountIntervalSend(3, 10 * i);
+        }
+        NS_TEST_EXPECT_MSG_EQ(hold.LossRatio(3), 0.0, "a send adds nothing");
+        hold.CountIntervalSend(3, 600);
+        hold.CountIntervalLoss(3, 600);
+        NS_TEST_EXPECT_MSG_EQ(hold.Holds(3), true, "the first loss holds at once");
+        NS_TEST_EXPECT_MSG_EQ(std::isinf(hold.LossRatio(3)), true, "L is +infinity");
+        // Interval 0 saw the loss; one clean sentinel in each of the next
+        // three releases the spine at the close of the third.
+        uint8_t spine = kSpines;
+        for (uint32_t interval = 1; interval <= 3; ++interval)
+        {
+            const uint64_t now = interval * kInterval + 1;
+            NS_TEST_EXPECT_MSG_EQ(hold.TakeHoldSentinel(now, spine), true, "a sentinel is due");
+            NS_TEST_EXPECT_MSG_EQ(static_cast<uint32_t>(spine), 3u, "on spine 3");
+            hold.CountIntervalSend(spine, now);
+        }
+        hold.TakeHoldSentinel(4 * kInterval + 1, spine);
+        NS_TEST_EXPECT_MSG_EQ(hold.Holds(3), false, "three clean sentinels release it");
+        NS_TEST_EXPECT_MSG_EQ(hold.LossRatio(3), 0.0, "and restart its test");
+    }
+
+    // p0 = 1e-4 and p1 = 1e-2, alpha = beta = 0.001: a send adds
+    // ln(0.99 / 0.9999), a loss ln(100), and the threshold is ln(999).
+    void Threshold()
+    {
+        const double p0 = 1e-4;
+        const double p1 = 1e-2;
+        Ptr<RdmaHw> hw = Hw(p0, p1);
+        SpineScores hold(kSpines, hw->LossHoldParameters());
+        const double send = std::log((1 - p1) / (1 - p0));
+        const double loss = std::log(p1 / p0);
+        const double threshold = std::log(0.999 / 0.001);
+        // Ten clean sends, then a lost one: L is clamped at 0 until the loss.
+        for (uint32_t i = 0; i < 11; ++i)
+        {
+            hold.CountIntervalSend(3, i);
+        }
+        hold.CountIntervalLoss(3, 11);
+        double expected = loss;
+        NS_TEST_EXPECT_MSG_EQ_TOL(hold.LossRatio(3), expected, 1e-9, "L after one loss");
+        NS_TEST_EXPECT_MSG_LT(expected, threshold, "below the threshold");
+        NS_TEST_EXPECT_MSG_EQ(hold.Holds(3), false, "one loss does not hold");
+        // Twenty clean sends and a lost one shortly after.
+        for (uint32_t i = 0; i < 21; ++i)
+        {
+            hold.CountIntervalSend(3, 20 + i);
+        }
+        expected += 21 * send;
+        NS_TEST_EXPECT_MSG_EQ_TOL(hold.LossRatio(3), expected, 1e-9, "L after the sends");
+        NS_TEST_EXPECT_MSG_EQ(hold.Holds(3), false, "still below the threshold");
+        hold.CountIntervalLoss(3, 50);
+        expected += loss;
+        NS_TEST_EXPECT_MSG_GT_OR_EQ(expected, threshold, "the second loss reaches it");
+        NS_TEST_EXPECT_MSG_EQ_TOL(hold.LossRatio(3), expected, 1e-9, "L after two losses");
+        NS_TEST_EXPECT_MSG_EQ(hold.Holds(3), true, "and holds the spine");
+
+        // On spine 5 one loss, then a long clean stretch: L falls by -send
+        // per send and reaches 0 after ceil(loss / -send) of them.
+        hold.CountIntervalSend(5, 100);
+        hold.CountIntervalLoss(5, 100);
+        const uint32_t decay = static_cast<uint32_t>(std::ceil(loss / -send));
+        for (uint32_t i = 0; i + 1 < decay; ++i)
+        {
+            hold.CountIntervalSend(5, 200);
+        }
+        NS_TEST_EXPECT_MSG_GT(hold.LossRatio(5), 0.0, "one send short of the decay");
+        hold.CountIntervalSend(5, 200);
+        NS_TEST_EXPECT_MSG_EQ(hold.LossRatio(5), 0.0, "decayed to 0");
+        for (uint32_t i = 0; i < 1000; ++i)
+        {
+            hold.CountIntervalSend(5, 300);
+        }
+        NS_TEST_EXPECT_MSG_EQ(hold.LossRatio(5), 0.0, "and clamped there");
+        hold.CountIntervalLoss(5, 400);
+        NS_TEST_EXPECT_MSG_EQ_TOL(hold.LossRatio(5), loss, 1e-9, "no credit against a loss");
+        NS_TEST_EXPECT_MSG_EQ(hold.Holds(5), false, "which does not hold");
+    }
+
+    // Under auto with p0 zero the first loss toward leaf 0 holds spine 3
+    // toward it alone, and a loss toward leaf 1 widens the hold.
+    void AutoScope()
+    {
+        Ptr<RdmaHw> hw = Hw(0, 0.001);
+        AutoLossHold hold(kSpines, hw->LossHoldParameters(), 2);
+        hold.AddLeaf(0);
+        hold.AddLeaf(1);
+        hold.CountSend(0, 3, 10);
+        hold.CountLoss(0, 3, 20);
+        NS_TEST_EXPECT_MSG_EQ(hold.Holds(0, 3), true, "held toward leaf 0 at the loss");
+        NS_TEST_EXPECT_MSG_EQ(hold.HostHolds(3), false, "in leaf scope");
+        NS_TEST_EXPECT_MSG_EQ(hold.Holds(1, 3), false, "not toward leaf 1");
+        NS_TEST_EXPECT_MSG_EQ(hold.LossRatio(1, 3), 0.0, "whose test is apart");
+        hold.CountSend(1, 3, 30);
+        hold.CountLoss(1, 3, 40);
+        NS_TEST_EXPECT_MSG_EQ(hold.HostHolds(3), true, "a second leaf widens it");
+    }
+};
+
 class SprayPolicyTransportTest : public TestCase
 {
   public:
@@ -9281,6 +9462,7 @@ PointToPointTestSuite::PointToPointTestSuite()
     AddTestCase(new RepsFlowHoldTest, TestCase::Duration::QUICK);
     AddTestCase(new RepsHoldScopeTest, TestCase::Duration::QUICK);
     AddTestCase(new RepsHoldAutoScopeTest, TestCase::Duration::QUICK);
+    AddTestCase(new RepsHoldLlrTest, TestCase::Duration::QUICK);
     AddTestCase(new SprayPolicyTransportTest, TestCase::Duration::QUICK);
     AddTestCase(new NsccReceiverPenaltyTest, TestCase::Duration::QUICK);
     AddTestCase(new SprayPolicyDefaultsTest, TestCase::Duration::QUICK);

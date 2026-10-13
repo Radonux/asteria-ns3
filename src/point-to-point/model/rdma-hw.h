@@ -223,6 +223,13 @@ public:
 	bool ValidRepsHold() const;
 	// The parameters of scores used as a loss hold alone.
 	SpineScores::Parameters LossHoldParameters() const;
+	// HoldRule of PathSelector RepsHold and RepsFlowHold, and under Llr its
+	// LossLikelihoodRatio::Parameters; whether Llr is set only under them,
+	// with a valid test.
+	uint32_t m_sprayHoldRule;
+	double m_sprayLossP0, m_sprayLossP1, m_sprayHoldAlpha, m_sprayHoldBeta;
+	bool ValidHoldRule() const;
+	LossLikelihoodRatio::Parameters Likelihood() const;
 	// HoldScope of PathSelector RepsHold. Under Leaf the queue pairs to the
 	// hosts of one leaf, which m_switchQueues names, share that leaf's loss
 	// hold in m_leafHolds, made at the first of them; under Host every queue

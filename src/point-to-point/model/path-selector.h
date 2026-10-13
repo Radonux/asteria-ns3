@@ -26,6 +26,52 @@ enum class HoldScope : uint32_t {
 	Auto,
 };
 
+// What puts a spine in the loss hold of RepsHold and RepsFlowHold, per hold
+// key: Count, a closed loss interval whose lost fraction grades it 0 through
+// the loss thresholds; Llr, the key's LossLikelihoodRatio reaching its
+// threshold, at the send declared lost that takes it there.
+enum class HoldRule : uint32_t {
+	Count = 0,
+	Llr,
+};
+
+// Wald's sequential probability ratio test of a hold key's sends, each taken
+// for a Bernoulli trial lost with probability p0 while the key's path works
+// and p1 while it is faulted. The statistic L starts at 0; each send adds
+// ln((1 - p1) / (1 - p0)), which is not positive, and each send declared lost
+// adds ln(p1 / p0). With p0 zero a loss adds +infinity, so that the first
+// loss reaches the threshold, and a send adds 0. The test is passed once L
+// reaches ln((1 - beta) / alpha), alpha being the probability of passing it
+// on a working path and beta that of missing a faulted one. L is clamped
+// below at 0, so that a clean stretch builds no unbounded credit against the
+// losses that follow it, and restarts at 0 at Reset.
+class LossLikelihoodRatio {
+public:
+	struct Parameters {
+		double p0 = 0;
+		double p1 = 0.001;
+		double alpha = 0.001;
+		double beta = 0.001;
+	};
+	// 0 <= p0 < p1 < 1 and alpha and beta in (0, 0.5).
+	explicit LossLikelihoodRatio(const Parameters &parameters);
+	static bool Valid(const Parameters &parameters);
+	void Send();
+	// A send declared lost; whether L has reached the threshold.
+	bool Loss();
+	void Reset();
+	double Value() const;
+	double SendStep() const;
+	double LossStep() const;
+	double Threshold() const;
+
+private:
+	double m_sendStep;
+	double m_lossStep;
+	double m_threshold;
+	double m_value;
+};
+
 // Which design chooses a data packet's entropy value under EntropyHash.
 enum class PathSelectorKind : uint32_t {
 	Ops = 0,
@@ -229,6 +275,11 @@ public:
 		// Drawn through a pool: whether a spine the pool holds is held for
 		// these scores' draws and sentinels too.
 		bool poolHoldPropagates = false;
+		// Scores used as a loss hold (CountIntervalSend and
+		// CountIntervalLoss): what puts a spine in loss hold, and under
+		// HoldRule::Llr the test kept per spine.
+		HoldRule holdRule = HoldRule::Count;
+		LossLikelihoodRatio::Parameters likelihood;
 	};
 	SpineScores(uint32_t spines, const Parameters &parameters);
 	void OnReport(const SpineReport &report, uint64_t nowNs);
@@ -247,9 +298,16 @@ public:
 	// With loss thresholds set, scores used as a loss hold without reports,
 	// as a pool is: a send on spine and a send on spine declared lost,
 	// counted in the loss interval in progress once those ended by now are
-	// closed.
+	// closed. Under HoldRule::Llr each is also a step of spine's
+	// LossLikelihoodRatio while spine is not in loss hold, and the loss that
+	// passes its test puts spine in loss hold at once, with its clean count
+	// at zero; the loss thresholds then grade the intervals passed to the
+	// loss interval callback but hold nothing, a spine in loss hold grading
+	// 0. A loss hold's release restarts spine's test.
 	void CountIntervalSend(uint32_t spine, uint64_t nowNs);
 	void CountIntervalLoss(uint32_t spine, uint64_t nowNs);
+	// Under HoldRule::Llr, spine's L.
+	double LossRatio(uint32_t spine) const;
 	// Scores used as a loss hold: close the loss intervals ended by now and,
 	// under the sentinel held exploration, whether a sentinel on a spine
 	// these scores hold is due, and which; the lowest such spine is taken
@@ -355,6 +413,8 @@ private:
 	// loss hold started or last saw a loss.
 	std::vector<bool> m_lossHeld;
 	std::vector<uint32_t> m_lossClean;
+	// Per spine, its test under HoldRule::Llr.
+	std::vector<LossLikelihoodRatio> m_likelihood;
 	// Per spine, whether the last report taken graded it 0, and when its
 	// last sentinel was sent.
 	std::vector<bool> m_held;
@@ -502,6 +562,15 @@ private:
 // Each held (spine, scope) is sent one sentinel per sentinel interval for the
 // host: a host-scope hold by the first queue pair to choose once one is due,
 // a leaf-scope hold by the first queue pair to its leaf.
+//
+// Under HoldRule::Llr, per destination leaf d and spine k a
+// LossLikelihoodRatio takes each send and each send declared lost toward d on
+// k while k is not held toward d, and the loss that passes its test holds k
+// at once, by the same choice of scope: for every destination if at least
+// autoLeaves leaves have a loss on k, else for d alone. The loss thresholds
+// then grade the intervals passed to the callback but hold nothing. A release
+// in leaf scope restarts the test of (d, k), one in host scope that of k
+// toward every leaf.
 class AutoLossHold {
 public:
 	// Called as each loss interval is closed, once per leaf seen, with the
@@ -510,8 +579,9 @@ public:
 	using LeafLossIntervalCallback = std::function<void(uint32_t leaf,
 		uint64_t endNs, const std::vector<uint32_t> &sent,
 		const std::vector<uint32_t> &lost, const std::vector<uint8_t> &grades)>;
-	// The loss thresholds, loss interval, clean sends and sentinel interval
-	// of parameters, as SpineScores reads them; autoLeaves is at least 2.
+	// The loss thresholds, loss interval, clean sends, sentinel interval,
+	// hold rule and likelihood of parameters, as SpineScores reads them;
+	// autoLeaves is at least 2.
 	AutoLossHold(uint32_t spines, const SpineScores::Parameters &parameters,
 		uint32_t autoLeaves);
 	// Make leaf's counts, if they are not yet made.
@@ -531,19 +601,27 @@ public:
 	// Whether spine is held in host scope, and the leaves with a loss on it.
 	bool HostHolds(uint32_t spine) const;
 	uint32_t LossLeaves(uint32_t spine) const;
+	// Under HoldRule::Llr, the L of (leaf, spine).
+	double LossRatio(uint32_t leaf, uint32_t spine) const;
 	void SetLossIntervalCallback(LeafLossIntervalCallback callback);
 
 private:
 	struct Leaf {
-		explicit Leaf(uint32_t spines);
+		Leaf(uint32_t spines, const LossLikelihoodRatio::Parameters &likelihood);
 		// The interval's counts; whether a spine is held in leaf scope, its
-		// clean sends, and when its last leaf-scope sentinel was sent.
+		// clean sends, when its last leaf-scope sentinel was sent, and its
+		// test under HoldRule::Llr.
 		std::vector<uint32_t> sent;
 		std::vector<uint32_t> lost;
 		std::vector<bool> held;
 		std::vector<uint32_t> clean;
 		std::vector<uint64_t> sentinelNs;
+		std::vector<LossLikelihoodRatio> likelihood;
 	};
+	// Hold spine toward leaf by the auto scope's choice.
+	void Hold(Leaf &counts, uint32_t spine);
+	// Restart the test of spine toward every leaf.
+	void ResetLikelihood(uint32_t spine);
 	void AdvanceLossInterval(uint64_t nowNs);
 	void CloseLossInterval();
 	uint8_t LossGrade(uint32_t sent, uint32_t lost) const;
@@ -559,6 +637,8 @@ private:
 	uint32_t m_cleanSends;
 	uint64_t m_sentinelIntervalNs;
 	uint32_t m_autoLeaves;
+	HoldRule m_holdRule;
+	LossLikelihoodRatio::Parameters m_likelihood;
 	// Ordered, so that the intervals are passed in leaf order.
 	std::map<uint32_t, Leaf> m_leaves;
 	std::vector<std::set<uint32_t>> m_lossLeaves;

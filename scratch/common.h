@@ -150,6 +150,33 @@ bool spray_hold_scope_given = false;
 // from which its hold is kept for every destination; at least 2.
 uint32_t spray_hold_auto_leaves = 2;
 bool spray_hold_auto_leaves_given = false;
+// Under reps_hold and reps_flow_hold, what puts a spine in loss hold, per
+// hold key: the (destination leaf, spine) under SPRAY_HOLD_SCOPE leaf and
+// auto, the spine under host, and the queue pair's spine under
+// reps_flow_hold. count: a loss interval whose lost fraction grades the
+// spine 0 through SPRAY_LOSS_THRESHOLDS. llr: a sequential likelihood-ratio
+// test per key, of the loss probability SPRAY_LOSS_P0 of a working path
+// against SPRAY_LOSS_P1 of a faulted one: its statistic L starts at 0, each
+// send on the key adds ln((1 - p1) / (1 - p0)) and each send declared lost
+// ln(p1 / p0), and the key is held at the loss that brings L to
+// ln((1 - beta) / alpha), SPRAY_HOLD_ALPHA being the probability of holding
+// a working path and SPRAY_HOLD_BETA that of missing a faulted one. L is
+// clamped below at 0, so that a clean stretch builds no unbounded credit
+// against the losses that follow it, and restarts at 0 at the key's release.
+// With SPRAY_LOSS_P0 0 a loss adds +infinity, so the first loss holds as
+// count holds it, and a send adds 0. Under llr SPRAY_LOSS_THRESHOLDS grade
+// the intervals SPINE_LOSS_OUTPUT_FILE writes but hold nothing, and the
+// release is unchanged. Under auto the leaves with a loss on a spine still
+// choose the scope of the hold the test starts. The test's keys are read
+// only under llr; 0 <= SPRAY_LOSS_P0 < SPRAY_LOSS_P1 < 1, and SPRAY_HOLD_ALPHA
+// and SPRAY_HOLD_BETA are in (0, 0.5).
+std::string spray_hold_rule = "count";
+bool spray_hold_rule_given = false;
+double spray_loss_p0 = 0;
+double spray_loss_p1 = 0.001;
+double spray_hold_alpha = 0.001;
+double spray_hold_beta = 0.001;
+std::set<std::string> hold_test_keys_given;
 uint32_t reps_buffer_size = 8;
 uint64_t reps_freezing_timeout_ns = 10000000;
 uint32_t ue_ev_set_size = 256;
@@ -783,6 +810,14 @@ uint32_t load_balancing_value() {
     return static_cast<uint32_t>(LoadBalancingMode::SprayUniform);
   if (load_balancing == "spray_policy")
     return static_cast<uint32_t>(LoadBalancingMode::SprayPolicy);
+  return std::numeric_limits<uint32_t>::max();
+}
+
+uint32_t spray_hold_rule_value() {
+  if (spray_hold_rule == "count")
+    return static_cast<uint32_t>(HoldRule::Count);
+  if (spray_hold_rule == "llr")
+    return static_cast<uint32_t>(HoldRule::Llr);
   return std::numeric_limits<uint32_t>::max();
 }
 
@@ -1594,6 +1629,46 @@ bool valid_loss_hold() {
   return true;
 }
 
+// The hold rule of reps_hold and reps_flow_hold, and the keys of its test
+// read only where it reads them, within the ranges its RdmaHw attributes
+// take.
+bool valid_hold_rule() {
+  if (spray_hold_rule_given && !reps_hold()) {
+    std::cerr << "SPRAY_HOLD_RULE is read only under PATH_SELECTOR reps_hold "
+                 "or reps_flow_hold\n";
+    return false;
+  }
+  if (spray_hold_rule_value() == std::numeric_limits<uint32_t>::max()) {
+    std::cerr << "SPRAY_HOLD_RULE must be count or llr\n";
+    return false;
+  }
+  for (const std::string &key : hold_test_keys_given) {
+    if (!reps_hold() || spray_hold_rule != "llr") {
+      std::cerr << key << " is read only under SPRAY_HOLD_RULE llr\n";
+      return false;
+    }
+  }
+  if (spray_hold_rule != "llr")
+    return true;
+  if (!(spray_loss_p1 < 1)) {
+    std::cerr << "SPRAY_LOSS_P1 must be below 1\n";
+    return false;
+  }
+  if (!(spray_loss_p0 >= 0 && spray_loss_p0 < spray_loss_p1)) {
+    std::cerr << "SPRAY_LOSS_P0 must be at least 0 and below SPRAY_LOSS_P1\n";
+    return false;
+  }
+  if (!(spray_hold_alpha > 0 && spray_hold_alpha < 0.5)) {
+    std::cerr << "SPRAY_HOLD_ALPHA must be in (0, 0.5)\n";
+    return false;
+  }
+  if (!(spray_hold_beta > 0 && spray_hold_beta < 0.5)) {
+    std::cerr << "SPRAY_HOLD_BETA must be in (0, 0.5)\n";
+    return false;
+  }
+  return true;
+}
+
 bool ReadConf(string network_configuration) {
   // Read the configuration file
   std::ifstream conf;
@@ -1819,6 +1894,21 @@ bool ReadConf(string network_configuration) {
     } else if (key.compare("SPRAY_HOLD_AUTO_LEAVES") == 0) {
       conf >> spray_hold_auto_leaves;
       spray_hold_auto_leaves_given = true;
+    } else if (key.compare("SPRAY_HOLD_RULE") == 0) {
+      conf >> spray_hold_rule;
+      spray_hold_rule_given = true;
+    } else if (key.compare("SPRAY_LOSS_P0") == 0) {
+      conf >> spray_loss_p0;
+      hold_test_keys_given.insert(key);
+    } else if (key.compare("SPRAY_LOSS_P1") == 0) {
+      conf >> spray_loss_p1;
+      hold_test_keys_given.insert(key);
+    } else if (key.compare("SPRAY_HOLD_ALPHA") == 0) {
+      conf >> spray_hold_alpha;
+      hold_test_keys_given.insert(key);
+    } else if (key.compare("SPRAY_HOLD_BETA") == 0) {
+      conf >> spray_hold_beta;
+      hold_test_keys_given.insert(key);
     } else if (key.compare("SPRAY_HELD_EXPLORATION") == 0) {
       conf >> spray_held_exploration;
     } else if (key.compare("SPRAY_HELD_SENTINEL_INTERVAL_NS") == 0) {
@@ -2205,6 +2295,8 @@ bool ReadConf(string network_configuration) {
     std::cerr << "SPRAY_HOLD_AUTO_LEAVES must be at least 2\n";
     return false;
   }
+  if (!valid_hold_rule())
+    return false;
   if (path_selector == "ack_redirect") {
     if (load_balancing != "spray_uniform") {
       std::cerr << "PATH_SELECTOR ack_redirect names spines and requires "
@@ -2729,6 +2821,12 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),
                            UintegerValue(spray_hold_scope_value()));
       rdmaHw->SetAttribute("SprayHoldAutoLeaves",
                            UintegerValue(spray_hold_auto_leaves));
+      rdmaHw->SetAttribute("SprayHoldRule",
+                           UintegerValue(spray_hold_rule_value()));
+      rdmaHw->SetAttribute("SprayLossP0", DoubleValue(spray_loss_p0));
+      rdmaHw->SetAttribute("SprayLossP1", DoubleValue(spray_loss_p1));
+      rdmaHw->SetAttribute("SprayHoldAlpha", DoubleValue(spray_hold_alpha));
+      rdmaHw->SetAttribute("SprayHoldBeta", DoubleValue(spray_hold_beta));
       rdmaHw->SetAttribute("UeEvSetSize", UintegerValue(ue_ev_set_size));
       rdmaHw->SetAttribute("UeSaturationFraction",
                            DoubleValue(ue_saturation_fraction));

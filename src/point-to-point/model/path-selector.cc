@@ -4,6 +4,7 @@
 #include <ns3/assert.h>
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <utility>
 
 namespace ns3 {
@@ -61,6 +62,52 @@ void AckRedirectSelector::OnRedirect(uint8_t spine, uint8_t carrying, uint64_t){
 	m_spine = spine != kNoRedirect ? spine : carrying;
 }
 
+LossLikelihoodRatio::LossLikelihoodRatio(const Parameters &parameters)
+	: m_sendStep(std::log((1 - parameters.p1) / (1 - parameters.p0))),
+	  m_lossStep(parameters.p0 > 0 ? std::log(parameters.p1 / parameters.p0)
+		: std::numeric_limits<double>::infinity()),
+	  m_threshold(std::log((1 - parameters.beta) / parameters.alpha)),
+	  m_value(0)
+{
+	NS_ASSERT_MSG(Valid(parameters),
+		"0 <= p0 < p1 < 1, and alpha and beta are in (0, 0.5)");
+}
+
+bool LossLikelihoodRatio::Valid(const Parameters &parameters){
+	return parameters.p0 >= 0 && parameters.p0 < parameters.p1 &&
+		parameters.p1 < 1 && parameters.alpha > 0 && parameters.alpha < 0.5 &&
+		parameters.beta > 0 && parameters.beta < 0.5;
+}
+
+void LossLikelihoodRatio::Send(){
+	m_value = std::max(0.0, m_value + m_sendStep);
+}
+
+bool LossLikelihoodRatio::Loss(){
+	m_value += m_lossStep;
+	return m_value >= m_threshold;
+}
+
+void LossLikelihoodRatio::Reset(){
+	m_value = 0;
+}
+
+double LossLikelihoodRatio::Value() const{
+	return m_value;
+}
+
+double LossLikelihoodRatio::SendStep() const{
+	return m_sendStep;
+}
+
+double LossLikelihoodRatio::LossStep() const{
+	return m_lossStep;
+}
+
+double LossLikelihoodRatio::Threshold() const{
+	return m_threshold;
+}
+
 SpineScores::SpineScores(uint32_t spines, const Parameters &parameters)
 	: m_parameters(parameters),
 	  m_decay(std::llround(parameters.gamma * 65536)),
@@ -71,8 +118,9 @@ SpineScores::SpineScores(uint32_t spines, const Parameters &parameters)
 		? parameters.lossIntervalNs : parameters.reportIntervalNs),
 	  m_lossIntervalEndNs(m_lossIntervalNs),
 	  m_lossGrades(spines, SpineReport::kTopGrade), m_lossHeld(spines),
-	  m_lossClean(spines), m_held(spines),
-	  m_sentinelNs(spines),
+	  m_lossClean(spines),
+	  m_likelihood(spines, LossLikelihoodRatio(parameters.likelihood)),
+	  m_held(spines), m_sentinelNs(spines),
 	  m_sentinelIntervalNs(parameters.sentinelIntervalNs > 0
 		? parameters.sentinelIntervalNs : parameters.reportIntervalNs),
 	  m_poolDecayEndNs(parameters.poolDecayIntervalNs),
@@ -160,6 +208,8 @@ void SpineScores::CountIntervalSend(uint32_t spine, uint64_t nowNs){
 		return;
 	AdvanceLossInterval(nowNs);
 	m_sent[spine]++;
+	if (m_parameters.holdRule == HoldRule::Llr && !m_lossHeld[spine])
+		m_likelihood[spine].Send();
 }
 
 void SpineScores::CountIntervalLoss(uint32_t spine, uint64_t nowNs){
@@ -167,6 +217,15 @@ void SpineScores::CountIntervalLoss(uint32_t spine, uint64_t nowNs){
 		return;
 	AdvanceLossInterval(nowNs);
 	m_lost[spine]++;
+	if (m_parameters.holdRule == HoldRule::Llr && !m_lossHeld[spine] &&
+			m_likelihood[spine].Loss()){
+		m_lossHeld[spine] = true;
+		m_lossClean[spine] = 0;
+	}
+}
+
+double SpineScores::LossRatio(uint32_t spine) const{
+	return m_likelihood[spine].Value();
 }
 
 uint8_t SpineScores::LossGrade(uint32_t sent, uint32_t lost) const{
@@ -183,7 +242,8 @@ uint8_t SpineScores::HeldLossGrade(uint32_t spine, uint32_t sent,
 	if (clean == 0)
 		return grade;
 	if (!m_lossHeld[spine]){
-		if (grade == 0){
+		// Under Llr the test holds a spine as its losses are declared.
+		if (grade == 0 && m_parameters.holdRule == HoldRule::Count){
 			m_lossHeld[spine] = true;
 			m_lossClean[spine] = 0;
 		}
@@ -198,6 +258,7 @@ uint8_t SpineScores::HeldLossGrade(uint32_t spine, uint32_t sent,
 		return 0;
 	m_lossHeld[spine] = false;
 	m_lossClean[spine] = 0;
+	m_likelihood[spine].Reset();
 	return SpineReport::kTopGrade;
 }
 
@@ -755,9 +816,10 @@ bool RepsHoldSelector::Excluded(uint16_t path) const{
 	return m_excluding && m_hold.Holds(path);
 }
 
-AutoLossHold::Leaf::Leaf(uint32_t spines)
+AutoLossHold::Leaf::Leaf(uint32_t spines,
+		const LossLikelihoodRatio::Parameters &likelihood)
 	: sent(spines), lost(spines), held(spines), clean(spines),
-	  sentinelNs(spines)
+	  sentinelNs(spines), likelihood(spines, LossLikelihoodRatio(likelihood))
 {
 }
 
@@ -770,7 +832,9 @@ AutoLossHold::AutoLossHold(uint32_t spines,
 	  m_cleanSends(parameters.lossHoldCleanSentinels),
 	  m_sentinelIntervalNs(parameters.sentinelIntervalNs > 0
 		? parameters.sentinelIntervalNs : parameters.reportIntervalNs),
-	  m_autoLeaves(autoLeaves), m_lossLeaves(spines), m_hostHeld(spines),
+	  m_autoLeaves(autoLeaves), m_holdRule(parameters.holdRule),
+	  m_likelihood(parameters.likelihood), m_lossLeaves(spines),
+	  m_hostHeld(spines),
 	  m_hostClean(spines), m_hostSentinelNs(spines)
 {
 	NS_ASSERT_MSG(spines > 0 && spines <= SpineReport::kMaxSpines,
@@ -785,23 +849,48 @@ AutoLossHold::AutoLossHold(uint32_t spines,
 }
 
 void AutoLossHold::AddLeaf(uint32_t leaf){
-	m_leaves.try_emplace(leaf, m_spines);
+	m_leaves.try_emplace(leaf, m_spines, m_likelihood);
 }
 
 void AutoLossHold::CountSend(uint32_t leaf, uint32_t spine, uint64_t nowNs){
 	NS_ASSERT_MSG(spine < m_spines, "a send is on a held spine's range");
 	AdvanceLossInterval(nowNs);
-	m_leaves.at(leaf).sent[spine]++;
+	Leaf &counts = m_leaves.at(leaf);
+	counts.sent[spine]++;
+	if (m_holdRule == HoldRule::Llr && !Holds(leaf, spine))
+		counts.likelihood[spine].Send();
 }
 
 void AutoLossHold::CountLoss(uint32_t leaf, uint32_t spine, uint64_t nowNs){
 	NS_ASSERT_MSG(spine < m_spines, "a loss is on a held spine's range");
 	AdvanceLossInterval(nowNs);
-	m_leaves.at(leaf).lost[spine]++;
+	Leaf &counts = m_leaves.at(leaf);
+	counts.lost[spine]++;
 	m_lossLeaves[spine].insert(leaf);
 	if (!m_hostHeld[spine] && LeafHolds(spine) &&
 			m_lossLeaves[spine].size() >= m_autoLeaves)
 		HoldHost(spine);
+	if (m_holdRule == HoldRule::Llr && !Holds(leaf, spine) &&
+			counts.likelihood[spine].Loss())
+		Hold(counts, spine);
+}
+
+void AutoLossHold::Hold(Leaf &counts, uint32_t spine){
+	if (m_lossLeaves[spine].size() >= m_autoLeaves)
+		HoldHost(spine);
+	else {
+		counts.held[spine] = true;
+		counts.clean[spine] = 0;
+	}
+}
+
+void AutoLossHold::ResetLikelihood(uint32_t spine){
+	for (auto &[leaf, counts] : m_leaves)
+		counts.likelihood[spine].Reset();
+}
+
+double AutoLossHold::LossRatio(uint32_t leaf, uint32_t spine) const{
+	return m_leaves.at(leaf).likelihood[spine].Value();
 }
 
 bool AutoLossHold::TakeSentinel(uint32_t leaf, uint64_t nowNs,
@@ -874,6 +963,7 @@ void AutoLossHold::CloseLossInterval(){
 				m_hostHeld[k] = false;
 				m_hostClean[k] = 0;
 				m_lossLeaves[k].clear();
+				ResetLikelihood(k);
 				grade = SpineReport::kTopGrade;
 			}
 			for (auto &[leaf, leafGrades] : grades)
@@ -895,17 +985,13 @@ void AutoLossHold::CloseLossInterval(){
 				} else {
 					counts.held[k] = false;
 					counts.clean[k] = 0;
+					counts.likelihood[k].Reset();
 					grade = SpineReport::kTopGrade;
 					released = true;
 				}
-			} else if (grade == 0){
-				if (m_lossLeaves[k].size() >= m_autoLeaves)
-					HoldHost(k);
-				else {
-					counts.held[k] = true;
-					counts.clean[k] = 0;
-				}
-			}
+			} else if (grade == 0 && m_holdRule == HoldRule::Count)
+				// Under Llr the test holds a spine as its losses are declared.
+				Hold(counts, k);
 		}
 		if (m_hostHeld[k]){
 			for (auto &[leaf, leafGrades] : grades)

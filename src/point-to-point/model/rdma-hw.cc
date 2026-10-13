@@ -562,6 +562,43 @@ TypeId RdmaHw::GetTypeId (void)
 				UintegerValue(2),
 				MakeUintegerAccessor(&RdmaHw::m_sprayHoldAutoLeaves),
 				MakeUintegerChecker<uint32_t>(2))
+		.AddAttribute("SprayHoldRule",
+				"Under PathSelector 6 and 7, what puts a spine in loss hold, per "
+				"hold key: 0=a loss interval whose lost fraction grades it 0 "
+				"through SprayLossThreshold1-3; 1=the key's sequential "
+				"likelihood-ratio test (LossLikelihoodRatio) of SprayLossP0 "
+				"against SprayLossP1, at the declared loss that passes it. "
+				"Default 0.",
+				UintegerValue(static_cast<uint32_t>(HoldRule::Count)),
+				MakeUintegerAccessor(&RdmaHw::m_sprayHoldRule),
+				MakeUintegerChecker<uint32_t>(
+					static_cast<uint32_t>(HoldRule::Count),
+					static_cast<uint32_t>(HoldRule::Llr)))
+		.AddAttribute("SprayLossP0",
+				"Under SprayHoldRule 1, the loss probability of a send on a "
+				"working path, at least 0 and below SprayLossP1; 0 holds at "
+				"the first loss. Default 0.",
+				DoubleValue(0),
+				MakeDoubleAccessor(&RdmaHw::m_sprayLossP0),
+				MakeDoubleChecker<double>(0, 1))
+		.AddAttribute("SprayLossP1",
+				"Under SprayHoldRule 1, the loss probability of a send on a "
+				"faulted path, below 1. Default 0.001.",
+				DoubleValue(0.001),
+				MakeDoubleAccessor(&RdmaHw::m_sprayLossP1),
+				MakeDoubleChecker<double>(0, 1))
+		.AddAttribute("SprayHoldAlpha",
+				"Under SprayHoldRule 1, the probability of holding a working "
+				"path, in (0, 0.5). Default 0.001.",
+				DoubleValue(0.001),
+				MakeDoubleAccessor(&RdmaHw::m_sprayHoldAlpha),
+				MakeDoubleChecker<double>(0, 0.5))
+		.AddAttribute("SprayHoldBeta",
+				"Under SprayHoldRule 1, the probability of missing a faulted "
+				"path, in (0, 0.5). Default 0.001.",
+				DoubleValue(0.001),
+				MakeDoubleAccessor(&RdmaHw::m_sprayHoldBeta),
+				MakeDoubleChecker<double>(0, 0.5))
 		.AddAttribute("SprayCandidates",
 				"Under LoadBalancing 3, the candidates drawn per packet, of which "
 				"the highest-scored is sent on. Default 1.",
@@ -902,6 +939,10 @@ void RdmaHw::Setup(QpCompleteCallback cb, QpFailureCallback failure_cb){
 		"SprayLossHoldCleanSentinels above zero and SprayHeldExploration "
 		"sentinel, and PathSelector 6 under SprayHoldScope 1 or 2 needs "
 		"SwitchQueueState for the hosts' leaves");
+	NS_ABORT_MSG_IF(!ValidHoldRule(),
+		"SprayHoldRule 1 is read only under PathSelector 6 and 7 and needs "
+		"0 <= SprayLossP0 < SprayLossP1 < 1 and SprayHoldAlpha and "
+		"SprayHoldBeta in (0, 0.5)");
 	NS_ABORT_MSG_IF(!ValidRepsOracle(),
 		"PathSelector 8 reads the spines' faults from SwitchQueueState and "
 		"needs LoadBalancing 2 and SprayGradeCostSource 1");
@@ -1322,6 +1363,16 @@ bool RdmaHw::ValidRepsHold() const{
 			((!IsLeafHold() && !IsAutoHold()) || m_switchQueues));
 }
 
+bool RdmaHw::ValidHoldRule() const{
+	return m_sprayHoldRule == static_cast<uint32_t>(HoldRule::Count) ||
+		(IsRepsHold() && LossLikelihoodRatio::Valid(Likelihood()));
+}
+
+LossLikelihoodRatio::Parameters RdmaHw::Likelihood() const{
+	return LossLikelihoodRatio::Parameters{m_sprayLossP0, m_sprayLossP1,
+		m_sprayHoldAlpha, m_sprayHoldBeta};
+}
+
 bool RdmaHw::IsRepsOracle() const{
 	return m_pathSelectorKind ==
 		static_cast<uint32_t>(PathSelectorKind::RepsOracle);
@@ -1399,6 +1450,9 @@ SpineScores::Parameters RdmaHw::LossHoldParameters() const{
 	parameters.lossHoldCleanSentinels = m_sprayLossHoldCleanSentinels;
 	parameters.heldExploration = m_sprayHeldExploration;
 	parameters.sentinelIntervalNs = m_sprayHeldSentinelIntervalNs;
+	parameters.holdRule = static_cast<HoldRule>(m_sprayHoldRule);
+	if (parameters.holdRule == HoldRule::Llr)
+		parameters.likelihood = Likelihood();
 	return parameters;
 }
 
