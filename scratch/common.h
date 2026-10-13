@@ -195,6 +195,25 @@ std::set<std::string> hold_test_keys_given;
 // of its evidence's p1 and that of the leaf-scope holds it ends. Under
 // trickle SPRAY_LOSS_HOLD_CLEAN_SENTINELS and SPRAY_HELD_SENTINEL_INTERVAL_NS
 // are refused, and SPRAY_HOLD_TRICKLE, in (0, 0.5], is read only under it.
+// Under reps_hold and reps_flow_hold, and every later selector that sends
+// through their loss hold, what an exploration send onto a held spine (a
+// sentinel under SPRAY_HOLD_RELEASE sentinels, a trickle send under trickle)
+// is. data: the data packet itself, in place of the spine REPS would choose.
+// duplicate: the data packet goes up the spine REPS chooses among the spines
+// not held, and a copy of it, the same sequence, goes up the held spine in
+// the same send, ahead of it through the NIC's high-priority queue. The
+// receiver takes whichever arrives first and discards the other as a
+// duplicate, acknowledging each with the spine it came by. The copy has a
+// record of its own on the held spine, apart from the data send records: its
+// acknowledgement and its loss move the hold's counts, its test and its
+// release statistic as a data exploration send's do, and the per-path rule
+// treats it as a send on its spine. Its loss queues no repair and no
+// retransmission timeout waits for it: once the data send is acknowledged, a
+// copy unanswered for more than one base RTT since it was sent is declared
+// lost for the hold alone. Where REPS's choice is the held spine itself,
+// which it is only while every spine is held, no copy is made.
+std::string spray_sentinel_mode = "data";
+bool spray_sentinel_mode_given = false;
 std::string spray_hold_release = "sentinels";
 bool spray_hold_release_given = false;
 double spray_hold_trickle = 0.01;
@@ -840,6 +859,14 @@ uint32_t spray_hold_rule_value() {
     return static_cast<uint32_t>(HoldRule::Count);
   if (spray_hold_rule == "llr")
     return static_cast<uint32_t>(HoldRule::Llr);
+  return std::numeric_limits<uint32_t>::max();
+}
+
+uint32_t spray_sentinel_mode_value() {
+  if (spray_sentinel_mode == "data")
+    return static_cast<uint32_t>(SentinelMode::Data);
+  if (spray_sentinel_mode == "duplicate")
+    return static_cast<uint32_t>(SentinelMode::Duplicate);
   return std::numeric_limits<uint32_t>::max();
 }
 
@@ -1697,6 +1724,15 @@ bool valid_hold_rule() {
                  "reps_hold or reps_flow_hold\n";
     return false;
   }
+  if (spray_sentinel_mode_given && !reps_hold()) {
+    std::cerr << "SPRAY_SENTINEL_MODE is read only under PATH_SELECTOR "
+                 "reps_hold or reps_flow_hold\n";
+    return false;
+  }
+  if (spray_sentinel_mode_value() == std::numeric_limits<uint32_t>::max()) {
+    std::cerr << "SPRAY_SENTINEL_MODE must be data or duplicate\n";
+    return false;
+  }
   if (spray_hold_release_value() == std::numeric_limits<uint32_t>::max()) {
     std::cerr << "SPRAY_HOLD_RELEASE must be sentinels or trickle\n";
     return false;
@@ -1972,6 +2008,9 @@ bool ReadConf(string network_configuration) {
     } else if (key.compare("SPRAY_HOLD_RULE") == 0) {
       conf >> spray_hold_rule;
       spray_hold_rule_given = true;
+    } else if (key.compare("SPRAY_SENTINEL_MODE") == 0) {
+      conf >> spray_sentinel_mode;
+      spray_sentinel_mode_given = true;
     } else if (key.compare("SPRAY_HOLD_RELEASE") == 0) {
       conf >> spray_hold_release;
       spray_hold_release_given = true;
@@ -2911,6 +2950,8 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),
       rdmaHw->SetAttribute("SprayHoldRelease",
                            UintegerValue(spray_hold_release_value()));
       rdmaHw->SetAttribute("SprayHoldTrickle", DoubleValue(spray_hold_trickle));
+      rdmaHw->SetAttribute("SpraySentinelMode",
+                           UintegerValue(spray_sentinel_mode_value()));
       rdmaHw->SetAttribute("UeEvSetSize", UintegerValue(ue_ev_set_size));
       rdmaHw->SetAttribute("UeSaturationFraction",
                            DoubleValue(ue_saturation_fraction));

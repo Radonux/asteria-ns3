@@ -55,6 +55,8 @@ public:
 	// name the resend's record.
 	bool ResendsLost(uint64_t packet) const;
 	bool Trickle(uint64_t packet) const;
+	// The newest outstanding send along path, or kNone.
+	uint64_t NewestOnPath(uint16_t path) const;
 	void Remove(uint64_t packet);
 	// Remove the record of a send declared lost.
 	void RemoveLost(uint64_t packet);
@@ -167,6 +169,40 @@ public:
 	OutstandingPackets m_outstanding;
 	// What draws those paths, set together with the send records.
 	std::unique_ptr<PathSelector> m_pathSelector;
+	// Under SentinelMode::Duplicate, the copies of data packets sent onto a
+	// held spine (PathSelector::TakeCopy) not yet answered, by sequence,
+	// apart from the send records: a copy is in no window, no retransmission
+	// timeout waits for it and its loss queues no repair. A copy ends in one
+	// of three ways. Its own acknowledgement, found by its sequence and
+	// path, answers it clean; the selector hears of it as of any answer,
+	// the window not at all. The per-path rule declares it lost as a send along its
+	// path: the acknowledgement of a newer send along that path, data or
+	// copy, finds it outstanding; and its own acknowledgement declares lost
+	// the older data sends and copies along its path as a data
+	// acknowledgement does. Once the data send of its sequence is
+	// acknowledged, by its own answer or cumulatively, a copy outstanding
+	// for more than one base RTT since it was sent is declared lost, and one
+	// younger waits for its own answer. A declared loss is told to the
+	// selector's OnLoss, and of a trickle copy to OnTrickleAnswer, and
+	// nothing else.
+	struct ExplorationCopy {
+		uint32_t size;
+		uint16_t path;
+		uint64_t sentNs;
+		bool trickle;
+		bool dataAcknowledged;
+	};
+	std::map<uint64_t, ExplorationCopy> m_copies;
+	uint32_t m_exploration_copies;
+	uint32_t m_exploration_copies_lost;
+	// A copy of the send of seq along path, at sentNs. A copy of seq still
+	// outstanding is released without a loss.
+	void AddCopy(uint64_t seq, uint32_t size, uint16_t path, uint64_t sentNs,
+		bool trickle);
+	// Whether the acknowledgement of seq along path answers a copy rather
+	// than a data send; if so the answer is taken, and lost is set to the
+	// data bytes the per-path rule declared lost.
+	bool AcknowledgeCopy(uint64_t seq, uint16_t path, uint64_t &lost);
 	EventId m_retransmissionTimer;
 	uint16_t m_pg;
 	uint16_t m_ipid;
@@ -276,6 +312,13 @@ public:
 private:
 	// Returns the bytes declared lost.
 	uint32_t DeclareLost(uint64_t packet);
+	// Declare lost, for the selector alone, the copies along path sent
+	// before sentNs, and those whose data send is acknowledged and that are
+	// outstanding past one base RTT by nowNs.
+	void DeclareCopiesLostOnPath(uint16_t path, uint64_t sentNs, uint64_t nowNs);
+	void ExpireCopies(uint64_t nowNs);
+	void DeclareCopyLost(std::map<uint64_t, ExplorationCopy>::iterator copy,
+		uint64_t nowNs);
 };
 
 class RdmaRxQueuePair : public Object { // Rx side queue pair

@@ -7929,6 +7929,170 @@ class RepsHoldTrickleTest : public TestCase
     }
 };
 
+class RepsHoldDuplicateTest : public TestCase
+{
+  public:
+    RepsHoldDuplicateTest()
+        : TestCase("Under SpraySentinelMode duplicate each trickle send onto a held spine is a "
+                   "copy of a data packet sent on REPS's choice: losing every copy causes no "
+                   "retransmission timeout and no repair, the hold still counts the copies' "
+                   "losses, and the copies' clean acknowledgements release the spine")
+    {
+    }
+
+    void DoRun() override
+    {
+        const bool savedPacketSeq = CustomHeader::ackCarriesPacketSeq;
+        CustomHeader::ackCarriesPacketSeq = true;
+        Flow();
+        CustomHeader::ackCarriesPacketSeq = savedPacketSeq;
+        Simulator::Destroy();
+    }
+
+  private:
+    static constexpr uint32_t kSpines = 8;
+    static constexpr uint64_t kInterval = 10000;
+    static constexpr uint32_t kMtu = IsolatedHost::kMtu;
+    static constexpr uint32_t kPackets = 1500;
+    static constexpr uint32_t kLosingSends = 400;
+    static constexpr uint64_t kStepNs = 100;
+
+    void Flow()
+    {
+        IsolatedHost sender(LoadBalancingMode::SprayUniform, kTestReceiver, kSpines);
+        Ptr<RdmaHw> hw = sender.hw;
+        hw->m_pathSelectorKind = static_cast<uint32_t>(PathSelectorKind::RepsHold);
+        hw->m_sprayHoldScope = static_cast<uint32_t>(HoldScope::Host);
+        hw->m_sprayLossThreshold1 = 0.1;
+        hw->m_sprayLossThreshold2 = 0.25;
+        hw->m_sprayLossThreshold3 = 0.5;
+        hw->m_sprayLossIntervalNs = kInterval;
+        hw->m_sprayHeldExploration = SpineScores::HeldExploration::Sentinel;
+        hw->m_sprayLossHoldCleanSentinels = 0;
+        hw->m_sprayHoldRelease = static_cast<uint32_t>(HoldRelease::Trickle);
+        hw->m_spraySentinelMode = static_cast<uint32_t>(SentinelMode::Duplicate);
+        NS_TEST_EXPECT_MSG_EQ(hw->ValidRepsHold(), true, "a valid hold");
+        NS_TEST_EXPECT_MSG_EQ((hw->LossHoldParameters().sentinelMode == SentinelMode::Duplicate),
+                              true,
+                              "the hold's parameters carry the mode");
+        bool completed = false;
+        hw->m_qpCompleteCallback =
+            Callback<void, Ptr<RdmaQueuePair>>([&](Ptr<RdmaQueuePair>) { completed = true; });
+        Ptr<RdmaQueuePair> qp =
+            sender.AddSender(kTestSender, kTestReceiver, uint64_t{kPackets} * kMtu);
+        qp->m_baseRtt = 2000;
+        qp->m_notifyAppFinish = Callback<void>([]() {});
+        SpineScores& hold = *hw->m_senderSpineScores;
+        uint32_t intervalLosses = 0;
+        hw->TraceConnectWithoutContext(
+            "SpineLossInterval",
+            Callback<void,
+                     uint64_t,
+                     const std::vector<uint32_t>&,
+                     const std::vector<uint32_t>&,
+                     const std::vector<uint8_t>&>([&](uint64_t endNs,
+                                                      const std::vector<uint32_t>&,
+                                                      const std::vector<uint32_t>& lost,
+                                                      const std::vector<uint8_t>&) {
+                if (endNs > kInterval)
+                {
+                    intervalLosses += lost[3];
+                }
+            }));
+        // Interval 0: half of 20 sends on spine 3 lost; p1 is 0.5.
+        for (uint32_t i = 0; i < 20; ++i)
+        {
+            hold.CountIntervalSend(3, 100 + i);
+        }
+        for (uint32_t i = 0; i < 10; ++i)
+        {
+            hold.CountIntervalLoss(3, 200 + i);
+        }
+
+        uint32_t sends = 0;
+        uint32_t copies = 0;
+        uint32_t copyAcks = 0;
+        uint32_t liveOnHeld = 0;
+        uint32_t chosenAfterRelease = 0;
+        uint32_t copyAcksAtRelease = 0;
+        bool copiesMatch = true;
+        bool heldAfterLosses = false;
+        double releaseAfterLosses = -1;
+        uint32_t copiesLostAfterLosses = 0;
+        std::function<void()> step = [&]() {
+            if (qp->IsFinished())
+            {
+                return;
+            }
+            const size_t before = sender.emitted.size();
+            Ptr<Packet> packet = hw->GetNxtPacket(qp);
+            sends++;
+            hw->ArmRetransmissionTimeout(qp);
+            CustomHeader live(CustomHeader::L2_Header | CustomHeader::L3_Header |
+                              CustomHeader::L4_Header);
+            packet->PeekHeader(live);
+            const bool held = hold.Holds(3);
+            liveOnHeld += held && RequestedSpine(live.ipid) == 3;
+            if (!held && RequestedSpine(live.ipid) == 3)
+            {
+                chosenAfterRelease++;
+            }
+            sender.ReceiveAck(kTestReceiver, live.udp.seq + kMtu, live.udp.seq, live.ipid);
+            if (sender.emitted.size() > before)
+            {
+                const CustomHeader& copy = sender.emitted.back();
+                copies++;
+                copiesMatch &= copy.udp.seq == live.udp.seq && RequestedSpine(copy.ipid) == 3 &&
+                               copy.l3Prot == 0x11;
+                if (sends > kLosingSends)
+                {
+                    sender.ReceiveAck(kTestReceiver,
+                                      live.udp.seq + kMtu,
+                                      copy.udp.seq,
+                                      copy.ipid);
+                    copyAcks++;
+                    if (!hold.Holds(3) && copyAcksAtRelease == 0)
+                    {
+                        copyAcksAtRelease = copyAcks;
+                    }
+                }
+            }
+            if (sends == kLosingSends + 50)
+            {
+                heldAfterLosses = hold.Holds(3);
+                releaseAfterLosses = hold.ReleaseValue(3);
+                copiesLostAfterLosses = qp->m_exploration_copies_lost;
+            }
+            Simulator::Schedule(NanoSeconds(kStepNs), step);
+        };
+        Simulator::Schedule(NanoSeconds(kInterval), step);
+        Simulator::Run();
+
+        NS_TEST_EXPECT_MSG_EQ(completed, true, "the flow completes");
+        NS_TEST_EXPECT_MSG_EQ(sends, kPackets, "in one send per packet");
+        NS_TEST_EXPECT_MSG_EQ(qp->m_retransmitted_bytes, 0u, "with no repair");
+        NS_TEST_EXPECT_MSG_EQ(qp->m_timeouts, 0u, "and no retransmission timeout");
+        NS_TEST_EXPECT_MSG_EQ(qp->m_recovery_events, 0u, "nor a data send declared lost");
+        NS_TEST_EXPECT_MSG_EQ(liveOnHeld, 0u, "no data send goes up the held spine");
+        NS_TEST_EXPECT_MSG_EQ(copiesMatch, true, "each copy is the data packet on spine 3");
+        // One copy per 100 sends: 4 lost over the first 400, then 10 clean
+        // ones, ceil(ln(1000) / ln(2)), release the spine.
+        const uint32_t expected =
+            static_cast<uint32_t>(std::ceil(std::log(1000.0) / -std::log(1 - 0.5)));
+        NS_TEST_EXPECT_MSG_EQ(expected, 10u, "ten clean copy acknowledgements");
+        NS_TEST_EXPECT_MSG_EQ(copies, 4 + expected, "the copies, besides the sends");
+        NS_TEST_EXPECT_MSG_EQ(qp->m_exploration_copies, copies, "each with a record");
+        NS_TEST_EXPECT_MSG_EQ(heldAfterLosses, true, "the lost copies keep the hold");
+        NS_TEST_EXPECT_MSG_EQ(releaseAfterLosses, 0.0, "and R at 0");
+        NS_TEST_EXPECT_MSG_EQ(copiesLostAfterLosses, 4u, "four copies declared lost");
+        NS_TEST_EXPECT_MSG_EQ(qp->m_exploration_copies_lost, 4u, "and no other");
+        NS_TEST_EXPECT_MSG_EQ(intervalLosses, 4u, "the hold's intervals count them");
+        NS_TEST_EXPECT_MSG_EQ(copyAcksAtRelease, expected, "released at the tenth copy ack");
+        NS_TEST_EXPECT_MSG_EQ(hold.Holds(3), false, "spine 3 is released");
+        NS_TEST_EXPECT_MSG_GT(chosenAfterRelease, 0u, "and REPS chooses it again");
+    }
+};
+
 class SprayPolicyTransportTest : public TestCase
 {
   public:
@@ -9695,6 +9859,7 @@ PointToPointTestSuite::PointToPointTestSuite()
     AddTestCase(new RepsHoldAutoScopeTest, TestCase::Duration::QUICK);
     AddTestCase(new RepsHoldLlrTest, TestCase::Duration::QUICK);
     AddTestCase(new RepsHoldTrickleTest, TestCase::Duration::QUICK);
+    AddTestCase(new RepsHoldDuplicateTest, TestCase::Duration::QUICK);
     AddTestCase(new SprayPolicyTransportTest, TestCase::Duration::QUICK);
     AddTestCase(new NsccReceiverPenaltyTest, TestCase::Duration::QUICK);
     AddTestCase(new SprayPolicyDefaultsTest, TestCase::Duration::QUICK);

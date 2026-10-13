@@ -618,6 +618,17 @@ TypeId RdmaHw::GetTypeId (void)
 				DoubleValue(0.01),
 				MakeDoubleAccessor(&RdmaHw::m_sprayHoldTrickle),
 				MakeDoubleChecker<double>(0, 0.5))
+		.AddAttribute("SpraySentinelMode",
+				"Under PathSelector 6 and 7, what an exploration send onto a "
+				"held spine, a sentinel or a trickle send, is: 0=the data "
+				"packet itself; 1=a copy of a data packet sent on the spine "
+				"REPS chooses, in the same send, which no retransmission or "
+				"timeout waits for (RdmaQueuePair::AddCopy). Default 0.",
+				UintegerValue(static_cast<uint32_t>(SentinelMode::Data)),
+				MakeUintegerAccessor(&RdmaHw::m_spraySentinelMode),
+				MakeUintegerChecker<uint32_t>(
+					static_cast<uint32_t>(SentinelMode::Data),
+					static_cast<uint32_t>(SentinelMode::Duplicate)))
 		.AddAttribute("SprayCandidates",
 				"Under LoadBalancing 3, the candidates drawn per packet, of which "
 				"the highest-scored is sent on. Default 1.",
@@ -967,6 +978,9 @@ void RdmaHw::Setup(QpCompleteCallback cb, QpFailureCallback failure_cb){
 		"neither SprayLossHoldCleanSentinels nor SprayHeldSentinelIntervalNs, "
 		"and needs SprayHoldTrickle in (0, 0.5], 0 <= SprayLossP0 < "
 		"SprayLossP1 < 1 and SprayHoldAlpha in (0, 0.5)");
+	NS_ABORT_MSG_IF(m_spraySentinelMode !=
+				static_cast<uint32_t>(SentinelMode::Data) && !IsRepsHold(),
+		"SpraySentinelMode 1 is read only under PathSelector 6 and 7");
 	NS_ABORT_MSG_IF(!ValidRepsOracle(),
 		"PathSelector 8 reads the spines' faults from SwitchQueueState and "
 		"needs LoadBalancing 2 and SprayGradeCostSource 1");
@@ -1489,6 +1503,7 @@ SpineScores::Parameters RdmaHw::LossHoldParameters() const{
 	parameters.holdRule = static_cast<HoldRule>(m_sprayHoldRule);
 	parameters.holdRelease = static_cast<HoldRelease>(m_sprayHoldRelease);
 	parameters.trickleFraction = m_sprayHoldTrickle;
+	parameters.sentinelMode = static_cast<SentinelMode>(m_spraySentinelMode);
 	if (parameters.holdRule == HoldRule::Llr || IsTrickleRelease())
 		parameters.likelihood = Likelihood();
 	return parameters;
@@ -1767,8 +1782,18 @@ int RdmaHw::ReceiveAck(Ptr<Packet> p, CustomHeader &ch){
 			const uint64_t now = Simulator::Now().GetNanoSeconds();
 			if (IsSprayPolicy())
 				qp->m_pathSelector->OnReport(ReportOf(ch), now);
+			uint64_t copyLost = 0;
 			if ((ch.ack.flags >> qbbHeader::FLAG_PROBE_ANSWER) & 1){
 				qp->m_pathSelector->OnProbeAnswer(path, cnp, now);
+			}else if (qp->AcknowledgeCopy(ch.ack.packet_seq, path, copyLost)){
+				// A copy's answer reaches the selector as a data exploration
+				// send's does, but not the window: the data send of its
+				// sequence has its own record and answer.
+				qp->m_pathSelector->OnAck(path, cnp, now);
+				if (copyLost > 0 && m_cc_mode == 11 && DeliverCongestionSignal(qp)){
+					qp->nscc.OnLoss(copyLost);
+					ApplyNsccWindow(qp);
+				}
 			}else{
 				if (IsAckRedirect())
 					qp->m_pathSelector->OnRedirect(
@@ -2590,6 +2615,21 @@ Ptr<Packet> RdmaHw::GetNxtPacket(Ptr<RdmaQueuePair> qp){
 			PathOf(static_cast<LoadBalancingMode>(m_loadBalancing), identification),
 			Simulator::Now().GetNanoSeconds(),
 			qp->m_pathSelector->ChoseTrickle());
+		uint8_t copySpine;
+		bool copyTrickle;
+		if (qp->m_pathSelector->TakeCopy(copySpine, copyTrickle)){
+			// The copy leaves ahead of the data packet, through the NIC's
+			// high-priority queue, outside the queue pair's pacing; switches
+			// queue it by its priority group as any data packet.
+			Ptr<Packet> copy = p->Copy();
+			Ipv4Header copyHeader = ipHeader;
+			copyHeader.SetIdentification(SpineIdentification(copySpine, copySpine));
+			copy->AddHeader(copyHeader);
+			AddHeader(copy, 0x800);
+			qp->AddCopy(seq, payload_size, copySpine,
+				Simulator::Now().GetNanoSeconds(), copyTrickle);
+			m_nic[GetNicIdxOfQp(qp)].dev->RdmaEnqueueHighPrioQ(copy);
+		}
 		if (is_repair && qp->m_outstanding.RepairsAgain(seq))
 			qp->m_duplicate_repairs++;
 	}else{

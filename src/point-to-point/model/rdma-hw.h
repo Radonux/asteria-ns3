@@ -238,6 +238,8 @@ public:
 	double m_sprayHoldTrickle;
 	bool IsTrickleRelease() const;
 	bool ValidHoldRelease() const;
+	// SentinelMode of PathSelector RepsHold and RepsFlowHold.
+	uint32_t m_spraySentinelMode;
 	// HoldScope of PathSelector RepsHold. Under Leaf the queue pairs to the
 	// hosts of one leaf, which m_switchQueues names, share that leaf's loss
 	// hold in m_leafHolds, made at the first of them; under Host every queue
