@@ -35,6 +35,10 @@ bool PathSelector::ChoseTrickle() const{
 void PathSelector::OnTrickleAnswer(uint16_t, bool, uint64_t){
 }
 
+bool PathSelector::ChoseExploration() const{
+	return false;
+}
+
 bool PathSelector::TakeCopy(uint8_t &, bool &){
 	return false;
 }
@@ -952,7 +956,7 @@ RepsHoldSelector::RepsHoldSelector(Ptr<UniformRandomVariable> random,
 	: RepsSelector(random, bufferSize, freezingTimeoutNs, explorePackets,
 		spines),
 	  m_hold(hold), m_excluding(false), m_trickle(spines),
-	  m_choseTrickle(false)
+	  m_choseTrickle(false), m_choseExploration(false)
 {
 }
 
@@ -962,7 +966,7 @@ RepsHoldSelector::RepsHoldSelector(Ptr<UniformRandomVariable> random,
 	: RepsSelector(random, bufferSize, freezingTimeoutNs, explorePackets,
 		spines),
 	  m_ownHold(std::move(hold)), m_hold(*m_ownHold), m_excluding(false),
-	  m_trickle(spines), m_choseTrickle(false)
+	  m_trickle(spines), m_choseTrickle(false), m_choseExploration(false)
 {
 }
 
@@ -973,22 +977,29 @@ uint16_t RepsHoldSelector::Choose(uint64_t nowNs){
 		(trickle = m_trickle.Take(m_hold.TrickleEvery(),
 			[this](uint32_t k){ return m_hold.Holds(k); }, explored));
 	m_choseTrickle = false;
+	m_choseExploration = false;
 	m_copy.pending = false;
 	uint8_t spine = explored;
-	if (exploring && m_hold.Sentinels() == SentinelMode::Data)
+	if (exploring && m_hold.Sentinels() == SentinelMode::Data){
 		m_choseTrickle = trickle;
-	else{
+		m_choseExploration = true;
+	}else{
 		m_excluding = !m_hold.HoldsEvery();
 		spine = RepsSelector::Choose(nowNs);
 		if (exploring){
-			if (m_copy.Set(spine, explored, trickle))
+			if (m_copy.Set(spine, explored, trickle)){
 				m_choseTrickle = trickle;
-			else
+				m_choseExploration = true;
+			}else
 				m_hold.CountIntervalSend(explored, nowNs);
 		}
 	}
 	m_hold.CountIntervalSend(spine, nowNs);
 	return SpineIdentification(spine, spine);
+}
+
+bool RepsHoldSelector::ChoseExploration() const{
+	return m_choseExploration;
 }
 
 bool RepsHoldSelector::TakeCopy(uint8_t &spine, bool &trickle){
@@ -1318,7 +1329,7 @@ RepsAutoHoldSelector::RepsAutoHoldSelector(Ptr<UniformRandomVariable> random,
 	: RepsSelector(random, bufferSize, freezingTimeoutNs, explorePackets,
 		spines),
 	  m_hold(hold), m_leaf(leaf), m_excluding(false), m_trickle(spines),
-	  m_choseTrickle(false)
+	  m_choseTrickle(false), m_choseExploration(false)
 {
 	m_hold.AddLeaf(leaf);
 }
@@ -1330,22 +1341,29 @@ uint16_t RepsAutoHoldSelector::Choose(uint64_t nowNs){
 		(trickle = m_trickle.Take(m_hold.TrickleEvery(),
 			[this](uint32_t k){ return m_hold.Holds(m_leaf, k); }, explored));
 	m_choseTrickle = false;
+	m_choseExploration = false;
 	m_copy.pending = false;
 	uint8_t spine = explored;
-	if (exploring && m_hold.Sentinels() == SentinelMode::Data)
+	if (exploring && m_hold.Sentinels() == SentinelMode::Data){
 		m_choseTrickle = trickle;
-	else{
+		m_choseExploration = true;
+	}else{
 		m_excluding = !m_hold.HoldsEvery(m_leaf);
 		spine = RepsSelector::Choose(nowNs);
 		if (exploring){
-			if (m_copy.Set(spine, explored, trickle))
+			if (m_copy.Set(spine, explored, trickle)){
 				m_choseTrickle = trickle;
-			else
+				m_choseExploration = true;
+			}else
 				m_hold.CountSend(m_leaf, explored, nowNs);
 		}
 	}
 	m_hold.CountSend(m_leaf, spine, nowNs);
 	return SpineIdentification(spine, spine);
+}
+
+bool RepsAutoHoldSelector::ChoseExploration() const{
+	return m_choseExploration;
 }
 
 bool RepsAutoHoldSelector::TakeCopy(uint8_t &spine, bool &trickle){

@@ -709,6 +709,14 @@ TypeId RdmaHw::GetTypeId (void)
 				"grade its lost fraction earns.",
 				MakeTraceSourceAccessor(&RdmaHw::m_traceSpineLossInterval),
 				"ns3::RdmaHw::SpineLossIntervalTracedCallback")
+		.AddTraceSource("RetransmissionTimeout",
+				"A queue pair's retransmission timeout fired and was taken: the "
+				"time, the queue pair, the requested spine of its oldest "
+				"outstanding send or -1 where none is kept or no spine is "
+				"named, whether that send was an exploration send onto a held "
+				"spine, and the bytes outstanding.",
+				MakeTraceSourceAccessor(&RdmaHw::m_traceRetransmissionTimeout),
+				"ns3::RdmaHw::RetransmissionTimeoutTracedCallback")
 		.AddTraceSource("LeafSpineLossInterval",
 				"Under PathSelector 6 with SprayHoldScope 1, the loss hold of "
 				"one destination leaf closed a loss interval, and with "
@@ -2463,6 +2471,18 @@ void RdmaHw::HandleRetransmissionTimeout(Ptr<RdmaQueuePair> qp){
 	qp->m_recovery_retries++;
 	qp->m_timeouts++;
 	ReportTransportEvent("rto_fired", 0);
+	{
+		// The send the timer waited for is the oldest outstanding one.
+		const uint64_t oldest = qp->m_outstanding.IsKept()
+			? qp->m_outstanding.Oldest() : OutstandingPackets::kNone;
+		const bool named = oldest != OutstandingPackets::kNone &&
+			NamesSpine(static_cast<LoadBalancingMode>(m_loadBalancing));
+		m_traceRetransmissionTimeout(Simulator::Now().GetNanoSeconds(), qp,
+			named ? static_cast<int32_t>(qp->m_outstanding.Path(oldest)) : -1,
+			oldest != OutstandingPackets::kNone &&
+				qp->m_outstanding.Exploration(oldest),
+			qp->GetOnTheFly());
+	}
 	if (qp->m_outstanding.IsKept()){
 		const uint64_t now = Simulator::Now().GetNanoSeconds();
 		const uint64_t lost =
@@ -2614,7 +2634,8 @@ Ptr<Packet> RdmaHw::GetNxtPacket(Ptr<RdmaQueuePair> qp){
 		qp->m_outstanding.Add(seq, payload_size,
 			PathOf(static_cast<LoadBalancingMode>(m_loadBalancing), identification),
 			Simulator::Now().GetNanoSeconds(),
-			qp->m_pathSelector->ChoseTrickle());
+			qp->m_pathSelector->ChoseTrickle(),
+			qp->m_pathSelector->ChoseExploration());
 		uint8_t copySpine;
 		bool copyTrickle;
 		if (qp->m_pathSelector->TakeCopy(copySpine, copyTrickle)){

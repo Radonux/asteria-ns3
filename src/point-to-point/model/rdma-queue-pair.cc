@@ -50,7 +50,7 @@ void OutstandingPackets::Reserve(uint64_t packet){
 }
 
 void OutstandingPackets::Add(uint64_t seq, uint32_t size, uint16_t path,
-		uint64_t sentNs, bool trickle){
+		uint64_t sentNs, bool trickle, bool exploration){
 	NS_ASSERT_MSG(m_packet_size != 0 && seq % m_packet_size == 0,
 		"a send record is indexed by its packet number");
 	const uint64_t packet = seq / m_packet_size;
@@ -64,8 +64,8 @@ void OutstandingPackets::Add(uint64_t seq, uint32_t size, uint16_t path,
 	const uint64_t olderOnPath = newestOnPath == m_newest_on_path.end()
 		? kNone : newestOnPath->second;
 	const bool resendsLost = m_lost.erase(packet) > 0;
-	record = {sentNs, size, path, true, resendsLost, trickle, m_newest, kNone,
-		olderOnPath, kNone};
+	record = {sentNs, size, path, true, resendsLost, trickle,
+		trickle || exploration, m_newest, kNone, olderOnPath, kNone};
 	if (m_newest != kNone)
 		At(m_newest).newer = packet;
 	else
@@ -120,6 +120,10 @@ bool OutstandingPackets::ResendsLost(uint64_t packet) const{
 
 bool OutstandingPackets::Trickle(uint64_t packet) const{
 	return At(packet).trickle;
+}
+
+bool OutstandingPackets::Exploration(uint64_t packet) const{
+	return At(packet).exploration;
 }
 
 uint64_t OutstandingPackets::NewestOnPath(uint16_t path) const{

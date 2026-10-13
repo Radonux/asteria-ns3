@@ -8093,6 +8093,93 @@ class RepsHoldDuplicateTest : public TestCase
     }
 };
 
+class RetransmissionTimeoutTraceTest : public TestCase
+{
+  public:
+    RetransmissionTimeoutTraceTest()
+        : TestCase("A retransmission timeout taken is traced once, with the requested spine of "
+                   "the oldest outstanding send and whether it was an exploration send")
+    {
+    }
+
+    void DoRun() override
+    {
+        const bool savedPacketSeq = CustomHeader::ackCarriesPacketSeq;
+        CustomHeader::ackCarriesPacketSeq = true;
+        Timeout(true);
+        Timeout(false);
+        CustomHeader::ackCarriesPacketSeq = savedPacketSeq;
+    }
+
+  private:
+    struct Row
+    {
+        uint64_t nowNs;
+        int32_t spine;
+        bool exploration;
+        uint64_t bytes;
+    };
+
+    // Two sends at 10 us, unanswered; with heldSpine3 spine 3 is held, so
+    // the first of them is its sentinel.
+    void Timeout(bool heldSpine3)
+    {
+        constexpr uint64_t kStart = 10000;
+        IsolatedHost sender(LoadBalancingMode::SprayUniform, kTestReceiver, 8);
+        Ptr<RdmaHw> hw = sender.hw;
+        hw->m_pathSelectorKind = static_cast<uint32_t>(PathSelectorKind::RepsHold);
+        hw->m_sprayHoldScope = static_cast<uint32_t>(HoldScope::Host);
+        hw->m_sprayLossThreshold1 = 0.1;
+        hw->m_sprayLossThreshold2 = 0.25;
+        hw->m_sprayLossThreshold3 = 0.5;
+        hw->m_sprayLossIntervalNs = kStart;
+        hw->m_sprayLossHoldCleanSentinels = 3;
+        hw->m_sprayHeldExploration = SpineScores::HeldExploration::Sentinel;
+        std::vector<Row> rows;
+        hw->TraceConnectWithoutContext(
+            "RetransmissionTimeout",
+            Callback<void, uint64_t, Ptr<RdmaQueuePair>, int32_t, bool, uint64_t>(
+                [&](uint64_t nowNs, Ptr<RdmaQueuePair>, int32_t spine, bool exploration,
+                    uint64_t bytes) { rows.push_back(Row{nowNs, spine, exploration, bytes}); }));
+        Ptr<RdmaQueuePair> qp =
+            sender.AddSender(kTestSender, kTestReceiver, 10 * IsolatedHost::kMtu);
+        SpineScores& hold = *hw->m_senderSpineScores;
+        if (heldSpine3)
+        {
+            hold.CountIntervalSend(3, 0);
+            hold.CountIntervalLoss(3, 0);
+        }
+        uint8_t first = 0;
+        Simulator::Schedule(NanoSeconds(kStart), [&]() {
+            CustomHeader parsed(CustomHeader::L2_Header | CustomHeader::L3_Header);
+            hw->GetNxtPacket(qp)->PeekHeader(parsed);
+            first = RequestedSpine(parsed.ipid);
+            hw->GetNxtPacket(qp);
+            hw->ArmRetransmissionTimeout(qp);
+        });
+        Simulator::Stop(NanoSeconds(kStart + IsolatedHost::kTimeoutNs + 1));
+        Simulator::Run();
+        const std::string which = heldSpine3 ? "sentinel: " : "data: ";
+        NS_TEST_EXPECT_MSG_EQ(rows.size(), 1u, which + "one timeout, one row");
+        if (!rows.empty())
+        {
+            NS_TEST_EXPECT_MSG_EQ(rows[0].nowNs, kStart + IsolatedHost::kTimeoutNs,
+                                  which + "at the oldest send's timeout");
+            NS_TEST_EXPECT_MSG_EQ(rows[0].spine, static_cast<int32_t>(first),
+                                  which + "the oldest send's spine");
+            NS_TEST_EXPECT_MSG_EQ(rows[0].exploration, heldSpine3, which + "the sentinel flag");
+            NS_TEST_EXPECT_MSG_EQ(rows[0].bytes, 2u * IsolatedHost::kMtu,
+                                  which + "two packets outstanding");
+        }
+        if (heldSpine3)
+        {
+            NS_TEST_EXPECT_MSG_EQ(static_cast<uint32_t>(first), 3u, "the sentinel is on spine 3");
+        }
+        NS_TEST_EXPECT_MSG_EQ(qp->m_timeouts, 1u, which + "the queue pair counts it");
+        Simulator::Destroy();
+    }
+};
+
 class SprayPolicyTransportTest : public TestCase
 {
   public:
@@ -9860,6 +9947,7 @@ PointToPointTestSuite::PointToPointTestSuite()
     AddTestCase(new RepsHoldLlrTest, TestCase::Duration::QUICK);
     AddTestCase(new RepsHoldTrickleTest, TestCase::Duration::QUICK);
     AddTestCase(new RepsHoldDuplicateTest, TestCase::Duration::QUICK);
+    AddTestCase(new RetransmissionTimeoutTraceTest, TestCase::Duration::QUICK);
     AddTestCase(new SprayPolicyTransportTest, TestCase::Duration::QUICK);
     AddTestCase(new NsccReceiverPenaltyTest, TestCase::Duration::QUICK);
     AddTestCase(new SprayPolicyDefaultsTest, TestCase::Duration::QUICK);

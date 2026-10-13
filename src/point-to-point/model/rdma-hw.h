@@ -271,6 +271,17 @@ public:
 	TracedCallback<uint32_t, uint64_t, const std::vector<uint32_t> &,
 		const std::vector<uint32_t> &, const std::vector<uint8_t> &>
 		m_traceLeafSpineLossInterval;
+	// The RetransmissionTimeout trace source: a queue pair's timeout fired
+	// and was taken, with the requested spine of its oldest outstanding send,
+	// -1 where none is kept or the mode names no spine, whether that send was
+	// an exploration send onto a held spine (OutstandingPackets::Exploration;
+	// a copy under SentinelMode::Duplicate has no send record, so no timeout
+	// waits for one), and the bytes outstanding.
+	typedef void (*RetransmissionTimeoutTracedCallback)(uint64_t nowNs,
+		Ptr<RdmaQueuePair> qp, int32_t spine, bool exploration,
+		uint64_t bytesOutstanding);
+	TracedCallback<uint64_t, Ptr<RdmaQueuePair>, int32_t, bool, uint64_t>
+		m_traceRetransmissionTimeout;
 	// The SpineLossInterval trace source: the host's pooled scores closed a
 	// loss interval (SpineScores::LossIntervalCallback): the time it ended
 	// at and, per spine, the sends and losses counted in it and the grade

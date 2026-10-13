@@ -220,6 +220,9 @@ public:
 	// Whether the latest Choose was a trickle send of a loss hold
 	// (HoldRelease::Trickle), whose answer is told to OnTrickleAnswer.
 	virtual bool ChoseTrickle() const;
+	// Whether the latest Choose's data packet was an exploration send onto a
+	// held spine: a sentinel or a trickle send.
+	virtual bool ChoseExploration() const;
 	// A trickle send along path acknowledged, or declared lost, after
 	// OnAck or OnLoss has been told.
 	virtual void OnTrickleAnswer(uint16_t path, bool lost, uint64_t nowNs);
@@ -675,6 +678,7 @@ public:
 	uint16_t Choose(uint64_t nowNs) override;
 	void OnLoss(uint16_t path, uint64_t nowNs) override;
 	bool ChoseTrickle() const override;
+	bool ChoseExploration() const override;
 	void OnTrickleAnswer(uint16_t path, bool lost, uint64_t nowNs) override;
 	bool TakeCopy(uint8_t &spine, bool &trickle) override;
 
@@ -689,6 +693,7 @@ private:
 	bool m_excluding;
 	TrickleSchedule m_trickle;
 	bool m_choseTrickle;
+	bool m_choseExploration;
 	PendingCopy m_copy;
 };
 
@@ -835,6 +840,7 @@ public:
 	uint16_t Choose(uint64_t nowNs) override;
 	void OnLoss(uint16_t path, uint64_t nowNs) override;
 	bool ChoseTrickle() const override;
+	bool ChoseExploration() const override;
 	void OnTrickleAnswer(uint16_t path, bool lost, uint64_t nowNs) override;
 	bool TakeCopy(uint8_t &spine, bool &trickle) override;
 
@@ -848,6 +854,7 @@ private:
 	bool m_excluding;
 	TrickleSchedule m_trickle;
 	bool m_choseTrickle;
+	bool m_choseExploration;
 	PendingCopy m_copy;
 };
 

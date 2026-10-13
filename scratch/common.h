@@ -78,8 +78,17 @@ std::string spine_report_output_file;
 // Each host's pooled loss intervals under SPRAY_LOSS_THRESHOLDS: one row per
 // host, closed interval and spine. Empty writes none.
 std::string spine_loss_output_file;
+// One row per retransmission timeout fired, under every mode: the time, the
+// host's rank and the destination's, the requested spine of the oldest
+// outstanding send the timer waited for (empty where no send record is kept
+// or the mode names no spine), whether that send was an exploration send
+// onto a held spine (a sentinel or a trickle send; a copy under
+// SPRAY_SENTINEL_MODE duplicate has no send record and no timeout waits for
+// it), and the bytes outstanding. Empty writes none.
+std::string rto_event_output_file;
 FILE *port_counter_file = nullptr, *spine_arrival_file = nullptr;
 FILE *spine_report_file = nullptr, *spine_loss_file = nullptr;
+FILE *rto_event_file = nullptr;
 
 double alpha_resume_interval = 55, rp_timer, ewma_gain = 1 / 16;
 double rate_decrease_interval = 4;
@@ -1318,7 +1327,7 @@ void write_fabric_counters() {
     }
   }
   for (FILE *file : {port_counter_file, spine_arrival_file, spine_report_file,
-                     spine_loss_file})
+                     spine_loss_file, rto_event_file})
     if (file != nullptr)
       fflush(file);
 }
@@ -1394,6 +1403,18 @@ void write_leaf_spine_loss_interval(uint32_t rank, uint32_t leaf,
     fprintf(spine_loss_file, "%lu,%u,%u,%u,%u,%u,%u\n",
             static_cast<unsigned long>(end_ns), rank, leaf, spine, sent[spine],
             lost[spine], grades[spine]);
+}
+
+// A retransmission timeout a host's queue pair took.
+void write_rto_event(uint32_t rank, uint64_t now_ns, Ptr<RdmaQueuePair> qp,
+                     int32_t spine, bool exploration,
+                     uint64_t bytes_outstanding) {
+  fprintf(rto_event_file, "%lu,%u,%u,", static_cast<unsigned long>(now_ns),
+          rank, ip_to_node_id(qp->dip));
+  if (spine >= 0)
+    fprintf(rto_event_file, "%d", spine);
+  fprintf(rto_event_file, ",%d,%lu\n", exploration ? 1 : 0,
+          static_cast<unsigned long>(bytes_outstanding));
 }
 
 // The link events' applier, which keeps what a restore puts back.
@@ -2103,6 +2124,8 @@ bool ReadConf(string network_configuration) {
       conf >> spine_report_output_file;
     } else if (key.compare("SPINE_LOSS_OUTPUT_FILE") == 0) {
       conf >> spine_loss_output_file;
+    } else if (key.compare("RTO_EVENT_OUTPUT_FILE") == 0) {
+      conf >> rto_event_output_file;
     } else if (key.compare("LINK_DOWN") == 0) {
       conf >> link_down_time >> link_down_A >> link_down_B;
     } else if (key.compare("LINK_FAILURE") == 0) {
@@ -3263,6 +3286,19 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),
               "SpineLossInterval",
               MakeBoundCallback(&write_spine_loss_interval, i));
       }
+  }
+  if (!rto_event_output_file.empty()) {
+    rto_event_file = fopen(rto_event_output_file.c_str(), "w");
+    if (rto_event_file == nullptr) {
+      std::cerr << "Error: cannot open " << rto_event_output_file << "\n";
+      return false;
+    }
+    fprintf(rto_event_file,
+            "time_ns,rank,dst_rank,spine,sentinel,bytes_outstanding\n");
+    for (uint32_t i = 0; i < node_num; i++)
+      if (n.Get(i)->GetNodeType() == 0)
+        n.Get(i)->GetObject<RdmaDriver>()->m_rdma->TraceConnectWithoutContext(
+            "RetransmissionTimeout", MakeBoundCallback(&write_rto_event, i));
   }
   std::set<uint64_t> event_times;
   for (const LinkEvent &event : link_events) {

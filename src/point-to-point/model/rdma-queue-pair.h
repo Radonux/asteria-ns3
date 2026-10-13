@@ -39,9 +39,10 @@ public:
 	// Every sequence is a multiple of the packet size, and a packet is resent
 	// only after its previous send has been removed. trickle marks a trickle
 	// send of a loss hold (PathSelector::ChoseTrickle), whose answer is told
-	// to PathSelector::OnTrickleAnswer.
+	// to PathSelector::OnTrickleAnswer; exploration marks any exploration
+	// send onto a held spine (PathSelector::ChoseExploration).
 	void Add(uint64_t seq, uint32_t size, uint16_t path, uint64_t sentNs,
-		bool trickle = false);
+		bool trickle = false, bool exploration = false);
 	// The packet number of the outstanding send of seq along path, or kNone.
 	uint64_t Find(uint64_t seq, uint16_t path) const;
 	uint64_t Oldest() const;
@@ -55,6 +56,7 @@ public:
 	// name the resend's record.
 	bool ResendsLost(uint64_t packet) const;
 	bool Trickle(uint64_t packet) const;
+	bool Exploration(uint64_t packet) const;
 	// The newest outstanding send along path, or kNone.
 	uint64_t NewestOnPath(uint16_t path) const;
 	void Remove(uint64_t packet);
@@ -75,6 +77,7 @@ private:
 		bool outstanding;
 		bool resends_lost;
 		bool trickle;
+		bool exploration;
 		// Neighbouring outstanding sends as packet numbers, kNone at either
 		// end: across every path, then along this record's path.
 		uint64_t older, newer;
