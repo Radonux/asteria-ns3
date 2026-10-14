@@ -254,6 +254,18 @@ bool spray_sentinel_mode_given = false;
 // resend's. 0 waits for the timeout. At least 0.
 double spray_held_loss_rtts = 2;
 bool spray_held_loss_rtts_given = false;
+// Under LOAD_BALANCING spray_uniform, with any PATH_SELECTOR,
+// SPRAY_ACK_LOSS_RTTS <x>: a data send that the cumulative acknowledgement
+// covers before its own acknowledgement arrives, and whose own acknowledgement
+// has still not arrived x of the queue pair's base RTTs after that, is declared
+// lost on its path for the path selector alone, as a lost acknowledgement: the
+// loss holds and SPINE_LOSS_OUTPUT_FILE count it as a loss on that spine, but
+// nothing is repaired, the retransmission timeout is left as it is and the
+// congestion controller is told nothing, the data having arrived. Each is
+// counted as the host transport event ack_loss_declared. 0, the default,
+// declares nothing. At least 0.
+double spray_ack_loss_rtts = 0;
+bool spray_ack_loss_rtts_given = false;
 std::string spray_hold_release = "sentinels";
 bool spray_hold_release_given = false;
 double spray_hold_trickle = 0.01;
@@ -2173,6 +2185,9 @@ bool ReadConf(string network_configuration) {
     } else if (key.compare("SPRAY_HELD_LOSS_RTTS") == 0) {
       conf >> spray_held_loss_rtts;
       spray_held_loss_rtts_given = true;
+    } else if (key.compare("SPRAY_ACK_LOSS_RTTS") == 0) {
+      conf >> spray_ack_loss_rtts;
+      spray_ack_loss_rtts_given = true;
     } else if (key.compare("SPRAY_HOLD_RELEASE") == 0) {
       conf >> spray_hold_release;
       spray_hold_release_given = true;
@@ -2616,6 +2631,15 @@ bool ReadConf(string network_configuration) {
                  "spray_uniform\n";
     return false;
   }
+  if (spray_ack_loss_rtts_given && load_balancing != "spray_uniform") {
+    std::cerr << "SPRAY_ACK_LOSS_RTTS is read only under LOAD_BALANCING "
+                 "spray_uniform\n";
+    return false;
+  }
+  if (!(spray_ack_loss_rtts >= 0)) {
+    std::cerr << "SPRAY_ACK_LOSS_RTTS must be at least 0\n";
+    return false;
+  }
   if (spray_tail_recovery != "on" && spray_tail_recovery != "off") {
     std::cerr << "SPRAY_TAIL_RECOVERY must be on or off\n";
     return false;
@@ -2915,6 +2939,8 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),
     std::cerr << "Error: cannot open PFC or transport event output files\n";
     return false;
   }
+  // Written under every mode, zero where SPRAY_ACK_LOSS_RTTS is off.
+  transport_event_totals[{"ack_loss_declared", "control"}];
   // The totals must land even when a watchdog exits the run mid-simulation.
   std::atexit(write_transport_event_summary);
   ZSTD_CCtx_setParameter(transport_event_raw_cctx, ZSTD_c_compressionLevel, 8);
@@ -3219,6 +3245,8 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),
                            UintegerValue(spray_sentinel_mode_value()));
       rdmaHw->SetAttribute("SprayHeldLossRtts",
                            DoubleValue(spray_held_loss_rtts));
+      rdmaHw->SetAttribute("SprayAckLossRtts",
+                           DoubleValue(spray_ack_loss_rtts));
       rdmaHw->SetAttribute("SprayPathSeq",
                            BooleanValue(spray_path_seq == "on"));
       rdmaHw->SetAttribute("SprayTailRecovery", BooleanValue(tail_recovery()));

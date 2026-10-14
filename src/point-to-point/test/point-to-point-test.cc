@@ -8846,6 +8846,251 @@ class HeldSpineFastLossTest : public TestCase
     }
 };
 
+class SprayAckLossTest : public TestCase
+{
+  public:
+    enum class Answer
+    {
+        Dropped,
+        Late,
+        Off,
+    };
+
+    explicit SprayAckLossTest(Answer answer)
+        : TestCase(Name(answer)),
+          m_answer(answer)
+    {
+    }
+
+    void DoRun() override
+    {
+        const bool savedPacketSeq = CustomHeader::ackCarriesPacketSeq;
+        CustomHeader::ackCarriesPacketSeq = true;
+        Flow();
+        CustomHeader::ackCarriesPacketSeq = savedPacketSeq;
+    }
+
+  private:
+    static constexpr uint32_t kSpines = 8;
+    static constexpr uint64_t kInterval = 10000;
+    static constexpr uint32_t kMtu = IsolatedHost::kMtu;
+    static constexpr uint32_t kPackets = 100;
+    static constexpr uint64_t kStepNs = 100;
+    static constexpr uint64_t kRttNs = 2000;
+
+    static std::string Name(Answer answer)
+    {
+        switch (answer)
+        {
+        case Answer::Dropped:
+            return "Under SprayAckLossRtts 2 a send whose acknowledgement is lost and that the "
+                   "cumulative acknowledgement covers is declared lost on its spine two base "
+                   "RTTs after, for the selector alone, with no repair";
+        case Answer::Late:
+            return "Under SprayAckLossRtts 2 a covered send whose own acknowledgement arrives "
+                   "before two base RTTs is not declared lost";
+        default:
+            return "With SprayAckLossRtts 0, the default, a covered send whose acknowledgement "
+                   "is lost is not declared lost";
+        }
+    }
+
+    // One message under reps_hold, one send per kStepNs, every send
+    // acknowledged kRttNs after it but one: its data arrives, and its
+    // acknowledgement is dropped, or under Late delivered 1.5 base RTTs late,
+    // while the cumulative acknowledgement of the next send, up another
+    // spine, covers it.
+    void Flow()
+    {
+        IsolatedHost sender(LoadBalancingMode::SprayUniform, kTestReceiver, kSpines);
+        Ptr<RdmaHw> hw = sender.hw;
+        DoubleValue rtts;
+        hw->GetAttribute("SprayAckLossRtts", rtts);
+        NS_TEST_EXPECT_MSG_EQ(rtts.Get(), 0.0, "SprayAckLossRtts is 0 by default");
+        hw->m_pathSelectorKind = static_cast<uint32_t>(PathSelectorKind::RepsHold);
+        hw->m_sprayHoldScope = static_cast<uint32_t>(HoldScope::Host);
+        hw->m_sprayLossThreshold1 = 0.1;
+        hw->m_sprayLossThreshold2 = 0.25;
+        hw->m_sprayLossThreshold3 = 0.5;
+        hw->m_sprayLossIntervalNs = kInterval;
+        hw->m_sprayHeldExploration = SpineScores::HeldExploration::Sentinel;
+        hw->m_sprayLossHoldCleanSentinels = 3;
+        hw->m_retransmission_timeout_ns = 50 * kRttNs;
+        if (m_answer != Answer::Off)
+        {
+            hw->m_sprayAckLossRtts = 2;
+        }
+        NS_TEST_EXPECT_MSG_EQ(hw->ValidAckLoss(), true, "accepted under spray_uniform");
+        bool completed = false;
+        hw->m_qpCompleteCallback =
+            Callback<void, Ptr<RdmaQueuePair>>([&](Ptr<RdmaQueuePair>) { completed = true; });
+        uint32_t events = 0;
+        uint64_t declaredNs = 0;
+        hw->m_transportEventCallback =
+            Callback<void, const char*, uint64_t>([&](const char* event, uint64_t bytes) {
+                if (std::string(event) == "ack_loss_declared")
+                {
+                    events++;
+                    declaredNs = Simulator::Now().GetNanoSeconds();
+                    NS_TEST_EXPECT_MSG_EQ(bytes, 0u, "the event carries no bytes");
+                }
+            });
+        std::vector<uint32_t> lost(kSpines, 0);
+        hw->TraceConnectWithoutContext(
+            "SpineLossInterval",
+            Callback<void,
+                     uint64_t,
+                     const std::vector<uint32_t>&,
+                     const std::vector<uint32_t>&,
+                     const std::vector<uint8_t>&>([&](uint64_t,
+                                                      const std::vector<uint32_t>&,
+                                                      const std::vector<uint32_t>& counted,
+                                                      const std::vector<uint8_t>&) {
+                for (uint32_t k = 0; k < kSpines; ++k)
+                {
+                    lost[k] += counted[k];
+                }
+            }));
+        Ptr<RdmaQueuePair> qp =
+            sender.AddSender(kTestSender, kTestReceiver, uint64_t{kPackets} * kMtu);
+        qp->m_baseRtt = kRttNs;
+        qp->m_notifyAppFinish = Callback<void>([]() {});
+        uint64_t received = 0;
+        std::set<uint64_t> arrived;
+        std::map<uint32_t, uint32_t> sends;
+        std::vector<uint16_t> ipids;
+        std::vector<uint64_t> sentNs;
+        // The first send whose next send goes up another spine, so that no
+        // later send up its spine is answered before the cumulative
+        // acknowledgement covers it.
+        uint32_t dropped = kPackets;
+        uint64_t coveredNs = 0;
+        uint32_t coveredAtCover = 0;
+        auto acknowledge = [&](uint32_t packet) {
+            if (qp->IsFinished())
+            {
+                return;
+            }
+            const uint32_t seq = packet * kMtu;
+            arrived.insert(seq);
+            while (arrived.count(received) > 0)
+            {
+                received += kMtu;
+            }
+            if (packet == dropped)
+            {
+                return;
+            }
+            sender.ReceiveAck(kTestReceiver, received, seq, ipids[packet]);
+            if (packet == dropped + 1)
+            {
+                coveredNs = Simulator::Now().GetNanoSeconds();
+                coveredAtCover = qp->m_covered.size();
+            }
+        };
+        std::function<void()> step = [&]() {
+            if (qp->IsFinished() || qp->snd_nxt >= qp->m_size)
+            {
+                return;
+            }
+            Ptr<Packet> packet = hw->GetNxtPacket(qp);
+            hw->ArmRetransmissionTimeout(qp);
+            CustomHeader live(CustomHeader::L2_Header | CustomHeader::L3_Header |
+                              CustomHeader::L4_Header);
+            packet->PeekHeader(live);
+            const uint32_t seq = live.udp.seq;
+            sends[seq]++;
+            const uint32_t index = seq / kMtu;
+            ipids.push_back(live.ipid);
+            sentNs.push_back(Simulator::Now().GetNanoSeconds());
+            if (dropped == kPackets && index > 0 &&
+                RequestedSpine(ipids[index - 1]) != RequestedSpine(live.ipid))
+            {
+                dropped = index - 1;
+                if (m_answer == Answer::Late)
+                {
+                    const uint64_t lateNs = sentNs[dropped] + kRttNs + 3 * kRttNs / 2;
+                    Simulator::Schedule(
+                        NanoSeconds(lateNs - Simulator::Now().GetNanoSeconds()), [&]() {
+                            sender.ReceiveAck(kTestReceiver, received, dropped * kMtu,
+                                              ipids[dropped]);
+                        });
+                }
+            }
+            Simulator::Schedule(NanoSeconds(kRttNs), [&, index]() { acknowledge(index); });
+            Simulator::Schedule(NanoSeconds(kStepNs), step);
+        };
+        Simulator::Schedule(NanoSeconds(kInterval), step);
+        Simulator::Stop(Seconds(1));
+        Simulator::Run();
+        // The loss intervals still open are closed by a later count.
+        hw->m_senderSpineScores->CountIntervalSend(0, Seconds(2).GetNanoSeconds());
+
+        const std::string which = m_answer == Answer::Dropped ? "dropped: "
+                                  : m_answer == Answer::Late  ? "late: "
+                                                              : "off: ";
+        NS_TEST_EXPECT_MSG_EQ(completed, true, which + "the message completes");
+        NS_TEST_ASSERT_MSG_LT(dropped, kPackets, which + "a send's answer is dropped");
+        const uint8_t first = RequestedSpine(ipids[dropped]);
+        NS_TEST_EXPECT_MSG_EQ(coveredNs, sentNs[dropped] + kStepNs + kRttNs,
+                              which + "the next send's acknowledgement covers it");
+        const uint32_t kept = m_answer == Answer::Off ? 0 : 1;
+        NS_TEST_EXPECT_MSG_EQ(coveredAtCover, kept,
+                              which + "and keeps it as covered only when the key is set");
+        uint32_t lostSends = 0;
+        for (uint32_t k = 0; k < kSpines; ++k)
+        {
+            lostSends += lost[k];
+        }
+        const uint32_t declared = m_answer == Answer::Dropped ? 1 : 0;
+        NS_TEST_EXPECT_MSG_EQ(qp->m_ack_loss_declared, declared, which + "the counter");
+        NS_TEST_EXPECT_MSG_EQ(events, declared, which + "the transport event");
+        if (declared > 0)
+        {
+            NS_TEST_EXPECT_MSG_EQ(declaredNs, coveredNs + 2 * kRttNs,
+                                  which + "two base RTTs after it was covered");
+        }
+        NS_TEST_EXPECT_MSG_EQ(lostSends, declared, which + "the losses the hold counts");
+        NS_TEST_EXPECT_MSG_EQ(lost[first], declared, which + "on that send's spine");
+        NS_TEST_EXPECT_MSG_EQ(sends[dropped * kMtu], 1u, which + "that send is not retransmitted");
+        NS_TEST_EXPECT_MSG_EQ(sends.size(), kPackets, which + "every packet is sent");
+        NS_TEST_EXPECT_MSG_EQ(qp->m_recovery_events, 0u, which + "no send is declared lost");
+        NS_TEST_EXPECT_MSG_EQ(qp->m_repair_ranges.empty(), true, which + "no repair is queued");
+        NS_TEST_EXPECT_MSG_EQ(qp->m_timeouts, 0u, which + "no retransmission timeout");
+        NS_TEST_EXPECT_MSG_EQ(qp->m_covered.empty(), true, which + "nothing is left covered");
+        Simulator::Destroy();
+    }
+
+    Answer m_answer;
+};
+
+class SprayAckLossValidTest : public TestCase
+{
+  public:
+    SprayAckLossValidTest()
+        : TestCase("SprayAckLossRtts is refused under every LoadBalancing but spray_uniform")
+    {
+    }
+
+    void DoRun() override
+    {
+        for (const LoadBalancingMode mode : {LoadBalancingMode::Ecmp,
+                                             LoadBalancingMode::EntropyHash,
+                                             LoadBalancingMode::SprayPolicy})
+        {
+            Ptr<RdmaHw> hw = CreateObject<RdmaHw>();
+            hw->m_loadBalancing = static_cast<uint32_t>(mode);
+            NS_TEST_EXPECT_MSG_EQ(hw->ValidAckLoss(), true, "unset, accepted under any mode");
+            hw->SetAttribute("SprayAckLossRtts", DoubleValue(2.0));
+            NS_TEST_EXPECT_MSG_EQ(hw->ValidAckLoss(), false, "set, refused");
+        }
+        Ptr<RdmaHw> uniform = CreateObject<RdmaHw>();
+        uniform->m_loadBalancing = static_cast<uint32_t>(LoadBalancingMode::SprayUniform);
+        uniform->SetAttribute("SprayAckLossRtts", DoubleValue(2.0));
+        NS_TEST_EXPECT_MSG_EQ(uniform->ValidAckLoss(), true, "accepted under spray_uniform");
+    }
+};
+
 class RetransmissionTimeoutTraceTest : public TestCase
 {
   public:
@@ -12247,6 +12492,11 @@ PointToPointTestSuite::PointToPointTestSuite()
     AddTestCase(new RetransmissionTimeoutTraceTest, TestCase::Duration::QUICK);
     AddTestCase(new HeldSpineLeakTest, TestCase::Duration::QUICK);
     AddTestCase(new HeldSpineFastLossTest, TestCase::Duration::QUICK);
+    AddTestCase(new SprayAckLossTest(SprayAckLossTest::Answer::Dropped),
+                TestCase::Duration::QUICK);
+    AddTestCase(new SprayAckLossTest(SprayAckLossTest::Answer::Late), TestCase::Duration::QUICK);
+    AddTestCase(new SprayAckLossTest(SprayAckLossTest::Answer::Off), TestCase::Duration::QUICK);
+    AddTestCase(new SprayAckLossValidTest, TestCase::Duration::QUICK);
     AddTestCase(new SprayTailRecoveryTest, TestCase::Duration::QUICK);
     AddTestCase(new SprayPathSeqTest, TestCase::Duration::QUICK);
     AddTestCase(new SprayReceiverHoldTest, TestCase::Duration::QUICK);

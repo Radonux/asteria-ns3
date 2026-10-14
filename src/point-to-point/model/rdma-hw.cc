@@ -643,6 +643,16 @@ TypeId RdmaHw::GetTypeId (void)
 				DoubleValue(2),
 				MakeDoubleAccessor(&RdmaHw::m_sprayHeldLossRtts),
 				MakeDoubleChecker<double>(0))
+		.AddAttribute("SprayAckLossRtts",
+				"Under LoadBalancing 2, the queue pair's base RTTs after "
+				"which a send the cumulative acknowledgement covered before "
+				"its own acknowledgement arrived, still without it, is "
+				"declared lost on its path for the path selector alone: no "
+				"repair, no change to the retransmission timeout and no "
+				"congestion signal. 0 declares nothing. Default 0.",
+				DoubleValue(0),
+				MakeDoubleAccessor(&RdmaHw::m_sprayAckLossRtts),
+				MakeDoubleChecker<double>(0))
 		.AddAttribute("SprayPathSeq",
 				"Under LoadBalancing 2, whether every data packet carries "
 				"its queue pair's count of the data packets sent before it up "
@@ -1079,6 +1089,9 @@ void RdmaHw::Setup(QpCompleteCallback cb, QpFailureCallback failure_cb){
 	NS_ABORT_MSG_IF(!ValidPoolHoldPropagates(),
 		"SprayPoolHoldPropagates needs SpraySenderPoolWeight above zero: "
 		"without a pool there is no pool's hold to propagate");
+	NS_ABORT_MSG_IF(!ValidAckLoss(),
+		"SprayAckLossRtts is read only under LoadBalancing 2, where every "
+		"send has a record and every acknowledgement names its path");
 	NS_ABORT_MSG_IF(m_loadBalancing !=
 				static_cast<uint32_t>(LoadBalancingMode::Ecmp) && !m_pathRandom,
 		"A LoadBalancing mode other than ECMP draws the identification of every "
@@ -1649,6 +1662,11 @@ bool RdmaHw::ValidPoolHoldPropagates() const{
 		m_spraySenderPoolWeight > 0;
 }
 
+bool RdmaHw::ValidAckLoss() const{
+	return m_sprayAckLossRtts == 0 || m_loadBalancing ==
+		static_cast<uint32_t>(LoadBalancingMode::SprayUniform);
+}
+
 std::optional<std::array<double, 3>> RdmaHw::SprayLossThresholds() const{
 	if (m_sprayLossThreshold1 == 0)
 		return std::nullopt;
@@ -1924,14 +1942,19 @@ int RdmaHw::ReceiveAck(Ptr<Packet> p, CustomHeader &ch){
 					HandleAckNscc(qp, ch.ack.packet_seq, path, cnp, rcvCwndPend);
 				else
 					qp->AcknowledgePacket(ch.ack.packet_seq, path);
+				// The answer to a send the cumulative acknowledgement covered
+				// first finds no record; the selector has heard it above.
+				if (!qp->m_covered.empty())
+					qp->AnswerCovered(ch.ack.packet_seq, path);
 			}
 		}
 		const uint64_t acknowledged_before = qp->snd_una;
+		const bool keepCovered = m_sprayAckLossRtts > 0;
 		if (!m_backto0){
-			qp->Acknowledge(seq);
+			qp->Acknowledge(seq, keepCovered);
 		}else {
 			uint32_t goback_seq = seq / m_chunk * m_chunk;
-			qp->Acknowledge(goback_seq);
+			qp->Acknowledge(goback_seq, keepCovered);
 		}
 		if (qp->snd_una > acknowledged_before){
 			qp->m_recovery_retries = 0;
@@ -1942,6 +1965,8 @@ int RdmaHw::ReceiveAck(Ptr<Packet> p, CustomHeader &ch){
 			QpComplete(qp);
 			return 0;
 		}
+		if (!qp->m_covered.empty())
+			ArmAckLossTimer(qp);
 	}
 	if (ch.l3Prot == 0xFD){ // NACK
 		if (EnforceProgressDeadline(qp)){
@@ -2640,6 +2665,28 @@ void RdmaHw::HeldSendDue(Ptr<RdmaQueuePair> qp, uint64_t seq, uint16_t path,
 	ArmRetransmissionTimeout(qp);
 }
 
+void RdmaHw::ArmAckLossTimer(Ptr<RdmaQueuePair> qp){
+	if (qp->m_covered.empty() || qp->m_ackLossTimer.IsPending())
+		return;
+	const uint64_t dueNs = qp->m_covered.front().coveredNs +
+		static_cast<uint64_t>(m_sprayAckLossRtts * qp->m_baseRtt);
+	const uint64_t now = Simulator::Now().GetNanoSeconds();
+	qp->m_ackLossTimer = Simulator::Schedule(
+		NanoSeconds(dueNs > now ? dueNs - now : 0), &RdmaHw::AckLossDue, this,
+		qp);
+}
+
+void RdmaHw::AckLossDue(Ptr<RdmaQueuePair> qp){
+	if (qp->IsFinished() || qp->IsFailed())
+		return;
+	const uint32_t declared = qp->DeclareAckLosses(
+		Simulator::Now().GetNanoSeconds(),
+		static_cast<uint64_t>(m_sprayAckLossRtts * qp->m_baseRtt));
+	for (uint32_t i = 0; i < declared; i++)
+		ReportTransportEvent("ack_loss_declared", 0);
+	ArmAckLossTimer(qp);
+}
+
 void RdmaHw::ReportTransportEvent(const char* event, uint64_t bytes){
 	if (!m_transportEventCallback.IsNull())
 		m_transportEventCallback(event, bytes);
@@ -2648,6 +2695,8 @@ void RdmaHw::ReportTransportEvent(const char* event, uint64_t bytes){
 void RdmaHw::QpComplete(Ptr<RdmaQueuePair> qp){
 	NS_ASSERT(!m_qpCompleteCallback.IsNull());
 	Simulator::Cancel(qp->m_retransmissionTimer);
+	Simulator::Cancel(qp->m_ackLossTimer);
+	qp->m_covered.clear();
 	if (m_cc_mode == 1){
 		Simulator::Cancel(qp->mlx.m_eventUpdateAlpha);
 		Simulator::Cancel(qp->mlx.m_eventDecreaseRate);
@@ -2671,6 +2720,8 @@ void RdmaHw::QpFail(Ptr<RdmaQueuePair> qp, uint32_t reason){
 	qp->m_failed = true;
 	qp->m_failure_reason = reason;
 	Simulator::Cancel(qp->m_retransmissionTimer);
+	Simulator::Cancel(qp->m_ackLossTimer);
+	qp->m_covered.clear();
 	if (m_cc_mode == 1){
 		Simulator::Cancel(qp->mlx.m_eventUpdateAlpha);
 		Simulator::Cancel(qp->mlx.m_eventDecreaseRate);

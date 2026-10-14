@@ -249,6 +249,16 @@ public:
 	// outstanding is declared lost and repaired (HeldSendDue); zero waits
 	// for the retransmission timeout.
 	double m_sprayHeldLossRtts;
+	// SprayAckLossRtts, under LoadBalancing SprayUniform with any selector:
+	// the queue pair's base RTTs after which a send the cumulative
+	// acknowledgement covered before its own acknowledgement arrived, and
+	// whose own acknowledgement has still not arrived, is declared lost on
+	// its path for the selector alone (RdmaQueuePair::m_covered), as a lost
+	// acknowledgement: no repair, no change to the retransmission timeout and
+	// no congestion signal, the data having been delivered. Zero keeps no
+	// covered sends.
+	double m_sprayAckLossRtts;
+	bool ValidAckLoss() const;
 	// HoldScope of PathSelector RepsHold and MrcHold. Under Leaf the queue
 	// pairs to the hosts of one leaf, which m_switchQueues names, share that
 	// leaf's loss hold in m_leafHolds, made at the first of them; under Host
@@ -576,6 +586,11 @@ public:
 	// lost if still outstanding, and its repair sent.
 	void HeldSendDue(Ptr<RdmaQueuePair> qp, uint64_t seq, uint16_t path,
 		uint64_t sentNs);
+	// Under SprayAckLossRtts: qp's timer set for its earliest covered send,
+	// unless it is set; and the covered sends due by now declared lost on
+	// their paths, and the timer set for the next.
+	void ArmAckLossTimer(Ptr<RdmaQueuePair> qp);
+	void AckLossDue(Ptr<RdmaQueuePair> qp);
 	bool EnforceProgressDeadline(Ptr<RdmaQueuePair> qp);
 	void SetLinkDown(Ptr<QbbNetDevice> dev);
 

@@ -13,6 +13,7 @@
 #include "spine-grader.h"
 #include "spine-redirect.h"
 #include "spine-sequence.h"
+#include <deque>
 #include <map>
 #include <memory>
 #include <set>
@@ -72,8 +73,18 @@ public:
 	// Note a repair send of seq. True when seq's packet was repaired before,
 	// so that this send repeats a repair.
 	bool RepairsAgain(uint64_t seq);
-	// Remove the record of every packet that starts below seq.
-	void RemoveBelow(uint64_t seq);
+	// A send whose record RemoveBelow removed: neither acknowledged by its
+	// own acknowledgement nor declared lost.
+	struct Unanswered {
+		uint64_t seq;
+		uint16_t path;
+		uint16_t pathSeq;
+		bool trickle;
+		bool resendsLost;
+	};
+	// Remove the record of every packet that starts below seq, and append to
+	// unanswered, unless it is null, the sends so removed in send order.
+	void RemoveBelow(uint64_t seq, std::vector<Unanswered> *unanswered = nullptr);
 	uint64_t Bytes() const;
 
 private:
@@ -326,6 +337,30 @@ public:
 	uint64_t DeclareHeldSendLost(uint64_t seq, uint16_t path, uint64_t sentNs);
 	// Sends on a held spine declared lost by DeclareHeldSendLost.
 	uint32_t m_held_declared_lost;
+	// Under SprayAckLossRtts, the sends the cumulative acknowledgement
+	// covered before their own acknowledgement arrived, in the order it
+	// covered them, each with the time it was covered. Their data was
+	// delivered, so only the acknowledgement may have been lost on its path.
+	// The own acknowledgement of one of them, found by its sequence and path,
+	// drops it; one still here when it is due (AckLossDue) is declared lost
+	// on its path for the selector alone. Empty unless a cumulative advance
+	// removes unanswered sends.
+	struct CoveredSend {
+		OutstandingPackets::Unanswered send;
+		uint64_t coveredNs;
+	};
+	std::deque<CoveredSend> m_covered;
+	EventId m_ackLossTimer;
+	// Covered sends declared lost on their paths.
+	uint32_t m_ack_loss_declared;
+	// Whether the acknowledgement of seq along path answers a covered send;
+	// if so it is dropped, and the answer to a trickle send that resends
+	// nothing declared lost is told to OnTrickleAnswer.
+	bool AnswerCovered(uint64_t seq, uint16_t path);
+	// Declare lost, on its path and for the selector alone, every covered
+	// send covered delayNs or more before nowNs, as DeclareLost tells the
+	// selector of a send, without a repair. Returns how many.
+	uint32_t DeclareAckLosses(uint64_t nowNs, uint64_t delayNs);
 
 	uint64_t GetBytesLeft();
 	uint64_t GetInitialSize();
@@ -334,7 +369,9 @@ public:
 	uint64_t GetTag();
 	void SetTag(uint64_t tag);void SetSrc(uint32_t src);void SetDest(uint32_t dest);void SetInitialSize(uint64_t size);
 	uint32_t GetHash(void);
-	void Acknowledge(uint64_t ack);
+	// The cumulative acknowledgement of every byte below ack; with
+	// keepCovered the sends it removes unanswered are kept in m_covered.
+	void Acknowledge(uint64_t ack, bool keepCovered = false);
 	uint64_t GetOnTheFly();
 	bool IsWinBound();
 	uint64_t GetWin(); // window size calculated from m_rate

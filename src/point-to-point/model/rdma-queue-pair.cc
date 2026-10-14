@@ -171,15 +171,23 @@ bool OutstandingPackets::RepairsAgain(uint64_t seq){
 	return !m_repaired.insert(seq / m_packet_size).second;
 }
 
-void OutstandingPackets::RemoveBelow(uint64_t seq){
+void OutstandingPackets::RemoveBelow(uint64_t seq,
+		std::vector<Unanswered> *unanswered){
 	// Rounded up so that the flow's last packet, the only one shorter than the
 	// packet size, is removed once the acknowledgement covers it.
 	const uint64_t end = (seq + m_packet_size - 1) / m_packet_size;
 	m_lost.erase(m_lost.begin(), m_lost.lower_bound(end));
 	m_repaired.erase(m_repaired.begin(), m_repaired.lower_bound(end));
 	for (; m_first < end; m_first++){
-		if (!m_ring.empty() && At(m_first).outstanding)
-			Remove(m_first);
+		if (m_ring.empty() || !At(m_first).outstanding)
+			continue;
+		if (unanswered){
+			const Record &record = At(m_first);
+			unanswered->push_back(Unanswered{Seq(m_first),
+				record.path, record.path_seq, record.trickle,
+				record.resends_lost});
+		}
+		Remove(m_first);
 	}
 }
 
@@ -223,6 +231,7 @@ RdmaQueuePair::RdmaQueuePair(uint16_t pg, Ipv4Address _sip, Ipv4Address _dip, ui
 	m_duplicate_repairs = 0;
 	m_tail_declared_lost = 0;
 	m_held_declared_lost = 0;
+	m_ack_loss_declared = 0;
 	m_tail_nacks_ignored = 0;
 	m_exploration_copies = 0;
 	m_exploration_copies_lost = 0;
@@ -557,6 +566,36 @@ uint64_t RdmaQueuePair::DeclareHeldSendLost(uint64_t seq, uint16_t path,
 	return DeclareLost(packet);
 }
 
+bool RdmaQueuePair::AnswerCovered(uint64_t seq, uint16_t path){
+	for (auto covered = m_covered.begin(); covered != m_covered.end();
+			++covered){
+		if (covered->send.seq != seq || covered->send.path != path)
+			continue;
+		if (covered->send.trickle && !covered->send.resendsLost)
+			m_pathSelector->OnTrickleAnswer(path, false,
+				Simulator::Now().GetNanoSeconds());
+		m_covered.erase(covered);
+		return true;
+	}
+	return false;
+}
+
+uint32_t RdmaQueuePair::DeclareAckLosses(uint64_t nowNs, uint64_t delayNs){
+	uint32_t declared = 0;
+	// Covered in order, and each due delayNs after it was covered.
+	while (!m_covered.empty() &&
+			m_covered.front().coveredNs + delayNs <= nowNs){
+		const OutstandingPackets::Unanswered send = m_covered.front().send;
+		m_covered.pop_front();
+		m_pathSelector->OnLoss(send.path, nowNs);
+		if (send.trickle)
+			m_pathSelector->OnTrickleAnswer(send.path, true, nowNs);
+		declared++;
+	}
+	m_ack_loss_declared += declared;
+	return declared;
+}
+
 uint32_t RdmaQueuePair::DeclareLost(uint64_t packet){
 	const uint64_t seq = m_outstanding.Seq(packet);
 	const uint32_t size = m_outstanding.Size(packet);
@@ -594,11 +633,18 @@ uint32_t RdmaQueuePair::GetHash(void){
 	return Hash32(buf.c, 12);
 }
 
-void RdmaQueuePair::Acknowledge(uint64_t ack){
+void RdmaQueuePair::Acknowledge(uint64_t ack, bool keepCovered){
 	if (ack > snd_una){
 		snd_una = ack;
-		if (m_outstanding.IsKept())
+		if (m_outstanding.IsKept() && keepCovered){
+			std::vector<OutstandingPackets::Unanswered> unanswered;
+			m_outstanding.RemoveBelow(snd_una, &unanswered);
+			const uint64_t nowNs = Simulator::Now().GetNanoSeconds();
+			for (const OutstandingPackets::Unanswered &send : unanswered)
+				m_covered.push_back(CoveredSend{send, nowNs});
+		}else if (m_outstanding.IsKept()){
 			m_outstanding.RemoveBelow(snd_una);
+		}
 		// A cumulative ACK can outrun a go-back-N rewind: resent duplicates
 		// make the receiver repeat its frontier ACK, which lands above the
 		// rewound snd_nxt. Unclamped, GetOnTheFly() underflows and the window
