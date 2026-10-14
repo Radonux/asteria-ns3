@@ -2207,7 +2207,8 @@ void RdmaHw::RecoverTrimmedQueue(Ptr<RdmaQueuePair> qp,
 			(ch.ack.flags >> qbbHeader::FLAG_CNP) & 1, now);
 		// A send a tail repair request declared lost was trimmed, not lost:
 		// the selector is not told of it. Its repair is already queued.
-		qp->CancelTailLoss(ch.ack.seq, path);
+		CancelTailLoss(GetQpKey(qp->dip.Get(), qp->sport, qp->m_pg), qp,
+			ch.ack.seq, path);
 	}
 	const uint64_t trimStart = ch.ack.seq;
 	const uint64_t trimEnd = trimStart + ch.ack.trim_payload_size;
@@ -2456,6 +2457,14 @@ int RdmaHw::ReceiveTrim(Ptr<Packet> p, CustomHeader &ch){
 
 	// The repair request the destination returned.
 	Ptr<RdmaQueuePair> qp = GetQp(ch.sip, ch.ack.dport, ch.ack.pg);
+	if (!qp && !m_tailLosses.empty() &&
+			!((ch.ack.flags >> qbbHeader::FLAG_TAIL_NACK) & 1)){
+		// The trim notification of a send of a completed queue pair, whose
+		// loss a tail repair request declared, can still drop that loss.
+		CancelTailLoss(GetQpKey(ch.sip, ch.ack.dport, ch.ack.pg), nullptr,
+			ch.ack.seq,
+			PathOf(static_cast<LoadBalancingMode>(m_loadBalancing), ch.ipid));
+	}
 	if (!qp || qp->IsFailed()) {
 		return 0;
 	}
@@ -2706,21 +2715,101 @@ void RdmaHw::AckLossDue(Ptr<RdmaQueuePair> qp){
 	ArmAckLossTimer(qp);
 }
 
-void RdmaHw::ArmTailLossTimer(Ptr<RdmaQueuePair> qp){
-	if (qp->m_tail_losses.empty() || qp->m_tailLossTimer.IsPending())
+void RdmaHw::DeferTailLosses(Ptr<RdmaQueuePair> qp,
+		const std::vector<RdmaQueuePair::DeclaredSend> &sends,
+		uint64_t guardNs){
+	if (sends.empty())
 		return;
-	const uint64_t dueNs = qp->m_tail_losses.front().dueNs;
-	const uint64_t now = Simulator::Now().GetNanoSeconds();
-	qp->m_tailLossTimer = Simulator::Schedule(
-		NanoSeconds(dueNs > now ? dueNs - now : 0), &RdmaHw::TailLossDue, this,
-		qp);
+	const uint64_t key = GetQpKey(qp->dip.Get(), qp->sport, qp->m_pg);
+	const uint32_t leaf = m_switchQueues ? m_switchQueues->LeafOf(qp->dip.Get())
+		: 0;
+	const uint64_t dueNs = Simulator::Now().GetNanoSeconds() + guardNs;
+	for (const RdmaQueuePair::DeclaredSend &send : sends)
+		m_tailLosses.emplace(dueNs,
+			TailLoss{key, qp, send.seq, send.path, send.trickle, leaf});
+	ArmTailLossTimer();
 }
 
-void RdmaHw::TailLossDue(Ptr<RdmaQueuePair> qp){
-	if (qp->IsFinished() || qp->IsFailed())
+bool RdmaHw::CancelTailLoss(uint64_t key, Ptr<RdmaQueuePair> qp, uint64_t seq,
+		uint16_t path){
+	for (auto entry = m_tailLosses.begin(); entry != m_tailLosses.end();
+			++entry){
+		const TailLoss &loss = entry->second;
+		if (loss.key != key || loss.seq != seq || loss.path != path ||
+				(loss.qp != qp && !loss.qp->IsFinished()))
+			continue;
+		m_tailLosses.erase(entry);
+		m_tailLossesCancelled++;
+		ReportTransportEvent("tail_loss_cancelled", 0);
+		ArmTailLossTimer();
+		return true;
+	}
+	return false;
+}
+
+void RdmaHw::DropTailLosses(Ptr<RdmaQueuePair> qp){
+	for (auto entry = m_tailLosses.begin(); entry != m_tailLosses.end();){
+		if (entry->second.qp == qp)
+			entry = m_tailLosses.erase(entry);
+		else
+			++entry;
+	}
+	ArmTailLossTimer();
+}
+
+void RdmaHw::ArmTailLossTimer(){
+	Simulator::Cancel(m_tailLossTimer);
+	if (m_tailLosses.empty())
 		return;
-	qp->ReportTailLosses(Simulator::Now().GetNanoSeconds());
-	ArmTailLossTimer(qp);
+	const uint64_t dueNs = m_tailLosses.begin()->first;
+	const uint64_t now = Simulator::Now().GetNanoSeconds();
+	m_tailLossTimer = Simulator::Schedule(
+		NanoSeconds(dueNs > now ? dueNs - now : 0), &RdmaHw::TailLossDue, this);
+}
+
+void RdmaHw::TailLossDue(){
+	// Each loss is told at the time it is told, which is the time the
+	// selector and the loss holds count it in.
+	const uint64_t now = Simulator::Now().GetNanoSeconds();
+	while (!m_tailLosses.empty() && m_tailLosses.begin()->first <= now){
+		const TailLoss loss = m_tailLosses.begin()->second;
+		m_tailLosses.erase(m_tailLosses.begin());
+		TellTailLoss(loss, now);
+	}
+	ArmTailLossTimer();
+}
+
+void RdmaHw::TellTailLoss(const TailLoss &loss, uint64_t nowNs){
+	if (loss.qp->IsFailed())
+		return;
+	if (!loss.qp->IsFinished()){
+		loss.qp->m_pathSelector->OnLoss(loss.path, nowNs);
+		if (loss.trickle)
+			loss.qp->m_pathSelector->OnTrickleAnswer(loss.path, true, nowNs);
+		return;
+	}
+	// The hold of RepsFlowHold was the queue pair's own.
+	if (!IsRepsHold() || m_pathSelectorKind ==
+			static_cast<uint32_t>(PathSelectorKind::RepsFlowHold))
+		return;
+	if (IsAutoHold()){
+		AutoHold().CountLoss(loss.leaf, loss.path, nowNs);
+		if (loss.trickle)
+			AutoHold().TrickleAnswer(loss.leaf, loss.path, true, nowNs);
+		return;
+	}
+	SpineScores &hold = IsLeafHold() ? LeafHold(loss.leaf)
+		: HostScores(LossHoldParameters());
+	hold.CountIntervalLoss(loss.path, nowNs);
+	if (loss.trickle)
+		hold.TrickleAnswer(loss.path, true, nowNs);
+}
+
+uint32_t RdmaHw::TailLossesWaiting(Ptr<RdmaQueuePair> qp) const{
+	uint32_t waiting = 0;
+	for (const auto &entry : m_tailLosses)
+		waiting += entry.second.qp == qp;
+	return waiting;
 }
 
 void RdmaHw::ReportTransportEvent(const char* event, uint64_t bytes){
@@ -2733,10 +2822,9 @@ void RdmaHw::QpComplete(Ptr<RdmaQueuePair> qp){
 	Simulator::Cancel(qp->m_retransmissionTimer);
 	Simulator::Cancel(qp->m_ackLossTimer);
 	qp->m_covered.clear();
-	// A completed queue pair hears of no more trims, so the losses still
-	// waiting are told now, as they would have been at once.
-	Simulator::Cancel(qp->m_tailLossTimer);
-	qp->ReportTailLosses(UINT64_MAX);
+	// The losses of qp still waiting in m_tailLosses stay: the trim
+	// notification of a send can still follow, and m_tailLosses tells them
+	// when due.
 	if (m_cc_mode == 1){
 		Simulator::Cancel(qp->mlx.m_eventUpdateAlpha);
 		Simulator::Cancel(qp->mlx.m_eventDecreaseRate);
@@ -2762,8 +2850,7 @@ void RdmaHw::QpFail(Ptr<RdmaQueuePair> qp, uint32_t reason){
 	Simulator::Cancel(qp->m_retransmissionTimer);
 	Simulator::Cancel(qp->m_ackLossTimer);
 	qp->m_covered.clear();
-	Simulator::Cancel(qp->m_tailLossTimer);
-	qp->m_tail_losses.clear();
+	DropTailLosses(qp);
 	if (m_cc_mode == 1){
 		Simulator::Cancel(qp->mlx.m_eventUpdateAlpha);
 		Simulator::Cancel(qp->mlx.m_eventDecreaseRate);

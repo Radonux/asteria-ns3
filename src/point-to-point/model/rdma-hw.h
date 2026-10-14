@@ -16,6 +16,7 @@
 #include "spine-grader.h"
 #include "spine-redirect.h"
 #include "switch-queue-state.h"
+#include <map>
 #include <memory>
 #include <unordered_map>
 #include "pint.h"
@@ -384,16 +385,63 @@ public:
 	// SprayTailLossRtts, under SprayTailRecovery: the queue pair's base RTTs
 	// after a tail repair request declares a send lost that the selector is
 	// told of it, unless the send's trim notification arrives first
-	// (RdmaQueuePair::m_tail_losses); its repair is sent at once all the
-	// same. Zero tells the selector at once.
+	// (m_tailLosses); its repair is sent at once all the same. Zero tells the
+	// selector at once.
 	double m_sprayTailLossRtts;
 	// Refused when set to other than its default without SprayTailRecovery.
 	bool ValidTailLoss() const;
-	// Under SprayTailLossRtts: qp's timer set for its earliest send in
-	// m_tail_losses, unless it is set; and the sends due by now told to the
-	// selector, and the timer set for the next.
-	void ArmTailLossTimer(Ptr<RdmaQueuePair> qp);
-	void TailLossDue(Ptr<RdmaQueuePair> qp);
+	// Under SprayTailLossRtts, the sends a tail repair request declared lost
+	// whose loss the selector is not yet told, by the time each is due, in
+	// the order they were declared among those due together. A request names
+	// what the receiver has not seen, and the trimmed header of a send can
+	// reach the receiver after the request for it: the trim notification of
+	// seq along path for the queue pair that arrives before the send is due
+	// drops it (CancelTailLoss), as a trim is no loss to the selector. They
+	// are the host's, not the queue pair's: the late trim notification can
+	// follow the queue pair's completion, which neither tells nor drops them.
+	// Only its failure drops them (DropTailLosses).
+	struct TailLoss {
+		// The queue pair, by its key in m_qpMap (GetQpKey) and itself, since
+		// a later queue pair can take the same key.
+		uint64_t key;
+		Ptr<RdmaQueuePair> qp;
+		uint64_t seq;
+		uint16_t path;
+		bool trickle;
+		// The receiver's leaf, by which a loss told after the queue pair
+		// completed reaches the host's hold (TellTailLoss).
+		uint32_t leaf;
+	};
+	std::multimap<uint64_t, TailLoss> m_tailLosses;
+	// One timer, for the earliest due.
+	EventId m_tailLossTimer;
+	// Sends in m_tailLosses dropped by their trim notifications, each
+	// reported as the transport event tail_loss_cancelled.
+	uint32_t m_tailLossesCancelled = 0;
+	// The sends qp's tail repair request declared lost, due guardNs from now.
+	void DeferTailLosses(Ptr<RdmaQueuePair> qp,
+		const std::vector<RdmaQueuePair::DeclaredSend> &sends,
+		uint64_t guardNs);
+	// Whether a send of seq along path waits in m_tailLosses for qp, the
+	// queue pair m_qpMap holds for key, or null when it holds none, or for a
+	// completed queue pair of key; if so the earliest such is dropped.
+	bool CancelTailLoss(uint64_t key, Ptr<RdmaQueuePair> qp, uint64_t seq,
+		uint16_t path);
+	// Drop qp's sends in m_tailLosses.
+	void DropTailLosses(Ptr<RdmaQueuePair> qp);
+	// The timer set for the earliest send in m_tailLosses; and the sends due
+	// by now told, and the timer set for the next.
+	void ArmTailLossTimer();
+	void TailLossDue();
+	// Tell the loss of a send in m_tailLosses at nowNs. A queue pair still
+	// open tells its selector, as RdmaQueuePair::DeclareLost does; once it
+	// completed, the loss goes to the host's hold for the receiver's leaf as
+	// LossHoldExploration::OnLoss routes it, under RepsHold and MrcHold of
+	// every scope, and is dropped under every other selector, whose state is
+	// the queue pair's alone, RepsFlowHold's hold among them.
+	void TellTailLoss(const TailLoss &loss, uint64_t nowNs);
+	// How many of qp's sends wait in m_tailLosses.
+	uint32_t TailLossesWaiting(Ptr<RdmaQueuePair> qp) const;
 	// The runs of q due by now, requested, and q's timer set for the next.
 	void RequestTailRuns(Ptr<RdmaRxQueuePair> q);
 	// The tail fields of the data packet of qp being sent, closing when the

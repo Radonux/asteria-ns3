@@ -332,9 +332,13 @@ bool spray_tail_recovery_delay_ns_given = false;
 // SPINE_LOSS_OUTPUT_FILE count it then. A trimmed header can reach the
 // receiver after its request for the trimmed packet; the trim notification of
 // that send arriving before then drops the loss, a trim being no loss to the
-// selector, and repairs nothing again. A queue pair that completes tells the
-// selector of the losses still waiting at once. 0 tells the selector at once.
-// Default 1. At least 0.
+// selector, and repairs nothing again; each loss so dropped is counted as the
+// host transport event tail_loss_cancelled. The losses wait on the host, so a
+// queue pair that completes leaves its own waiting, and a trim notification
+// that follows the completion still drops one; one told after the completion
+// reaches the host's loss hold for the receiver's leaf, and under
+// reps_flow_hold, whose hold was the queue pair's, is dropped. 0 tells the
+// selector at once. Default 1. At least 0.
 double spray_tail_loss_rtts = 1;
 bool spray_tail_loss_rtts_given = false;
 bool tail_recovery() { return spray_tail_recovery == "on"; }
@@ -2964,6 +2968,8 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),
   }
   // Written under every mode, zero where SPRAY_ACK_LOSS_RTTS is off.
   transport_event_totals[{"ack_loss_declared", "control"}];
+  // Written under every mode, zero where SPRAY_TAIL_LOSS_RTTS defers nothing.
+  transport_event_totals[{"tail_loss_cancelled", "control"}];
   // The totals must land even when a watchdog exits the run mid-simulation.
   std::atexit(write_transport_event_summary);
   ZSTD_CCtx_setParameter(transport_event_raw_cctx, ZSTD_c_compressionLevel, 8);

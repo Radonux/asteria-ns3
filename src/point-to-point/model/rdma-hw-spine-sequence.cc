@@ -131,12 +131,14 @@ void RdmaHw::SendTailNack(Ptr<RdmaRxQueuePair> q, uint8_t spine,
 void RdmaHw::RecoverTail(Ptr<RdmaQueuePair> qp, const CustomHeader &ch){
 	if (!qp->m_outstanding.IsKept() || EnforceProgressDeadline(qp))
 		return;
+	const uint64_t guardNs =
+		static_cast<uint64_t>(m_sprayTailLossRtts * qp->m_baseRtt);
+	std::vector<RdmaQueuePair::DeclaredSend> deferred;
 	const uint64_t lost = qp->DeclareLostOnPathSeqs(ch.ack.tail_spine,
-		ch.ack.tail_seq, ch.ack.tail_count,
-		static_cast<uint64_t>(m_sprayTailLossRtts * qp->m_baseRtt));
+		ch.ack.tail_seq, ch.ack.tail_count, guardNs > 0 ? &deferred : nullptr);
+	DeferTailLosses(qp, deferred, guardNs);
 	if (lost == 0)
 		return;
-	ArmTailLossTimer(qp);
 	if (m_cc_mode == 11 && DeliverCongestionSignal(qp)){
 		qp->nscc.OnLoss(lost);
 		ApplyNsccWindow(qp);
