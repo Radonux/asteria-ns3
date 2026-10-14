@@ -384,8 +384,8 @@ public:
 	bool ValidTailRecovery() const;
 	// SprayTailLossRtts, under SprayTailRecovery: the queue pair's base RTTs
 	// after a tail repair request declares a send lost that the selector is
-	// told of it, unless the send's trim notification arrives first
-	// (m_tailLosses); its repair is sent at once all the same. Zero tells the
+	// told of it, unless the send's trim notification or acknowledgement
+	// arrives first (m_tailLosses); its repair is sent at once all the same. Zero tells the
 	// selector at once.
 	double m_sprayTailLossRtts;
 	// Refused when set to other than its default without SprayTailRecovery.
@@ -393,13 +393,15 @@ public:
 	// Under SprayTailLossRtts, the sends a tail repair request declared lost
 	// whose loss the selector is not yet told, by the time each is due, in
 	// the order they were declared among those due together. A request names
-	// what the receiver has not seen, and the trimmed header of a send can
-	// reach the receiver after the request for it: the trim notification of
-	// seq along path for the queue pair that arrives before the send is due
-	// drops it (CancelTailLoss), as a trim is no loss to the selector. They
-	// are the host's, not the queue pair's: the late trim notification can
-	// follow the queue pair's completion, which neither tells nor drops them.
-	// Only its failure drops them (DropTailLosses).
+	// what the receiver has not seen, and the trimmed header of a send, or
+	// the send itself queued longer than the receiver's delay, can reach the
+	// receiver after the request for it: the trim notification of seq along
+	// path for the queue pair, or the acknowledgement of seq along path, that
+	// arrives before the send is due drops it (CancelTailLoss), as a trim is
+	// no loss to the selector and an acknowledged send none at all. They are
+	// the host's, not the queue pair's: the late trim notification or
+	// acknowledgement can follow the queue pair's completion, which neither
+	// tells nor drops them. Only its failure drops them (DropTailLosses).
 	struct TailLoss {
 		// The queue pair, by its key in m_qpMap (GetQpKey) and itself, since
 		// a later queue pair can take the same key.
@@ -411,6 +413,10 @@ public:
 		// The receiver's leaf, by which a loss told after the queue pair
 		// completed reaches the host's hold (TellTailLoss).
 		uint32_t leaf;
+		// Whether a repair of seq left along path, so that an
+		// acknowledgement of seq along path may be the repair's
+		// (NoteTailRepair).
+		bool repairedOnPath = false;
 	};
 	std::multimap<uint64_t, TailLoss> m_tailLosses;
 	// One timer, for the earliest due.
@@ -418,15 +424,28 @@ public:
 	// Sends in m_tailLosses dropped by their trim notifications, each
 	// reported as the transport event tail_loss_cancelled.
 	uint32_t m_tailLossesCancelled = 0;
+	// Sends in m_tailLosses dropped by their acknowledgements, each reported
+	// as the transport event tail_loss_delivered; and those of them a repair
+	// of the same sequence along the same path had left before, whose
+	// acknowledgement may be the repair's, each reported as
+	// tail_loss_ambiguous instead.
+	uint32_t m_tailLossesDelivered = 0;
+	uint32_t m_tailLossesAmbiguous = 0;
+	// What names a send in m_tailLosses as not lost.
+	enum class TailLossEnd { Trimmed, Acknowledged };
 	// The sends qp's tail repair request declared lost, due guardNs from now.
 	void DeferTailLosses(Ptr<RdmaQueuePair> qp,
 		const std::vector<RdmaQueuePair::DeclaredSend> &sends,
 		uint64_t guardNs);
 	// Whether a send of seq along path waits in m_tailLosses for qp, the
 	// queue pair m_qpMap holds for key, or null when it holds none, or for a
-	// completed queue pair of key; if so the earliest such is dropped.
+	// completed queue pair of key; if so the earliest such is dropped,
+	// counted and reported by end.
 	bool CancelTailLoss(uint64_t key, Ptr<RdmaQueuePair> qp, uint64_t seq,
-		uint16_t path);
+		uint16_t path, TailLossEnd end);
+	// A repair of seq left for qp along path: each of qp's sends of seq
+	// along path in m_tailLosses is marked repairedOnPath.
+	void NoteTailRepair(Ptr<RdmaQueuePair> qp, uint64_t seq, uint16_t path);
 	// Drop qp's sends in m_tailLosses.
 	void DropTailLosses(Ptr<RdmaQueuePair> qp);
 	// The timer set for the earliest send in m_tailLosses; and the sends due

@@ -1903,6 +1903,15 @@ int RdmaHw::ReceiveAck(Ptr<Packet> p, CustomHeader &ch){
 	int i;
 	Ptr<RdmaQueuePair> qp = GetQp(ch.sip, port, qIndex);
 	if (!qp){
+		// The receiver answers a send that arrives after the queue pair
+		// completed, as a duplicate; the answer of a send a tail repair
+		// request declared lost can still drop that loss.
+		if (!m_tailLosses.empty() &&
+				!((ch.ack.flags >> qbbHeader::FLAG_PROBE_ANSWER) & 1))
+			CancelTailLoss(GetQpKey(ch.sip, port, qIndex), nullptr,
+				ch.ack.packet_seq,
+				PathOf(static_cast<LoadBalancingMode>(m_loadBalancing), ch.ipid),
+				TailLossEnd::Acknowledged);
 		return 0;
 	}
 
@@ -1944,6 +1953,12 @@ int RdmaHw::ReceiveAck(Ptr<Packet> p, CustomHeader &ch){
 					ApplyNsccWindow(qp);
 				}
 			}else{
+				// A send a tail repair request declared lost that is
+				// answered arrived: it had waited in a queue longer than the
+				// receiver's delay. Its record is gone, so this looks first.
+				if (!m_tailLosses.empty())
+					CancelTailLoss(GetQpKey(qp->dip.Get(), qp->sport, qp->m_pg),
+						qp, ch.ack.packet_seq, path, TailLossEnd::Acknowledged);
 				if (IsAckRedirect())
 					qp->m_pathSelector->OnRedirect(
 						DecodeRedirect(ch.ack.redirect, m_spineCount),
@@ -2208,7 +2223,7 @@ void RdmaHw::RecoverTrimmedQueue(Ptr<RdmaQueuePair> qp,
 		// A send a tail repair request declared lost was trimmed, not lost:
 		// the selector is not told of it. Its repair is already queued.
 		CancelTailLoss(GetQpKey(qp->dip.Get(), qp->sport, qp->m_pg), qp,
-			ch.ack.seq, path);
+			ch.ack.seq, path, TailLossEnd::Trimmed);
 	}
 	const uint64_t trimStart = ch.ack.seq;
 	const uint64_t trimEnd = trimStart + ch.ack.trim_payload_size;
@@ -2463,7 +2478,8 @@ int RdmaHw::ReceiveTrim(Ptr<Packet> p, CustomHeader &ch){
 		// loss a tail repair request declared, can still drop that loss.
 		CancelTailLoss(GetQpKey(ch.sip, ch.ack.dport, ch.ack.pg), nullptr,
 			ch.ack.seq,
-			PathOf(static_cast<LoadBalancingMode>(m_loadBalancing), ch.ipid));
+			PathOf(static_cast<LoadBalancingMode>(m_loadBalancing), ch.ipid),
+			TailLossEnd::Trimmed);
 	}
 	if (!qp || qp->IsFailed()) {
 		return 0;
@@ -2731,20 +2747,38 @@ void RdmaHw::DeferTailLosses(Ptr<RdmaQueuePair> qp,
 }
 
 bool RdmaHw::CancelTailLoss(uint64_t key, Ptr<RdmaQueuePair> qp, uint64_t seq,
-		uint16_t path){
+		uint16_t path, TailLossEnd end){
 	for (auto entry = m_tailLosses.begin(); entry != m_tailLosses.end();
 			++entry){
 		const TailLoss &loss = entry->second;
 		if (loss.key != key || loss.seq != seq || loss.path != path ||
 				(loss.qp != qp && !loss.qp->IsFinished()))
 			continue;
+		const bool repairedOnPath = loss.repairedOnPath;
 		m_tailLosses.erase(entry);
-		m_tailLossesCancelled++;
-		ReportTransportEvent("tail_loss_cancelled", 0);
+		if (end == TailLossEnd::Trimmed){
+			m_tailLossesCancelled++;
+			ReportTransportEvent("tail_loss_cancelled", 0);
+		}else if (repairedOnPath){
+			m_tailLossesAmbiguous++;
+			ReportTransportEvent("tail_loss_ambiguous", 0);
+		}else{
+			m_tailLossesDelivered++;
+			ReportTransportEvent("tail_loss_delivered", 0);
+		}
 		ArmTailLossTimer();
 		return true;
 	}
 	return false;
+}
+
+void RdmaHw::NoteTailRepair(Ptr<RdmaQueuePair> qp, uint64_t seq,
+		uint16_t path){
+	for (auto &entry : m_tailLosses){
+		TailLoss &loss = entry.second;
+		if (loss.qp == qp && loss.seq == seq && loss.path == path)
+			loss.repairedOnPath = true;
+	}
 }
 
 void RdmaHw::DropTailLosses(Ptr<RdmaQueuePair> qp){
@@ -3008,6 +3042,10 @@ Ptr<Packet> RdmaHw::GetNxtPacket(Ptr<RdmaQueuePair> qp){
 		}
 		if (is_repair && qp->m_outstanding.RepairsAgain(seq))
 			qp->m_duplicate_repairs++;
+		// The acknowledgement of this repair names seq along path, as that
+		// of a send of seq along path declared lost would.
+		if (is_repair && !m_tailLosses.empty())
+			NoteTailRepair(qp, seq, path);
 	}else{
 		ipHeader.SetIdentification(qp->m_ipid);
 	}

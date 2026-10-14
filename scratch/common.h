@@ -329,11 +329,14 @@ bool spray_tail_recovery_delay_ns_given = false;
 // Under SPRAY_TAIL_RECOVERY on, SPRAY_TAIL_LOSS_RTTS <x>: a send a tail repair
 // request declares lost is repaired at once, but the path selector is told of
 // its loss x of the queue pair's base RTTs later, so that the loss holds and
-// SPINE_LOSS_OUTPUT_FILE count it then. A trimmed header can reach the
-// receiver after its request for the trimmed packet; the trim notification of
-// that send arriving before then drops the loss, a trim being no loss to the
-// selector, and repairs nothing again; each loss so dropped is counted as the
-// host transport event tail_loss_cancelled. The losses wait on the host, so a
+// SPINE_LOSS_OUTPUT_FILE count it then. A trimmed header can reach the receiver
+// after its request for the trimmed packet; the trim notification of that send
+// arriving before then drops the loss, a trim being no loss to the selector,
+// and repairs nothing again; each loss so dropped is counted as the host
+// transport event tail_loss_cancelled. An acknowledgement of the declared send
+// along its path, the send having arrived after the request, drops the loss as
+// well, counted as tail_loss_delivered, or as tail_loss_ambiguous when a repair
+// of the send had left along the same path. The losses wait on the host, so a
 // queue pair that completes leaves its own waiting, and a trim notification
 // that follows the completion still drops one; one told after the completion
 // reaches the host's loss hold for the receiver's leaf, and under
@@ -2970,6 +2973,8 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),
   transport_event_totals[{"ack_loss_declared", "control"}];
   // Written under every mode, zero where SPRAY_TAIL_LOSS_RTTS defers nothing.
   transport_event_totals[{"tail_loss_cancelled", "control"}];
+  transport_event_totals[{"tail_loss_delivered", "control"}];
+  transport_event_totals[{"tail_loss_ambiguous", "control"}];
   // The totals must land even when a watchdog exits the run mid-simulation.
   std::atexit(write_transport_event_summary);
   ZSTD_CCtx_setParameter(transport_event_raw_cctx, ZSTD_c_compressionLevel, 8);
