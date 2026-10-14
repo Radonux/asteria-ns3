@@ -684,6 +684,16 @@ TypeId RdmaHw::GetTypeId (void)
 				UintegerValue(RdmaHw::kTailDelayBaseRtt),
 				MakeUintegerAccessor(&RdmaHw::m_sprayTailRecoveryDelayNs),
 				MakeUintegerChecker<uint64_t>())
+		.AddAttribute("SprayTailLossRtts",
+				"Under SprayTailRecovery, the queue pair's base RTTs after a "
+				"tail repair request declares a send lost that the path "
+				"selector is told of the loss; a trim notification of the "
+				"send arriving before then drops it, a trim being no loss. "
+				"The send is repaired at once all the same. 0 tells the "
+				"selector at once. Default 1.",
+				DoubleValue(1),
+				MakeDoubleAccessor(&RdmaHw::m_sprayTailLossRtts),
+				MakeDoubleChecker<double>(0))
 		.AddAttribute("SprayReceiverHold",
 				"Under PathSelector 6, 7 and 9 with SprayPathSeq, whether the "
 				"receiver holds spines by the packets missing on them per "
@@ -1078,6 +1088,8 @@ void RdmaHw::Setup(QpCompleteCallback cb, QpFailureCallback failure_cb){
 		"at most 8 spines, and data headers carry a count per spine and "
 		"repair requests the tail fields exactly when it is set "
 		"(CustomHeader::udpTailCounts, CustomHeader::ackTailNackBytes)");
+	NS_ABORT_MSG_IF(!ValidTailLoss(),
+		"SprayTailLossRtts is read only under SprayTailRecovery");
 	NS_ABORT_MSG_IF(!ValidReceiverHold(),
 		"SprayReceiverHold needs SprayPathSeq, PathSelector 6, 7 or 9, "
 		"SwitchQueueState for the hosts' leaves and at most 8 spines, and "
@@ -1662,6 +1674,10 @@ bool RdmaHw::ValidPoolHoldPropagates() const{
 		m_spraySenderPoolWeight > 0;
 }
 
+bool RdmaHw::ValidTailLoss() const{
+	return m_sprayTailLossRtts == 1 || m_sprayTailRecovery;
+}
+
 bool RdmaHw::ValidAckLoss() const{
 	return m_sprayAckLossRtts == 0 || m_loadBalancing ==
 		static_cast<uint32_t>(LoadBalancingMode::SprayUniform);
@@ -2189,6 +2205,9 @@ void RdmaHw::RecoverTrimmedQueue(Ptr<RdmaQueuePair> qp,
 			qp->m_pathSelector->OnReport(ReportOf(ch), now);
 		qp->m_pathSelector->OnTrim(path, lastHop,
 			(ch.ack.flags >> qbbHeader::FLAG_CNP) & 1, now);
+		// A send a tail repair request declared lost was trimmed, not lost:
+		// the selector is not told of it. Its repair is already queued.
+		qp->CancelTailLoss(ch.ack.seq, path);
 	}
 	const uint64_t trimStart = ch.ack.seq;
 	const uint64_t trimEnd = trimStart + ch.ack.trim_payload_size;
@@ -2687,6 +2706,23 @@ void RdmaHw::AckLossDue(Ptr<RdmaQueuePair> qp){
 	ArmAckLossTimer(qp);
 }
 
+void RdmaHw::ArmTailLossTimer(Ptr<RdmaQueuePair> qp){
+	if (qp->m_tail_losses.empty() || qp->m_tailLossTimer.IsPending())
+		return;
+	const uint64_t dueNs = qp->m_tail_losses.front().dueNs;
+	const uint64_t now = Simulator::Now().GetNanoSeconds();
+	qp->m_tailLossTimer = Simulator::Schedule(
+		NanoSeconds(dueNs > now ? dueNs - now : 0), &RdmaHw::TailLossDue, this,
+		qp);
+}
+
+void RdmaHw::TailLossDue(Ptr<RdmaQueuePair> qp){
+	if (qp->IsFinished() || qp->IsFailed())
+		return;
+	qp->ReportTailLosses(Simulator::Now().GetNanoSeconds());
+	ArmTailLossTimer(qp);
+}
+
 void RdmaHw::ReportTransportEvent(const char* event, uint64_t bytes){
 	if (!m_transportEventCallback.IsNull())
 		m_transportEventCallback(event, bytes);
@@ -2697,6 +2733,10 @@ void RdmaHw::QpComplete(Ptr<RdmaQueuePair> qp){
 	Simulator::Cancel(qp->m_retransmissionTimer);
 	Simulator::Cancel(qp->m_ackLossTimer);
 	qp->m_covered.clear();
+	// A completed queue pair hears of no more trims, so the losses still
+	// waiting are told now, as they would have been at once.
+	Simulator::Cancel(qp->m_tailLossTimer);
+	qp->ReportTailLosses(UINT64_MAX);
 	if (m_cc_mode == 1){
 		Simulator::Cancel(qp->mlx.m_eventUpdateAlpha);
 		Simulator::Cancel(qp->mlx.m_eventDecreaseRate);
@@ -2722,6 +2762,8 @@ void RdmaHw::QpFail(Ptr<RdmaQueuePair> qp, uint32_t reason){
 	Simulator::Cancel(qp->m_retransmissionTimer);
 	Simulator::Cancel(qp->m_ackLossTimer);
 	qp->m_covered.clear();
+	Simulator::Cancel(qp->m_tailLossTimer);
+	qp->m_tail_losses.clear();
 	if (m_cc_mode == 1){
 		Simulator::Cancel(qp->mlx.m_eventUpdateAlpha);
 		Simulator::Cancel(qp->mlx.m_eventDecreaseRate);

@@ -233,6 +233,7 @@ RdmaQueuePair::RdmaQueuePair(uint16_t pg, Ipv4Address _sip, Ipv4Address _dip, ui
 	m_held_declared_lost = 0;
 	m_ack_loss_declared = 0;
 	m_tail_nacks_ignored = 0;
+	m_tail_losses_cancelled = 0;
 	m_exploration_copies = 0;
 	m_exploration_copies_lost = 0;
 	m_timeouts = 0;
@@ -536,7 +537,7 @@ uint64_t RdmaQueuePair::DeclareLostSentBy(uint64_t sentNs){
 }
 
 uint64_t RdmaQueuePair::DeclareLostOnPathSeqs(uint16_t path, uint16_t first,
-		uint16_t count){
+		uint16_t count, uint64_t guardNs){
 	std::vector<uint64_t> named;
 	for (uint64_t send = m_outstanding.NewestOnPath(path);
 			send != OutstandingPackets::kNone;
@@ -548,12 +549,45 @@ uint64_t RdmaQueuePair::DeclareLostOnPathSeqs(uint16_t path, uint16_t first,
 	}
 	uint64_t lost = 0;
 	// Oldest first, as the per-path rule declares them.
-	for (auto send = named.rbegin(); send != named.rend(); ++send)
-		lost += DeclareLost(*send);
+	const uint64_t dueNs = Simulator::Now().GetNanoSeconds() + guardNs;
+	for (auto send = named.rbegin(); send != named.rend(); ++send){
+		if (guardNs == 0){
+			lost += DeclareLost(*send);
+			continue;
+		}
+		m_tail_losses.push_back(TailLoss{m_outstanding.Seq(*send),
+			m_outstanding.Path(*send), m_outstanding.Trickle(*send), dueNs});
+		lost += DeclareLost(*send, false);
+	}
 	m_tail_declared_lost += named.size();
 	if (named.empty())
 		m_tail_nacks_ignored++;
 	return lost;
+}
+
+bool RdmaQueuePair::CancelTailLoss(uint64_t seq, uint16_t path){
+	for (auto loss = m_tail_losses.begin(); loss != m_tail_losses.end(); ++loss){
+		if (loss->seq != seq || loss->path != path)
+			continue;
+		m_tail_losses.erase(loss);
+		m_tail_losses_cancelled++;
+		return true;
+	}
+	return false;
+}
+
+uint32_t RdmaQueuePair::ReportTailLosses(uint64_t nowNs){
+	uint32_t reported = 0;
+	// Declared in order, and each due the same guard after it was declared.
+	while (!m_tail_losses.empty() && m_tail_losses.front().dueNs <= nowNs){
+		const TailLoss loss = m_tail_losses.front();
+		m_tail_losses.pop_front();
+		m_pathSelector->OnLoss(loss.path, nowNs);
+		if (loss.trickle)
+			m_pathSelector->OnTrickleAnswer(loss.path, true, nowNs);
+		reported++;
+	}
+	return reported;
 }
 
 uint64_t RdmaQueuePair::DeclareHeldSendLost(uint64_t seq, uint16_t path,
@@ -596,14 +630,16 @@ uint32_t RdmaQueuePair::DeclareAckLosses(uint64_t nowNs, uint64_t delayNs){
 	return declared;
 }
 
-uint32_t RdmaQueuePair::DeclareLost(uint64_t packet){
+uint32_t RdmaQueuePair::DeclareLost(uint64_t packet, bool report){
 	const uint64_t seq = m_outstanding.Seq(packet);
 	const uint32_t size = m_outstanding.Size(packet);
-	m_pathSelector->OnLoss(m_outstanding.Path(packet),
-		Simulator::Now().GetNanoSeconds());
-	if (m_outstanding.Trickle(packet))
-		m_pathSelector->OnTrickleAnswer(m_outstanding.Path(packet), true,
+	if (report){
+		m_pathSelector->OnLoss(m_outstanding.Path(packet),
 			Simulator::Now().GetNanoSeconds());
+		if (m_outstanding.Trickle(packet))
+			m_pathSelector->OnTrickleAnswer(m_outstanding.Path(packet), true,
+				Simulator::Now().GetNanoSeconds());
+	}
 	AddRepairRange(seq, seq + size);
 	m_outstanding.RemoveLost(packet);
 	m_recovery_events++;

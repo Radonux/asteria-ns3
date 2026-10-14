@@ -132,9 +132,11 @@ void RdmaHw::RecoverTail(Ptr<RdmaQueuePair> qp, const CustomHeader &ch){
 	if (!qp->m_outstanding.IsKept() || EnforceProgressDeadline(qp))
 		return;
 	const uint64_t lost = qp->DeclareLostOnPathSeqs(ch.ack.tail_spine,
-		ch.ack.tail_seq, ch.ack.tail_count);
+		ch.ack.tail_seq, ch.ack.tail_count,
+		static_cast<uint64_t>(m_sprayTailLossRtts * qp->m_baseRtt));
 	if (lost == 0)
 		return;
+	ArmTailLossTimer(qp);
 	if (m_cc_mode == 11 && DeliverCongestionSignal(qp)){
 		qp->nscc.OnLoss(lost);
 		ApplyNsccWindow(qp);

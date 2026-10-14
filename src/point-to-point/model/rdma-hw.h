@@ -381,6 +381,19 @@ public:
 	uint64_t m_sprayTailRecoveryDelayNs;
 	uint64_t TailRecoveryDelayNs() const;
 	bool ValidTailRecovery() const;
+	// SprayTailLossRtts, under SprayTailRecovery: the queue pair's base RTTs
+	// after a tail repair request declares a send lost that the selector is
+	// told of it, unless the send's trim notification arrives first
+	// (RdmaQueuePair::m_tail_losses); its repair is sent at once all the
+	// same. Zero tells the selector at once.
+	double m_sprayTailLossRtts;
+	// Refused when set to other than its default without SprayTailRecovery.
+	bool ValidTailLoss() const;
+	// Under SprayTailLossRtts: qp's timer set for its earliest send in
+	// m_tail_losses, unless it is set; and the sends due by now told to the
+	// selector, and the timer set for the next.
+	void ArmTailLossTimer(Ptr<RdmaQueuePair> qp);
+	void TailLossDue(Ptr<RdmaQueuePair> qp);
 	// The runs of q due by now, requested, and q's timer set for the next.
 	void RequestTailRuns(Ptr<RdmaRxQueuePair> q);
 	// The tail fields of the data packet of qp being sent, closing when the

@@ -10021,6 +10021,8 @@ class SprayTailRecoveryTest : public TestCase
         TailLoss();
         LostClosingPacket();
         OvertakenClosingPacket();
+        TrimmedAfterRequest();
+        LossReportedAtOnce();
 
         CustomHeader::ackTailNackBytes = savedNack;
         CustomHeader::udpTailCounts = savedCounts;
@@ -10050,6 +10052,24 @@ class SprayTailRecoveryTest : public TestCase
     {
         CustomHeader::udpTailCounts = on ? kSpines : 0;
         CustomHeader::ackTailNackBytes = on ? 5 : 0;
+    }
+
+    // Trim packet as SwitchNode::TrimInPlace does with MIN_TRIM_SIZE 24: keep
+    // the larger of it and the data headers of IP payload, and mark it.
+    static void Trim(Ptr<Packet> packet)
+    {
+        const uint32_t kept =
+            std::max<uint32_t>(std::max<uint32_t>(24, CustomHeader::GetUdpHeaderSize()),
+                               60 - 14 - 20);
+        packet->RemoveAtEnd(packet->GetSize() - PppHeader::GetStaticSize() - 20 - kept);
+        PppHeader ppp;
+        Ipv4Header ip;
+        packet->RemoveHeader(ppp);
+        packet->RemoveHeader(ip);
+        ip.SetDscp(static_cast<Ipv4Header::DscpType>(kUetDscpTrimmed));
+        ip.SetPayloadSize(kept);
+        packet->AddHeader(ip);
+        packet->AddHeader(ppp);
     }
 
     static CustomHeader Parse(Ptr<const Packet> packet)
@@ -10312,6 +10332,24 @@ class SprayTailRecoveryTest : public TestCase
         NS_TEST_EXPECT_MSG_EQ(hw->ValidTailRecovery(), false, "off, the headers do not grow");
         hw->m_sprayTailRecovery = true;
         NS_TEST_EXPECT_MSG_EQ(hw->ValidTailRecovery(), true, "accepted again");
+
+        Ptr<RdmaHw> guarded = CreateObject<RdmaHw>();
+        DoubleValue rtts;
+        guarded->GetAttribute("SprayTailLossRtts", rtts);
+        NS_TEST_EXPECT_MSG_EQ(rtts.Get(), 1.0, "SprayTailLossRtts is 1 by default");
+        NS_TEST_EXPECT_MSG_EQ(guarded->ValidTailLoss(), true, "unset, accepted without tail recovery");
+        for (double value : {0.0, 2.0})
+        {
+            guarded->SetAttribute("SprayTailLossRtts", DoubleValue(value));
+            guarded->m_sprayTailRecovery = false;
+            NS_TEST_EXPECT_MSG_EQ(guarded->ValidTailLoss(),
+                                  false,
+                                  "set, refused without SprayTailRecovery");
+            guarded->m_sprayTailRecovery = true;
+            NS_TEST_EXPECT_MSG_EQ(guarded->ValidTailLoss(),
+                                  true,
+                                  "accepted under SprayTailRecovery");
+        }
     }
 
     enum class Loss
@@ -10325,6 +10363,9 @@ class SprayTailRecoveryTest : public TestCase
         // The same packet delayed instead, to arrive kOvertakeNs after the
         // last one.
         Overtaken,
+        // The same packet trimmed instead: its header arrives trimLateNs
+        // after the packet would have, and its payload is dropped.
+        Trimmed,
     };
 
     struct Nack
@@ -10348,6 +10389,20 @@ class SprayTailRecoveryTest : public TestCase
         uint32_t tailDrops = 0;
         uint8_t droppedSpine = 0;
         uint16_t droppedPathSeq = 0;
+        uint64_t droppedSeq = UINT64_MAX;
+        // The sends of droppedSeq after its first.
+        uint32_t repairs = 0;
+        uint32_t trimNotifications = 0;
+        // When the first tail repair request reached the sender, when the
+        // first repair of droppedSeq left, and the losses then waiting on
+        // the guard; the losses still waiting just before and just after the
+        // guard of the first request ends.
+        uint64_t nackArrivalNs = 0;
+        uint64_t repairNs = 0;
+        uint32_t waitingAtRepair = 0;
+        uint32_t waitingBeforeDue = 0;
+        uint32_t waitingAfterDue = 0;
+        uint32_t lossesCancelled = 0;
         uint32_t tailDeclared = 0;
         uint32_t tailIgnored = 0;
         uint32_t closingSends = 0;
@@ -10360,12 +10415,14 @@ class SprayTailRecoveryTest : public TestCase
     static void Configure(Ptr<RdmaHw> hw,
                           bool tailRecovery,
                           PathSelectorKind kind,
-                          uint64_t delayNs)
+                          uint64_t delayNs,
+                          double tailLossRtts)
     {
         hw->m_sprayBaseRttNs = kBaseRttNs;
         hw->m_sprayTailRecoveryDelayNs = delayNs;
         hw->m_sprayPathSeq = true;
         hw->m_sprayTailRecovery = tailRecovery;
+        hw->m_sprayTailLossRtts = tailLossRtts;
         hw->m_pathSelectorKind = static_cast<uint32_t>(kind);
         if (kind == PathSelectorKind::RepsHold)
         {
@@ -10385,15 +10442,17 @@ class SprayTailRecoveryTest : public TestCase
                  Loss loss,
                  PathSelectorKind kind,
                  uint32_t packets,
-                 uint64_t delayNs = RdmaHw::kTailDelayBaseRtt)
+                 uint64_t delayNs = RdmaHw::kTailDelayBaseRtt,
+                 uint64_t trimLateNs = 0,
+                 double tailLossRtts = 1)
     {
         SetHeaders(tailRecovery);
         Outcome outcome;
         {
             IsolatedHost sender(LoadBalancingMode::SprayUniform, kTestReceiver, kSpines);
             IsolatedHost receiver(LoadBalancingMode::SprayUniform, kTestSender, kSpines);
-            Configure(sender.hw, tailRecovery, kind, delayNs);
-            Configure(receiver.hw, tailRecovery, kind, delayNs);
+            Configure(sender.hw, tailRecovery, kind, delayNs, tailLossRtts);
+            Configure(receiver.hw, tailRecovery, kind, delayNs, tailLossRtts);
             Ptr<RdmaHw> hw = sender.hw;
             hw->m_retransmission_timeout_ns = kTimeoutNs;
             NS_TEST_EXPECT_MSG_EQ(hw->ValidTailRecovery(), true, "a valid configuration");
@@ -10440,6 +10499,18 @@ class SprayTailRecoveryTest : public TestCase
                     {
                         outcome.nacks.push_back(
                             Nack{parsed.ack.tail_spine, parsed.ack.tail_seq, parsed.ack.tail_count});
+                        if (outcome.nackArrivalNs == 0)
+                        {
+                            outcome.nackArrivalNs = Simulator::Now().GetNanoSeconds() + kOneWayNs;
+                            const uint64_t guardNs =
+                                static_cast<uint64_t>(tailLossRtts * kBaseRttNs);
+                            Simulator::Schedule(NanoSeconds(kOneWayNs + guardNs - 1), [&]() {
+                                outcome.waitingBeforeDue = qp->m_tail_losses.size();
+                            });
+                            Simulator::Schedule(NanoSeconds(kOneWayNs + guardNs + 1), [&]() {
+                                outcome.waitingAfterDue = qp->m_tail_losses.size();
+                            });
+                        }
                     }
                     Simulator::Schedule(NanoSeconds(kOneWayNs), [&sender, packet]() {
                         CustomHeader header = Parse(packet);
@@ -10467,6 +10538,7 @@ class SprayTailRecoveryTest : public TestCase
             std::set<uint64_t> sent;
             std::vector<EventId> inFlight(kSpines);
             std::vector<uint16_t> inFlightPathSeq(kSpines, 0);
+            std::vector<uint64_t> inFlightSeq(kSpines, 0);
             std::vector<uint64_t> inFlightSentNs(kSpines, 0);
             std::vector<Ptr<Packet>> inFlightPacket(kSpines);
             std::function<void()> step = [&]() {
@@ -10483,6 +10555,11 @@ class SprayTailRecoveryTest : public TestCase
                     const uint64_t now = Simulator::Now().GetNanoSeconds();
                     const bool fresh = sent.insert(header.udp.seq).second;
                     const bool last = fresh && header.udp.seq + kMtu >= size;
+                    if (!fresh && header.udp.seq == outcome.droppedSeq && outcome.repairs++ == 0)
+                    {
+                        outcome.repairNs = now;
+                        outcome.waitingAtRepair = qp->m_tail_losses.size();
+                    }
                     outcome.closingSends +=
                         tailRecovery && (header.udp.tail_flags & kTailCloses) != 0;
                     if (last)
@@ -10516,9 +10593,18 @@ class SprayTailRecoveryTest : public TestCase
                             Simulator::Cancel(inFlight[newest]);
                             outcome.droppedSpine = static_cast<uint8_t>(newest);
                             outcome.droppedPathSeq = inFlightPathSeq[newest];
+                            outcome.droppedSeq = inFlightSeq[newest];
                             if (loss == Loss::ClosingPacket)
                             {
                                 outcome.drops++;
+                            }
+                            else if (loss == Loss::Trimmed)
+                            {
+                                const Ptr<Packet> trimmed = inFlightPacket[newest]->Copy();
+                                Trim(trimmed);
+                                const uint64_t left = inFlightSentNs[newest] + kOneWayNs - now;
+                                Simulator::Schedule(NanoSeconds(left + trimLateNs),
+                                                    [&deliver, trimmed]() { deliver(trimmed); });
                             }
                             else
                             {
@@ -10545,6 +10631,7 @@ class SprayTailRecoveryTest : public TestCase
                         {
                             inFlight[spine] = arrival;
                             inFlightPathSeq[spine] = header.udp.path_seq;
+                            inFlightSeq[spine] = header.udp.seq;
                             inFlightSentNs[spine] = now;
                             inFlightPacket[spine] = packet;
                         }
@@ -10566,6 +10653,8 @@ class SprayTailRecoveryTest : public TestCase
             outcome.tailDeclared = qp->m_tail_declared_lost;
             outcome.tailIgnored = qp->m_tail_nacks_ignored;
             outcome.declaredLost = qp->m_recovery_events;
+            outcome.trimNotifications = qp->m_trim_notifications;
+            outcome.lossesCancelled = qp->m_tail_losses_cancelled;
             Simulator::Destroy();
         }
         return outcome;
@@ -10634,6 +10723,14 @@ class SprayTailRecoveryTest : public TestCase
         NS_TEST_EXPECT_MSG_EQ(on.lossesTraced[on.droppedSpine],
                               1u,
                               "the hold's loss trace counts it on its spine");
+        NS_TEST_EXPECT_MSG_EQ(on.repairs, 1u, "it is repaired once");
+        NS_TEST_EXPECT_MSG_LT_OR_EQ(on.repairNs - on.nackArrivalNs,
+                                    kStepNs,
+                                    "at once on the request");
+        NS_TEST_EXPECT_MSG_EQ(on.waitingAtRepair, 1u, "while its loss waits on the guard");
+        NS_TEST_EXPECT_MSG_EQ(on.waitingBeforeDue, 1u, "until the guard ends");
+        NS_TEST_EXPECT_MSG_EQ(on.waitingAfterDue, 0u, "and is told then");
+        NS_TEST_EXPECT_MSG_EQ(on.lossesCancelled, 0u, "no trim drops it");
         NS_TEST_EXPECT_MSG_LT_OR_EQ(on.receivedNs - on.endNs,
                                     kBaseRttNs * 3 / 2 + kDelayNs + kStepNs,
                                     "within 1.5 base RTT and the delay of the end");
@@ -10644,6 +10741,83 @@ class SprayTailRecoveryTest : public TestCase
         const Outcome off = Flow(false, Loss::ClosingPacket, PathSelectorKind::RepsHold, kPackets);
         NS_TEST_EXPECT_MSG_EQ(off.completed, true, "off: the flow completes");
         NS_TEST_EXPECT_MSG_GT(off.timeouts, 0u, "off: the loss waits out the timeout");
+    }
+
+    // The trimmed header of spine k's last packet before the end reaches the
+    // receiver after its request for the packet: the request declares it
+    // lost and it is repaired at once, and its trim notification, inside the
+    // guard, keeps the loss from the selector.
+    void TrimmedAfterRequest()
+    {
+        constexpr uint32_t kPackets = 400;
+        constexpr uint64_t kLateNs = 4000;
+        const Outcome on = Flow(true,
+                                Loss::Trimmed,
+                                PathSelectorKind::RepsHold,
+                                kPackets,
+                                RdmaHw::kTailDelayBaseRtt,
+                                kLateNs);
+        NS_TEST_EXPECT_MSG_EQ(on.completed, true, "the flow completes");
+        NS_TEST_EXPECT_MSG_EQ(on.timeouts, 0u, "without a retransmission timeout");
+        NS_TEST_EXPECT_MSG_EQ(on.nacks.size(), 1u, "the trimmed packet is requested");
+        if (!on.nacks.empty())
+        {
+            NS_TEST_EXPECT_MSG_EQ(static_cast<uint32_t>(on.nacks[0].spine),
+                                  static_cast<uint32_t>(on.droppedSpine),
+                                  "on its spine");
+            NS_TEST_EXPECT_MSG_EQ(on.nacks[0].first, on.droppedPathSeq, "by its path sequence");
+            NS_TEST_EXPECT_MSG_EQ(on.nacks[0].count, 1u, "alone");
+        }
+        NS_TEST_EXPECT_MSG_EQ(on.tailDeclared, 1u, "declared lost by the request");
+        NS_TEST_EXPECT_MSG_EQ(on.declaredLost, 1u, "once");
+        NS_TEST_EXPECT_MSG_EQ(on.repairs, 1u, "repaired once");
+        NS_TEST_EXPECT_MSG_LT_OR_EQ(on.repairNs - on.nackArrivalNs,
+                                    kStepNs,
+                                    "at once on the request");
+        NS_TEST_EXPECT_MSG_EQ(on.waitingAtRepair, 1u, "while its loss waits on the guard");
+        NS_TEST_EXPECT_MSG_EQ(on.trimNotifications, 1u, "its trim notification arrives");
+        NS_TEST_EXPECT_MSG_EQ(on.lossesCancelled, 1u, "inside the guard, and drops the loss");
+        NS_TEST_EXPECT_MSG_EQ(on.waitingBeforeDue, 0u, "before the guard ends");
+        NS_TEST_EXPECT_MSG_EQ(on.lossesTraced[on.droppedSpine],
+                              0u,
+                              "no loss reaches the selector on its spine");
+    }
+
+    // With SprayTailLossRtts 0 the selector is told of a send a tail repair
+    // request declares lost at once, trimmed or not.
+    void LossReportedAtOnce()
+    {
+        constexpr uint32_t kPackets = 400;
+        const Outcome trimmed = Flow(true,
+                                     Loss::Trimmed,
+                                     PathSelectorKind::RepsHold,
+                                     kPackets,
+                                     RdmaHw::kTailDelayBaseRtt,
+                                     4000,
+                                     0);
+        NS_TEST_EXPECT_MSG_EQ(trimmed.completed, true, "trimmed: the flow completes");
+        NS_TEST_EXPECT_MSG_EQ(trimmed.tailDeclared, 1u, "trimmed: declared lost by the request");
+        NS_TEST_EXPECT_MSG_EQ(trimmed.repairs, 1u, "trimmed: repaired once");
+        NS_TEST_EXPECT_MSG_EQ(trimmed.waitingAtRepair, 0u, "trimmed: no loss waits");
+        NS_TEST_EXPECT_MSG_EQ(trimmed.lossesCancelled, 0u, "trimmed: none is dropped");
+        NS_TEST_EXPECT_MSG_EQ(trimmed.lossesTraced[trimmed.droppedSpine],
+                              1u,
+                              "trimmed: the loss reaches the selector");
+
+        const Outcome lost = Flow(true,
+                                  Loss::ClosingPacket,
+                                  PathSelectorKind::RepsHold,
+                                  kPackets,
+                                  RdmaHw::kTailDelayBaseRtt,
+                                  0,
+                                  0);
+        NS_TEST_EXPECT_MSG_EQ(lost.completed, true, "lost: the flow completes");
+        NS_TEST_EXPECT_MSG_EQ(lost.tailDeclared, 1u, "lost: declared lost by the request");
+        NS_TEST_EXPECT_MSG_EQ(lost.repairs, 1u, "lost: repaired once");
+        NS_TEST_EXPECT_MSG_EQ(lost.waitingAtRepair, 0u, "lost: told at once");
+        NS_TEST_EXPECT_MSG_EQ(lost.lossesTraced[lost.droppedSpine],
+                              1u,
+                              "lost: the loss reaches the selector");
     }
 
     // The last packet overtakes the last one of a slower spine by less than

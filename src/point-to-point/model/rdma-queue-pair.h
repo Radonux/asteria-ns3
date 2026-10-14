@@ -323,13 +323,39 @@ public:
 	// from first, and queue its range for repair. A send already
 	// acknowledged or declared lost is no longer outstanding and is left
 	// alone, as is a later send of the same packet, which carries a path
-	// sequence of its own. Returns the bytes declared lost.
+	// sequence of its own. With a guardNs above zero the selector is told
+	// of each send declared lost guardNs later, in m_tail_losses, rather
+	// than at once. Returns the bytes declared lost.
 	uint64_t DeclareLostOnPathSeqs(uint16_t path, uint16_t first,
-		uint16_t count);
+		uint16_t count, uint64_t guardNs = 0);
 	// Sends declared lost by tail repair requests, and the requests that
 	// found no outstanding send.
 	uint32_t m_tail_declared_lost;
 	uint32_t m_tail_nacks_ignored;
+	// Under SprayTailLossRtts, the sends a tail repair request declared lost
+	// whose loss the selector is not yet told, in the order they were
+	// declared, each with the time it is due. A request names what the
+	// receiver has not seen, and the trimmed header of a send can reach the
+	// receiver after the request for it: the trim notification of seq along
+	// path that arrives before the send is due (CancelTailLoss) drops it, as
+	// a trim is no loss to the selector. One due is told to the selector as
+	// DeclareLost tells it (ReportTailLosses). Repairs are not delayed.
+	struct TailLoss {
+		uint64_t seq;
+		uint16_t path;
+		bool trickle;
+		uint64_t dueNs;
+	};
+	std::deque<TailLoss> m_tail_losses;
+	EventId m_tailLossTimer;
+	// Sends in m_tail_losses dropped by their trim notifications.
+	uint32_t m_tail_losses_cancelled;
+	// Whether a send of seq along path waits in m_tail_losses; if so the
+	// earliest such is dropped.
+	bool CancelTailLoss(uint64_t seq, uint16_t path);
+	// Tell the selector of every send in m_tail_losses due by nowNs.
+	// Returns how many.
+	uint32_t ReportTailLosses(uint64_t nowNs);
 	// Declare lost the send of seq along path made at sentNs, a send on a
 	// held spine (OutstandingPackets::Held), if it is still outstanding, and
 	// queue its range for repair. Returns the bytes declared lost: zero when
@@ -380,8 +406,9 @@ public:
 	uint64_t HpGetCurWin(); // window size calculated from hp.m_curRate, used by HPCC
 
 private:
-	// Returns the bytes declared lost.
-	uint32_t DeclareLost(uint64_t packet);
+	// Returns the bytes declared lost. Without report the selector is not
+	// told.
+	uint32_t DeclareLost(uint64_t packet, bool report = true);
 	// Declare lost, for the selector alone, the copies along path sent
 	// before sentNs, and those whose data send is acknowledged and that are
 	// outstanding past one base RTT by nowNs.

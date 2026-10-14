@@ -326,6 +326,17 @@ bool spray_tail_recovery_given = false;
 // SprayBaseRttNs); 0 requests at once.
 uint64_t spray_tail_recovery_delay_ns = 0;
 bool spray_tail_recovery_delay_ns_given = false;
+// Under SPRAY_TAIL_RECOVERY on, SPRAY_TAIL_LOSS_RTTS <x>: a send a tail repair
+// request declares lost is repaired at once, but the path selector is told of
+// its loss x of the queue pair's base RTTs later, so that the loss holds and
+// SPINE_LOSS_OUTPUT_FILE count it then. A trimmed header can reach the
+// receiver after its request for the trimmed packet; the trim notification of
+// that send arriving before then drops the loss, a trim being no loss to the
+// selector, and repairs nothing again. A queue pair that completes tells the
+// selector of the losses still waiting at once. 0 tells the selector at once.
+// Default 1. At least 0.
+double spray_tail_loss_rtts = 1;
+bool spray_tail_loss_rtts_given = false;
 bool tail_recovery() { return spray_tail_recovery == "on"; }
 // Under reps_hold, reps_flow_hold or mrc_hold with SPRAY_PATH_SEQ on,
 // SPRAY_RECEIVER_HOLD on: each receiving host counts, per sender leaf and spine, the data packets
@@ -2215,6 +2226,9 @@ bool ReadConf(string network_configuration) {
     } else if (key.compare("SPRAY_TAIL_RECOVERY_DELAY_NS") == 0) {
       conf >> spray_tail_recovery_delay_ns;
       spray_tail_recovery_delay_ns_given = true;
+    } else if (key.compare("SPRAY_TAIL_LOSS_RTTS") == 0) {
+      conf >> spray_tail_loss_rtts;
+      spray_tail_loss_rtts_given = true;
     } else if (key.compare("SPRAY_RECEIVER_HOLD") == 0) {
       conf >> spray_receiver_hold;
       spray_receiver_hold_given = true;
@@ -2661,6 +2675,15 @@ bool ReadConf(string network_configuration) {
   if (spray_tail_recovery_delay_ns_given &&
       spray_tail_recovery_delay_ns == RdmaHw::kTailDelayBaseRtt) {
     std::cerr << "SPRAY_TAIL_RECOVERY_DELAY_NS is out of range\n";
+    return false;
+  }
+  if (spray_tail_loss_rtts_given && !tail_recovery()) {
+    std::cerr << "SPRAY_TAIL_LOSS_RTTS is read only with "
+                 "SPRAY_TAIL_RECOVERY on\n";
+    return false;
+  }
+  if (!(spray_tail_loss_rtts >= 0)) {
+    std::cerr << "SPRAY_TAIL_LOSS_RTTS must be at least 0\n";
     return false;
   }
   if (spray_receiver_hold != "on" && spray_receiver_hold != "off") {
@@ -3254,6 +3277,8 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),
                            UintegerValue(spray_tail_recovery_delay_ns_given
                                              ? spray_tail_recovery_delay_ns
                                              : RdmaHw::kTailDelayBaseRtt));
+      rdmaHw->SetAttribute("SprayTailLossRtts",
+                           DoubleValue(spray_tail_loss_rtts));
       rdmaHw->SetAttribute("SprayReceiverHold", BooleanValue(receiver_hold()));
       rdmaHw->SetAttribute("SprayReceiverHoldClean",
                            UintegerValue(spray_receiver_hold_clean));
