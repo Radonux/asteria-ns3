@@ -544,11 +544,12 @@ private:
 	uint8_t DrawEpsilon(double fraction) const;
 	// The epsilon term of spine's share.
 	double EpsilonShare(uint32_t spine) const;
-	// The grade the lost fraction of sent sends earns.
+	// The grade the lost fraction of sent sends earns; losses with no sends
+	// are a fraction of 1, and neither the top grade.
 	uint8_t LossGrade(uint32_t sent, uint32_t lost) const;
 	// The loss grade of a period in which spine had sent sends and lost
 	// declared lost, through the loss hold; the top grade for a spine not
-	// sent on and not in loss hold.
+	// sent on, not lost on and not in loss hold.
 	uint8_t HeldLossGrade(uint32_t spine, uint32_t sent, uint32_t lost,
 		uint32_t answered);
 	// As a pool: close the loss intervals ended by now, grading the spines by

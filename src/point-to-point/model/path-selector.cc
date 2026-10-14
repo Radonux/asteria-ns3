@@ -304,8 +304,8 @@ void SpineScores::OnReport(const SpineReport &report, uint64_t nowNs){
 	m_sequence = report.sequence;
 	SpineReport combined = report;
 	if (m_parameters.lossThresholds){
-		// A spine not sent on and not in loss hold earns the top grade, and
-		// keeps the report's.
+		// A spine not sent on, not lost on and not in loss hold earns the top
+		// grade, and keeps the report's.
 		for (uint32_t k = 0; k < m_scores.size(); k++)
 			combined.SetGrade(k, std::min(report.Grade(k),
 				HeldLossGrade(k, m_sent[k], m_lost[k], m_answered[k])));
@@ -416,10 +416,13 @@ double SpineScores::LossRatio(uint32_t spine) const{
 }
 
 uint8_t SpineScores::LossGrade(uint32_t sent, uint32_t lost) const{
-	if (sent == 0)
+	if (sent == 0 && lost == 0)
 		return SpineReport::kTopGrade;
-	return QuantizeGrade(std::min(1.0, static_cast<double>(lost) / sent),
-		*m_parameters.lossThresholds);
+	// A loss declared in an interval without sends, as by a timeout, is a
+	// lost fraction of 1.
+	const double fraction = sent == 0
+		? 1 : std::min(1.0, static_cast<double>(lost) / sent);
+	return QuantizeGrade(fraction, *m_parameters.lossThresholds);
 }
 
 uint8_t SpineScores::HeldLossGrade(uint32_t spine, uint32_t sent,
@@ -1248,10 +1251,13 @@ void AutoLossHold::CloseLossInterval(){
 }
 
 uint8_t AutoLossHold::LossGrade(uint32_t sent, uint32_t lost) const{
-	if (sent == 0)
+	if (sent == 0 && lost == 0)
 		return SpineReport::kTopGrade;
-	return QuantizeGrade(std::min(1.0, static_cast<double>(lost) / sent),
-		m_lossThresholds);
+	// A loss declared in an interval without sends, as by a timeout, is a
+	// lost fraction of 1.
+	const double fraction = sent == 0
+		? 1 : std::min(1.0, static_cast<double>(lost) / sent);
+	return QuantizeGrade(fraction, m_lossThresholds);
 }
 
 void AutoLossHold::HoldHost(uint32_t spine, double rate){

@@ -6347,9 +6347,10 @@ class SpineLossThresholdsTest : public TestCase
         NS_TEST_EXPECT_MSG_EQ(scores.Score(0), 3072u, "no loss keeps the top grade");
         NS_TEST_EXPECT_MSG_EQ(scores.Score(3), 2304u + 256u, "3 of 10 lost grades the spine 1");
         NS_TEST_EXPECT_MSG_EQ(scores.Score(4), 2304u, "the receiver's lower grade wins");
-        NS_TEST_EXPECT_MSG_EQ(scores.Score(6), 2304u + 512u, "a spine not sent on keeps its grade");
+        NS_TEST_EXPECT_MSG_EQ(scores.Score(6), 2304u, "losses with no sends grade the spine 0");
         std::vector<uint8_t> combined = grades;
         combined[3] = 1;
+        combined[6] = 0;
         reference.OnReport(ScoresFixture::Report(1, combined), kInterval);
         ExpectScores(scores, reference, "the first report, combined");
 
@@ -6387,7 +6388,7 @@ class SpineLossThresholdsTest : public TestCase
 
         // First interval: spine 3 loses none of 10 towards the first and 6 of
         // 10 towards the second, 6 of 20 from the host; spine 5 loses a send
-        // but carries none.
+        // but carries none, which grades it 0.
         Send(toFirst, 3, 10, 0, 1000);
         Send(toSecond, 3, 10, 6, 2000);
         Send(toFirst, 5, 0, 1, 3000);
@@ -6399,8 +6400,9 @@ class SpineLossThresholdsTest : public TestCase
                               "the pool grades spine 3 by the host's 6 of 20, grade 1");
         std::vector<uint8_t> expected = top;
         expected[3] = 1;
+        expected[5] = 0;
         referencePool.OnReport(ScoresFixture::Report(1, expected), kInterval + 5000);
-        ExpectScores(pool, referencePool, "spine 5, not sent on, is not graded down");
+        ExpectScores(pool, referencePool, "spine 5, lost on and not sent on, is graded 0");
 
         // The second destination's own loss, 6 of 10, grades spine 3 0, below
         // the pool's grade.
@@ -6448,6 +6450,7 @@ class SpineLossThresholdsTest : public TestCase
         expectedClosed[0].lost[3] = 6;
         expectedClosed[0].grades[3] = 1;
         expectedClosed[0].lost[5] = 1;
+        expectedClosed[0].grades[5] = 0;
         expectedClosed[0].sent[0] = 10;
         expectedClosed[1].sent[4] = 4;
         expectedClosed[1].lost[4] = 4;
@@ -7818,6 +7821,102 @@ class RepsHoldAutoScopeTest : public TestCase
   private:
     static constexpr uint64_t kInterval = LossHoldFixture::kInterval;
     static constexpr uint32_t kIntervals = 7;
+};
+
+class LossWithoutSendsTest : public TestCase
+{
+  public:
+    LossWithoutSendsTest()
+        : TestCase("A loss declared in a loss interval with no send on its spine grades the "
+                   "spine 0 and holds it, in host scope and in auto scope; an interval with "
+                   "neither sends nor losses keeps the top grade")
+    {
+    }
+
+    void DoRun() override
+    {
+        HostScope();
+        AutoScope();
+        Simulator::Destroy();
+    }
+
+  private:
+    static constexpr uint32_t kSpines = LossHoldFixture::kSpines;
+    static constexpr uint64_t kInterval = LossHoldFixture::kInterval;
+
+    // Spine 3 is sent on in interval 0, which closes clean; its loss is
+    // declared in interval 1, with no send on it. Spine 2 is sent on in
+    // every interval and spine 5 never.
+    void HostScope()
+    {
+        SpineScores hold(kSpines, LossHoldFixture::Hw()->LossHoldParameters());
+        std::vector<std::vector<uint8_t>> closed;
+        hold.SetLossIntervalCallback([&](uint64_t,
+                                         const std::vector<uint32_t>&,
+                                         const std::vector<uint32_t>&,
+                                         const std::vector<uint8_t>& grades) {
+            closed.push_back(grades);
+        });
+        hold.CountIntervalSend(3, 0);
+        hold.CountIntervalSend(2, 10);
+        hold.CountIntervalSend(2, kInterval + 10);
+        NS_TEST_EXPECT_MSG_EQ(closed.size(), 1u, "interval 0 is closed");
+        NS_TEST_EXPECT_MSG_EQ(+closed[0][3], +SpineReport::kTopGrade, "spine 3 closes it clean");
+        NS_TEST_EXPECT_MSG_EQ(hold.Holds(3), false, "and is not held");
+        hold.CountIntervalLoss(3, kInterval + 20);
+        hold.CountIntervalSend(2, 2 * kInterval + 10);
+        NS_TEST_EXPECT_MSG_EQ(closed.size(), 2u, "interval 1 is closed");
+        NS_TEST_EXPECT_MSG_EQ(+closed[1][3], 0, "its loss without sends grades spine 3 0");
+        NS_TEST_EXPECT_MSG_EQ(hold.Holds(3), true, "and holds it");
+        for (const auto& grades : closed)
+        {
+            NS_TEST_EXPECT_MSG_EQ(+grades[5],
+                                  +SpineReport::kTopGrade,
+                                  "no sends and no losses keep the top grade");
+            NS_TEST_EXPECT_MSG_EQ(+grades[2], +SpineReport::kTopGrade, "as do clean sends");
+        }
+        NS_TEST_EXPECT_MSG_EQ(hold.Holds(5), false, "spine 5 is not held");
+        NS_TEST_EXPECT_MSG_EQ(hold.Holds(2), false, "nor spine 2");
+    }
+
+    // The same toward leaf 0, with leaf 1 sending on spine 2 alone.
+    void AutoScope()
+    {
+        AutoLossHold hold(kSpines, LossHoldFixture::Hw()->LossHoldParameters(), 2);
+        hold.AddLeaf(0);
+        hold.AddLeaf(1);
+        std::map<uint32_t, std::vector<std::vector<uint8_t>>> closed;
+        hold.SetLossIntervalCallback([&](uint32_t leaf,
+                                         uint64_t,
+                                         const std::vector<uint32_t>&,
+                                         const std::vector<uint32_t>&,
+                                         const std::vector<uint8_t>& grades) {
+            closed[leaf].push_back(grades);
+        });
+        hold.CountSend(0, 3, 0);
+        hold.CountSend(1, 2, 10);
+        hold.CountSend(1, 2, kInterval + 10);
+        NS_TEST_EXPECT_MSG_EQ(closed[0].size(), 1u, "interval 0 is closed");
+        NS_TEST_EXPECT_MSG_EQ(+closed[0][0][3], +SpineReport::kTopGrade, "spine 3 closes it clean");
+        NS_TEST_EXPECT_MSG_EQ(hold.Holds(0, 3), false, "and is not held");
+        hold.CountLoss(0, 3, kInterval + 20);
+        hold.CountSend(1, 2, 2 * kInterval + 10);
+        NS_TEST_EXPECT_MSG_EQ(closed[0].size(), 2u, "interval 1 is closed");
+        NS_TEST_EXPECT_MSG_EQ(+closed[0][1][3], 0, "its loss without sends grades spine 3 0");
+        NS_TEST_EXPECT_MSG_EQ(hold.Holds(0, 3), true, "and holds it toward leaf 0");
+        NS_TEST_EXPECT_MSG_EQ(hold.Holds(1, 3), false, "and not toward leaf 1");
+        NS_TEST_EXPECT_MSG_EQ(hold.HostHolds(3), false, "nor for the host");
+        for (uint32_t leaf : {0u, 1u})
+        {
+            for (const auto& grades : closed[leaf])
+            {
+                NS_TEST_EXPECT_MSG_EQ(+grades[5],
+                                      +SpineReport::kTopGrade,
+                                      "no sends and no losses keep the top grade");
+            }
+        }
+        NS_TEST_EXPECT_MSG_EQ(hold.Holds(0, 5), false, "spine 5 is not held");
+    }
 };
 
 class RepsHoldLlrTest : public TestCase
@@ -12141,6 +12240,7 @@ PointToPointTestSuite::PointToPointTestSuite()
     AddTestCase(new RepsFlowHoldTest, TestCase::Duration::QUICK);
     AddTestCase(new RepsHoldScopeTest, TestCase::Duration::QUICK);
     AddTestCase(new RepsHoldAutoScopeTest, TestCase::Duration::QUICK);
+    AddTestCase(new LossWithoutSendsTest, TestCase::Duration::QUICK);
     AddTestCase(new RepsHoldLlrTest, TestCase::Duration::QUICK);
     AddTestCase(new RepsHoldTrickleTest, TestCase::Duration::QUICK);
     AddTestCase(new RepsHoldDuplicateTest, TestCase::Duration::QUICK);
