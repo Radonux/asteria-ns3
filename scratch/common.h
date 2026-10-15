@@ -336,12 +336,15 @@ bool spray_tail_recovery_delay_ns_given = false;
 // transport event tail_loss_cancelled. An acknowledgement of the declared send
 // along its path, the send having arrived after the request, drops the loss as
 // well, counted as tail_loss_delivered, or as tail_loss_ambiguous when a repair
-// of the send had left along the same path. The losses wait on the host, so a
-// queue pair that completes leaves its own waiting, and a trim notification
-// that follows the completion still drops one; one told after the completion
-// reaches the host's loss hold for the receiver's leaf, and under
-// reps_flow_hold, whose hold was the queue pair's, is dropped. 0 tells the
-// selector at once. Default 1. At least 0.
+// of the send had left along the same path. The selector chooses again, up to
+// once per spine, for a repair it would send along the path of the waiting
+// declared send, and a repair so moved to another path is counted as
+// tail_repair_rerouted. The losses wait on the host, so a queue pair that
+// completes leaves its own waiting, and a trim notification that follows the
+// completion still drops one; one told after the completion reaches the host's
+// loss hold for the receiver's leaf, and under reps_flow_hold, whose hold was
+// the queue pair's, is dropped. 0 tells the selector at once. Default 1. At
+// least 0.
 double spray_tail_loss_rtts = 1;
 bool spray_tail_loss_rtts_given = false;
 bool tail_recovery() { return spray_tail_recovery == "on"; }
@@ -2974,6 +2977,7 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),
   // Written under every mode, zero where SPRAY_TAIL_LOSS_RTTS defers nothing.
   transport_event_totals[{"tail_loss_cancelled", "control"}];
   transport_event_totals[{"tail_loss_delivered", "control"}];
+  transport_event_totals[{"tail_repair_rerouted", "control"}];
   transport_event_totals[{"tail_loss_ambiguous", "control"}];
   // The totals must land even when a watchdog exits the run mid-simulation.
   std::atexit(write_transport_event_summary);

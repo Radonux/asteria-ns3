@@ -9994,6 +9994,108 @@ class SprayPathSeqTrimTest : public TestCase
     }
 };
 
+/**
+ * A selector that hands out the identification force gives while it gives
+ * one, and otherwise asks the selector it wraps, which every answer is told.
+ */
+class ForcedChoiceSelector : public PathSelector
+{
+  public:
+    ForcedChoiceSelector(std::unique_ptr<PathSelector> inner,
+                         std::function<bool(uint16_t&)> force)
+        : m_inner(std::move(inner)),
+          m_force(std::move(force))
+    {
+    }
+
+    uint16_t Choose(uint64_t nowNs) override
+    {
+        uint16_t identification = 0;
+        m_forced = m_force(identification);
+        return m_forced ? identification : m_inner->Choose(nowNs);
+    }
+
+    void OnAck(uint16_t path, bool marked, uint64_t nowNs) override
+    {
+        m_inner->OnAck(path, marked, nowNs);
+    }
+
+    void OnTrim(uint16_t path, bool lastHop, bool marked, uint64_t nowNs) override
+    {
+        m_inner->OnTrim(path, lastHop, marked, nowNs);
+    }
+
+    void OnLoss(uint16_t path, uint64_t nowNs) override
+    {
+        m_inner->OnLoss(path, nowNs);
+    }
+
+    void OnTimeout(uint64_t nowNs) override
+    {
+        m_inner->OnTimeout(nowNs);
+    }
+
+    bool TakeProbe(uint64_t nowNs, uint16_t& path) override
+    {
+        return m_inner->TakeProbe(nowNs, path);
+    }
+
+    void OnProbeAnswer(uint16_t path, bool marked, uint64_t nowNs) override
+    {
+        m_inner->OnProbeAnswer(path, marked, nowNs);
+    }
+
+    bool ChoseTrickle() const override
+    {
+        return !m_forced && m_inner->ChoseTrickle();
+    }
+
+    bool ChoseExploration() const override
+    {
+        return !m_forced && m_inner->ChoseExploration();
+    }
+
+    bool ChoseHeld() const override
+    {
+        return !m_forced && m_inner->ChoseHeld();
+    }
+
+    void OnTrickleAnswer(uint16_t path, bool lost, uint64_t nowNs) override
+    {
+        m_inner->OnTrickleAnswer(path, lost, nowNs);
+    }
+
+    bool TakeCopy(uint8_t& spine, bool& trickle) override
+    {
+        return !m_forced && m_inner->TakeCopy(spine, trickle);
+    }
+
+    void OnReport(const SpineReport& report, uint64_t nowNs) override
+    {
+        m_inner->OnReport(report, nowNs);
+    }
+
+    void OnRedirect(uint8_t spine, uint8_t carrying, uint64_t nowNs) override
+    {
+        m_inner->OnRedirect(spine, carrying, nowNs);
+    }
+
+    void OnReceiverHold(uint32_t receiver, uint8_t bitmap, uint64_t nowNs) override
+    {
+        m_inner->OnReceiverHold(receiver, bitmap, nowNs);
+    }
+
+    void SetReceiverHold(std::shared_ptr<ReceiverHoldMarks> marks, uint32_t leaf) override
+    {
+        m_inner->SetReceiverHold(std::move(marks), leaf);
+    }
+
+  private:
+    std::unique_ptr<PathSelector> m_inner;
+    std::function<bool(uint16_t&)> m_force;
+    bool m_forced = false;
+};
+
 class SprayTailRecoveryTest : public TestCase
 {
   public:
@@ -10027,6 +10129,8 @@ class SprayTailRecoveryTest : public TestCase
         AcknowledgedAfterRequest();
         AcknowledgedAfterCompletion();
         RepairAcknowledgedOnOtherPath();
+        RepairReroutedOffDeclaredPath();
+        RepairKeptOnDeclaredPathWhenNoOther();
         LossReportedAtOnce();
 
         CustomHeader::ackTailNackBytes = savedNack;
@@ -10378,6 +10482,18 @@ class SprayTailRecoveryTest : public TestCase
         Delayed,
     };
 
+    // What the selector chooses while a loss of the queue pair waits in
+    // m_tailLosses.
+    enum class RepairDraw
+    {
+        // Its own choice.
+        Selector,
+        // The declared send's path, once, then its own choice.
+        DeclaredFirst,
+        // The declared send's path at every choice.
+        DeclaredOnly,
+    };
+
     struct Nack
     {
         uint8_t spine;
@@ -10431,6 +10547,11 @@ class SprayTailRecoveryTest : public TestCase
         uint32_t cancelledEvents = 0;
         uint32_t deliveredEvents = 0;
         uint32_t ambiguousEvents = 0;
+        // The transport events tail_repair_rerouted reported, and the
+        // sender's counts of repairs rerouted and of choices again.
+        uint32_t reroutedEvents = 0;
+        uint32_t repairsRerouted = 0;
+        uint32_t repairRedraws = 0;
         // When the first trim notification reached the sender.
         uint64_t trimArrivalNs = 0;
         uint32_t tailDeclared = 0;
@@ -10476,7 +10597,8 @@ class SprayTailRecoveryTest : public TestCase
                  uint32_t packets,
                  uint64_t delayNs = RdmaHw::kTailDelayBaseRtt,
                  uint64_t trimLateNs = 0,
-                 double tailLossRtts = 1)
+                 double tailLossRtts = 1,
+                 RepairDraw repairDraw = RepairDraw::Selector)
     {
         SetHeaders(tailRecovery);
         Outcome outcome;
@@ -10500,6 +10622,7 @@ class SprayTailRecoveryTest : public TestCase
                     outcome.cancelledEvents += std::string(event) == "tail_loss_cancelled";
                     outcome.deliveredEvents += std::string(event) == "tail_loss_delivered";
                     outcome.ambiguousEvents += std::string(event) == "tail_loss_ambiguous";
+                    outcome.reroutedEvents += std::string(event) == "tail_repair_rerouted";
                 });
             hw->TraceConnectWithoutContext(
                 "RetransmissionTimeout",
@@ -10511,6 +10634,23 @@ class SprayTailRecoveryTest : public TestCase
             Ptr<RdmaQueuePair> qp = sender.AddSender(kTestSender, kTestReceiver, size);
             qp->m_baseRtt = kBaseRttNs;
             qp->m_notifyAppFinish = Callback<void>([]() {});
+            bool forcedOnce = false;
+            if (repairDraw != RepairDraw::Selector)
+            {
+                qp->m_pathSelector = std::make_unique<ForcedChoiceSelector>(
+                    std::move(qp->m_pathSelector),
+                    [&](uint16_t& identification) {
+                        if (outcome.droppedSeq == UINT64_MAX || hw->TailLossesWaiting(qp) == 0 ||
+                            (repairDraw == RepairDraw::DeclaredFirst && forcedOnce))
+                        {
+                            return false;
+                        }
+                        forcedOnce = true;
+                        const uint8_t spine = static_cast<uint8_t>(outcome.droppedPath);
+                        identification = SpineIdentification(spine, spine);
+                        return true;
+                    });
+            }
             if (kind == PathSelectorKind::RepsHold)
             {
                 hw->TraceConnectWithoutContext(
@@ -10729,6 +10869,8 @@ class SprayTailRecoveryTest : public TestCase
             outcome.lossesCancelled = hw->m_tailLossesCancelled;
             outcome.lossesDelivered = hw->m_tailLossesDelivered;
             outcome.lossesAmbiguous = hw->m_tailLossesAmbiguous;
+            outcome.repairsRerouted = hw->m_tailRepairsRerouted;
+            outcome.repairRedraws = hw->m_tailRepairRedraws;
             Simulator::Destroy();
         }
         return outcome;
@@ -11063,6 +11205,73 @@ class SprayTailRecoveryTest : public TestCase
         NS_TEST_EXPECT_MSG_EQ(on.lossesTraced[on.droppedSpine],
                               1u,
                               "the hold counts it once on its spine");
+    }
+
+    // The late packet of AcknowledgedAfterRequest with a selector that
+    // chooses the declared send's path for its repair first: the repair is
+    // chosen again and leaves along another path, and the late packet's
+    // acknowledgement drops the loss as delivered.
+    void RepairReroutedOffDeclaredPath()
+    {
+        constexpr uint32_t kPackets = 400;
+        constexpr uint64_t kLateNs = 3500;
+        const Outcome on = Flow(true,
+                                Loss::Delayed,
+                                PathSelectorKind::RepsHold,
+                                kPackets,
+                                RdmaHw::kTailDelayBaseRtt,
+                                kLateNs,
+                                1,
+                                RepairDraw::DeclaredFirst);
+        NS_TEST_EXPECT_MSG_EQ(on.completed, true, "the flow completes");
+        NS_TEST_EXPECT_MSG_EQ(on.timeouts, 0u, "without a retransmission timeout");
+        NS_TEST_EXPECT_MSG_EQ(on.drops, 0u, "nothing is lost");
+        NS_TEST_EXPECT_MSG_EQ(on.tailDeclared, 1u, "declared lost by the request");
+        NS_TEST_EXPECT_MSG_EQ(on.repairs, 1u, "repaired once");
+        NS_TEST_EXPECT_MSG_EQ(on.waitingAtRepair, 1u, "while its loss waits on the guard");
+        NS_TEST_EXPECT_MSG_NE(on.repairPath, on.droppedPath, "the repair takes another path");
+        NS_TEST_EXPECT_MSG_EQ(on.repairRedraws, 1u, "chosen again once");
+        NS_TEST_EXPECT_MSG_EQ(on.repairsRerouted, 1u, "counted as rerouted");
+        NS_TEST_EXPECT_MSG_EQ(on.reroutedEvents, 1u, "reported once as tail_repair_rerouted");
+        NS_TEST_EXPECT_MSG_GT(on.droppedAckNs, on.nackArrivalNs, "its acknowledgement follows");
+        NS_TEST_EXPECT_MSG_EQ(on.lossesDelivered, 1u, "the acknowledgement drops the loss");
+        NS_TEST_EXPECT_MSG_EQ(on.deliveredEvents, 1u, "reported as tail_loss_delivered");
+        NS_TEST_EXPECT_MSG_EQ(on.ambiguousEvents, 0u, "not as tail_loss_ambiguous");
+        NS_TEST_EXPECT_MSG_EQ(on.cancelledEvents, 0u, "nor as tail_loss_cancelled");
+        NS_TEST_EXPECT_MSG_EQ(on.waitingBeforeDue, 0u, "before the guard ends");
+        for (uint32_t k = 0; k < kSpines; ++k)
+        {
+            NS_TEST_EXPECT_MSG_EQ(on.lossesTraced[k], 0u, "no loss reaches the selector");
+        }
+    }
+
+    // The same with a selector that only chooses the declared send's path:
+    // every choice again lands on it, the repair leaves along it, and the
+    // late packet's acknowledgement drops the loss as ambiguous.
+    void RepairKeptOnDeclaredPathWhenNoOther()
+    {
+        constexpr uint32_t kPackets = 400;
+        constexpr uint64_t kLateNs = 3500;
+        const Outcome on = Flow(true,
+                                Loss::Delayed,
+                                PathSelectorKind::RepsHold,
+                                kPackets,
+                                RdmaHw::kTailDelayBaseRtt,
+                                kLateNs,
+                                1,
+                                RepairDraw::DeclaredOnly);
+        NS_TEST_EXPECT_MSG_EQ(on.completed, true, "the flow completes");
+        NS_TEST_EXPECT_MSG_EQ(on.tailDeclared, 1u, "declared lost by the request");
+        NS_TEST_EXPECT_MSG_EQ(on.repairs, 1u, "repaired once");
+        NS_TEST_EXPECT_MSG_EQ(on.repairPath, on.droppedPath, "along the declared path");
+        NS_TEST_EXPECT_MSG_EQ(on.repairRedraws, kSpines, "chosen again once per spine");
+        NS_TEST_EXPECT_MSG_EQ(on.repairsRerouted, 0u, "not rerouted");
+        NS_TEST_EXPECT_MSG_EQ(on.reroutedEvents, 0u, "nor reported as tail_repair_rerouted");
+        NS_TEST_EXPECT_MSG_EQ(on.lossesAmbiguous, 1u, "the acknowledgement drops the loss");
+        NS_TEST_EXPECT_MSG_EQ(on.ambiguousEvents, 1u, "reported as tail_loss_ambiguous");
+        NS_TEST_EXPECT_MSG_EQ(on.lossesDelivered, 0u, "not as delivered");
+        NS_TEST_EXPECT_MSG_EQ(on.deliveredEvents, 0u, "nor reported as tail_loss_delivered");
+        NS_TEST_EXPECT_MSG_EQ(on.cancelledEvents, 0u, "nor as tail_loss_cancelled");
     }
 
     // With SprayTailLossRtts 0 the selector is told of a send a tail repair

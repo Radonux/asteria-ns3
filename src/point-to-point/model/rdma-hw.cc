@@ -2781,6 +2781,35 @@ void RdmaHw::NoteTailRepair(Ptr<RdmaQueuePair> qp, uint64_t seq,
 	}
 }
 
+bool RdmaHw::TailLossWaitsOn(Ptr<RdmaQueuePair> qp, uint64_t seq,
+		uint16_t path) const{
+	for (const auto &entry : m_tailLosses){
+		const TailLoss &loss = entry.second;
+		if (loss.qp == qp && loss.seq == seq && loss.path == path)
+			return true;
+	}
+	return false;
+}
+
+uint16_t RdmaHw::RerouteTailRepair(Ptr<RdmaQueuePair> qp, uint64_t seq,
+		uint16_t identification, uint64_t nowNs){
+	const LoadBalancingMode mode = static_cast<LoadBalancingMode>(m_loadBalancing);
+	if (!TailLossWaitsOn(qp, seq, PathOf(mode, identification)))
+		return identification;
+	// Chosen before the path sequence and the outstanding record are taken,
+	// so that both follow the path finally used.
+	for (uint32_t draw = 0; draw < m_spineCount; ++draw){
+		identification = qp->m_pathSelector->Choose(nowNs);
+		m_tailRepairRedraws++;
+		if (!TailLossWaitsOn(qp, seq, PathOf(mode, identification))){
+			m_tailRepairsRerouted++;
+			ReportTransportEvent("tail_repair_rerouted", 0);
+			break;
+		}
+	}
+	return identification;
+}
+
 void RdmaHw::DropTailLosses(Ptr<RdmaQueuePair> qp){
 	for (auto entry = m_tailLosses.begin(); entry != m_tailLosses.end();){
 		if (entry->second.qp == qp)
@@ -2958,6 +2987,8 @@ Ptr<Packet> RdmaHw::GetNxtPacket(Ptr<RdmaQueuePair> qp){
 		if (qp->m_pathSelector->TakeProbe(now, probed))
 			SendPathProbe(qp, probed);
 		identification = qp->m_pathSelector->Choose(now);
+		if (is_repair && !m_tailLosses.empty())
+			identification = RerouteTailRepair(qp, seq, identification, now);
 	}
 	uint8_t copySpine = 0;
 	bool copyTrickle = false;

@@ -446,6 +446,22 @@ public:
 	// A repair of seq left for qp along path: each of qp's sends of seq
 	// along path in m_tailLosses is marked repairedOnPath.
 	void NoteTailRepair(Ptr<RdmaQueuePair> qp, uint64_t seq, uint16_t path);
+	// The identification of a repair of seq for qp, which the selector chose
+	// as identification at nowNs: while one of qp's sends of seq waits in
+	// m_tailLosses along the path it names, the selector chooses again, at
+	// most m_spineCount times, and the first choice along another path is
+	// taken, so that the acknowledgement of the declared send cannot be taken
+	// for the repair's. Each choice again counts in m_tailRepairRedraws, and
+	// a repair so moved counts in m_tailRepairsRerouted and reports the
+	// transport event tail_repair_rerouted. When every choice names a waiting
+	// send's path, the last one is taken, and NoteTailRepair marks the loss.
+	uint16_t RerouteTailRepair(Ptr<RdmaQueuePair> qp, uint64_t seq,
+		uint16_t identification, uint64_t nowNs);
+	// Whether one of qp's sends of seq along path waits in m_tailLosses.
+	bool TailLossWaitsOn(Ptr<RdmaQueuePair> qp, uint64_t seq,
+		uint16_t path) const;
+	uint32_t m_tailRepairRedraws = 0;
+	uint32_t m_tailRepairsRerouted = 0;
 	// Drop qp's sends in m_tailLosses.
 	void DropTailLosses(Ptr<RdmaQueuePair> qp);
 	// The timer set for the earliest send in m_tailLosses; and the sends due
