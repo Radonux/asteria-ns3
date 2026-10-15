@@ -120,6 +120,8 @@ private:
 	std::set<uint64_t> m_repaired;
 };
 
+struct NsccConnection;
+
 class RdmaQueuePair : public Object {
 public:
 	Time startTime;
@@ -290,6 +292,14 @@ public:
 		uint32_t m_incStage;
 	}hpccPint;
 	NsccWindow nscc;
+	// Under NsccWindowState connection, the window of the queue pair's
+	// connection, which NSCC moves in place of nscc.
+	std::shared_ptr<NsccConnection> m_nsccConnection;
+	// The window NSCC moves for the queue pair: nscc, or its connection's.
+	NsccWindow &Nscc();
+	// The bytes in flight its window bounds: its own, or under a connection's
+	// window those of every queue pair open on it.
+	uint64_t WindowOnTheFly();
 
 	/***********
 	 * methods
@@ -397,6 +407,17 @@ private:
 	void ExpireCopies(uint64_t nowNs);
 	void DeclareCopyLost(std::map<uint64_t, ExplorationCopy>::iterator copy,
 		uint64_t nowNs);
+};
+
+// Under NsccWindowState connection, the NSCC window of a sending host's queue
+// pairs to one destination and priority group, each carrying one message. It is
+// opened once, by the first of them, bounds the bytes all of them have in
+// flight together, and outlives them, so that the next message to the
+// destination starts from it; it persists across idle periods as it is.
+struct NsccConnection {
+	NsccWindow window;
+	// The queue pairs open on it, each until it completes or fails.
+	std::vector<Ptr<RdmaQueuePair>> queuePairs;
 };
 
 class RdmaRxQueuePair : public Object { // Rx side queue pair

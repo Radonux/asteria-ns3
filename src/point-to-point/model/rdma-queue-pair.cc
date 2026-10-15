@@ -672,7 +672,20 @@ uint64_t RdmaQueuePair::GetOnTheFly(){
 
 bool RdmaQueuePair::IsWinBound(){
 	uint64_t w = GetWin();
-	return w != 0 && GetOnTheFly() >= w;
+	return w != 0 && WindowOnTheFly() >= w;
+}
+
+NsccWindow &RdmaQueuePair::Nscc(){
+	return m_nsccConnection ? m_nsccConnection->window : nscc;
+}
+
+uint64_t RdmaQueuePair::WindowOnTheFly(){
+	if (!m_nsccConnection)
+		return GetOnTheFly();
+	uint64_t bytes = 0;
+	for (const Ptr<RdmaQueuePair> &qp : m_nsccConnection->queuePairs)
+		bytes += qp->GetOnTheFly();
+	return bytes;
 }
 
 uint64_t RdmaQueuePair::GetWin(){

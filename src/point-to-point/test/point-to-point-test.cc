@@ -3854,6 +3854,150 @@ class NsccCutTest : public TestCase
     }
 };
 
+class NsccConnectionWindowTest : public TestCase
+{
+  public:
+    NsccConnectionWindowTest()
+        : TestCase("Under NsccWindowState connection the queue pairs of a host to one destination "
+                   "share one NSCC window, opened once at MaxWnd and kept past them: the next "
+                   "message to it starts from the window the last one left, another "
+                   "destination starts at MaxWnd, and the window bounds the bytes all of them "
+                   "have in flight; per message every queue pair starts at MaxWnd alone")
+    {
+    }
+
+    void DoRun() override
+    {
+        Refusals();
+        NextMessage();
+        Concurrent();
+        Simulator::Destroy();
+    }
+
+  private:
+    static constexpr uint32_t kMtu = IsolatedHost::kMtu;
+    static inline const Ipv4Address kOther{"11.0.3.1"};
+
+    static void Configure(Ptr<RdmaHw> hw, NsccWindowState state)
+    {
+        hw->m_cc_mode = 11;
+        hw->m_nscc_adjust_period = 1000;
+        hw->m_retransmission_timeout_ns = 0;
+        hw->SetAttribute("NsccWindowState", UintegerValue(static_cast<uint32_t>(state)));
+    }
+
+    static Ptr<RdmaQueuePair> Started(IsolatedHost& sender, Ipv4Address destination, uint16_t port)
+    {
+        Ptr<RdmaQueuePair> qp = sender.AddSender(kTestSender, destination, 10 * kMtu, port);
+        sender.hw->StartNscc(qp, NsccPath::kBdp, NsccPath::kBaseRtt);
+        return qp;
+    }
+
+    void Refusals()
+    {
+        Ptr<RdmaHw> hw = CreateObject<RdmaHw>();
+        UintegerValue state;
+        hw->GetAttribute("NsccWindowState", state);
+        NS_TEST_EXPECT_MSG_EQ(state.Get(),
+                              static_cast<uint32_t>(NsccWindowState::Message),
+                              "NsccWindowState is message by default");
+        hw->SetAttribute("NsccWindowState",
+                         UintegerValue(static_cast<uint32_t>(NsccWindowState::Connection)));
+        for (const uint32_t mode : {1u, 3u, 12u})
+        {
+            hw->m_cc_mode = mode;
+            NS_TEST_EXPECT_MSG_EQ(hw->ValidNsccWindowState(),
+                                  false,
+                                  "refused under a mode whose state is per queue pair");
+        }
+        hw->m_cc_mode = 11;
+        NS_TEST_EXPECT_MSG_EQ(hw->ValidNsccWindowState(), true, "accepted under NSCC");
+    }
+
+    // A send of the first message to d is declared lost, which cuts the
+    // window, and the message completes. Under connection the next message to
+    // d starts from the cut window and one to another destination at MaxWnd;
+    // per message the next one to d starts at MaxWnd too.
+    void NextMessage()
+    {
+        for (const NsccWindowState state : {NsccWindowState::Connection, NsccWindowState::Message})
+        {
+            IsolatedHost sender(LoadBalancingMode::SprayUniform, kTestReceiver, 8);
+            Configure(sender.hw, state);
+            sender.hw->m_qpCompleteCallback =
+                Callback<void, Ptr<RdmaQueuePair>>([](Ptr<RdmaQueuePair>) {});
+            Ptr<RdmaQueuePair> first = Started(sender, kTestReceiver, 10000);
+            NS_TEST_EXPECT_MSG_EQ(first->GetWin(), NsccPath::kCeiling, "opened at MaxWnd");
+            first->Nscc().OnLoss(3 * kMtu);
+            sender.hw->ApplyNsccWindow(first);
+            NS_TEST_EXPECT_MSG_EQ(first->GetWin(),
+                                  NsccPath::kCeiling - 3 * kMtu,
+                                  "the loss cuts the window");
+            first->m_notifyAppFinish = Callback<void>([]() {});
+            sender.hw->QpComplete(first);
+            Ptr<RdmaQueuePair> second = Started(sender, kTestReceiver, 10001);
+            Ptr<RdmaQueuePair> other = Started(sender, kOther, 10002);
+            NS_TEST_EXPECT_MSG_EQ(other->GetWin(),
+                                  NsccPath::kCeiling,
+                                  "another destination starts at MaxWnd");
+            if (state == NsccWindowState::Connection)
+            {
+                NS_TEST_EXPECT_MSG_EQ(second->GetWin(),
+                                      NsccPath::kCeiling - 3 * kMtu,
+                                      "connection: the next message to d starts from it");
+                NS_TEST_EXPECT_MSG_EQ(sender.hw->m_nsccConnections.size(),
+                                      2u,
+                                      "one window per destination");
+            }
+            else
+            {
+                NS_TEST_EXPECT_MSG_EQ(second->GetWin(),
+                                      NsccPath::kCeiling,
+                                      "message: the next message to d starts at MaxWnd");
+                NS_TEST_EXPECT_MSG_EQ(sender.hw->m_nsccConnections.size(), 0u, "none is kept");
+            }
+            Simulator::Destroy();
+        }
+    }
+
+    // Two queue pairs to d open at once. Under connection a loss of one cuts
+    // the window of both, and the sends of one that fill the window leave the
+    // other none; per message each has its own window.
+    void Concurrent()
+    {
+        for (const NsccWindowState state : {NsccWindowState::Connection, NsccWindowState::Message})
+        {
+            IsolatedHost sender(LoadBalancingMode::SprayUniform, kTestReceiver, 8);
+            Configure(sender.hw, state);
+            Ptr<RdmaQueuePair> busy = Started(sender, kTestReceiver, 10000);
+            Ptr<RdmaQueuePair> idle = Started(sender, kTestReceiver, 10001);
+            busy->Nscc().OnLoss(kMtu);
+            sender.hw->ApplyNsccWindow(busy);
+            const uint64_t window = NsccPath::kCeiling - kMtu;
+            for (uint64_t i = 0; i < window / kMtu; ++i)
+            {
+                busy->m_outstanding.Add(i * kMtu, kMtu, 3, 0);
+            }
+            NS_TEST_EXPECT_MSG_EQ(idle->GetOnTheFly(), 0u, "the other has nothing in flight");
+            if (state == NsccWindowState::Connection)
+            {
+                NS_TEST_EXPECT_MSG_EQ(idle->GetWin(), window, "connection: the cut is both's");
+                NS_TEST_EXPECT_MSG_EQ(idle->WindowOnTheFly(), window, "the bytes are both's");
+                NS_TEST_EXPECT_MSG_EQ(idle->IsWinBound(), true, "and leave the other no room");
+            }
+            else
+            {
+                NS_TEST_EXPECT_MSG_EQ(idle->GetWin(),
+                                      NsccPath::kCeiling,
+                                      "message: the other's window is its own");
+                NS_TEST_EXPECT_MSG_EQ(idle->IsWinBound(), false, "and it may send");
+            }
+            NS_TEST_EXPECT_MSG_EQ(busy->IsWinBound(), true, "the full queue pair may not");
+            Simulator::Destroy();
+        }
+    }
+};
+
 class NsccBoundsTest : public TestCase
 {
   public:
@@ -14014,6 +14158,7 @@ PointToPointTestSuite::PointToPointTestSuite()
     AddTestCase(new NsccQuickAdaptTest, TestCase::Duration::QUICK);
     AddTestCase(new NsccFastIncreaseTest, TestCase::Duration::QUICK);
     AddTestCase(new NsccCutTest, TestCase::Duration::QUICK);
+    AddTestCase(new NsccConnectionWindowTest, TestCase::Duration::QUICK);
     AddTestCase(new NsccBoundsTest, TestCase::Duration::QUICK);
     AddTestCase(new NsccRttTest, TestCase::Duration::QUICK);
     AddTestCase(new SpineReportHeaderTest, TestCase::Duration::QUICK);

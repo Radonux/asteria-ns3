@@ -5,6 +5,14 @@
 
 namespace ns3 {
 
+// How long a sending host keeps an NSCC window: for one queue pair, which
+// carries one message, or for the connection to a destination and priority
+// group, shared by the queue pairs to it and kept past them.
+enum class NsccWindowState : uint32_t {
+	Message = 0,
+	Connection,
+};
+
 // The congestion window of UEC 1.0.3 section 3.6.13 (NSCC) for one queue pair:
 // one window in payload bytes over every path the queue pair's packets take.
 // Each answer to a send moves it: an acknowledgement through the four cases of

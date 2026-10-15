@@ -1039,6 +1039,18 @@ TypeId RdmaHw::GetTypeId (void)
 				DoubleValue(1.0),
 				MakeDoubleAccessor(&RdmaHw::m_nscc_adjust_period),
 				MakeDoubleChecker<double>(0))
+		.AddAttribute("NsccWindowState",
+				"Under CC mode 11, how long a host keeps an NSCC window: 0=per "
+				"queue pair, one message; 1=per connection, one window per "
+				"destination and priority group, opened once at MaxWnd, "
+				"shared by the host's queue pairs to it, bounding the bytes "
+				"they have in flight together, and kept past them and across "
+				"idle periods as it stands. Default 0.",
+				UintegerValue(static_cast<uint32_t>(NsccWindowState::Message)),
+				MakeUintegerAccessor(&RdmaHw::m_nsccWindowState),
+				MakeUintegerChecker<uint32_t>(
+					static_cast<uint32_t>(NsccWindowState::Message),
+					static_cast<uint32_t>(NsccWindowState::Connection)))
 		.AddTraceSource("NsccWindow",
 				"Under CC mode 11, the window a queue pair may keep in flight "
 				"changed: the queue pair, then the old and the new window in "
@@ -1125,6 +1137,9 @@ void RdmaHw::Setup(QpCompleteCallback cb, QpFailureCallback failure_cb){
 	NS_ABORT_MSG_IF(!ValidReceiverTailMissing(),
 		"SprayReceiverTailMissing needs SprayReceiverHold and "
 		"SprayTailRecovery");
+	NS_ABORT_MSG_IF(!ValidNsccWindowState(),
+		"NsccWindowState 1 is read only under CC mode 11: the other modes keep "
+		"their congestion state per queue pair");
 	NS_ABORT_MSG_IF(!ValidPathState(),
 		"SprayPathState 1 is read only under LoadBalancing 2, where an "
 		"identification names a spine whatever the queue pair's ports");
@@ -1281,11 +1296,7 @@ void RdmaHw::AddQueuePair(uint32_t src, uint32_t dest, uint64_t tag, uint64_t si
 		// line rate, so VarWin scales nothing.
 		NS_ABORT_MSG_IF(win == 0, "CC mode 11 sizes its window from the queue "
 			"pair's bandwidth-delay product");
-		qp->nscc.Start(NsccParameters(), m_mtu, win, baseRtt,
-			Simulator::Now().GetNanoSeconds());
-		NS_ABORT_MSG_IF(qp->nscc.MaxWnd() > UINT32_MAX,
-			"a queue pair's window is 32 bits");
-		ApplyNsccWindow(qp);
+		StartNscc(qp, win, baseRtt);
 	}
 
 	// Notify Nic
@@ -2006,7 +2017,7 @@ int RdmaHw::ReceiveAck(Ptr<Packet> p, CustomHeader &ch){
 				// sequence has its own record and answer.
 				qp->m_pathSelector->OnAck(path, cnp, now);
 				if (copyLost > 0 && m_cc_mode == 11 && DeliverCongestionSignal(qp)){
-					qp->nscc.OnLoss(copyLost);
+					qp->Nscc().OnLoss(copyLost);
 					ApplyNsccWindow(qp);
 				}
 			}else{
@@ -2336,8 +2347,8 @@ void RdmaHw::RecoverTrimmedQueue(Ptr<RdmaQueuePair> qp,
 	// longer count the trimmed send. A trim whose send was already declared
 	// lost is congestion all the same, and cuts the window again.
 	if (m_cc_mode == 11 && DeliverCongestionSignal(qp)){
-		qp->nscc.OnTrim(ch.ack.trim_payload_size, trimmedRtt, qp->GetOnTheFly(),
-			Simulator::Now().GetNanoSeconds());
+		qp->Nscc().OnTrim(ch.ack.trim_payload_size, trimmedRtt,
+			qp->WindowOnTheFly(), Simulator::Now().GetNanoSeconds());
 		ApplyNsccWindow(qp);
 	}
 	const uint32_t nicIdx = GetNicIdxOfQp(qp);
@@ -2740,7 +2751,7 @@ void RdmaHw::HandleRetransmissionTimeout(Ptr<RdmaQueuePair> qp){
 		NS_ASSERT_MSG(lost > 0, "the timer expires with the oldest send");
 		qp->m_pathSelector->OnTimeout(now);
 		if (m_cc_mode == 11 && DeliverCongestionSignal(qp)){
-			qp->nscc.OnLoss(lost);
+			qp->Nscc().OnLoss(lost);
 			ApplyNsccWindow(qp);
 		}
 	}else{
@@ -2759,7 +2770,7 @@ void RdmaHw::HeldSendDue(Ptr<RdmaQueuePair> qp, uint64_t seq, uint16_t path,
 	if (lost == 0)
 		return;
 	if (m_cc_mode == 11 && DeliverCongestionSignal(qp)){
-		qp->nscc.OnLoss(lost);
+		qp->Nscc().OnLoss(lost);
 		ApplyNsccWindow(qp);
 	}
 	m_nic[GetNicIdxOfQp(qp)].dev->TriggerTransmit();
@@ -2942,6 +2953,7 @@ void RdmaHw::QpComplete(Ptr<RdmaQueuePair> qp){
 	Simulator::Cancel(qp->m_retransmissionTimer);
 	Simulator::Cancel(qp->m_ackLossTimer);
 	qp->m_covered.clear();
+	LeaveNsccConnection(qp);
 	// The losses of qp still waiting in m_tailLosses stay: the trim
 	// notification of a send can still follow, and m_tailLosses tells them
 	// when due.
@@ -2971,6 +2983,7 @@ void RdmaHw::QpFail(Ptr<RdmaQueuePair> qp, uint32_t reason){
 	Simulator::Cancel(qp->m_ackLossTimer);
 	qp->m_covered.clear();
 	DropTailLosses(qp);
+	LeaveNsccConnection(qp);
 	if (m_cc_mode == 1){
 		Simulator::Cancel(qp->mlx.m_eventUpdateAlpha);
 		Simulator::Cancel(qp->mlx.m_eventDecreaseRate);
@@ -3848,19 +3861,63 @@ void RdmaHw::HandleAckNscc(Ptr<RdmaQueuePair> qp, uint64_t seq, uint16_t path,
 	const uint32_t bytes = qp->m_outstanding.Size(packet);
 	const uint64_t rtt = AnswerRtt(qp->m_outstanding, packet);
 	const uint64_t lost = qp->AcknowledgePacket(seq, path);
-	qp->nscc.OnAck(bytes, marked, rtt, qp->GetOnTheFly(),
+	qp->Nscc().OnAck(bytes, marked, rtt, qp->WindowOnTheFly(),
 		Simulator::Now().GetNanoSeconds(), rcvCwndPend);
 	if (lost > 0)
-		qp->nscc.OnLoss(lost);
+		qp->Nscc().OnLoss(lost);
 	ApplyNsccWindow(qp);
 }
 
 void RdmaHw::ApplyNsccWindow(Ptr<RdmaQueuePair> qp){
-	const uint32_t previous = qp->m_win;
-	const uint32_t window = static_cast<uint32_t>(qp->nscc.Cwnd());
-	qp->SetWin(window);
-	if (window != previous)
-		m_traceNsccWindow(qp, previous, window);
+	const uint32_t window = static_cast<uint32_t>(qp->Nscc().Cwnd());
+	const auto apply = [this, window](Ptr<RdmaQueuePair> each){
+		const uint32_t previous = each->m_win;
+		each->SetWin(window);
+		if (window != previous)
+			m_traceNsccWindow(each, previous, window);
+	};
+	if (!qp->m_nsccConnection){
+		apply(qp);
+		return;
+	}
+	for (const Ptr<RdmaQueuePair> &each : qp->m_nsccConnection->queuePairs)
+		apply(each);
+}
+
+bool RdmaHw::ValidNsccWindowState() const{
+	return m_nsccWindowState ==
+			static_cast<uint32_t>(NsccWindowState::Message) ||
+		m_cc_mode == 11;
+}
+
+void RdmaHw::StartNscc(Ptr<RdmaQueuePair> qp, uint64_t bdpBytes,
+		uint64_t baseRttNs){
+	const uint64_t now = Simulator::Now().GetNanoSeconds();
+	if (m_nsccWindowState ==
+			static_cast<uint32_t>(NsccWindowState::Connection)){
+		// The connection's priority group stands where GetQpKey takes the
+		// port.
+		std::shared_ptr<NsccConnection> &connection =
+			m_nsccConnections[GetQpKey(qp->dip.Get(), 0, qp->m_pg)];
+		if (!connection){
+			connection = std::make_shared<NsccConnection>();
+			connection->window.Start(NsccParameters(), m_mtu, bdpBytes,
+				baseRttNs, now);
+		}
+		connection->queuePairs.push_back(qp);
+		qp->m_nsccConnection = connection;
+	}else
+		qp->Nscc().Start(NsccParameters(), m_mtu, bdpBytes, baseRttNs, now);
+	NS_ABORT_MSG_IF(qp->Nscc().MaxWnd() > UINT32_MAX,
+		"a queue pair's window is 32 bits");
+	ApplyNsccWindow(qp);
+}
+
+void RdmaHw::LeaveNsccConnection(Ptr<RdmaQueuePair> qp){
+	if (!qp->m_nsccConnection)
+		return;
+	std::vector<Ptr<RdmaQueuePair>> &open = qp->m_nsccConnection->queuePairs;
+	open.erase(std::remove(open.begin(), open.end(), qp), open.end());
 }
 
 }

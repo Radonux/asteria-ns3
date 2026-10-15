@@ -58,6 +58,17 @@ using namespace std;
 NS_LOG_COMPONENT_DEFINE("GENERIC_SIMULATION");
 
 uint32_t cc_mode = 1;
+// Under CC_MODE 11 (NSCC), NSCC_WINDOW_STATE message or connection: how long a
+// host keeps an NSCC window. message, the default, opens one per queue pair,
+// that is per message. connection keeps one per destination and priority
+// group, opened once at MaxWnd by the first queue pair to it, shared by every
+// queue pair to it, at once or later, as the bound of the bytes they have in
+// flight together, and kept past them: the next message to the destination
+// starts from the window the last one left, and an idle connection keeps its
+// window as it stands. Each queue pair keeps its own send records, repairs and
+// timers. The other CC modes keep their state per queue pair and refuse it.
+std::string nscc_window_state = "message";
+bool nscc_window_state_given = false;
 bool enable_qcn = true, use_dynamic_pfc_threshold = true;
 uint32_t packet_payload_size = 1000, l2_chunk_size = 0, l2_ack_interval = 0;
 double pause_time = 5, simulator_stop_time = 3.01;
@@ -2333,6 +2344,9 @@ bool ReadConf(string network_configuration) {
 	  conf >> trimmed_queue_bytes;
     } else if (key.compare("CC_MODE") == 0) {
       conf >> cc_mode;
+    } else if (key.compare("NSCC_WINDOW_STATE") == 0) {
+      conf >> nscc_window_state;
+      nscc_window_state_given = true;
     } else if (key.compare("RATE_DECREASE_INTERVAL") == 0) {
       double v;
       conf >> v;
@@ -2863,6 +2877,14 @@ bool ReadConf(string network_configuration) {
     std::cerr << "CC_MODE 11 (NSCC) requires HAS_WIN 1\n";
     return false;
   }
+  if (nscc_window_state != "message" && nscc_window_state != "connection") {
+    std::cerr << "NSCC_WINDOW_STATE must be message or connection\n";
+    return false;
+  }
+  if (nscc_window_state_given && cc_mode != 11) {
+    std::cerr << "NSCC_WINDOW_STATE is read only under CC_MODE 11 (NSCC)\n";
+    return false;
+  }
   if (load_balancing_value() != static_cast<uint32_t>(LoadBalancingMode::Ecmp) &&
       data_loss_duration_ns != 0 &&
       data_loss_rng_stream == static_cast<uint64_t>(path_rng_stream)) {
@@ -3331,6 +3353,11 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),
       rdmaHw->SetAttribute("SelectiveRetransmission",
                BooleanValue(selective_retransmission != 0));
       rdmaHw->SetAttribute("CcMode", UintegerValue(cc_mode));
+      rdmaHw->SetAttribute(
+          "NsccWindowState",
+          UintegerValue(static_cast<uint32_t>(
+              nscc_window_state == "connection" ? NsccWindowState::Connection
+                                                : NsccWindowState::Message)));
       rdmaHw->SetAttribute("RateDecreaseInterval",
                            DoubleValue(rate_decrease_interval));
       rdmaHw->SetAttribute("MinRate", DataRateValue(DataRate(min_rate)));

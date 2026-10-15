@@ -861,13 +861,36 @@ public:
 	uint32_t m_nscc_adjust_bytes;
 	double m_nscc_adjust_period;
 	NsccWindow::Parameters NsccParameters() const;
+	// NsccWindowState, under CC mode 11: NsccWindowState::Message opens a
+	// window per queue pair, which ends with it. Under
+	// NsccWindowState::Connection the queue pairs of the host to one
+	// destination and priority group share the window of their connection in
+	// m_nsccConnections, opened once at MaxWnd by the first of them with its
+	// bandwidth-delay product and base RTT: it bounds the bytes they have in
+	// flight together, every answer to any of them moves it, NSCC's state
+	// with it, and it is kept past them, across idle periods as it stands,
+	// since no rule for an idle window is taken from the specification. Each
+	// queue pair keeps what belongs to its own packets: its send records,
+	// repairs, timers and rate. The other modes keep their state per queue
+	// pair and refuse it.
+	uint32_t m_nsccWindowState;
+	std::unordered_map<uint64_t, std::shared_ptr<NsccConnection>>
+		m_nsccConnections;
+	bool ValidNsccWindowState() const;
+	// The window of qp, its own or its connection's, opened, and qp's window
+	// set from it; bdpBytes and baseRttNs as AddQueuePair receives them.
+	void StartNscc(Ptr<RdmaQueuePair> qp, uint64_t bdpBytes,
+		uint64_t baseRttNs);
+	// qp, completed or failed, no longer in flight on its connection.
+	void LeaveNsccConnection(Ptr<RdmaQueuePair> qp);
 	// The acknowledgement of the send of seq along path, as AcknowledgePacket
 	// takes it, with the window following what it says and the receiver's
 	// Rcv_Cwnd_Pend.
 	void HandleAckNscc(Ptr<RdmaQueuePair> qp, uint64_t seq, uint16_t path,
 		bool marked, uint32_t rcvCwndPend);
 	// The window the NIC enforces follows the controller's, as the rate does
-	// under the rate-based modes.
+	// under the rate-based modes: qp's, or every queue pair's open on qp's
+	// connection.
 	void ApplyNsccWindow(Ptr<RdmaQueuePair> qp);
 	// The NsccWindow trace source: queue pair, old window, new window.
 	typedef void (*NsccWindowTracedCallback)(Ptr<RdmaQueuePair> qp,

@@ -196,7 +196,7 @@ void RdmaHw::RecoverTail(Ptr<RdmaQueuePair> qp, const CustomHeader &ch){
 	if (lost == 0)
 		return;
 	if (m_cc_mode == 11 && DeliverCongestionSignal(qp)){
-		qp->nscc.OnLoss(lost);
+		qp->Nscc().OnLoss(lost);
 		ApplyNsccWindow(qp);
 	}
 	m_nic[GetNicIdxOfQp(qp)].dev->TriggerTransmit();
