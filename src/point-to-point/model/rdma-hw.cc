@@ -551,13 +551,15 @@ TypeId RdmaHw::GetTypeId (void)
 				"to it and holding a spine for them alone, 2=per spine either, "
 				"the host's every destination once SprayHoldAutoLeaves "
 				"destination leaves have a loss on it, else the destination "
-				"leaf it is graded 0 toward (AutoLossHold). Default 2. Leaf "
-				"and auto need the hosts' leaves, from SwitchQueueState.",
+				"leaf it is graded 0 toward (AutoLossHold), 3=one destination "
+				"host, its hold counting and holding as a leaf's does under 1 "
+				"and outlasting the queue pairs to it. Default 2. Leaf and "
+				"auto need the hosts' leaves, from SwitchQueueState.",
 				UintegerValue(static_cast<uint32_t>(HoldScope::Auto)),
 				MakeUintegerAccessor(&RdmaHw::m_sprayHoldScope),
 				MakeUintegerChecker<uint32_t>(
 					static_cast<uint32_t>(HoldScope::Host),
-					static_cast<uint32_t>(HoldScope::Auto)))
+					static_cast<uint32_t>(HoldScope::Pair)))
 		.AddAttribute("SprayHoldAutoLeaves",
 				"Under PathSelector 6 and 9 with SprayHoldScope 2, the destination "
 				"leaves with a loss on a spine from which its hold is kept "
@@ -815,7 +817,9 @@ TypeId RdmaHw::GetTypeId (void)
 				"one destination leaf closed a loss interval, and with "
 				"SprayHoldScope 2 the host's loss hold did, once per "
 				"destination leaf: the leaf, and what SpineLossInterval "
-				"passes.",
+				"passes; with SprayHoldScope 3 the loss hold of one "
+				"destination host did, passed with its address for the "
+				"leaf.",
 				MakeTraceSourceAccessor(&RdmaHw::m_traceLeafSpineLossInterval),
 				"ns3::RdmaHw::LeafSpineLossIntervalTracedCallback")
 		.AddTraceSource("ReceiverHoldInterval",
@@ -1604,6 +1608,12 @@ bool RdmaHw::IsLeafHold() const{
 		m_sprayHoldScope == static_cast<uint32_t>(HoldScope::Leaf);
 }
 
+bool RdmaHw::IsPairHold() const{
+	return (m_pathSelectorKind ==
+			static_cast<uint32_t>(PathSelectorKind::RepsHold) || IsMrcHold()) &&
+		m_sprayHoldScope == static_cast<uint32_t>(HoldScope::Pair);
+}
+
 bool RdmaHw::IsAutoHold() const{
 	return (m_pathSelectorKind ==
 			static_cast<uint32_t>(PathSelectorKind::RepsHold) || IsMrcHold()) &&
@@ -1624,18 +1634,26 @@ AutoLossHold &RdmaHw::AutoHold(){
 	return *m_autoHold;
 }
 
-SpineScores &RdmaHw::LeafHold(uint32_t leaf){
-	const auto [found, made] = m_leafHolds.try_emplace(leaf, m_spineCount,
+SpineScores &RdmaHw::LeafHold(uint32_t key){
+	const auto [found, made] = m_leafHolds.try_emplace(key, m_spineCount,
 		LossHoldParameters());
 	SpineScores &hold = found->second;
 	if (made)
 		hold.SetLossIntervalCallback(
-			[this, leaf](uint64_t endNs, const std::vector<uint32_t> &sent,
+			[this, key](uint64_t endNs, const std::vector<uint32_t> &sent,
 					const std::vector<uint32_t> &lost,
 					const std::vector<uint8_t> &grades){
-				m_traceLeafSpineLossInterval(leaf, endNs, sent, lost, grades);
+				m_traceLeafSpineLossInterval(key, endNs, sent, lost, grades);
 			});
 	return hold;
+}
+
+SpineScores &RdmaHw::DestinationHold(uint32_t destination){
+	if (IsPairHold())
+		return LeafHold(destination);
+	if (IsLeafHold())
+		return LeafHold(m_switchQueues->LeafOf(destination));
+	return HostScores(LossHoldParameters());
 }
 
 SpineScores::Parameters RdmaHw::LossHoldParameters() const{
@@ -2751,12 +2769,10 @@ void RdmaHw::DeferTailLosses(Ptr<RdmaQueuePair> qp,
 	if (sends.empty())
 		return;
 	const uint64_t key = GetQpKey(qp->dip.Get(), qp->sport, qp->m_pg);
-	const uint32_t leaf = m_switchQueues ? m_switchQueues->LeafOf(qp->dip.Get())
-		: 0;
 	const uint64_t dueNs = Simulator::Now().GetNanoSeconds() + guardNs;
 	for (const RdmaQueuePair::DeclaredSend &send : sends)
-		m_tailLosses.emplace(dueNs,
-			TailLoss{key, qp, send.seq, send.path, send.trickle, leaf});
+		m_tailLosses.emplace(dueNs, TailLoss{key, qp, send.seq, send.path,
+			send.trickle, qp->dip.Get()});
 	ArmTailLossTimer();
 }
 
@@ -2870,13 +2886,13 @@ void RdmaHw::TellTailLoss(const TailLoss &loss, uint64_t nowNs){
 			static_cast<uint32_t>(PathSelectorKind::RepsFlowHold))
 		return;
 	if (IsAutoHold()){
-		AutoHold().CountLoss(loss.leaf, loss.path, nowNs);
+		const uint32_t leaf = m_switchQueues->LeafOf(loss.destination);
+		AutoHold().CountLoss(leaf, loss.path, nowNs);
 		if (loss.trickle)
-			AutoHold().TrickleAnswer(loss.leaf, loss.path, true, nowNs);
+			AutoHold().TrickleAnswer(leaf, loss.path, true, nowNs);
 		return;
 	}
-	SpineScores &hold = IsLeafHold() ? LeafHold(loss.leaf)
-		: HostScores(LossHoldParameters());
+	SpineScores &hold = DestinationHold(loss.destination);
 	hold.CountIntervalLoss(loss.path, nowNs);
 	if (loss.trickle)
 		hold.TrickleAnswer(loss.path, true, nowNs);
@@ -3189,9 +3205,7 @@ void RdmaHw::StartPathSelection(Ptr<RdmaQueuePair> qp, uint64_t bdpBytes,
 				m_switchQueues->LeafOf(qp->dip.Get()));
 		else
 			qp->m_pathSelector = std::make_unique<MrcHoldSelector>(m_pathRandom,
-				m_spineCount, skipNs, probeNs, IsLeafHold()
-					? LeafHold(m_switchQueues->LeafOf(qp->dip.Get()))
-					: HostScores(LossHoldParameters()));
+				m_spineCount, skipNs, probeNs, DestinationHold(qp->dip.Get()));
 		return;
 	}
 	if (IsAutoHold()){
@@ -3202,12 +3216,9 @@ void RdmaHw::StartPathSelection(Ptr<RdmaQueuePair> qp, uint64_t bdpBytes,
 		return;
 	}
 	if (IsRepsHold()){
-		SpineScores &hold = IsLeafHold()
-			? LeafHold(m_switchQueues->LeafOf(qp->dip.Get()))
-			: HostScores(LossHoldParameters());
 		qp->m_pathSelector = std::make_unique<RepsHoldSelector>(m_pathRandom,
 			m_repsBufferSize, m_repsFreezingTimeoutNs, bdpBytes / m_mtu,
-			m_spineCount, hold);
+			m_spineCount, DestinationHold(qp->dip.Get()));
 		return;
 	}
 	if (m_loadBalancing == static_cast<uint32_t>(LoadBalancingMode::SprayUniform)){

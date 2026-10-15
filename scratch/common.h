@@ -159,45 +159,51 @@ bool hold_scope_read() {
   return path_selector == "reps_hold" || path_selector == "mrc_hold";
 }
 // Under reps_hold and mrc_hold, what one loss hold is kept for: host, every
-// destination of the host, leaf, the destinations on one leaf, or auto, per
-// spine either of the two. Under auto the host counts each spine's sends and losses per
-// destination leaf and keeps the destination leaves with a loss on it since
-// it was last released. A spine graded 0 toward a leaf is held for every
-// destination when at least SPRAY_HOLD_AUTO_LEAVES leaves have a loss on it,
-// else for that leaf alone; a leaf-scope hold widens to every destination
-// once a loss on the spine brings its leaves to SPRAY_HOLD_AUTO_LEAVES. A
-// hold ends by the clean sends at the scope it has, counted over every leaf
-// for a host-scope hold, whose release clears the spine's leaves. Each held
-// (spine, scope) is sent one sentinel per sentinel interval for the host.
+// destination of the host, leaf, the destinations on one leaf, auto, per spine
+// either of the two, or pair, one destination host. Under auto the host counts
+// each spine's sends and losses per destination leaf and keeps the destination
+// leaves with a loss on it since it was last released. A spine graded 0 toward
+// a leaf is held for every destination when at least SPRAY_HOLD_AUTO_LEAVES
+// leaves have a loss on it, else for that leaf alone; a leaf-scope hold widens
+// to every destination once a loss on the spine brings its leaves to
+// SPRAY_HOLD_AUTO_LEAVES. A hold ends by the clean sends at the scope it has,
+// counted over every leaf for a host-scope hold, whose release clears the
+// spine's leaves. Each held (spine, scope) is sent one sentinel per sentinel
+// interval for the host.
 // SPINE_LOSS_OUTPUT_FILE writes one row per destination leaf and spine, as
-// leaf writes it, with the grade of the scope the spine is held at.
+// leaf writes it, with the grade of the scope the spine is held at. Under pair
+// the hold is leaf's, kept per destination host instead of per leaf: the
+// host's queue pairs to one destination, each made for one message, share it,
+// so that it outlasts them as one queue pair kept across the messages would
+// keep it. SPINE_LOSS_OUTPUT_FILE writes one row per destination and spine,
+// with the destination's node id where leaf writes the leaf.
 std::string spray_hold_scope = "auto";
 bool spray_hold_scope_given = false;
 // Under SPRAY_HOLD_SCOPE auto, the destination leaves with a loss on a spine
 // from which its hold is kept for every destination; at least 2.
 uint32_t spray_hold_auto_leaves = 2;
 bool spray_hold_auto_leaves_given = false;
-// Under reps_hold, reps_flow_hold and mrc_hold, what puts a spine in loss
-// hold, per hold key: the (destination leaf, spine) under SPRAY_HOLD_SCOPE
-// leaf and auto, the spine under host, and the queue pair's spine under
-// reps_flow_hold. count: a loss interval whose lost fraction grades the
-// spine 0 through SPRAY_LOSS_THRESHOLDS. llr: a sequential likelihood-ratio
-// test per key, of the loss probability SPRAY_LOSS_P0 of a working path
-// against SPRAY_LOSS_P1 of a faulted one: its statistic L starts at 0, each
-// send on the key adds ln((1 - p1) / (1 - p0)) and each send declared lost
-// ln(p1 / p0), and the key is held at the loss that brings L to
-// ln((1 - beta) / alpha), SPRAY_HOLD_ALPHA being the probability of holding
-// a working path and SPRAY_HOLD_BETA that of missing a faulted one. L is
-// clamped below at 0, so that a clean stretch builds no unbounded credit
-// against the losses that follow it, and restarts at 0 at the key's release.
-// With SPRAY_LOSS_P0 0 a loss adds +infinity, so the first loss holds as
-// count holds it, and a send adds 0. Under llr SPRAY_LOSS_THRESHOLDS grade
-// the intervals SPINE_LOSS_OUTPUT_FILE writes but hold nothing, and the
-// release is unchanged. Under auto the leaves with a loss on a spine still
-// choose the scope of the hold the test starts. SPRAY_HOLD_BETA is read only
-// under llr, and SPRAY_LOSS_P0, SPRAY_LOSS_P1 and SPRAY_HOLD_ALPHA only under
-// llr or SPRAY_HOLD_RELEASE trickle; 0 <= SPRAY_LOSS_P0 < SPRAY_LOSS_P1 < 1,
-// and SPRAY_HOLD_ALPHA and SPRAY_HOLD_BETA are in (0, 0.5).
+// Under reps_hold, reps_flow_hold and mrc_hold, what puts a spine in loss hold,
+// per hold key: the (destination leaf, spine) under SPRAY_HOLD_SCOPE leaf and
+// auto, the (destination, spine) under pair, the spine under host, and the
+// queue pair's spine under reps_flow_hold. count: a loss interval whose lost
+// fraction grades the spine 0 through SPRAY_LOSS_THRESHOLDS. llr: a sequential
+// likelihood-ratio test per key, of the loss probability SPRAY_LOSS_P0 of a
+// working path against SPRAY_LOSS_P1 of a faulted one: its statistic L starts
+// at 0, each send on the key adds ln((1 - p1) / (1 - p0)) and each send
+// declared lost ln(p1 / p0), and the key is held at the loss that brings L to
+// ln((1 - beta) / alpha), SPRAY_HOLD_ALPHA being the probability of holding a
+// working path and SPRAY_HOLD_BETA that of missing a faulted one. L is clamped
+// below at 0, so that a clean stretch builds no unbounded credit against the
+// losses that follow it, and restarts at 0 at the key's release. With
+// SPRAY_LOSS_P0 0 a loss adds +infinity, so the first loss holds as count holds
+// it, and a send adds 0. Under llr SPRAY_LOSS_THRESHOLDS grade the intervals
+// SPINE_LOSS_OUTPUT_FILE writes but hold nothing, and the release is unchanged.
+// Under auto the leaves with a loss on a spine still choose the scope of the
+// hold the test starts. SPRAY_HOLD_BETA is read only under llr, and
+// SPRAY_LOSS_P0, SPRAY_LOSS_P1 and SPRAY_HOLD_ALPHA only under llr or
+// SPRAY_HOLD_RELEASE trickle; 0 <= SPRAY_LOSS_P0 < SPRAY_LOSS_P1 < 1, and
+// SPRAY_HOLD_ALPHA and SPRAY_HOLD_BETA are in (0, 0.5).
 std::string spray_hold_rule = "count";
 bool spray_hold_rule_given = false;
 double spray_loss_p0 = 0;
@@ -1057,6 +1063,8 @@ uint32_t spray_hold_scope_value() {
     return static_cast<uint32_t>(HoldScope::Leaf);
   if (spray_hold_scope == "auto")
     return static_cast<uint32_t>(HoldScope::Auto);
+  if (spray_hold_scope == "pair")
+    return static_cast<uint32_t>(HoldScope::Pair);
   return std::numeric_limits<uint32_t>::max();
 }
 
@@ -1066,6 +1074,10 @@ bool leaf_hold() {
   return hold_scope_read() &&
          (spray_hold_scope == "leaf" || spray_hold_scope == "auto");
 }
+
+// Under reps_hold and mrc_hold, whether a loss hold is kept per destination
+// host, under pair.
+bool pair_hold() { return hold_scope_read() && spray_hold_scope == "pair"; }
 
 uint32_t spray_candidate_draw_value() {
   if (spray_candidate_draw == "proportional")
@@ -1566,6 +1578,18 @@ void write_leaf_spine_loss_interval(uint32_t rank, uint32_t leaf,
     fprintf(spine_loss_file, "%lu,%u,%u,%u,%u,%u,%u\n",
             static_cast<unsigned long>(end_ns), rank, leaf, spine, sent[spine],
             lost[spine], grades[spine]);
+}
+
+// A loss interval a destination host's loss hold closed under pair, as
+// write_leaf_spine_loss_interval writes it with the destination's node id
+// for the leaf.
+void write_pair_spine_loss_interval(uint32_t rank, uint32_t destination,
+                                    uint64_t end_ns,
+                                    const std::vector<uint32_t> &sent,
+                                    const std::vector<uint32_t> &lost,
+                                    const std::vector<uint8_t> &grades) {
+  write_leaf_spine_loss_interval(rank, ip_to_node_id(Ipv4Address(destination)),
+                                 end_ns, sent, lost, grades);
 }
 
 // A retransmission timeout a host's queue pair took.
@@ -2648,7 +2672,7 @@ bool ReadConf(string network_configuration) {
     return false;
   }
   if (spray_hold_scope_value() == std::numeric_limits<uint32_t>::max()) {
-    std::cerr << "SPRAY_HOLD_SCOPE must be host, leaf or auto\n";
+    std::cerr << "SPRAY_HOLD_SCOPE must be host, leaf, auto or pair\n";
     return false;
   }
   if (spray_hold_auto_leaves_given &&
@@ -3630,11 +3654,17 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),
       return false;
     }
     fprintf(spine_loss_file, "time_ns,rank,%sspine,sent,lost,grade\n",
-            leaf_hold() ? "destination_leaf," : "");
+            pair_hold()   ? "destination,"
+            : leaf_hold() ? "destination_leaf,"
+                          : "");
     for (uint32_t i = 0; i < node_num; i++)
       if (n.Get(i)->GetNodeType() == 0) {
         Ptr<RdmaHw> hw = n.Get(i)->GetObject<RdmaDriver>()->m_rdma;
-        if (leaf_hold())
+        if (pair_hold())
+          hw->TraceConnectWithoutContext(
+              "LeafSpineLossInterval",
+              MakeBoundCallback(&write_pair_spine_loss_interval, i));
+        else if (leaf_hold())
           hw->TraceConnectWithoutContext(
               "LeafSpineLossInterval",
               MakeBoundCallback(&write_leaf_spine_loss_interval, i));

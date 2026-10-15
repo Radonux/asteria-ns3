@@ -19,12 +19,14 @@
 namespace ns3 {
 
 // What the host-wide loss hold of RepsHold is kept for: the host's every
-// destination, each destination leaf apart, or per spine either of the two
-// by the destination leaves it loses toward (AutoLossHold).
+// destination, each destination leaf apart, per spine either of the two by
+// the destination leaves it loses toward (AutoLossHold), or each destination
+// host apart.
 enum class HoldScope : uint32_t {
 	Host = 0,
 	Leaf,
 	Auto,
+	Pair,
 };
 
 // What puts a spine in the loss hold of RepsHold, RepsFlowHold and MrcHold,

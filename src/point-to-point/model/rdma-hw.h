@@ -262,18 +262,25 @@ public:
 	bool ValidAckLoss() const;
 	// HoldScope of PathSelector RepsHold and MrcHold. Under Leaf the queue
 	// pairs to the hosts of one leaf, which m_switchQueues names, share that
-	// leaf's loss hold in m_leafHolds, made at the first of them; under Host
-	// every queue pair shares m_senderSpineScores. Under Auto every queue
-	// pair shares m_autoHold, made at the first of them, toward its
-	// destination's leaf, which m_switchQueues names; m_sprayHoldAutoLeaves
-	// is its AutoLossHold autoLeaves.
+	// leaf's loss hold in m_leafHolds, made at the first of them; under Pair
+	// the queue pairs to one destination host share its own there, keyed by
+	// its address, so that the hold outlasts each queue pair as one queue
+	// pair kept across the host's messages to it would; under Host every
+	// queue pair shares m_senderSpineScores. Under Auto every queue pair
+	// shares m_autoHold, made at the first of them, toward its destination's
+	// leaf, which m_switchQueues names; m_sprayHoldAutoLeaves is its
+	// AutoLossHold autoLeaves.
 	uint32_t m_sprayHoldScope;
 	uint32_t m_sprayHoldAutoLeaves;
 	std::unordered_map<uint32_t, SpineScores> m_leafHolds;
 	std::unique_ptr<AutoLossHold> m_autoHold;
 	bool IsLeafHold() const;
+	bool IsPairHold() const;
 	bool IsAutoHold() const;
 	AutoLossHold &AutoHold();
+	// The loss hold of the queue pairs to destination under Host, Leaf and
+	// Pair.
+	SpineScores &DestinationHold(uint32_t destination);
 	// PathSelector RepsOracle, whether it has the switches' state to read,
 	// and per destination leaf the spines it excludes, made at the first
 	// queue pair to that leaf and read once per base RTT.
@@ -283,10 +290,13 @@ public:
 	bool IsRepsSpine() const;
 	std::unordered_map<uint32_t, FaultedSpines> m_faultedSpines;
 	FaultedSpines &FaultedSpinesTo(uint32_t leaf);
-	SpineScores &LeafHold(uint32_t leaf);
+	// The hold in m_leafHolds of key: a destination leaf, or under Pair a
+	// destination host's address.
+	SpineScores &LeafHold(uint32_t key);
 	// The LeafSpineLossInterval trace source: a destination leaf's loss hold
 	// closed a loss interval, or under Auto the host's did toward one
-	// destination leaf, as SpineLossInterval passes it.
+	// destination leaf, as SpineLossInterval passes it; under Pair a
+	// destination host's did, passed with the host's address for the leaf.
 	typedef void (*LeafSpineLossIntervalTracedCallback)(uint32_t leaf,
 		uint64_t endNs, const std::vector<uint32_t> &sent,
 		const std::vector<uint32_t> &lost, const std::vector<uint8_t> &grades);
@@ -410,9 +420,9 @@ public:
 		uint64_t seq;
 		uint16_t path;
 		bool trickle;
-		// The receiver's leaf, by which a loss told after the queue pair
-		// completed reaches the host's hold (TellTailLoss).
-		uint32_t leaf;
+		// The receiver's address, by which a loss told after the queue pair
+		// completed reaches the host's hold for it (TellTailLoss).
+		uint32_t destination;
 		// Whether a repair of seq left along path, so that an
 		// acknowledgement of seq along path may be the repair's
 		// (NoteTailRepair).
@@ -470,7 +480,7 @@ public:
 	void TailLossDue();
 	// Tell the loss of a send in m_tailLosses at nowNs. A queue pair still
 	// open tells its selector, as RdmaQueuePair::DeclareLost does; once it
-	// completed, the loss goes to the host's hold for the receiver's leaf as
+	// completed, the loss goes to the host's hold for the receiver as
 	// LossHoldExploration::OnLoss routes it, under RepsHold and MrcHold of
 	// every scope, and is dropped under every other selector, whose state is
 	// the queue pair's alone, RepsFlowHold's hold among them.

@@ -7696,6 +7696,132 @@ class RepsHoldScopeTest : public TestCase
     static constexpr uint64_t kInterval = LossHoldFixture::kInterval;
 };
 
+class RepsHoldPairScopeTest : public TestCase
+{
+  public:
+    RepsHoldPairScopeTest()
+        : TestCase("Under reps_hold with SprayHoldScope pair a spine lost on toward one host is "
+                   "held toward that host alone, also by a later queue pair to it, with one "
+                   "sentinel per interval for the host, released by the clean sentinels; a "
+                   "tail loss told after its queue pair completed reaches that host's hold")
+    {
+    }
+
+    void DoRun() override
+    {
+        Hold();
+        TailLossAfterCompletion();
+        Simulator::Destroy();
+    }
+
+  private:
+    static constexpr uint64_t kInterval = LossHoldFixture::kInterval;
+    static constexpr uint8_t kLossy = 3;
+    // Destinations d and e on one leaf, and the sender.
+    static inline const Ipv4Address kD{"11.0.2.1"};
+    static inline const Ipv4Address kE{"11.0.3.1"};
+    static inline const Ipv4Address kSelf{"11.0.1.1"};
+
+    static Ptr<RdmaHw> Hw()
+    {
+        Ptr<RdmaHw> hw = LossHoldFixture::Hw();
+        hw->SetAttribute("SprayHoldScope", UintegerValue(static_cast<uint32_t>(HoldScope::Pair)));
+        hw->SetAttribute("Mtu", UintegerValue(1000));
+        hw->SetAttribute("PathRandomVariable", PointerValue(SelectorStream()));
+        return hw;
+    }
+
+    static Ptr<RdmaQueuePair> Qp(Ptr<RdmaHw> hw, Ipv4Address destination, uint16_t port)
+    {
+        Ptr<RdmaQueuePair> qp = CreateObject<RdmaQueuePair>(3, kSelf, destination, port, 100);
+        hw->StartPathSelection(qp, 0, 0);
+        return qp;
+    }
+
+    // Over the first interval every send of the queue pair to d on spine 3
+    // is lost; from the second a new queue pair to d takes its place, and
+    // over the next three each is sent its sentinel, which arrives. The
+    // queue pair to e sends throughout.
+    void Hold()
+    {
+        Ptr<RdmaHw> hw = Hw();
+        NS_TEST_EXPECT_MSG_EQ(hw->ValidRepsHold(), true, "accepted without the hosts' leaves");
+        hw->m_switchQueues = Create<SwitchQueueState>(1, LossHoldFixture::kSpines);
+        hw->m_switchQueues->SetLeafOf(kD.Get(), 0);
+        hw->m_switchQueues->SetLeafOf(kE.Get(), 0);
+        Ptr<RdmaQueuePair> first = Qp(hw, kD, 10000);
+        Ptr<RdmaQueuePair> toE = Qp(hw, kE, 10001);
+        NS_TEST_EXPECT_MSG_EQ(hw->m_leafHolds.size(), 2u, "one hold per destination host");
+        NS_TEST_EXPECT_MSG_EQ(hw->m_senderSpineScores.get(), nullptr, "and none for the host");
+        Ptr<RdmaQueuePair> second;
+
+        uint32_t step = 0;
+        std::vector<uint32_t> toDOn3(5);
+        std::vector<uint32_t> toEOn3(5);
+        for (uint32_t interval = 0; interval < 5; ++interval)
+        {
+            if (interval == 1)
+            {
+                second = Qp(hw, kD, 10002);
+                NS_TEST_EXPECT_MSG_EQ(hw->m_leafHolds.size(),
+                                      2u,
+                                      "a new queue pair to d takes d's hold");
+            }
+            for (uint32_t i = 0; i < 200; ++i, ++step)
+            {
+                const bool toD = step % 2 == 0;
+                const uint64_t now = interval * kInterval + 50 * i;
+                const std::set<uint8_t> lost =
+                    toD && interval == 0 ? std::set<uint8_t>{kLossy} : std::set<uint8_t>{};
+                PathSelector& selector =
+                    *(toD ? (interval == 0 ? first : second) : toE)->m_pathSelector;
+                const uint8_t spine = LossHoldFixture::Send(selector, now, step / 2, lost);
+                (toD ? toDOn3 : toEOn3)[interval] += spine == kLossy;
+            }
+            if (interval == 1)
+            {
+                NS_TEST_EXPECT_MSG_EQ(hw->m_leafHolds.at(kD.Get()).Holds(kLossy),
+                                      true,
+                                      "d's hold holds spine 3");
+                NS_TEST_EXPECT_MSG_EQ(hw->m_leafHolds.at(kE.Get()).Holds(kLossy),
+                                      false,
+                                      "e's, on the same leaf, does not");
+            }
+        }
+        NS_TEST_EXPECT_MSG_GT(toDOn3[0], 0u, "the queue pair to d loses on spine 3");
+        for (uint32_t interval = 1; interval < 4; ++interval)
+        {
+            NS_TEST_EXPECT_MSG_EQ(toDOn3[interval],
+                                  1u,
+                                  "the new queue pair to d sends spine 3 one sentinel");
+            NS_TEST_EXPECT_MSG_GT(toEOn3[interval], 1u, "the queue pair to e keeps spine 3");
+        }
+        NS_TEST_EXPECT_MSG_EQ(hw->m_leafHolds.at(kD.Get()).Holds(kLossy),
+                              false,
+                              "three clean sentinels release it");
+        NS_TEST_EXPECT_MSG_GT(toDOn3[4], 1u, "and REPS chooses it toward d again");
+    }
+
+    // A tail loss on spine 3 told after the queue pair to e completed grades
+    // spine 3 0 in e's hold alone, with no sends in its interval.
+    void TailLossAfterCompletion()
+    {
+        Ptr<RdmaHw> hw = Hw();
+        Ptr<RdmaQueuePair> toD = Qp(hw, kD, 10000);
+        Ptr<RdmaQueuePair> toE = Qp(hw, kE, 10001);
+        NS_TEST_EXPECT_MSG_EQ(toE->IsFinished(), true, "the queue pair to e has nothing left");
+        hw->TellTailLoss(
+            RdmaHw::TailLoss{RdmaHw::GetQpKey(kE.Get(), 10001, 3), toE, 0, kLossy, false, kE.Get()},
+            100);
+        for (const Ipv4Address& destination : {kD, kE})
+        {
+            hw->m_leafHolds.at(destination.Get()).CountIntervalSend(0, 2 * kInterval);
+        }
+        NS_TEST_EXPECT_MSG_EQ(hw->m_leafHolds.at(kE.Get()).Holds(kLossy), true, "e's hold holds it");
+        NS_TEST_EXPECT_MSG_EQ(hw->m_leafHolds.at(kD.Get()).Holds(kLossy), false, "d's does not");
+    }
+};
+
 class RepsHoldAutoScopeTest : public TestCase
 {
   public:
@@ -13616,6 +13742,7 @@ PointToPointTestSuite::PointToPointTestSuite()
     AddTestCase(new MrcHoldExplorationTest, TestCase::Duration::QUICK);
     AddTestCase(new RepsFlowHoldTest, TestCase::Duration::QUICK);
     AddTestCase(new RepsHoldScopeTest, TestCase::Duration::QUICK);
+    AddTestCase(new RepsHoldPairScopeTest, TestCase::Duration::QUICK);
     AddTestCase(new RepsHoldAutoScopeTest, TestCase::Duration::QUICK);
     AddTestCase(new LossWithoutSendsTest, TestCase::Duration::QUICK);
     AddTestCase(new RepsHoldLlrTest, TestCase::Duration::QUICK);
