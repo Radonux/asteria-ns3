@@ -724,6 +724,18 @@ TypeId RdmaHw::GetTypeId (void)
 				BooleanValue(false),
 				MakeBooleanAccessor(&RdmaHw::m_sprayReceiverTailMissing),
 				MakeBooleanChecker())
+		.AddAttribute("SprayPathState",
+				"Under LoadBalancing 2, how long a host keeps the path "
+				"selector of a queue pair: 0=for that queue pair alone, one "
+				"message; 1=for its connection, one selector per destination "
+				"and priority group, shared by the host's queue pairs to it "
+				"and kept past them, so that what it learns of the paths "
+				"carries from one message to the next. Default 0.",
+				UintegerValue(static_cast<uint32_t>(PathState::Message)),
+				MakeUintegerAccessor(&RdmaHw::m_sprayPathState),
+				MakeUintegerChecker<uint32_t>(
+					static_cast<uint32_t>(PathState::Message),
+					static_cast<uint32_t>(PathState::Connection)))
 		.AddAttribute("SprayCandidates",
 				"Under LoadBalancing 3, the candidates drawn per packet, of which "
 				"the highest-scored is sent on. Default 1.",
@@ -1113,6 +1125,9 @@ void RdmaHw::Setup(QpCompleteCallback cb, QpFailureCallback failure_cb){
 	NS_ABORT_MSG_IF(!ValidReceiverTailMissing(),
 		"SprayReceiverTailMissing needs SprayReceiverHold and "
 		"SprayTailRecovery");
+	NS_ABORT_MSG_IF(!ValidPathState(),
+		"SprayPathState 1 is read only under LoadBalancing 2, where an "
+		"identification names a spine whatever the queue pair's ports");
 	NS_ABORT_MSG_IF(!ValidRepsOracle(),
 		"PathSelector 8 reads the spines' faults from SwitchQueueState and "
 		"needs LoadBalancing 2 and SprayGradeCostSource 1");
@@ -1235,9 +1250,10 @@ void RdmaHw::AddQueuePair(uint32_t src, uint32_t dest, uint64_t tag, uint64_t si
 	m_nic[nic_idx].qpGrp->AddQp(qp);
 	uint64_t key = GetQpKey(dip.Get(), sport, pg);
 	m_qpMap[key] = qp;
-	if (IsPathPerPacket())
-		StartPathSelection(qp, win, baseRtt);
-	if (IsReceiverHold())
+	// A selector kept from an earlier queue pair to the same destination has
+	// its receivers' marks already.
+	if (IsPathPerPacket() && StartPathSelection(qp, win, baseRtt) &&
+			IsReceiverHold())
 		AttachReceiverHold(qp);
 	// The liveness invariant starts at birth: an unfinished QP always has a
 	// pending timer, even if its first send never gets scheduled.
@@ -1704,6 +1720,15 @@ bool RdmaHw::ValidHeldExploration() const{
 bool RdmaHw::ValidPoolHoldPropagates() const{
 	return !IsSprayPolicy() || !m_sprayPoolHoldPropagates ||
 		m_spraySenderPoolWeight > 0;
+}
+
+bool RdmaHw::IsConnectionPathState() const{
+	return m_sprayPathState == static_cast<uint32_t>(PathState::Connection);
+}
+
+bool RdmaHw::ValidPathState() const{
+	return !IsConnectionPathState() || m_loadBalancing ==
+		static_cast<uint32_t>(LoadBalancingMode::SprayUniform);
 }
 
 bool RdmaHw::ValidTailLoss() const{
@@ -2875,7 +2900,9 @@ void RdmaHw::TailLossDue(){
 void RdmaHw::TellTailLoss(const TailLoss &loss, uint64_t nowNs){
 	if (loss.qp->IsFailed())
 		return;
-	if (!loss.qp->IsFinished()){
+	// Under SprayPathState connection the queue pair's selector is its
+	// connection's, which outlives it.
+	if (!loss.qp->IsFinished() || IsConnectionPathState()){
 		loss.qp->m_pathSelector->OnLoss(loss.path, nowNs);
 		if (loss.trickle)
 			loss.qp->m_pathSelector->OnTrickleAnswer(loss.path, true, nowNs);
@@ -3165,67 +3192,65 @@ void RdmaHw::SendPathProbe(Ptr<RdmaQueuePair> qp, uint16_t path){
 	ReportTransportEvent("path_probe", 0);
 }
 
-void RdmaHw::StartPathSelection(Ptr<RdmaQueuePair> qp, uint64_t bdpBytes,
+bool RdmaHw::StartPathSelection(Ptr<RdmaQueuePair> qp, uint64_t bdpBytes,
 		uint64_t baseRttNs){
 	qp->m_outstanding.SetPacketSize(m_mtu);
-	if (IsAckRedirect()){
-		qp->m_pathSelector =
-			std::make_unique<AckRedirectSelector>(m_pathRandom, m_spineCount);
-		return;
+	if (!IsConnectionPathState()){
+		qp->m_pathSelector = MakePathSelector(qp, bdpBytes, baseRttNs);
+		return true;
 	}
+	// The connection's priority group stands where GetQpKey takes the port.
+	std::shared_ptr<PathSelector> &shared =
+		m_connectionSelectors[GetQpKey(qp->dip.Get(), 0, qp->m_pg)];
+	const bool made = !shared;
+	if (made)
+		shared = MakePathSelector(qp, bdpBytes, baseRttNs);
+	qp->m_pathSelector = std::make_unique<SharedPathSelector>(shared);
+	return made;
+}
+
+std::unique_ptr<PathSelector> RdmaHw::MakePathSelector(Ptr<RdmaQueuePair> qp,
+		uint64_t bdpBytes, uint64_t baseRttNs){
+	if (IsAckRedirect())
+		return std::make_unique<AckRedirectSelector>(m_pathRandom, m_spineCount);
 	if (m_pathSelectorKind ==
-			static_cast<uint32_t>(PathSelectorKind::RepsFlowHold)){
-		qp->m_pathSelector = std::make_unique<RepsHoldSelector>(m_pathRandom,
+			static_cast<uint32_t>(PathSelectorKind::RepsFlowHold))
+		return std::make_unique<RepsHoldSelector>(m_pathRandom,
 			m_repsBufferSize, m_repsFreezingTimeoutNs, bdpBytes / m_mtu,
 			m_spineCount,
 			std::make_unique<SpineScores>(m_spineCount, LossHoldParameters()));
-		return;
-	}
-	if (IsRepsSpine()){
-		qp->m_pathSelector = std::make_unique<RepsSpineSelector>(m_pathRandom,
+	if (IsRepsSpine())
+		return std::make_unique<RepsSpineSelector>(m_pathRandom,
 			m_repsBufferSize, m_repsFreezingTimeoutNs, bdpBytes / m_mtu,
 			m_spineCount);
-		return;
-	}
-	if (IsRepsOracle()){
-		qp->m_pathSelector = std::make_unique<RepsOracleSelector>(m_pathRandom,
+	if (IsRepsOracle())
+		return std::make_unique<RepsOracleSelector>(m_pathRandom,
 			m_repsBufferSize, m_repsFreezingTimeoutNs, bdpBytes / m_mtu,
 			m_spineCount,
 			FaultedSpinesTo(m_switchQueues->LeafOf(qp->dip.Get())));
-		return;
-	}
 	if (IsMrcHold()){
 		const uint64_t skipNs =
 			static_cast<uint64_t>(m_mrcSkipBaseRtts * baseRttNs);
 		const uint64_t probeNs = static_cast<uint64_t>(
 			m_mrcProbeTimeouts * m_retransmission_timeout_ns);
 		if (IsAutoHold())
-			qp->m_pathSelector = std::make_unique<MrcHoldSelector>(m_pathRandom,
+			return std::make_unique<MrcHoldSelector>(m_pathRandom,
 				m_spineCount, skipNs, probeNs, AutoHold(),
 				m_switchQueues->LeafOf(qp->dip.Get()));
-		else
-			qp->m_pathSelector = std::make_unique<MrcHoldSelector>(m_pathRandom,
-				m_spineCount, skipNs, probeNs, DestinationHold(qp->dip.Get()));
-		return;
+		return std::make_unique<MrcHoldSelector>(m_pathRandom,
+			m_spineCount, skipNs, probeNs, DestinationHold(qp->dip.Get()));
 	}
-	if (IsAutoHold()){
-		qp->m_pathSelector = std::make_unique<RepsHoldSelector>(
+	if (IsAutoHold())
+		return std::make_unique<RepsHoldSelector>(
 			m_pathRandom, m_repsBufferSize, m_repsFreezingTimeoutNs,
 			bdpBytes / m_mtu, m_spineCount, AutoHold(),
 			m_switchQueues->LeafOf(qp->dip.Get()));
-		return;
-	}
-	if (IsRepsHold()){
-		qp->m_pathSelector = std::make_unique<RepsHoldSelector>(m_pathRandom,
+	if (IsRepsHold())
+		return std::make_unique<RepsHoldSelector>(m_pathRandom,
 			m_repsBufferSize, m_repsFreezingTimeoutNs, bdpBytes / m_mtu,
 			m_spineCount, DestinationHold(qp->dip.Get()));
-		return;
-	}
-	if (m_loadBalancing == static_cast<uint32_t>(LoadBalancingMode::SprayUniform)){
-		qp->m_pathSelector =
-			std::make_unique<UniformSpineSelector>(m_pathRandom, m_spineCount);
-		return;
-	}
+	if (m_loadBalancing == static_cast<uint32_t>(LoadBalancingMode::SprayUniform))
+		return std::make_unique<UniformSpineSelector>(m_pathRandom, m_spineCount);
 	if (IsSprayPolicy()){
 		SpineScores::Parameters parameters{m_sprayGamma, m_sprayEpsilon,
 			m_sprayCandidates,
@@ -3248,42 +3273,36 @@ void RdmaHw::StartPathSelection(Ptr<RdmaQueuePair> qp, uint64_t bdpBytes,
 			auto scores = std::make_unique<SpineScores>(m_spineCount, parameters);
 			if (m_senderSpineScores)
 				scores->Pool(*m_senderSpineScores, m_spraySenderPoolWeight);
-			qp->m_pathSelector = std::make_unique<PolicySpineSelector>(
+			return std::make_unique<PolicySpineSelector>(
 				m_pathRandom, std::move(scores));
-			return;
 		}
 		SpineScores &scores = m_spineScores.try_emplace(qp->dip.Get(),
 			m_spineCount, parameters).first->second;
 		if (m_senderSpineScores)
 			scores.Pool(*m_senderSpineScores, m_spraySenderPoolWeight);
-		qp->m_pathSelector =
-			std::make_unique<PolicySpineSelector>(m_pathRandom, scores);
-		return;
+		return std::make_unique<PolicySpineSelector>(m_pathRandom, scores);
 	}
 	switch (static_cast<PathSelectorKind>(m_pathSelectorKind)){
 	case PathSelectorKind::Ops:
-		qp->m_pathSelector = std::make_unique<ObliviousSelector>(m_pathRandom);
-		break;
+		return std::make_unique<ObliviousSelector>(m_pathRandom);
 	case PathSelectorKind::Reps:
 		// NUM_PKTS_CWND is the window in packets, as the REPS artifact sizes
 		// its exploration from the bandwidth-delay product.
-		qp->m_pathSelector = std::make_unique<RepsSelector>(m_pathRandom,
+		return std::make_unique<RepsSelector>(m_pathRandom,
 			m_repsBufferSize, m_repsFreezingTimeoutNs, bdpBytes / m_mtu);
-		break;
 	case PathSelectorKind::UeOblivious:
-		qp->m_pathSelector =
-			std::make_unique<UeObliviousSelector>(m_pathRandom, m_ueEvSetSize);
-		break;
+		return std::make_unique<UeObliviousSelector>(m_pathRandom,
+			m_ueEvSetSize);
 	case PathSelectorKind::UeAware:
-		qp->m_pathSelector = std::make_unique<UeAwareSelector>(m_pathRandom,
+		return std::make_unique<UeAwareSelector>(m_pathRandom,
 			m_ueEvSetSize, m_ueSaturationFraction);
-		break;
 	case PathSelectorKind::Mrc:
-		qp->m_pathSelector = std::make_unique<MrcSelector>(m_pathRandom,
+		return std::make_unique<MrcSelector>(m_pathRandom,
 			m_mrcEvSetSize, static_cast<uint64_t>(m_mrcSkipBaseRtts * baseRttNs),
 			static_cast<uint64_t>(
 				m_mrcProbeTimeouts * m_retransmission_timeout_ns));
-		break;
+	default:
+		return nullptr;
 	}
 }
 

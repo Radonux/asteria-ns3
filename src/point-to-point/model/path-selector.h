@@ -29,6 +29,15 @@ enum class HoldScope : uint32_t {
 	Pair,
 };
 
+// How long a sending host keeps a queue pair's path selector: for its one
+// message, or for the connection to its destination, a selector per
+// destination and priority group shared by the queue pairs to it and kept
+// past them (SharedPathSelector).
+enum class PathState : uint32_t {
+	Message = 0,
+	Connection,
+};
+
 // What puts a spine in the loss hold of RepsHold, RepsFlowHold and MrcHold,
 // per hold key: Count, a closed loss interval whose lost fraction grades it 0
 // through the loss thresholds; Llr, the key's LossLikelihoodRatio reaching its
@@ -259,6 +268,35 @@ public:
 	// them.
 	virtual void SetReceiverHold(std::shared_ptr<ReceiverHoldMarks> marks,
 		uint32_t leaf);
+};
+
+// A queue pair's handle on the path selector of its connection under
+// PathState::Connection, which the host's other queue pairs to the same
+// destination share and which outlives them all: every call goes to it.
+class SharedPathSelector : public PathSelector {
+public:
+	explicit SharedPathSelector(std::shared_ptr<PathSelector> shared);
+	uint16_t Choose(uint64_t nowNs) override;
+	void OnAck(uint16_t path, bool marked, uint64_t nowNs) override;
+	void OnTrim(uint16_t path, bool lastHop, bool marked, uint64_t nowNs) override;
+	void OnLoss(uint16_t path, uint64_t nowNs) override;
+	void OnTimeout(uint64_t nowNs) override;
+	bool TakeProbe(uint64_t nowNs, uint16_t &path) override;
+	void OnProbeAnswer(uint16_t path, bool marked, uint64_t nowNs) override;
+	bool ChoseTrickle() const override;
+	bool ChoseExploration() const override;
+	bool ChoseHeld() const override;
+	void OnTrickleAnswer(uint16_t path, bool lost, uint64_t nowNs) override;
+	bool TakeCopy(uint8_t &spine, bool &trickle) override;
+	void OnReport(const SpineReport &report, uint64_t nowNs) override;
+	void OnRedirect(uint8_t spine, uint8_t carrying, uint64_t nowNs) override;
+	void OnReceiverHold(uint32_t receiver, uint8_t bitmap,
+		uint64_t nowNs) override;
+	void SetReceiverHold(std::shared_ptr<ReceiverHoldMarks> marks,
+		uint32_t leaf) override;
+
+private:
+	std::shared_ptr<PathSelector> m_shared;
 };
 
 // A spine drawn uniformly per packet, named as both the requested and the

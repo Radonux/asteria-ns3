@@ -295,6 +295,22 @@ bool spray_hold_trickle_given = false;
 // data header as it is.
 std::string spray_path_seq = "off";
 bool spray_path_seq_given = false;
+// Under LOAD_BALANCING spray_uniform, with any PATH_SELECTOR or none,
+// SPRAY_PATH_STATE message or connection: how long a host keeps the path
+// selector of a queue pair, each queue pair carrying one message. message, the
+// default, keeps it for that queue pair alone, so every message starts afresh.
+// connection keeps one per destination and priority group, made by the first
+// queue pair to it, shared by every queue pair to it, at once or later, and
+// kept past them, as one queue pair kept across the messages would keep it:
+// REPS's cached values and freezing mode, MRC's value states, rotation and
+// probes, a loss hold selector's trickle schedule and receivers' marks,
+// reps_flow_hold's own hold and ack_redirect's redirect carry from one message
+// to the next. A queue pair's send records, copies, covered sends and path
+// sequences stay its own, and the host's holds are as SPRAY_HOLD_SCOPE keeps
+// them. A tail repair request's loss told after its queue pair completed
+// reaches the connection's selector.
+std::string spray_path_state = "message";
+bool spray_path_state_given = false;
 // Under LOAD_BALANCING spray_uniform, with any PATH_SELECTOR,
 // SPRAY_TAIL_RECOVERY on, which requires SPRAY_PATH_SEQ on and at most 8
 // spines: a queue pair's message is its flow's data, and it ends with the send
@@ -2271,6 +2287,9 @@ bool ReadConf(string network_configuration) {
     } else if (key.compare("SPRAY_HOLD_BETA") == 0) {
       conf >> spray_hold_beta;
       hold_test_keys_given.insert(key);
+    } else if (key.compare("SPRAY_PATH_STATE") == 0) {
+      conf >> spray_path_state;
+      spray_path_state_given = true;
     } else if (key.compare("SPRAY_PATH_SEQ") == 0) {
       conf >> spray_path_seq;
       spray_path_seq_given = true;
@@ -2699,6 +2718,15 @@ bool ReadConf(string network_configuration) {
   }
   if (spray_path_seq_given && load_balancing != "spray_uniform") {
     std::cerr << "SPRAY_PATH_SEQ is read only under LOAD_BALANCING "
+                 "spray_uniform\n";
+    return false;
+  }
+  if (spray_path_state != "message" && spray_path_state != "connection") {
+    std::cerr << "SPRAY_PATH_STATE must be message or connection\n";
+    return false;
+  }
+  if (spray_path_state_given && load_balancing != "spray_uniform") {
+    std::cerr << "SPRAY_PATH_STATE is read only under LOAD_BALANCING "
                  "spray_uniform\n";
     return false;
   }
@@ -3347,6 +3375,11 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),
                            DoubleValue(spray_held_loss_rtts));
       rdmaHw->SetAttribute("SprayAckLossRtts",
                            DoubleValue(spray_ack_loss_rtts));
+      rdmaHw->SetAttribute(
+          "SprayPathState",
+          UintegerValue(static_cast<uint32_t>(spray_path_state == "connection"
+                                                  ? PathState::Connection
+                                                  : PathState::Message)));
       rdmaHw->SetAttribute("SprayPathSeq",
                            BooleanValue(spray_path_seq == "on"));
       rdmaHw->SetAttribute("SprayTailRecovery", BooleanValue(tail_recovery()));

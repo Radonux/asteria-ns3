@@ -479,11 +479,13 @@ public:
 	void ArmTailLossTimer();
 	void TailLossDue();
 	// Tell the loss of a send in m_tailLosses at nowNs. A queue pair still
-	// open tells its selector, as RdmaQueuePair::DeclareLost does; once it
-	// completed, the loss goes to the host's hold for the receiver as
-	// LossHoldExploration::OnLoss routes it, under RepsHold and MrcHold of
-	// every scope, and is dropped under every other selector, whose state is
-	// the queue pair's alone, RepsFlowHold's hold among them.
+	// open, or under SprayPathState connection any queue pair, its selector
+	// outliving it, tells its selector, as RdmaQueuePair::DeclareLost does;
+	// otherwise, the queue pair having completed, the loss goes to the host's
+	// hold for the receiver as LossHoldExploration::OnLoss routes it, under
+	// RepsHold and MrcHold of every scope, and is dropped under every other
+	// selector, whose state was the queue pair's alone, RepsFlowHold's hold
+	// among them.
 	void TellTailLoss(const TailLoss &loss, uint64_t nowNs);
 	// How many of qp's sends wait in m_tailLosses.
 	uint32_t TailLossesWaiting(Ptr<RdmaQueuePair> qp) const;
@@ -743,9 +745,33 @@ public:
 	// Where every data packet draws its own path: keep the queue pair's send
 	// records and give it the selector that draws its paths. bdpBytes and
 	// baseRttNs are the queue pair's bandwidth-delay product and base round
-	// trip, as AddQueuePair receives them.
-	void StartPathSelection(Ptr<RdmaQueuePair> qp, uint64_t bdpBytes,
+	// trip, as AddQueuePair receives them. Under SprayPathState connection
+	// the selector is its connection's, made by the first queue pair to the
+	// destination and priority group in m_connectionSelectors with that queue
+	// pair's bdpBytes and baseRttNs. Whether the selector is a new one.
+	bool StartPathSelection(Ptr<RdmaQueuePair> qp, uint64_t bdpBytes,
 		uint64_t baseRttNs);
+	// The selector StartPathSelection gives a queue pair of its own, or makes
+	// for a connection.
+	std::unique_ptr<PathSelector> MakePathSelector(Ptr<RdmaQueuePair> qp,
+		uint64_t bdpBytes, uint64_t baseRttNs);
+	// SprayPathState, under LoadBalancing 2: PathState::Message gives every
+	// queue pair a selector of its own, which ends with it. Under
+	// PathState::Connection the queue pairs of the host to one destination
+	// and priority group, each made for one message, share one selector
+	// through SharedPathSelector, which m_connectionSelectors keeps past them
+	// as a queue pair kept across the messages would keep it: what each kind
+	// learns of its paths persists, REPS's cached values and freezing mode,
+	// MRC's value states, rotation and probes, the loss hold exploration's
+	// trickle schedule and the receivers' marks, RepsFlowHold's own hold, and
+	// the redirect of AckRedirect. What belongs to one queue pair's packets
+	// stays with it: its send records, copies, covered sends and path
+	// sequences. The host's holds are as they are under every scope.
+	uint32_t m_sprayPathState;
+	std::unordered_map<uint64_t, std::shared_ptr<PathSelector>>
+		m_connectionSelectors;
+	bool IsConnectionPathState() const;
+	bool ValidPathState() const;
 	void PktSent(Ptr<RdmaQueuePair> qp, Ptr<Packet> pkt, Time interframeGap);
 	void UpdateNextAvail(Ptr<RdmaQueuePair> qp, Time interframeGap, uint32_t pkt_size);
 	void ChangeRate(Ptr<RdmaQueuePair> qp, DataRate new_rate);

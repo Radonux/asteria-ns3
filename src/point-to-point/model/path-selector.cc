@@ -84,6 +84,81 @@ void PathSelector::SetReceiverHold(std::shared_ptr<ReceiverHoldMarks>,
 		uint32_t){
 }
 
+SharedPathSelector::SharedPathSelector(std::shared_ptr<PathSelector> shared)
+	: m_shared(std::move(shared))
+{
+}
+
+uint16_t SharedPathSelector::Choose(uint64_t nowNs){
+	return m_shared->Choose(nowNs);
+}
+
+void SharedPathSelector::OnAck(uint16_t path, bool marked, uint64_t nowNs){
+	m_shared->OnAck(path, marked, nowNs);
+}
+
+void SharedPathSelector::OnTrim(uint16_t path, bool lastHop, bool marked,
+		uint64_t nowNs){
+	m_shared->OnTrim(path, lastHop, marked, nowNs);
+}
+
+void SharedPathSelector::OnLoss(uint16_t path, uint64_t nowNs){
+	m_shared->OnLoss(path, nowNs);
+}
+
+void SharedPathSelector::OnTimeout(uint64_t nowNs){
+	m_shared->OnTimeout(nowNs);
+}
+
+bool SharedPathSelector::TakeProbe(uint64_t nowNs, uint16_t &path){
+	return m_shared->TakeProbe(nowNs, path);
+}
+
+void SharedPathSelector::OnProbeAnswer(uint16_t path, bool marked,
+		uint64_t nowNs){
+	m_shared->OnProbeAnswer(path, marked, nowNs);
+}
+
+bool SharedPathSelector::ChoseTrickle() const{
+	return m_shared->ChoseTrickle();
+}
+
+bool SharedPathSelector::ChoseExploration() const{
+	return m_shared->ChoseExploration();
+}
+
+bool SharedPathSelector::ChoseHeld() const{
+	return m_shared->ChoseHeld();
+}
+
+void SharedPathSelector::OnTrickleAnswer(uint16_t path, bool lost,
+		uint64_t nowNs){
+	m_shared->OnTrickleAnswer(path, lost, nowNs);
+}
+
+bool SharedPathSelector::TakeCopy(uint8_t &spine, bool &trickle){
+	return m_shared->TakeCopy(spine, trickle);
+}
+
+void SharedPathSelector::OnReport(const SpineReport &report, uint64_t nowNs){
+	m_shared->OnReport(report, nowNs);
+}
+
+void SharedPathSelector::OnRedirect(uint8_t spine, uint8_t carrying,
+		uint64_t nowNs){
+	m_shared->OnRedirect(spine, carrying, nowNs);
+}
+
+void SharedPathSelector::OnReceiverHold(uint32_t receiver, uint8_t bitmap,
+		uint64_t nowNs){
+	m_shared->OnReceiverHold(receiver, bitmap, nowNs);
+}
+
+void SharedPathSelector::SetReceiverHold(
+		std::shared_ptr<ReceiverHoldMarks> marks, uint32_t leaf){
+	m_shared->SetReceiverHold(std::move(marks), leaf);
+}
+
 UniformSpineSelector::UniformSpineSelector(Ptr<UniformRandomVariable> random,
 		uint32_t spines)
 	: m_random(random), m_spines(spines)

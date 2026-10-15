@@ -7822,6 +7822,265 @@ class RepsHoldPairScopeTest : public TestCase
     }
 };
 
+class SprayPathStateTest : public TestCase
+{
+  public:
+    SprayPathStateTest()
+        : TestCase("Under SprayPathState connection the queue pairs of a host to one destination "
+                   "share one path selector, which outlives them: REPS's cached values and "
+                   "freezing mode and reps_flow_hold's hold carry from one queue pair to the "
+                   "next to that destination and to no other, and a tail loss told after a "
+                   "queue pair completed reaches it; under message every queue pair starts "
+                   "afresh")
+    {
+    }
+
+    void DoRun() override
+    {
+        Refusals();
+        RepsCache();
+        RepsFreezing();
+        ConcurrentQueuePairs();
+        FlowHold();
+        TailLossAfterCompletion();
+        Simulator::Destroy();
+    }
+
+  private:
+    static constexpr uint64_t kInterval = LossHoldFixture::kInterval;
+    static constexpr uint32_t kBuffer = 8;
+    static constexpr uint8_t kLossy = 3;
+    // The spine the acknowledgements cache.
+    static constexpr uint8_t kCached = 5;
+    // Destinations d and e, and the sender.
+    static inline const Ipv4Address kD{"11.0.2.1"};
+    static inline const Ipv4Address kE{"11.0.3.1"};
+    static inline const Ipv4Address kSelf{"11.0.1.1"};
+
+    // A host under spray_uniform with kind, reps_spine by default, keeping
+    // its selectors as state has it.
+    static Ptr<RdmaHw> Hw(PathState state, PathSelectorKind kind = PathSelectorKind::RepsSpine)
+    {
+        Ptr<RdmaHw> hw = LossHoldFixture::Hw();
+        hw->m_pathSelectorKind = static_cast<uint32_t>(kind);
+        hw->SetAttribute("SprayPathState", UintegerValue(static_cast<uint32_t>(state)));
+        hw->SetAttribute("RepsBufferSize", UintegerValue(kBuffer));
+        hw->SetAttribute("Mtu", UintegerValue(1000));
+        hw->SetAttribute("PathRandomVariable", PointerValue(SelectorStream()));
+        return hw;
+    }
+
+    static Ptr<RdmaQueuePair> Qp(Ptr<RdmaHw> hw,
+                                 Ipv4Address destination,
+                                 uint16_t port,
+                                 uint16_t pg = 3)
+    {
+        Ptr<RdmaQueuePair> qp = CreateObject<RdmaQueuePair>(pg, kSelf, destination, port, 100);
+        hw->StartPathSelection(qp, 0, 0);
+        return qp;
+    }
+
+    // How many of sends choices of qp, 2 ns apart from nowNs, go up spine.
+    static uint32_t OnSpine(Ptr<RdmaQueuePair> qp, uint64_t nowNs, uint32_t sends, uint8_t spine)
+    {
+        uint32_t on = 0;
+        for (uint32_t i = 0; i < sends; ++i)
+        {
+            on += RequestedSpine(qp->m_pathSelector->Choose(nowNs + 2 * i)) == spine;
+        }
+        return on;
+    }
+
+    void Refusals()
+    {
+        UintegerValue state;
+        CreateObject<RdmaHw>()->GetAttribute("SprayPathState", state);
+        NS_TEST_EXPECT_MSG_EQ(state.Get(),
+                              static_cast<uint32_t>(PathState::Message),
+                              "SprayPathState is message by default");
+        Ptr<RdmaHw> hw = Hw(PathState::Connection);
+        NS_TEST_EXPECT_MSG_EQ(hw->ValidPathState(), true, "connection under spray_uniform");
+        hw->m_loadBalancing = static_cast<uint32_t>(LoadBalancingMode::EntropyHash);
+        NS_TEST_EXPECT_MSG_EQ(hw->ValidPathState(),
+                              false,
+                              "refused where an entropy value's path depends on the ports");
+        hw->m_sprayPathState = static_cast<uint32_t>(PathState::Message);
+        NS_TEST_EXPECT_MSG_EQ(hw->ValidPathState(), true, "message under every mode");
+    }
+
+    // A queue pair to d caches spine 5 in every slot; the next queue pair to
+    // d, under connection, sends on each cached value, and one to e on none
+    // of them.
+    void RepsCache()
+    {
+        for (const PathState state : {PathState::Connection, PathState::Message})
+        {
+            Ptr<RdmaHw> hw = Hw(state);
+            Ptr<RdmaQueuePair> first = Qp(hw, kD, 10000);
+            for (uint32_t i = 0; i < kBuffer; ++i)
+            {
+                first->m_pathSelector->OnAck(kCached, false, 100);
+            }
+            const uint32_t toD = OnSpine(Qp(hw, kD, 10001), 200, kBuffer, kCached);
+            const uint32_t toE = OnSpine(Qp(hw, kE, 10002), 200, kBuffer, kCached);
+            if (state == PathState::Connection)
+            {
+                NS_TEST_EXPECT_MSG_EQ(toD, kBuffer, "connection: d's next queue pair reuses them");
+                NS_TEST_EXPECT_MSG_LT(toE, kBuffer, "e's draws fresh values");
+                NS_TEST_EXPECT_MSG_EQ(hw->m_connectionSelectors.size(),
+                                      2u,
+                                      "one selector per destination");
+            }
+            else
+            {
+                NS_TEST_EXPECT_MSG_LT(toD, kBuffer, "message: d's next queue pair starts afresh");
+                NS_TEST_EXPECT_MSG_EQ(hw->m_connectionSelectors.size(), 0u, "and none is kept");
+            }
+        }
+    }
+
+    // A queue pair to d uses its one cached value up and times out, which
+    // puts REPS into freezing mode: under connection the next queue pair to
+    // d cycles through the value held, and one to e draws fresh values.
+    void RepsFreezing()
+    {
+        constexpr uint32_t kSends = 20;
+        for (const PathState state : {PathState::Connection, PathState::Message})
+        {
+            Ptr<RdmaHw> hw = Hw(state);
+            Ptr<RdmaQueuePair> first = Qp(hw, kD, 10000);
+            first->m_pathSelector->OnAck(kCached, false, 100);
+            NS_TEST_EXPECT_MSG_EQ(static_cast<uint32_t>(
+                                      RequestedSpine(first->m_pathSelector->Choose(150))),
+                                  static_cast<uint32_t>(kCached),
+                                  "the cached value is used up");
+            first->m_pathSelector->OnTimeout(200);
+            const uint32_t toD = OnSpine(Qp(hw, kD, 10001), 300, kSends, kCached);
+            const uint32_t toE = OnSpine(Qp(hw, kE, 10002), 300, kSends, kCached);
+            if (state == PathState::Connection)
+            {
+                NS_TEST_EXPECT_MSG_EQ(toD, kSends, "connection: d's next queue pair is frozen");
+                NS_TEST_EXPECT_MSG_LT(toE, kSends, "e's is not");
+            }
+            else
+            {
+                NS_TEST_EXPECT_MSG_LT(toD, kSends, "message: d's next queue pair is not frozen");
+            }
+        }
+    }
+
+    // Two queue pairs to d open at once share the selector, which the
+    // first of them made: the acknowledgements of one cache the values the
+    // other sends on. Another priority group to d is another connection.
+    void ConcurrentQueuePairs()
+    {
+        Ptr<RdmaHw> hw = Hw(PathState::Connection);
+        Ptr<RdmaQueuePair> first = CreateObject<RdmaQueuePair>(3, kSelf, kD, 10000, 100);
+        Ptr<RdmaQueuePair> second = CreateObject<RdmaQueuePair>(3, kSelf, kD, 10001, 100);
+        NS_TEST_EXPECT_MSG_EQ(hw->StartPathSelection(first, 0, 0), true, "the first makes it");
+        NS_TEST_EXPECT_MSG_EQ(hw->StartPathSelection(second, 0, 0), false, "the second shares it");
+        for (uint32_t i = 0; i < kBuffer; ++i)
+        {
+            first->m_pathSelector->OnAck(kCached, false, 100);
+        }
+        NS_TEST_EXPECT_MSG_EQ(OnSpine(second, 200, kBuffer, kCached),
+                              kBuffer,
+                              "the second sends on the first's cached values");
+        Ptr<RdmaQueuePair> other = CreateObject<RdmaQueuePair>(4, kSelf, kD, 10002, 100);
+        NS_TEST_EXPECT_MSG_EQ(hw->StartPathSelection(other, 0, 0),
+                              true,
+                              "another priority group to d makes its own");
+        NS_TEST_EXPECT_MSG_EQ(hw->m_connectionSelectors.size(), 2u, "two connections to d");
+    }
+
+    // Under reps_flow_hold over the first interval every send of the queue
+    // pair to d on spine 3 is lost; from the second a new queue pair to d
+    // takes its place. Under connection the hold is kept, as under
+    // hold_scope pair: the new queue pair sends spine 3 one sentinel per
+    // interval until the clean sentinels release it, and the queue pair to e
+    // keeps it. Under message the new queue pair starts afresh.
+    void FlowHold()
+    {
+        for (const PathState state : {PathState::Connection, PathState::Message})
+        {
+            Ptr<RdmaHw> hw = Hw(state, PathSelectorKind::RepsFlowHold);
+            Ptr<RdmaQueuePair> first = Qp(hw, kD, 10000);
+            Ptr<RdmaQueuePair> toE = Qp(hw, kE, 10001);
+            Ptr<RdmaQueuePair> second;
+            uint32_t step = 0;
+            std::vector<uint32_t> toDOn3(5);
+            std::vector<uint32_t> toEOn3(5);
+            for (uint32_t interval = 0; interval < 5; ++interval)
+            {
+                if (interval == 1)
+                {
+                    second = Qp(hw, kD, 10002);
+                }
+                for (uint32_t i = 0; i < 200; ++i, ++step)
+                {
+                    const bool toD = step % 2 == 0;
+                    const uint64_t now = interval * kInterval + 50 * i;
+                    const std::set<uint8_t> lost =
+                        toD && interval == 0 ? std::set<uint8_t>{kLossy} : std::set<uint8_t>{};
+                    PathSelector& selector =
+                        *(toD ? (interval == 0 ? first : second) : toE)->m_pathSelector;
+                    const uint8_t spine = LossHoldFixture::Send(selector, now, step / 2, lost);
+                    (toD ? toDOn3 : toEOn3)[interval] += spine == kLossy;
+                }
+            }
+            NS_TEST_EXPECT_MSG_GT(toDOn3[0], 0u, "the queue pair to d loses on spine 3");
+            if (state == PathState::Connection)
+            {
+                for (uint32_t interval = 1; interval < 4; ++interval)
+                {
+                    NS_TEST_EXPECT_MSG_EQ(toDOn3[interval],
+                                          1u,
+                                          "connection: d's next queue pair sends one sentinel");
+                    NS_TEST_EXPECT_MSG_GT(toEOn3[interval], 1u, "the queue pair to e keeps it");
+                }
+                NS_TEST_EXPECT_MSG_GT(toDOn3[4], 1u, "the clean sentinels release it");
+            }
+            else
+            {
+                NS_TEST_EXPECT_MSG_GT(toDOn3[1], 1u, "message: d's next queue pair keeps it");
+            }
+        }
+    }
+
+    // Under reps_flow_hold a tail loss on spine 3 told after the queue pair
+    // to d completed, with no sends in its interval, grades spine 3 0 in the
+    // hold of d's connection, and the next queue pair to d sends it one
+    // sentinel in the next interval. Under message the loss is dropped.
+    void TailLossAfterCompletion()
+    {
+        for (const PathState state : {PathState::Connection, PathState::Message})
+        {
+            Ptr<RdmaHw> hw = Hw(state, PathSelectorKind::RepsFlowHold);
+            Ptr<RdmaQueuePair> done = Qp(hw, kD, 10000);
+            NS_TEST_EXPECT_MSG_EQ(done->IsFinished(), true, "the queue pair has nothing left");
+            hw->TellTailLoss(
+                RdmaHw::TailLoss{RdmaHw::GetQpKey(kD.Get(), 10000, 3), done, 0, kLossy, false,
+                                 kD.Get()},
+                100);
+            Ptr<RdmaQueuePair> next = Qp(hw, kD, 10001);
+            uint32_t on3 = 0;
+            for (uint32_t i = 0; i < 200; ++i)
+            {
+                on3 += LossHoldFixture::Send(*next->m_pathSelector, kInterval + 50 * i, i, {}) ==
+                       kLossy;
+            }
+            if (state == PathState::Connection)
+            {
+                NS_TEST_EXPECT_MSG_EQ(on3, 1u, "connection: the loss holds spine 3 toward d");
+            }
+            else
+            {
+                NS_TEST_EXPECT_MSG_GT(on3, 1u, "message: the loss is dropped");
+            }
+        }
+    }
+};
+
 class RepsHoldAutoScopeTest : public TestCase
 {
   public:
@@ -13782,6 +14041,7 @@ PointToPointTestSuite::PointToPointTestSuite()
     AddTestCase(new RepsFlowHoldTest, TestCase::Duration::QUICK);
     AddTestCase(new RepsHoldScopeTest, TestCase::Duration::QUICK);
     AddTestCase(new RepsHoldPairScopeTest, TestCase::Duration::QUICK);
+    AddTestCase(new SprayPathStateTest, TestCase::Duration::QUICK);
     AddTestCase(new RepsHoldAutoScopeTest, TestCase::Duration::QUICK);
     AddTestCase(new LossWithoutSendsTest, TestCase::Duration::QUICK);
     AddTestCase(new RepsHoldLlrTest, TestCase::Duration::QUICK);
