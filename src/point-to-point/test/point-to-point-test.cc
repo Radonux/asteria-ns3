@@ -2331,6 +2331,148 @@ class IsolatedHost
 const Ipv4Address kTestSender("11.0.1.1");
 const Ipv4Address kTestReceiver("11.0.2.1");
 
+class LinkByteLossTest : public TestCase
+{
+  public:
+    LinkByteLossTest()
+        : TestCase("A loss failure with a byte unit drops each packet by its size, so that a full "
+                   "data frame is lost at the rate the per-byte rate was derived from and a small "
+                   "acknowledgement about as much less often as it is smaller; a restore puts "
+                   "the unit back, and without the unit every packet is lost at the rate")
+    {
+    }
+
+    void DoRun() override
+    {
+        DataFrame();
+        ByteUnit();
+        Simulator::Destroy();
+    }
+
+  private:
+    static constexpr uint32_t kPayload = IsolatedHost::kMtu;
+    // A frame's loss rate, and the size of an acknowledgement.
+    static constexpr double kFrameRate = 0.01;
+    static constexpr uint32_t kAckBytes = 48;
+    static constexpr uint32_t kDraws = 200000;
+
+    // DataFrameBytes is the size of the data packet the sender builds, with
+    // and without the path sequence.
+    void DataFrame()
+    {
+        const IntHeader::Mode savedIntMode = IntHeader::mode;
+        const bool savedPathSeq = CustomHeader::udpCarriesPathSeq;
+        IntHeader::mode = IntHeader::NONE;
+        for (const bool pathSeq : {false, true})
+        {
+            CustomHeader::udpCarriesPathSeq = pathSeq;
+            IsolatedHost sender(LoadBalancingMode::SprayUniform, kTestReceiver, 8);
+            sender.hw->m_sprayPathSeq = pathSeq;
+            Ptr<RdmaQueuePair> qp = sender.AddSender(kTestSender, kTestReceiver, 4 * kPayload);
+            NS_TEST_EXPECT_MSG_EQ(sender.hw->GetNxtPacket(qp)->GetSize(),
+                                  RdmaHw::DataFrameBytes(kPayload),
+                                  "a full data frame as the receiving device sees it");
+        }
+        CustomHeader::udpCarriesPathSeq = false;
+        NS_TEST_EXPECT_MSG_EQ(RdmaHw::DataFrameBytes(kPayload),
+                              kPayload + 36,
+                              "the PPP, IPv4, UDP and data headers are 36 bytes");
+        CustomHeader::udpCarriesPathSeq = savedPathSeq;
+        IntHeader::mode = savedIntMode;
+    }
+
+    static Ptr<RateErrorModel> ModelOf(Ptr<QbbNetDevice> device)
+    {
+        return DynamicCast<RateErrorModel>(device->GetLinkErrorModel());
+    }
+
+    // The packets of bytes each, out of kDraws, device's model drops.
+    static uint32_t Dropped(Ptr<QbbNetDevice> device, uint32_t bytes)
+    {
+        uint32_t dropped = 0;
+        for (uint32_t i = 0; i < kDraws; ++i)
+        {
+            dropped += ModelOf(device)->IsCorrupt(Create<Packet>(bytes));
+        }
+        return dropped;
+    }
+
+    // Whether count is within five standard deviations of kDraws draws at
+    // probability.
+    static bool Binomial(uint32_t count, double probability)
+    {
+        const double mean = kDraws * probability;
+        return std::abs(count - mean) < 5 * std::sqrt(mean * (1 - probability));
+    }
+
+    void ByteUnit()
+    {
+        const uint32_t frame = RdmaHw::DataFrameBytes(kPayload);
+        // The per-byte rate a full data frame keeps kFrameRate at.
+        const double perByte = 1 - std::pow(1 - kFrameRate, 1.0 / frame);
+        const double ackRate = 1 - std::pow(1 - perByte, kAckBytes);
+        LinkEnds ends;
+        ends.atA = CreateObject<QbbNetDevice>();
+        ends.atB = CreateObject<QbbNetDevice>();
+        LinkEventApplier applier(
+            [](Ptr<QbbNetDevice> device, double rate) {
+                Ptr<RateErrorModel> model = ModelOf(device);
+                if (!model)
+                {
+                    model = CreateObject<RateErrorModel>();
+                    model->SetRandomVariable(
+                        CreateObjectWithAttributes<UniformRandomVariable>("Stream",
+                                                                          IntegerValue(31)));
+                    model->SetAttribute("ErrorUnit", StringValue("ERROR_UNIT_PACKET"));
+                    device->SetLinkErrorModel(model);
+                }
+                model->SetRate(rate);
+            },
+            [](uint32_t, uint32_t) {});
+        LinkEvent loss;
+        loss.kind = LinkEventKind::Loss;
+        loss.a = 0;
+        loss.b = 1;
+        loss.direction = LinkDirection::Forward;
+        loss.errorRate = kFrameRate;
+        LinkEvent restore;
+        restore.kind = LinkEventKind::Restore;
+        restore.a = 0;
+        restore.b = 1;
+
+        // Per frame, as before: every packet at the rate.
+        applier.Apply(loss, ends);
+        NS_TEST_EXPECT_MSG_EQ(Binomial(Dropped(ends.atB, frame), kFrameRate),
+                              true,
+                              "frame: a data frame is lost at the rate");
+        NS_TEST_EXPECT_MSG_EQ(Binomial(Dropped(ends.atB, kAckBytes), kFrameRate),
+                              true,
+                              "and so is an acknowledgement");
+
+        // Per byte, replacing it: the data frame keeps the rate, and the
+        // acknowledgement is lost about frame / 48 times less often.
+        LinkEvent bytes = loss;
+        bytes.errorRate = perByte;
+        bytes.unit = RateErrorModel::ERROR_UNIT_BYTE;
+        bytes.frameBytes = frame;
+        applier.Apply(bytes, ends);
+        NS_TEST_EXPECT_MSG_EQ(ModelOf(ends.atA), nullptr, "forward: a's end is untouched");
+        const uint32_t frames = Dropped(ends.atB, frame);
+        const uint32_t acks = Dropped(ends.atB, kAckBytes);
+        NS_TEST_EXPECT_MSG_EQ(Binomial(frames, kFrameRate), true, "byte: a data frame keeps it");
+        NS_TEST_EXPECT_MSG_EQ(Binomial(acks, ackRate), true, "an acknowledgement by its size");
+        NS_TEST_EXPECT_MSG_GT(acks * frame, frames * kAckBytes / 2, "about the size ratio less");
+        NS_TEST_EXPECT_MSG_LT(acks * frame, frames * kAckBytes * 2, "within a factor of 2");
+
+        // The restore puts back the frame failure's rate and unit.
+        applier.Apply(restore, ends);
+        NS_TEST_EXPECT_MSG_EQ(ModelOf(ends.atB)->GetUnit(),
+                              RateErrorModel::ERROR_UNIT_PACKET,
+                              "the restore puts the frame unit back");
+        NS_TEST_EXPECT_MSG_EQ(ModelOf(ends.atB)->GetRate(), kFrameRate, "with its rate");
+    }
+};
+
 class AckNamesPacketTest : public TestCase
 {
   public:
@@ -14134,6 +14276,7 @@ PointToPointTestSuite::PointToPointTestSuite()
     AddTestCase(new LinkRateChangeTest, TestCase::Duration::QUICK);
     AddTestCase(new LinkRestoreTest, TestCase::Duration::QUICK);
     AddTestCase(new DirectionalLinkFaultTest, TestCase::Duration::QUICK);
+    AddTestCase(new LinkByteLossTest, TestCase::Duration::QUICK);
     AddTestCase(new PortCountersTest, TestCase::Duration::QUICK);
     AddTestCase(new MarkingStreamTest, TestCase::Duration::QUICK);
     AddTestCase(new PfcIdentificationTest, TestCase::Duration::QUICK);

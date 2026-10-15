@@ -56,8 +56,10 @@ LinkEventApplier::EndState LinkEventApplier::Capture(Ptr<QbbNetDevice> device){
 	EndState state;
 	state.rate = device->GetDataRate();
 	state.errorModel = DynamicCast<RateErrorModel>(device->GetLinkErrorModel());
-	if (state.errorModel)
+	if (state.errorModel){
 		state.errorRate = state.errorModel->GetRate();
+		state.errorUnit = state.errorModel->GetUnit();
+	}
 	return state;
 }
 
@@ -67,9 +69,18 @@ void LinkEventApplier::PutBack(Ptr<QbbNetDevice> device, const EndState &state,
 		device->SetDataRate(state.rate);
 		return;
 	}
-	if (state.errorModel)
+	if (state.errorModel){
 		state.errorModel->SetRate(state.errorRate);
+		state.errorModel->SetUnit(state.errorUnit);
+	}
 	device->SetLinkErrorModel(state.errorModel);
+}
+
+void LinkEventApplier::SetLoss(Ptr<QbbNetDevice> device,
+		const LinkEvent &event){
+	m_setErrorRate(device, event.errorRate);
+	DynamicCast<RateErrorModel>(device->GetLinkErrorModel())->SetUnit(
+		event.unit);
 }
 
 void LinkEventApplier::Apply(const LinkEvent &event, const LinkEnds &ends){
@@ -93,8 +104,8 @@ void LinkEventApplier::Apply(const LinkEvent &event, const LinkEnds &ends){
 		saved.setA = !forward;
 		saved.setB = true;
 		if (saved.setA)
-			m_setErrorRate(ends.atA, event.errorRate);
-		m_setErrorRate(ends.atB, event.errorRate);
+			SetLoss(ends.atA, event);
+		SetLoss(ends.atB, event);
 		break;
 	case LinkEventKind::Rate:
 		// A device's data rate is the rate it transmits at.

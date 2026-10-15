@@ -740,6 +740,11 @@ public:
 	void RedistributeQp();
 
 	Ptr<Packet> GetNxtPacket(Ptr<RdmaQueuePair> qp); // get next packet to send, inc snd_nxt
+	// The bytes of a data packet carrying payload bytes as a device receives
+	// it, which a link's error model draws on: the PPP header, the IPv4
+	// header, the data headers as CustomHeader sizes them for the run, and
+	// the payload.
+	static uint32_t DataFrameBytes(uint32_t payload);
 	bool IsPathPerPacket() const;
 	void SendPathProbe(Ptr<RdmaQueuePair> qp, uint16_t path);
 	// Where every data packet draws its own path: keep the queue pair's send

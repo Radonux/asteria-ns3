@@ -596,6 +596,7 @@ uint32_t link_down_A = 0, link_down_B = 0;
 //   LINK_FAILURE <time_ns> down <a> <b>
 //   LINK_FAILURE <time_ns> blackhole <a> <b>
 //   LINK_FAILURE <time_ns> loss <a> <b> <error_rate> [forward|both]
+//                [byte <frame_bytes>]
 //   LINK_FAILURE <time_ns> rate <a> <b> <data_rate> [forward|both]
 //   LINK_RESTORE <time_ns> <a> <b>
 // down takes the link down for the rest of the run. blackhole needs b to be a
@@ -613,7 +614,14 @@ uint32_t link_down_A = 0, link_down_B = 0;
 // link fail and restore independently when each failure and its restore name
 // the nodes in the same order. A later failure named in the same order
 // replaces the one before it, which a restore then no longer puts back; a link
-// taken down is not restored.
+// taken down is not restored. Under loss, byte makes error_rate each byte's:
+// a packet of s bytes as the device receives it, data, acknowledgement,
+// repair request or trimmed header alike, is dropped with probability
+// 1 - (1 - error_rate)^s, as a frame corrupted in any byte fails its check.
+// frame_bytes is the full data frame error_rate was derived at, which must be
+// the run's: the PPP, IPv4 and data headers and PACKET_PAYLOAD_SIZE
+// (RdmaHw::DataFrameBytes). Without byte every packet is dropped with
+// error_rate whatever its size.
 vector<LinkEvent> link_events;
 
 uint32_t enable_trace = 1;
@@ -2437,22 +2445,47 @@ bool ReadConf(string network_configuration) {
       }
       if (failure.kind == LinkEventKind::Loss ||
           failure.kind == LinkEventKind::Rate) {
-        // An optional last token on the line: both, the default, or forward,
-        // the direction from the first node named to the second alone.
-        std::string rest, direction, extra;
+        // Optional last tokens on the line: both, the default, or forward,
+        // the direction from the first node named to the second alone; then,
+        // under loss, byte and the bytes of the full data frame the rate was
+        // derived at, the rate being each byte's.
+        std::string rest, word;
         std::getline(conf, rest);
         std::istringstream tokens(rest);
-        tokens >> direction >> extra;
-        if (direction == "forward") {
-          failure.direction = LinkDirection::Forward;
-        } else if (!direction.empty() && direction != "both") {
+        std::vector<std::string> words;
+        while (tokens >> word)
+          words.push_back(word);
+        size_t next = 0;
+        if (next < words.size() &&
+            (words[next] == "forward" || words[next] == "both")) {
+          if (words[next] == "forward")
+            failure.direction = LinkDirection::Forward;
+          next++;
+        }
+        if (failure.kind == LinkEventKind::Loss && next < words.size() &&
+            words[next] == "byte") {
+          std::istringstream frame(next + 1 < words.size() ? words[next + 1]
+                                                           : "");
+          if (!(frame >> failure.frameBytes) || failure.frameBytes == 0 ||
+              !frame.eof()) {
+            std::cerr << "LINK_FAILURE loss byte needs the data frame's "
+                         "bytes\n";
+            return false;
+          }
+          failure.unit = RateErrorModel::ERROR_UNIT_BYTE;
+          next += 2;
+        }
+        if (next == 0 && !words.empty()) {
           std::cerr << "LINK_FAILURE " << kind
                     << " direction must be forward or both\n";
           return false;
         }
-        if (!extra.empty()) {
-          std::cerr << "LINK_FAILURE " << kind
-                    << " takes nothing after its direction\n";
+        if (next < words.size()) {
+          std::cerr << "LINK_FAILURE " << kind << " takes nothing after its "
+                    << (failure.unit == RateErrorModel::ERROR_UNIT_BYTE
+                            ? "unit"
+                            : "direction")
+                    << "\n";
           return false;
         }
       }
@@ -3780,6 +3813,14 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),
     if (event.kind == LinkEventKind::Blackhole &&
         n.Get(event.b)->GetNodeType() != 1) {
       std::cerr << "LINK_FAILURE blackhole needs a switch as its second node\n";
+      return false;
+    }
+    // The headers are sized for the run by now.
+    if (event.unit == RateErrorModel::ERROR_UNIT_BYTE &&
+        event.frameBytes != RdmaHw::DataFrameBytes(packet_payload_size)) {
+      std::cerr << "LINK_FAILURE loss byte derives its rate at a data frame of "
+                << event.frameBytes << " bytes, and this run's is "
+                << RdmaHw::DataFrameBytes(packet_payload_size) << "\n";
       return false;
     }
     event_times.insert(event.timeNs);

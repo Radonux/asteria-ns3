@@ -3205,6 +3205,11 @@ void RdmaHw::SendPathProbe(Ptr<RdmaQueuePair> qp, uint16_t path){
 	ReportTransportEvent("path_probe", 0);
 }
 
+uint32_t RdmaHw::DataFrameBytes(uint32_t payload){
+	return PppHeader::GetStaticSize() + Ipv4Header().GetSerializedSize() +
+		CustomHeader::GetUdpHeaderSize() + payload;
+}
+
 bool RdmaHw::StartPathSelection(Ptr<RdmaQueuePair> qp, uint64_t bdpBytes,
 		uint64_t baseRttNs){
 	qp->m_outstanding.SetPacketSize(m_mtu);
