@@ -11467,8 +11467,8 @@ class SprayReceiverTailMissingTest : public TestCase
     SprayReceiverTailMissingTest()
         : TestCase("Under SprayReceiverTailMissing the receiver's hold counts the path sequences "
                    "a tail repair request names that are still missing a guard after it, so that "
-                   "a black-holed spine is held, and counts no late, trimmed or gap-counted "
-                   "packet")
+                   "a black-holed spine is held, counts no late, trimmed or gap-counted "
+                   "packet, and reports the counted packets that arrive after all")
     {
     }
 
@@ -11574,7 +11574,9 @@ class SprayReceiverTailMissingTest : public TestCase
             hw->m_switchQueues = leaves;
             hw->m_transportEventCallback =
                 Callback<void, const char*, uint64_t>([this](const char* event, uint64_t) {
+                    events[event]++;
                     counted += std::string(event) == "receiver_tail_missing";
+                    late += std::string(event) == "receiver_tail_missing_late";
                 });
         }
 
@@ -11666,8 +11668,11 @@ class SprayReceiverTailMissingTest : public TestCase
         Ptr<SwitchQueueState> leaves;
         IsolatedHost host;
         uint32_t seq = 0;
-        // The transport events receiver_tail_missing reported.
+        // Every transport event reported, and of them receiver_tail_missing
+        // and receiver_tail_missing_late.
+        std::map<std::string, uint32_t> events;
         uint32_t counted = 0;
+        uint32_t late = 0;
     };
 
     void Unit()
@@ -11677,6 +11682,7 @@ class SprayReceiverTailMissingTest : public TestCase
         NS_TEST_EXPECT_MSG_EQ(receiver.TakeTailMissing(kLossy, 1, 2), 2u, "1 and 2 are counted");
         const SpineSequenceReceiver::Arrival late = receiver.OnArrival(kLossy, kLossy, 2);
         NS_TEST_EXPECT_MSG_EQ(late.late, true, "a counted packet that arrives is late");
+        NS_TEST_EXPECT_MSG_EQ(late.counted, true, "and known for one counted");
         NS_TEST_EXPECT_MSG_EQ(late.gaps, 0u, "and counts nothing");
         NS_TEST_EXPECT_MSG_EQ(receiver.OnArrival(kLossy, kLossy, 4).gaps,
                               1u,
@@ -11687,11 +11693,19 @@ class SprayReceiverTailMissingTest : public TestCase
         receiver.OnArrival(6, 6, 0);
         NS_TEST_EXPECT_MSG_EQ(receiver.OnArrival(6, 6, 4).gaps, 3u, "1 to 3 are a gap");
         NS_TEST_EXPECT_MSG_EQ(receiver.TakeTailMissing(6, 1, 3), 0u, "and not counted again");
+        const SpineSequenceReceiver::Arrival gap = receiver.OnArrival(6, 6, 2);
+        NS_TEST_EXPECT_MSG_EQ(gap.late, true, "one of them arriving is late");
+        NS_TEST_EXPECT_MSG_EQ(gap.counted, false, "but was not counted by the tail");
         NS_TEST_EXPECT_MSG_EQ(receiver.TakeTailMissing(6, 3, 4), 2u, "of 3 to 6, 5 and 6 are");
 
         // Nothing arrived up spine 5: its own path is made, expecting 0.
         NS_TEST_EXPECT_MSG_EQ(receiver.TakeTailMissing(5, 0, 3), 3u, "0 to 2 are counted");
         NS_TEST_EXPECT_MSG_EQ(receiver.OnArrival(5, 5, 3).gaps, 0u, "and are no gap after");
+
+        // A trimmed header of a counted packet is known for one.
+        receiver.TakeTailMissing(4, 0, 2);
+        NS_TEST_EXPECT_MSG_EQ(receiver.OnTrim(4, 4, 1), true, "1 was counted");
+        NS_TEST_EXPECT_MSG_EQ(receiver.OnTrim(4, 4, 2), false, "2 was not");
 
         // A packet a source leaf moved from spine 2 onto spine 7 is late on
         // its path.
@@ -11769,6 +11783,7 @@ class SprayReceiverTailMissingTest : public TestCase
                 NS_TEST_EXPECT_MSG_EQ(request.count, 4u, "all four");
             }
             NS_TEST_EXPECT_MSG_EQ(receiver.Gaps(kLossy), 0u, "no arrival shows a gap");
+            NS_TEST_EXPECT_MSG_EQ(receiver.late, 0u, "nothing counted arrives");
             NS_TEST_EXPECT_MSG_EQ(beforeGuard.leaf0, false, "nothing is held before the guard ends");
             NS_TEST_EXPECT_MSG_EQ(beforeGuard.counted, 0u, "nor counted");
             if (tailMissing)
@@ -11778,6 +11793,9 @@ class SprayReceiverTailMissingTest : public TestCase
                 NS_TEST_EXPECT_MSG_EQ(afterA.counted, 4u, "counting its four");
                 NS_TEST_EXPECT_MSG_EQ(afterB.host, true, "leaf 1's widens it to every leaf");
                 NS_TEST_EXPECT_MSG_EQ(afterB.counted, 8u, "counting four more");
+                NS_TEST_EXPECT_MSG_EQ(receiver.events["receiver_tail_missing_spine3"],
+                                      8u,
+                                      "all of them on spine 3 in the breakdown");
                 NS_TEST_EXPECT_MSG_EQ(static_cast<uint32_t>(receiver.Bitmap()),
                                       1u << kLossy,
                                       "the acknowledgements hold spine 3");
@@ -11831,6 +11849,7 @@ class SprayReceiverTailMissingTest : public TestCase
                 NS_TEST_EXPECT_MSG_EQ(requests[0].count, 1u, "alone");
             }
             NS_TEST_EXPECT_MSG_EQ(receiver.counted, 0u, "neither is counted");
+            NS_TEST_EXPECT_MSG_EQ(receiver.late, 0u, "nor counted late");
             NS_TEST_EXPECT_MSG_EQ(receiver.Hold().LossLeaves(kLossy), 0u, "nor held");
             NS_TEST_EXPECT_MSG_EQ(receiver.Gaps(kLossy), 0u, "nor a gap");
             emitted[tailMissing] = receiver.host.emitted;
@@ -11869,6 +11888,10 @@ class SprayReceiverTailMissingTest : public TestCase
         Simulator::Run();
         NS_TEST_EXPECT_MSG_EQ(heldAtGuard, true, "the second holds spine 3 when the guard ends");
         NS_TEST_EXPECT_MSG_EQ(receiver.counted, 1u, "counted once");
+        NS_TEST_EXPECT_MSG_EQ(receiver.late, 1u, "its arrival is counted late");
+        NS_TEST_EXPECT_MSG_EQ(receiver.events["receiver_tail_missing_late_spine3"],
+                              1u,
+                              "on spine 3 in the breakdown");
         NS_TEST_EXPECT_MSG_EQ(heldAfterLate, true, "its late arrival leaves the hold");
         NS_TEST_EXPECT_MSG_EQ(cleanAfterLate, 0u, "and counts nothing toward the release");
         NS_TEST_EXPECT_MSG_EQ(receiver.Hold().Clean(0, kLossy), 1u, "the next packet counts");
@@ -11879,18 +11902,33 @@ class SprayReceiverTailMissingTest : public TestCase
 
     // Test (d): the second's trimmed header arrives after the request and
     // before the guard ends. Tail recovery has requested it, but it is not
-    // counted, a trim being no loss.
+    // counted, a trim being no loss. Arriving after the guard ends, the
+    // packet was counted, and its trimmed header is counted late.
     void TrimmedAfterRequest()
     {
-        Receiver receiver(true);
-        receiver.Deliver(kClosingNs - 500, kA, kLossy, 0);
-        receiver.Deliver(kClosingNs, kA, kClosing, 0, Counts(2));
-        receiver.Deliver(kRequestNs + 1000, kA, kLossy, 1, {}, true);
-        Simulator::Run();
-        NS_TEST_EXPECT_MSG_EQ(receiver.Requests().size(), 1u, "the trimmed packet is requested");
-        NS_TEST_EXPECT_MSG_EQ(receiver.counted, 0u, "but not counted");
-        NS_TEST_EXPECT_MSG_EQ(receiver.Hold().LossLeaves(kLossy), 0u, "nor held");
-        Simulator::Destroy();
+        for (const uint64_t trimNs : {kRequestNs + 1000, kGuardEndNs + 1000})
+        {
+            Receiver receiver(true);
+            receiver.Deliver(kClosingNs - 500, kA, kLossy, 0);
+            receiver.Deliver(kClosingNs, kA, kClosing, 0, Counts(2));
+            receiver.Deliver(trimNs, kA, kLossy, 1, {}, true);
+            Simulator::Run();
+            NS_TEST_EXPECT_MSG_EQ(receiver.Requests().size(),
+                                  1u,
+                                  "the trimmed packet is requested");
+            if (trimNs < kGuardEndNs)
+            {
+                NS_TEST_EXPECT_MSG_EQ(receiver.counted, 0u, "inside the guard: not counted");
+                NS_TEST_EXPECT_MSG_EQ(receiver.late, 0u, "nor counted late");
+                NS_TEST_EXPECT_MSG_EQ(receiver.Hold().LossLeaves(kLossy), 0u, "nor held");
+            }
+            else
+            {
+                NS_TEST_EXPECT_MSG_EQ(receiver.counted, 1u, "after it: counted");
+                NS_TEST_EXPECT_MSG_EQ(receiver.late, 1u, "and its trimmed header counted late");
+            }
+            Simulator::Destroy();
+        }
     }
 
     // Test (e): a gap and the closing counts name a packet once. From a, 1
@@ -11921,6 +11959,7 @@ class SprayReceiverTailMissingTest : public TestCase
         NS_TEST_EXPECT_MSG_EQ(countedAtGuard, 2u, "the guards count b's 1 and 2 alone");
         NS_TEST_EXPECT_MSG_EQ(receiver.Gaps(kLossy), 5u, "b's arrival counts 3 alone");
         NS_TEST_EXPECT_MSG_EQ(receiver.counted, 2u, "and nothing more is counted");
+        NS_TEST_EXPECT_MSG_EQ(receiver.late, 0u, "nor counted late");
         NS_TEST_EXPECT_MSG_EQ(receiver.Hold().HostHolds(kLossy),
                               true,
                               "both leaves hold spine 3, each by its own count");

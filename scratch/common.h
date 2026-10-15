@@ -386,8 +386,12 @@ bool spray_receiver_hold_clean_given = false;
 // data arrival passed meanwhile was counted as a gap and is not counted
 // again; and a sequence counted that arrives later is a late arrival, which
 // neither counts toward the release nor restarts it. Each send counted is
-// the host transport event receiver_tail_missing. Off, the default, leaves
-// the hold to the gaps.
+// the host transport event receiver_tail_missing, and each of them whose data
+// packet or trimmed header arrives after all is receiver_tail_missing_late.
+// Each is also written as receiver_tail_missing_spine<k> or
+// receiver_tail_missing_late_spine<k> for the requested spine k of its send,
+// the breakdown of the two by spine. Off, the default, leaves the hold to the
+// gaps.
 std::string spray_receiver_tail_missing = "off";
 bool spray_receiver_tail_missing_given = false;
 bool receiver_hold() { return spray_receiver_hold == "on"; }
@@ -3033,8 +3037,10 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),
   transport_event_totals[{"tail_loss_delivered", "control"}];
   transport_event_totals[{"tail_repair_rerouted", "control"}];
   transport_event_totals[{"tail_loss_ambiguous", "control"}];
-  // Written under every mode, zero where SPRAY_RECEIVER_TAIL_MISSING is off.
+  // Written under every mode, zero where SPRAY_RECEIVER_TAIL_MISSING is off;
+  // their breakdowns by spine only where a spine has one.
   transport_event_totals[{"receiver_tail_missing", "control"}];
+  transport_event_totals[{"receiver_tail_missing_late", "control"}];
   // The totals must land even when a watchdog exits the run mid-simulation.
   std::atexit(write_transport_event_summary);
   ZSTD_CCtx_setParameter(transport_event_raw_cctx, ZSTD_c_compressionLevel, 8);

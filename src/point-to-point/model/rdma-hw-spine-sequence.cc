@@ -6,6 +6,7 @@
 #include "load-balancing.h"
 #include "path-selector.h"
 #include <ns3/simulator.h>
+#include <string>
 
 namespace ns3 {
 
@@ -32,7 +33,8 @@ void RdmaHw::CountPathSeq(Ptr<RdmaRxQueuePair> q, const CustomHeader &ch,
 	if (trimmed){
 		// A trimmed header can overtake earlier data of its path in the
 		// switches' high-priority queue: it only accounts its sequence.
-		q->m_pathSeqReceiver.OnTrim(requested, carrying, ch.udp.path_seq);
+		if (q->m_pathSeqReceiver.OnTrim(requested, carrying, ch.udp.path_seq))
+			ReportTailMissing("receiver_tail_missing_late", requested);
 		if (IsReceiverHold())
 			ReceiverHoldOf().OnTrim(m_switchQueues->LeafOf(ch.sip), carrying,
 				Simulator::Now().GetNanoSeconds());
@@ -40,6 +42,8 @@ void RdmaHw::CountPathSeq(Ptr<RdmaRxQueuePair> q, const CustomHeader &ch,
 	}
 	const SpineSequenceReceiver::Arrival arrival =
 		q->m_pathSeqReceiver.OnArrival(requested, carrying, ch.udp.path_seq);
+	if (arrival.counted)
+		ReportTailMissing("receiver_tail_missing_late", requested);
 	if (carrying >= m_spineGaps.size())
 		m_spineGaps.resize(carrying + 1, 0);
 	m_spineGaps[carrying] += arrival.gaps;
@@ -166,12 +170,18 @@ void RdmaHw::CountTailMissing(Ptr<RdmaRxQueuePair> q){
 			continue;
 		ReceiverHoldOf().OnTailMissing(leaf, run.spine, missing, now);
 		for (uint16_t i = 0; i < missing; i++)
-			ReportTransportEvent("receiver_tail_missing", 0);
+			ReportTailMissing("receiver_tail_missing", run.spine);
 	}
 	const uint64_t next = q->m_tailMissingRuns.NextDue();
 	if (next != PendingTailRuns::kNone)
 		q->m_tailMissingTimer = Simulator::Schedule(NanoSeconds(next - now),
 			&RdmaHw::CountTailMissing, this, q);
+}
+
+void RdmaHw::ReportTailMissing(const char *event, uint8_t spine){
+	ReportTransportEvent(event, 0);
+	ReportTransportEvent(
+		(std::string(event) + "_spine" + std::to_string(spine)).c_str(), 0);
 }
 
 void RdmaHw::RecoverTail(Ptr<RdmaQueuePair> qp, const CustomHeader &ch){

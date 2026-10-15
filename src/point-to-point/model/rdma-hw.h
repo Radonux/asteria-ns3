@@ -547,7 +547,9 @@ public:
 	// was counted as a gap and is not counted again; and a sequence counted
 	// and arriving later is a late arrival
 	// (SpineSequenceReceiver::TakeTailMissing). Each send counted is reported
-	// as the transport event receiver_tail_missing.
+	// as the transport event receiver_tail_missing, and each of them whose
+	// data packet or trimmed header arrives after all as
+	// receiver_tail_missing_late (ReportTailMissing).
 	bool m_sprayReceiverTailMissing;
 	bool ValidReceiverTailMissing() const;
 	// The run q requested of count path sequences from first on spine, to
@@ -557,6 +559,10 @@ public:
 	// The runs of q whose guard ended by now counted, and q's timer set for
 	// the next.
 	void CountTailMissing(Ptr<RdmaRxQueuePair> q);
+	// The transport event event of a send requested up spine, and the same
+	// with _spine and the spine appended, the transport summary's breakdown of
+	// event by spine.
+	void ReportTailMissing(const char *event, uint8_t spine);
 	bool m_var_win, m_fast_react;
 	bool m_rateBound;
 	uint32_t m_total_pause_times; 

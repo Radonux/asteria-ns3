@@ -69,6 +69,8 @@ public:
 		// Whether the arrival is behind the expected sequence, or one
 		// TakeTailMissing counted.
 		bool late;
+		// Whether it is one TakeTailMissing counted.
+		bool counted;
 	};
 	// A data arrival with path sequence pathSeq, requested up requested and
 	// carried by carrying.
@@ -76,7 +78,9 @@ public:
 	// A trimmed header with path sequence pathSeq, requested up requested
 	// and carried by carrying: its sequence is accounted where it is at or
 	// beyond the path's expected one and within kAccountedWindow of it.
-	void OnTrim(uint8_t requested, uint8_t carrying, uint16_t pathSeq);
+	// Whether TakeTailMissing counted it on the path: a send is trimmed once,
+	// so a sequence its path accounted already was counted.
+	bool OnTrim(uint8_t requested, uint8_t carrying, uint16_t pathSeq);
 	// Whether pathSeq is accounted on any path requested up requested.
 	bool Accounted(uint8_t requested, uint16_t pathSeq) const;
 	// A run of path sequences of one requested spine: count of them from
