@@ -441,6 +441,10 @@ public:
 	// requested, and the one timer that requests those due.
 	PendingTailRuns m_tailRuns;
 	EventId m_tailTimer;
+	// Under SprayReceiverTailMissing, the runs requested whose guard has
+	// not yet ended, and the one timer that counts those due.
+	PendingTailRuns m_tailMissingRuns;
+	EventId m_tailMissingTimer;
 	// Whether the experiment layer may forgive this flow on this step, asked
 	// once when the queue pair is created. Every acknowledgement this queue
 	// pair emits carries it, and an acknowledgement carrying it without the

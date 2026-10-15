@@ -368,6 +368,22 @@ std::string spray_receiver_hold = "off";
 bool spray_receiver_hold_given = false;
 uint32_t spray_receiver_hold_clean = 1024;
 bool spray_receiver_hold_clean_given = false;
+// With SPRAY_RECEIVER_HOLD and SPRAY_TAIL_RECOVERY on,
+// SPRAY_RECEIVER_TAIL_MISSING on: the receiving host's hold also counts as
+// missing, for the sender's leaf on their requested spine, the path sequences
+// a tail repair request names that are still missing SPRAY_TAIL_LOSS_RTTS of
+// the fabric's largest base RTT after the request. The gaps alone never show
+// a black-holed spine, on which no data arrives. The wait matches the
+// sender's: a send that arrives late in it is the one whose acknowledgement
+// cancels the sender's report of it. A data packet or a trimmed header of the
+// run arriving before then takes it out, a trim being no loss; a sequence a
+// data arrival passed meanwhile was counted as a gap and is not counted
+// again; and a sequence counted that arrives later is a late arrival, which
+// neither counts toward the release nor restarts it. Each send counted is
+// the host transport event receiver_tail_missing. Off, the default, leaves
+// the hold to the gaps.
+std::string spray_receiver_tail_missing = "off";
+bool spray_receiver_tail_missing_given = false;
 bool receiver_hold() { return spray_receiver_hold == "on"; }
 uint32_t reps_buffer_size = 8;
 uint64_t reps_freezing_timeout_ns = 10000000;
@@ -2245,6 +2261,9 @@ bool ReadConf(string network_configuration) {
     } else if (key.compare("SPRAY_RECEIVER_HOLD_CLEAN") == 0) {
       conf >> spray_receiver_hold_clean;
       spray_receiver_hold_clean_given = true;
+    } else if (key.compare("SPRAY_RECEIVER_TAIL_MISSING") == 0) {
+      conf >> spray_receiver_tail_missing;
+      spray_receiver_tail_missing_given = true;
     } else if (key.compare("SPRAY_HELD_EXPLORATION") == 0) {
       conf >> spray_held_exploration;
     } else if (key.compare("SPRAY_HELD_SENTINEL_INTERVAL_NS") == 0) {
@@ -2719,6 +2738,17 @@ bool ReadConf(string network_configuration) {
     std::cerr << "SPRAY_RECEIVER_HOLD_CLEAN must be above zero\n";
     return false;
   }
+  if (spray_receiver_tail_missing != "on" &&
+      spray_receiver_tail_missing != "off") {
+    std::cerr << "SPRAY_RECEIVER_TAIL_MISSING must be on or off\n";
+    return false;
+  }
+  if (spray_receiver_tail_missing_given &&
+      (!receiver_hold() || !tail_recovery())) {
+    std::cerr << "SPRAY_RECEIVER_TAIL_MISSING is read only with "
+                 "SPRAY_RECEIVER_HOLD and SPRAY_TAIL_RECOVERY on\n";
+    return false;
+  }
   if (!receiver_hold_output_file.empty() && !receiver_hold()) {
     std::cerr << "RECEIVER_HOLD_OUTPUT_FILE is read only with "
                  "SPRAY_RECEIVER_HOLD on\n";
@@ -2979,6 +3009,8 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),
   transport_event_totals[{"tail_loss_delivered", "control"}];
   transport_event_totals[{"tail_repair_rerouted", "control"}];
   transport_event_totals[{"tail_loss_ambiguous", "control"}];
+  // Written under every mode, zero where SPRAY_RECEIVER_TAIL_MISSING is off.
+  transport_event_totals[{"receiver_tail_missing", "control"}];
   // The totals must land even when a watchdog exits the run mid-simulation.
   std::atexit(write_transport_event_summary);
   ZSTD_CCtx_setParameter(transport_event_raw_cctx, ZSTD_c_compressionLevel, 8);
@@ -3297,6 +3329,9 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),
       rdmaHw->SetAttribute("SprayReceiverHold", BooleanValue(receiver_hold()));
       rdmaHw->SetAttribute("SprayReceiverHoldClean",
                            UintegerValue(spray_receiver_hold_clean));
+      rdmaHw->SetAttribute(
+          "SprayReceiverTailMissing",
+          BooleanValue(spray_receiver_tail_missing == "on"));
       rdmaHw->SetAttribute("UeEvSetSize", UintegerValue(ue_ev_set_size));
       rdmaHw->SetAttribute("UeSaturationFraction",
                            DoubleValue(ue_saturation_fraction));

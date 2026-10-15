@@ -22,9 +22,13 @@ void RdmaHw::CountPathSeq(Ptr<RdmaRxQueuePair> q, const CustomHeader &ch,
 	const uint8_t requested = RequestedSpine(ch.ipid);
 	const uint8_t carrying = CarryingSpine(ch.ipid);
 	// An arrival, or a trimmed header, whose request is not yet due needs
-	// none: the data arrived or its trim is repaired as any trim.
+	// none: the data arrived or its trim is repaired as any trim. One whose
+	// request's guard has not ended is not missing to the receiver's hold:
+	// the data arrived, or the trim is no loss.
 	if (m_sprayTailRecovery && !q->m_tailRuns.Empty())
 		q->m_tailRuns.OnArrival(requested, ch.udp.path_seq);
+	if (!q->m_tailMissingRuns.Empty())
+		q->m_tailMissingRuns.OnArrival(requested, ch.udp.path_seq);
 	if (trimmed){
 		// A trimmed header can overtake earlier data of its path in the
 		// switches' high-priority queue: it only accounts its sequence.
@@ -126,6 +130,48 @@ void RdmaHw::SendTailNack(Ptr<RdmaRxQueuePair> q, uint8_t spine,
 	request.SetTailNack(spine, first, count);
 	SendRepairRequest(request, q->sip, q->dip,
 		SpineIdentification(spine, spine));
+	if (m_sprayReceiverTailMissing)
+		WaitTailMissing(q, spine, first, count);
+}
+
+bool RdmaHw::ValidReceiverTailMissing() const{
+	return !m_sprayReceiverTailMissing ||
+		(m_sprayReceiverHold && m_sprayTailRecovery);
+}
+
+void RdmaHw::WaitTailMissing(Ptr<RdmaRxQueuePair> q, uint8_t spine,
+		uint16_t first, uint16_t count){
+	NS_ABORT_MSG_IF(m_sprayTailLossRtts > 0 && m_sprayBaseRttNs == 0,
+		"SprayReceiverTailMissing counts its guard in SprayBaseRttNs, which "
+		"is not set");
+	const uint64_t guardNs =
+		static_cast<uint64_t>(m_sprayTailLossRtts * m_sprayBaseRttNs);
+	// Every run waits the same guard, so a run added later is never due
+	// before the timer already set.
+	q->m_tailMissingRuns.Add(spine, first, count,
+		Simulator::Now().GetNanoSeconds() + guardNs);
+	if (!q->m_tailMissingTimer.IsPending())
+		q->m_tailMissingTimer = Simulator::Schedule(NanoSeconds(guardNs),
+			&RdmaHw::CountTailMissing, this, q);
+}
+
+void RdmaHw::CountTailMissing(Ptr<RdmaRxQueuePair> q){
+	const uint64_t now = Simulator::Now().GetNanoSeconds();
+	// The receive queue pair's addresses are the data's destination's first.
+	const uint32_t leaf = m_switchQueues->LeafOf(q->dip);
+	for (const PendingTailRuns::Request &run : q->m_tailMissingRuns.TakeDue(now)){
+		const uint16_t missing = q->m_pathSeqReceiver.TakeTailMissing(run.spine,
+			run.first, run.count);
+		if (missing == 0)
+			continue;
+		ReceiverHoldOf().OnTailMissing(leaf, run.spine, missing, now);
+		for (uint16_t i = 0; i < missing; i++)
+			ReportTransportEvent("receiver_tail_missing", 0);
+	}
+	const uint64_t next = q->m_tailMissingRuns.NextDue();
+	if (next != PendingTailRuns::kNone)
+		q->m_tailMissingTimer = Simulator::Schedule(NanoSeconds(next - now),
+			&RdmaHw::CountTailMissing, this, q);
 }
 
 void RdmaHw::RecoverTail(Ptr<RdmaQueuePair> qp, const CustomHeader &ch){

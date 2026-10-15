@@ -711,6 +711,17 @@ TypeId RdmaHw::GetTypeId (void)
 				UintegerValue(1024),
 				MakeUintegerAccessor(&RdmaHw::m_sprayReceiverHoldClean),
 				MakeUintegerChecker<uint32_t>(1))
+		.AddAttribute("SprayReceiverTailMissing",
+				"Under SprayReceiverHold and SprayTailRecovery, whether the "
+				"receiver's hold also counts missing, on their requested "
+				"spine, the path sequences a tail repair request names that "
+				"neither arrived nor were trimmed SprayTailLossRtts base RTTs "
+				"(SprayBaseRttNs) after the request and that no gap counted, "
+				"so that a spine on which nothing arrives is held. Default "
+				"false.",
+				BooleanValue(false),
+				MakeBooleanAccessor(&RdmaHw::m_sprayReceiverTailMissing),
+				MakeBooleanChecker())
 		.AddAttribute("SprayCandidates",
 				"Under LoadBalancing 3, the candidates drawn per packet, of which "
 				"the highest-scored is sent on. Default 1.",
@@ -1095,6 +1106,9 @@ void RdmaHw::Setup(QpCompleteCallback cb, QpFailureCallback failure_cb){
 		"SwitchQueueState for the hosts' leaves and at most 8 spines, and "
 		"acknowledgements carry the receiver_hold field exactly when it is "
 		"set (CustomHeader::ackReceiverHoldBytes)");
+	NS_ABORT_MSG_IF(!ValidReceiverTailMissing(),
+		"SprayReceiverTailMissing needs SprayReceiverHold and "
+		"SprayTailRecovery");
 	NS_ABORT_MSG_IF(!ValidRepsOracle(),
 		"PathSelector 8 reads the spines' faults from SwitchQueueState and "
 		"needs LoadBalancing 2 and SprayGradeCostSource 1");

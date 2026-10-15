@@ -17,9 +17,11 @@ constexpr uint32_t kReceiverHoldSpines = 8;
 
 // The receiving host's pooled hold under SprayReceiverHold. Per sender leaf
 // and spine it counts the data packets that arrived and the packets the
-// path sequences show missing (SpineSequenceReceiver), and per spine it keeps
-// the sender leaves with a missing packet on it since that spine was last
-// released.
+// path sequences show missing (SpineSequenceReceiver), under
+// SprayReceiverTailMissing with those a closing packet's counts show sent and
+// that are still missing a guard after the receiver requested them, and per
+// spine it keeps the sender leaves with a missing packet on it since that
+// spine was last released.
 //
 // A packet missing on spine k from sender leaf a holds k: for every sender
 // leaf (host scope) if at least autoLeaves leaves have a missing packet on
@@ -60,6 +62,12 @@ public:
 	// neither as an arrival nor as a clean one, and only closes the
 	// intervals ended by nowNs.
 	void OnTrim(uint32_t leaf, uint32_t spine, uint64_t nowNs);
+	// missing data packets from sender leaf leaf requested up spine, counted
+	// at nowNs by SpineSequenceReceiver::TakeTailMissing. They hold as the
+	// gaps of an arrival do, and are no arrival: a spine on which nothing
+	// arrives shows no gap, and is held by these alone.
+	void OnTailMissing(uint32_t leaf, uint32_t spine, uint32_t missing,
+		uint64_t nowNs);
 	// Whether spine is held for sender leaf leaf, at either scope; and the
 	// bitmap of the spines held for it, bit k for spine k.
 	bool Holds(uint32_t leaf, uint32_t spine) const;

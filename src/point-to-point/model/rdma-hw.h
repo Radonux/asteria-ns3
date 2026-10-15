@@ -487,7 +487,8 @@ public:
 	// arriving at q asks for, before ch's own path sequence is counted.
 	void AskTailMissing(Ptr<RdmaRxQueuePair> q, const CustomHeader &ch);
 	// The repair request of q's flow for count path sequences from first on
-	// spine.
+	// spine; under SprayReceiverTailMissing the receiver's hold then waits on
+	// them (WaitTailMissing).
 	void SendTailNack(Ptr<RdmaRxQueuePair> q, uint8_t spine, uint16_t first,
 		uint16_t count);
 	// The sender's handling of a tail repair request for qp.
@@ -521,6 +522,31 @@ public:
 	TracedCallback<uint32_t, uint64_t, const std::vector<uint32_t> &,
 		const std::vector<uint32_t> &, const std::vector<uint8_t> &>
 		m_traceReceiverHoldInterval;
+	// SprayReceiverTailMissing, under SprayReceiverHold and SprayTailRecovery:
+	// the path sequences a tail repair request names that are still missing
+	// m_sprayTailLossRtts base RTTs (m_sprayBaseRttNs) after the request are
+	// counted missing by the receiver's hold, for the sender's leaf on their
+	// requested spine (ReceiverHold::OnTailMissing). The gaps alone miss a
+	// black-holed spine, where no data arrives to show one. The guard starts at
+	// the request, as the sender's report of the sends the request declares
+	// lost waits m_sprayTailLossRtts after the request reaches it: a send that
+	// arrives late in that time cancels the report by its acknowledgement and
+	// is left out here, so both ends count the same sends. A data packet or a
+	// trimmed header of the run that arrives before the guard ends takes it
+	// out, a trim being no loss; a sequence a data arrival passed meanwhile
+	// was counted as a gap and is not counted again; and a sequence counted
+	// and arriving later is a late arrival
+	// (SpineSequenceReceiver::TakeTailMissing). Each send counted is reported
+	// as the transport event receiver_tail_missing.
+	bool m_sprayReceiverTailMissing;
+	bool ValidReceiverTailMissing() const;
+	// The run q requested of count path sequences from first on spine, to
+	// be counted when its guard ends.
+	void WaitTailMissing(Ptr<RdmaRxQueuePair> q, uint8_t spine, uint16_t first,
+		uint16_t count);
+	// The runs of q whose guard ended by now counted, and q's timer set for
+	// the next.
+	void CountTailMissing(Ptr<RdmaRxQueuePair> q);
 	bool m_var_win, m_fast_react;
 	bool m_rateBound;
 	uint32_t m_total_pause_times; 

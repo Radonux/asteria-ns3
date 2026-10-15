@@ -11335,6 +11335,473 @@ class SprayTailRecoveryTest : public TestCase
     }
 };
 
+class SprayReceiverTailMissingTest : public TestCase
+{
+  public:
+    SprayReceiverTailMissingTest()
+        : TestCase("Under SprayReceiverTailMissing the receiver's hold counts the path sequences "
+                   "a tail repair request names that are still missing a guard after it, so that "
+                   "a black-holed spine is held, and counts no late, trimmed or gap-counted "
+                   "packet")
+    {
+    }
+
+    void DoRun() override
+    {
+        const IntHeader::Mode savedIntMode = IntHeader::mode;
+        const bool savedPathSeq = CustomHeader::udpCarriesPathSeq;
+        const bool savedPacketSeq = CustomHeader::ackCarriesPacketSeq;
+        const uint32_t savedHoldBytes = CustomHeader::ackReceiverHoldBytes;
+        const uint32_t savedCounts = CustomHeader::udpTailCounts;
+        const uint32_t savedNack = CustomHeader::ackTailNackBytes;
+        IntHeader::mode = IntHeader::NONE;
+        CustomHeader::ackCarriesPacketSeq = true;
+        CustomHeader::udpCarriesPathSeq = true;
+        CustomHeader::ackReceiverHoldBytes = 1;
+        CustomHeader::udpTailCounts = kSpines;
+        CustomHeader::ackTailNackBytes = 5;
+
+        Unit();
+        Refusals();
+        Blackhole();
+        LateBeforeGuardEnds();
+        LateAfterGuardEnds();
+        TrimmedAfterRequest();
+        GapsNotCountedTwice();
+
+        CustomHeader::ackTailNackBytes = savedNack;
+        CustomHeader::udpTailCounts = savedCounts;
+        CustomHeader::ackReceiverHoldBytes = savedHoldBytes;
+        CustomHeader::udpCarriesPathSeq = savedPathSeq;
+        CustomHeader::ackCarriesPacketSeq = savedPacketSeq;
+        IntHeader::mode = savedIntMode;
+        Simulator::Destroy();
+    }
+
+  private:
+    static constexpr uint32_t kSpines = 8;
+    static constexpr uint8_t kLossy = 3;
+    // The spine every closing packet takes.
+    static constexpr uint8_t kClosing = 1;
+    static constexpr uint64_t kBaseRttNs = 2000;
+    static constexpr double kGuardRtts = 2;
+    static constexpr uint64_t kGuardNs = 4000;
+    static constexpr uint32_t kClean = 5;
+    // When a message's closing packet arrives, when its request leaves, the
+    // receiver's delay, the base RTT by default, later, and when the guard
+    // ends.
+    static constexpr uint64_t kClosingNs = 1000;
+    static constexpr uint64_t kRequestNs = kClosingNs + kBaseRttNs;
+    static constexpr uint64_t kGuardEndNs = kRequestNs + kGuardNs;
+    // Senders a on leaf 0 and b on leaf 1, and the receiver r on leaf 2.
+    static inline const Ipv4Address kA{"11.0.1.1"};
+    static inline const Ipv4Address kB{"11.0.3.1"};
+    static inline const Ipv4Address kR{"11.0.2.1"};
+
+    // The closing packet's counts: sent up spine kLossy, nothing up the
+    // others before it.
+    static std::vector<uint16_t> Counts(uint16_t sent)
+    {
+        std::vector<uint16_t> counts(kSpines, 0);
+        counts[kLossy] = sent;
+        return counts;
+    }
+
+    struct Request
+    {
+        uint32_t spine;
+        uint32_t first;
+        uint32_t count;
+    };
+
+    // The receiving host r under reps_hold with the receiver's hold and
+    // tail recovery, and with tailMissing SprayReceiverTailMissing guarded
+    // by guardRtts.
+    struct Receiver
+    {
+        explicit Receiver(bool tailMissing, double guardRtts = kGuardRtts)
+            : leaves(Create<SwitchQueueState>(3, kSpines)),
+              host(LoadBalancingMode::SprayUniform, kA, kSpines)
+        {
+            leaves->SetLeafOf(kA.Get(), 0);
+            leaves->SetLeafOf(kB.Get(), 1);
+            leaves->SetLeafOf(kR.Get(), 2);
+            Ptr<RdmaHw> hw = host.hw;
+            hw->m_rtTable[kB.Get()] = {0};
+            hw->m_retransmission_timeout_ns = 0;
+            hw->m_pathSelectorKind = static_cast<uint32_t>(PathSelectorKind::RepsHold);
+            hw->m_sprayHoldScope = static_cast<uint32_t>(HoldScope::Auto);
+            hw->m_sprayHoldAutoLeaves = 2;
+            hw->m_sprayLossThreshold1 = 0.1;
+            hw->m_sprayLossThreshold2 = 0.25;
+            hw->m_sprayLossThreshold3 = 0.5;
+            hw->m_sprayLossIntervalNs = 100000;
+            hw->m_sprayLossHoldCleanSentinels = 3;
+            hw->m_sprayHeldExploration = SpineScores::HeldExploration::Sentinel;
+            hw->m_sprayBaseRttNs = kBaseRttNs;
+            hw->m_sprayPathSeq = true;
+            hw->m_sprayTailRecovery = true;
+            hw->m_sprayTailLossRtts = guardRtts;
+            hw->m_sprayReceiverHold = true;
+            hw->m_sprayReceiverHoldClean = kClean;
+            hw->m_sprayReceiverTailMissing = tailMissing;
+            hw->m_switchQueues = leaves;
+            hw->m_transportEventCallback =
+                Callback<void, const char*, uint64_t>([this](const char* event, uint64_t) {
+                    counted += std::string(event) == "receiver_tail_missing";
+                });
+        }
+
+        // At atNs, the data packet sender sent up spine with path sequence
+        // pathSeq, or with trimmed its trimmed header; with counts, closing,
+        // carrying them as each spine's count.
+        void Deliver(uint64_t atNs,
+                     Ipv4Address sender,
+                     uint8_t spine,
+                     uint16_t pathSeq,
+                     const std::vector<uint16_t>& counts = {},
+                     bool trimmed = false)
+        {
+            const uint32_t dataSeq = seq;
+            seq += IsolatedHost::kMtu;
+            Simulator::Schedule(NanoSeconds(atNs), [=, this]() {
+                Ptr<Packet> packet = Create<Packet>(trimmed ? 0 : IsolatedHost::kMtu);
+                SeqTsHeader seqTs;
+                seqTs.SetSeq(dataSeq);
+                seqTs.SetPG(IsolatedHost::kPriorityGroup);
+                seqTs.SetPathSeq(pathSeq);
+                uint16_t tail[kSpines] = {};
+                std::copy(counts.begin(), counts.end(), tail);
+                seqTs.SetTail(counts.empty() ? 0 : kTailCloses, tail, kSpines);
+                packet->AddHeader(seqTs);
+                UdpHeader udp;
+                udp.SetSourcePort(IsolatedHost::kSenderPort);
+                udp.SetDestinationPort(IsolatedHost::kReceiverPort);
+                udp.ForcePayloadSize(CustomHeader::GetUdpHeaderSize() + IsolatedHost::kMtu);
+                packet->AddHeader(udp);
+                Ipv4Header ip;
+                ip.SetSource(sender);
+                ip.SetDestination(kR);
+                ip.SetProtocol(0x11);
+                ip.SetDscp(static_cast<Ipv4Header::DscpType>(trimmed ? kUetDscpTrimmed
+                                                                     : kUetDscpTrimmable));
+                ip.SetIdentification(SpineIdentification(spine, spine));
+                ip.SetPayloadSize(packet->GetSize());
+                packet->AddHeader(ip);
+                PppHeader ppp;
+                ppp.SetProtocol(0x0021);
+                packet->AddHeader(ppp);
+                CustomHeader parsed(CustomHeader::L2_Header | CustomHeader::L3_Header |
+                                    CustomHeader::L4_Header);
+                packet->PeekHeader(parsed);
+                host.hw->Receive(packet, parsed);
+            });
+        }
+
+        ReceiverHold& Hold()
+        {
+            return host.hw->ReceiverHoldOf();
+        }
+
+        uint64_t Gaps(uint8_t spine) const
+        {
+            const std::vector<uint64_t>& gaps = host.hw->m_spineGaps;
+            return spine < gaps.size() ? gaps[spine] : 0;
+        }
+
+        std::vector<Request> Requests() const
+        {
+            std::vector<Request> requests;
+            for (const CustomHeader& sent : host.emitted)
+            {
+                if (sent.l3Prot == kUecTrimRepairProtocol &&
+                    ((sent.ack.flags >> qbbHeader::FLAG_TAIL_NACK) & 1))
+                {
+                    requests.push_back(
+                        Request{sent.ack.tail_spine, sent.ack.tail_seq, sent.ack.tail_count});
+                }
+            }
+            return requests;
+        }
+
+        // The receiver_hold bitmap of the latest acknowledgement.
+        uint8_t Bitmap() const
+        {
+            for (auto sent = host.emitted.rbegin(); sent != host.emitted.rend(); ++sent)
+            {
+                if (sent->l3Prot == 0xFC)
+                {
+                    return sent->ack.receiver_hold;
+                }
+            }
+            return 0;
+        }
+
+        Ptr<SwitchQueueState> leaves;
+        IsolatedHost host;
+        uint32_t seq = 0;
+        // The transport events receiver_tail_missing reported.
+        uint32_t counted = 0;
+    };
+
+    void Unit()
+    {
+        SpineSequenceReceiver receiver;
+        receiver.OnArrival(kLossy, kLossy, 0);
+        NS_TEST_EXPECT_MSG_EQ(receiver.TakeTailMissing(kLossy, 1, 2), 2u, "1 and 2 are counted");
+        const SpineSequenceReceiver::Arrival late = receiver.OnArrival(kLossy, kLossy, 2);
+        NS_TEST_EXPECT_MSG_EQ(late.late, true, "a counted packet that arrives is late");
+        NS_TEST_EXPECT_MSG_EQ(late.gaps, 0u, "and counts nothing");
+        NS_TEST_EXPECT_MSG_EQ(receiver.OnArrival(kLossy, kLossy, 4).gaps,
+                              1u,
+                              "the next arrival counts 3 alone as a gap");
+        NS_TEST_EXPECT_MSG_EQ(receiver.OnArrival(kLossy, kLossy, 1).late, true, "1 is late too");
+
+        // A gap counted first is not counted again.
+        receiver.OnArrival(6, 6, 0);
+        NS_TEST_EXPECT_MSG_EQ(receiver.OnArrival(6, 6, 4).gaps, 3u, "1 to 3 are a gap");
+        NS_TEST_EXPECT_MSG_EQ(receiver.TakeTailMissing(6, 1, 3), 0u, "and not counted again");
+        NS_TEST_EXPECT_MSG_EQ(receiver.TakeTailMissing(6, 3, 4), 2u, "of 3 to 6, 5 and 6 are");
+
+        // Nothing arrived up spine 5: its own path is made, expecting 0.
+        NS_TEST_EXPECT_MSG_EQ(receiver.TakeTailMissing(5, 0, 3), 3u, "0 to 2 are counted");
+        NS_TEST_EXPECT_MSG_EQ(receiver.OnArrival(5, 5, 3).gaps, 0u, "and are no gap after");
+
+        // A packet a source leaf moved from spine 2 onto spine 7 is late on
+        // its path.
+        receiver.OnArrival(2, 2, 0);
+        receiver.OnArrival(2, 7, 10);
+        NS_TEST_EXPECT_MSG_EQ(receiver.TakeTailMissing(2, 11, 1), 1u, "11 is counted");
+        NS_TEST_EXPECT_MSG_EQ(receiver.OnArrival(2, 7, 11).late, true, "late on the moved path");
+
+        ReceiverHold hold(kSpines, 2, kClean, 0);
+        hold.OnTailMissing(0, kLossy, 2, 0);
+        NS_TEST_EXPECT_MSG_EQ(hold.Holds(0, kLossy), true, "missing packets hold for their leaf");
+        NS_TEST_EXPECT_MSG_EQ(hold.HostHolds(kLossy), false, "for it alone");
+        hold.OnTailMissing(1, kLossy, 1, 0);
+        NS_TEST_EXPECT_MSG_EQ(hold.HostHolds(kLossy), true, "a second leaf widens to every leaf");
+    }
+
+    void Refusals()
+    {
+        Ptr<RdmaHw> hw = CreateObject<RdmaHw>();
+        BooleanValue on;
+        hw->GetAttribute("SprayReceiverTailMissing", on);
+        NS_TEST_EXPECT_MSG_EQ(on.Get(), false, "SprayReceiverTailMissing is off by default");
+        NS_TEST_EXPECT_MSG_EQ(hw->ValidReceiverTailMissing(), true, "and accepted off");
+        hw->m_sprayReceiverTailMissing = true;
+        NS_TEST_EXPECT_MSG_EQ(hw->ValidReceiverTailMissing(), false, "refused alone");
+        hw->m_sprayReceiverHold = true;
+        NS_TEST_EXPECT_MSG_EQ(hw->ValidReceiverTailMissing(),
+                              false,
+                              "refused without SprayTailRecovery");
+        hw->m_sprayTailRecovery = true;
+        NS_TEST_EXPECT_MSG_EQ(hw->ValidReceiverTailMissing(), true, "accepted with both");
+        hw->m_sprayReceiverHold = false;
+        NS_TEST_EXPECT_MSG_EQ(hw->ValidReceiverTailMissing(),
+                              false,
+                              "refused without SprayReceiverHold");
+    }
+
+    // Test (a): nothing arrives up spine 3 from sender leaf 0 or leaf 1, and
+    // each sender's closing packet shows four packets sent up it. The
+    // receiver requests them; a guard after the request it holds spine 3
+    // for leaf 0, and for every leaf once leaf 1's guard ends too, and its
+    // acknowledgements say so. Without the key the same requests leave and
+    // nothing is held, the gaps' blind spot; with a zero guard the hold
+    // comes with the request.
+    void Blackhole()
+    {
+        struct State
+        {
+            bool leaf0 = false;
+            bool host = false;
+            uint32_t counted = 0;
+        };
+
+        for (const bool tailMissing : {true, false})
+        {
+            Receiver receiver(tailMissing);
+            receiver.Deliver(kClosingNs, kA, kClosing, 0, Counts(4));
+            receiver.Deliver(kClosingNs + 500, kB, kClosing, 0, Counts(4));
+            receiver.Deliver(kGuardEndNs + 1000, kA, kClosing, 1);
+            State beforeGuard, afterA, afterB;
+            auto state = [&receiver]() {
+                ReceiverHold& hold = receiver.Hold();
+                return State{hold.Holds(0, kLossy), hold.HostHolds(kLossy), receiver.counted};
+            };
+            Simulator::Schedule(NanoSeconds(kGuardEndNs - 1), [&]() { beforeGuard = state(); });
+            Simulator::Schedule(NanoSeconds(kGuardEndNs + 1), [&]() { afterA = state(); });
+            Simulator::Schedule(NanoSeconds(kGuardEndNs + 501), [&]() { afterB = state(); });
+            Simulator::Run();
+            const std::vector<Request> requests = receiver.Requests();
+            NS_TEST_EXPECT_MSG_EQ(requests.size(), 2u, "each sender's four are requested");
+            for (const Request& request : requests)
+            {
+                NS_TEST_EXPECT_MSG_EQ(request.spine, static_cast<uint32_t>(kLossy), "on spine 3");
+                NS_TEST_EXPECT_MSG_EQ(request.first, 0u, "from 0");
+                NS_TEST_EXPECT_MSG_EQ(request.count, 4u, "all four");
+            }
+            NS_TEST_EXPECT_MSG_EQ(receiver.Gaps(kLossy), 0u, "no arrival shows a gap");
+            NS_TEST_EXPECT_MSG_EQ(beforeGuard.leaf0, false, "nothing is held before the guard ends");
+            NS_TEST_EXPECT_MSG_EQ(beforeGuard.counted, 0u, "nor counted");
+            if (tailMissing)
+            {
+                NS_TEST_EXPECT_MSG_EQ(afterA.leaf0, true, "on: leaf 0's guard holds spine 3");
+                NS_TEST_EXPECT_MSG_EQ(afterA.host, false, "for leaf 0 alone");
+                NS_TEST_EXPECT_MSG_EQ(afterA.counted, 4u, "counting its four");
+                NS_TEST_EXPECT_MSG_EQ(afterB.host, true, "leaf 1's widens it to every leaf");
+                NS_TEST_EXPECT_MSG_EQ(afterB.counted, 8u, "counting four more");
+                NS_TEST_EXPECT_MSG_EQ(static_cast<uint32_t>(receiver.Bitmap()),
+                                      1u << kLossy,
+                                      "the acknowledgements hold spine 3");
+            }
+            else
+            {
+                NS_TEST_EXPECT_MSG_EQ(afterB.leaf0, false, "off: nothing is held");
+                NS_TEST_EXPECT_MSG_EQ(afterB.host, false, "for any leaf");
+                NS_TEST_EXPECT_MSG_EQ(afterB.counted, 0u, "and nothing counted");
+                NS_TEST_EXPECT_MSG_EQ(static_cast<uint32_t>(receiver.Bitmap()),
+                                      0u,
+                                      "the acknowledgements hold nothing");
+            }
+            Simulator::Destroy();
+        }
+
+        Receiver atOnce(true, 0);
+        atOnce.Deliver(kClosingNs, kA, kClosing, 0, Counts(4));
+        bool beforeRequest = true;
+        bool afterRequest = false;
+        Simulator::Schedule(NanoSeconds(kRequestNs - 1),
+                            [&]() { beforeRequest = atOnce.Hold().Holds(0, kLossy); });
+        Simulator::Schedule(NanoSeconds(kRequestNs + 1),
+                            [&]() { afterRequest = atOnce.Hold().Holds(0, kLossy); });
+        Simulator::Run();
+        NS_TEST_EXPECT_MSG_EQ(beforeRequest, false, "zero guard: nothing held before the request");
+        NS_TEST_EXPECT_MSG_EQ(afterRequest, true, "and spine 3 held with it");
+        Simulator::Destroy();
+    }
+
+    // Test (b): of two packets up spine 3 missing when the closing packet
+    // arrives, the first arrives before the request and the second after it,
+    // as originals queued long on spine 3 do, before the guard ends: the
+    // second is requested, neither is counted, and the receiver answers as
+    // it does without the key.
+    void LateBeforeGuardEnds()
+    {
+        std::vector<CustomHeader> emitted[2];
+        for (const bool tailMissing : {true, false})
+        {
+            Receiver receiver(tailMissing);
+            receiver.Deliver(kClosingNs, kA, kClosing, 0, Counts(2));
+            receiver.Deliver(kClosingNs + 500, kA, kLossy, 0);
+            receiver.Deliver(kGuardEndNs - 1, kA, kLossy, 1);
+            Simulator::Run();
+            const std::vector<Request> requests = receiver.Requests();
+            NS_TEST_EXPECT_MSG_EQ(requests.size(), 1u, "one request");
+            if (!requests.empty())
+            {
+                NS_TEST_EXPECT_MSG_EQ(requests[0].first, 1u, "for the second");
+                NS_TEST_EXPECT_MSG_EQ(requests[0].count, 1u, "alone");
+            }
+            NS_TEST_EXPECT_MSG_EQ(receiver.counted, 0u, "neither is counted");
+            NS_TEST_EXPECT_MSG_EQ(receiver.Hold().LossLeaves(kLossy), 0u, "nor held");
+            NS_TEST_EXPECT_MSG_EQ(receiver.Gaps(kLossy), 0u, "nor a gap");
+            emitted[tailMissing] = receiver.host.emitted;
+            Simulator::Destroy();
+        }
+        NS_TEST_ASSERT_MSG_EQ(emitted[true].size(), emitted[false].size(), "the same answers");
+        for (size_t i = 0; i < emitted[true].size(); ++i)
+        {
+            NS_TEST_EXPECT_MSG_EQ(emitted[true][i].l3Prot, emitted[false][i].l3Prot, "in kind");
+            NS_TEST_EXPECT_MSG_EQ(static_cast<uint32_t>(emitted[true][i].ack.receiver_hold),
+                                  static_cast<uint32_t>(emitted[false][i].ack.receiver_hold),
+                                  "and in the spines they hold");
+        }
+    }
+
+    // Test (c): the second arrives only after the guard ends. It is counted
+    // and holds spine 3; its arrival is late, so it neither releases the
+    // hold nor counts toward the release, and the next packet up spine 3
+    // shows no gap for it and counts.
+    void LateAfterGuardEnds()
+    {
+        Receiver receiver(true);
+        receiver.Deliver(kClosingNs - 500, kA, kLossy, 0);
+        receiver.Deliver(kClosingNs, kA, kClosing, 0, Counts(2));
+        receiver.Deliver(kGuardEndNs + 1000, kA, kLossy, 1);
+        receiver.Deliver(kGuardEndNs + 2000, kA, kLossy, 2);
+        bool heldAtGuard = false;
+        bool heldAfterLate = false;
+        uint32_t cleanAfterLate = UINT32_MAX;
+        Simulator::Schedule(NanoSeconds(kGuardEndNs + 1),
+                            [&]() { heldAtGuard = receiver.Hold().Holds(0, kLossy); });
+        Simulator::Schedule(NanoSeconds(kGuardEndNs + 1001), [&]() {
+            heldAfterLate = receiver.Hold().Holds(0, kLossy);
+            cleanAfterLate = receiver.Hold().Clean(0, kLossy);
+        });
+        Simulator::Run();
+        NS_TEST_EXPECT_MSG_EQ(heldAtGuard, true, "the second holds spine 3 when the guard ends");
+        NS_TEST_EXPECT_MSG_EQ(receiver.counted, 1u, "counted once");
+        NS_TEST_EXPECT_MSG_EQ(heldAfterLate, true, "its late arrival leaves the hold");
+        NS_TEST_EXPECT_MSG_EQ(cleanAfterLate, 0u, "and counts nothing toward the release");
+        NS_TEST_EXPECT_MSG_EQ(receiver.Hold().Clean(0, kLossy), 1u, "the next packet counts");
+        NS_TEST_EXPECT_MSG_EQ(receiver.Gaps(kLossy), 0u, "and shows no gap");
+        NS_TEST_EXPECT_MSG_EQ(receiver.Hold().Holds(0, kLossy), true, "still held");
+        Simulator::Destroy();
+    }
+
+    // Test (d): the second's trimmed header arrives after the request and
+    // before the guard ends. Tail recovery has requested it, but it is not
+    // counted, a trim being no loss.
+    void TrimmedAfterRequest()
+    {
+        Receiver receiver(true);
+        receiver.Deliver(kClosingNs - 500, kA, kLossy, 0);
+        receiver.Deliver(kClosingNs, kA, kClosing, 0, Counts(2));
+        receiver.Deliver(kRequestNs + 1000, kA, kLossy, 1, {}, true);
+        Simulator::Run();
+        NS_TEST_EXPECT_MSG_EQ(receiver.Requests().size(), 1u, "the trimmed packet is requested");
+        NS_TEST_EXPECT_MSG_EQ(receiver.counted, 0u, "but not counted");
+        NS_TEST_EXPECT_MSG_EQ(receiver.Hold().LossLeaves(kLossy), 0u, "nor held");
+        Simulator::Destroy();
+    }
+
+    // Test (e): a gap and the closing counts name a packet once. From a, 1
+    // to 3 up spine 3 are missing at the closing packet, and a packet sent
+    // up spine 3 after it, path sequence 5, arrives before the guard ends:
+    // it counts 1 to 4 as a gap, and the guard counts none of them again.
+    // From b, 1 and 2 are missing at the closing packet and counted when the
+    // guard ends; path sequence 4, arriving after, counts 3 alone as a gap.
+    void GapsNotCountedTwice()
+    {
+        Receiver receiver(true);
+        for (const Ipv4Address& sender : {kA, kB})
+        {
+            receiver.Deliver(kClosingNs - 500, sender, kLossy, 0);
+        }
+        receiver.Deliver(kClosingNs, kA, kClosing, 0, Counts(4));
+        receiver.Deliver(kClosingNs, kB, kClosing, 0, Counts(3));
+        receiver.Deliver(kRequestNs + 1000, kA, kLossy, 5);
+        receiver.Deliver(kGuardEndNs + 1000, kB, kLossy, 4);
+        uint64_t gapsAtGuard = 0;
+        uint32_t countedAtGuard = 0;
+        Simulator::Schedule(NanoSeconds(kGuardEndNs + 1), [&]() {
+            gapsAtGuard = receiver.Gaps(kLossy);
+            countedAtGuard = receiver.counted;
+        });
+        Simulator::Run();
+        NS_TEST_EXPECT_MSG_EQ(gapsAtGuard, 4u, "a's arrival counts 1 to 4 as a gap");
+        NS_TEST_EXPECT_MSG_EQ(countedAtGuard, 2u, "the guards count b's 1 and 2 alone");
+        NS_TEST_EXPECT_MSG_EQ(receiver.Gaps(kLossy), 5u, "b's arrival counts 3 alone");
+        NS_TEST_EXPECT_MSG_EQ(receiver.counted, 2u, "and nothing more is counted");
+        NS_TEST_EXPECT_MSG_EQ(receiver.Hold().HostHolds(kLossy),
+                              true,
+                              "both leaves hold spine 3, each by its own count");
+        Simulator::Destroy();
+    }
+};
+
 class SprayPolicyTransportTest : public TestCase
 {
   public:
@@ -13163,6 +13630,7 @@ PointToPointTestSuite::PointToPointTestSuite()
     AddTestCase(new SprayAckLossTest(SprayAckLossTest::Answer::Off), TestCase::Duration::QUICK);
     AddTestCase(new SprayAckLossValidTest, TestCase::Duration::QUICK);
     AddTestCase(new SprayTailRecoveryTest, TestCase::Duration::QUICK);
+    AddTestCase(new SprayReceiverTailMissingTest, TestCase::Duration::QUICK);
     AddTestCase(new SprayPathSeqTest, TestCase::Duration::QUICK);
     AddTestCase(new SprayReceiverHoldTest, TestCase::Duration::QUICK);
     AddTestCase(new SprayReceiverHoldTraceTest, TestCase::Duration::QUICK);

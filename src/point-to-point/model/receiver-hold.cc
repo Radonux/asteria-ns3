@@ -57,6 +57,13 @@ void ReceiverHold::OnTrim(uint32_t leaf, uint32_t spine, uint64_t nowNs){
 	LeafCounts(leaf);
 }
 
+void ReceiverHold::OnTailMissing(uint32_t leaf, uint32_t spine,
+		uint32_t missing, uint64_t nowNs){
+	NS_ASSERT_MSG(spine < m_spines, "a missing packet is on a held spine's range");
+	AdvanceInterval(nowNs);
+	CountMissing(LeafCounts(leaf), leaf, spine, missing);
+}
+
 void ReceiverHold::CountMissing(Leaf &counts, uint32_t leaf, uint32_t spine,
 		uint32_t gaps){
 	counts.lost[spine] += gaps;

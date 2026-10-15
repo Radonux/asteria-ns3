@@ -37,6 +37,12 @@ private:
 // sequences it passes are dropped. A data arrival behind the expected one, in
 // 16-bit serial number order, is a late packet and changes nothing.
 //
+// The sequences TakeTailMissing counts missing are accounted as well, since
+// they are counted already. No data packet arrives with a trimmed header's
+// sequence, whose payload was dropped, so a data arrival of an accounted
+// sequence is one TakeTailMissing counted, arriving after all: it is a late
+// packet too and changes nothing.
+//
 // Trimmed headers travel in the switches' high-priority queue and can overtake
 // earlier data packets of their path. A trimmed header therefore neither moves
 // the expected sequence on nor counts a gap: it only marks its path sequence
@@ -60,7 +66,8 @@ public:
 	struct Arrival {
 		// The packets of the path the arrival shows missing, zero for none.
 		uint16_t gaps;
-		// Whether the arrival is behind the expected sequence.
+		// Whether the arrival is behind the expected sequence, or one
+		// TakeTailMissing counted.
 		bool late;
 	};
 	// A data arrival with path sequence pathSeq, requested up requested and
@@ -86,6 +93,15 @@ public:
 	// taken are not taken again, and an owed count not ahead of that start
 	// in 16-bit serial order takes nothing.
 	std::vector<Missing> TakeMissing(uint8_t requested, uint16_t owed);
+	// Count missing the count path sequences from first, requested up
+	// requested, that a receiver found missing and that neither arrived nor
+	// were trimmed since: those no data arrival requested up requested has
+	// passed, as one that did counted them as a gap. Each sequence counted is
+	// accounted on every path requested up requested, the path requested up
+	// it and carried by it made where there is none yet, so that a data
+	// arrival ahead of it counts it no more and its own is late. Returns how
+	// many it counted.
+	uint16_t TakeTailMissing(uint8_t requested, uint16_t first, uint16_t count);
 
 private:
 	struct Path {
@@ -97,6 +113,13 @@ private:
 	};
 	// Drop the accounted sequences of path that are behind its expected one.
 	static void Prune(Path &path);
+	// Account pathSeq on path where it is at or beyond the expected sequence
+	// and within kAccountedWindow of it, or before the path starts while it
+	// keeps fewer than kAccountedWindow.
+	static void Account(Path &path, uint16_t pathSeq);
+	// The furthest expected sequence among the started paths requested up
+	// requested, in next; false, with next left as it is, where none is.
+	bool Furthest(uint8_t requested, uint16_t &next) const;
 	// Keyed by the identification that names the path.
 	std::unordered_map<uint16_t, Path> m_paths;
 	// Per requested spine, the end of the runs TakeMissing has taken.
