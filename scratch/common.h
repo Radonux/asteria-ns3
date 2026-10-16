@@ -126,6 +126,11 @@ std::string spine_loss_output_file;
 // and one row (spine 0's) of an interval that would write none
 // (spine_loss_rows). Off, the default, writes every row.
 bool spine_loss_sparse = false;
+// RECEIVER_HOLD_SPARSE on: RECEIVER_HOLD_OUTPUT_FILE writes its rows as
+// SPINE_LOSS_SPARSE writes SPINE_LOSS_OUTPUT_FILE's, a row where the series
+// had an arrival or a missing packet in the interval or its hold changed
+// (receiver_hold_rows). Off, the default, writes every row.
+bool receiver_hold_sparse = false;
 // One row per retransmission timeout fired, under every mode: the time, the
 // host's rank and the destination's, the requested spine of the oldest
 // outstanding send the timer waited for (empty where no send record is kept
@@ -1943,31 +1948,56 @@ void write_spine_report(uint32_t rank, uint64_t now_ns,
 // destination (the leaf, the destination's node id, or none for the pooled
 // scores), per spine; 0xffff for none yet.
 std::map<std::pair<uint32_t, int64_t>, std::vector<uint16_t>> spine_loss_grades;
+// Under RECEIVER_HOLD_SPARSE, each series' last hold written, by receiving
+// host and sender leaf, per spine; 0xffff for none yet.
+std::map<std::pair<uint32_t, uint32_t>, std::vector<uint16_t>> receiver_hold_scopes;
 
-// Whether spine's row of a closed interval of the host's series toward
-// destination is written: every row densely; under SPINE_LOSS_SPARSE a row
-// with a send or a loss in it, or a grade other than the series' last, and
-// spine 0's where the interval would write none, which marks it closed. A
-// reader takes a row left out as no send and no loss at the series' last
-// grade.
-std::vector<bool> spine_loss_rows(uint32_t rank, int64_t destination,
-                                  const std::vector<uint32_t> &sent,
-                                  const std::vector<uint32_t> &lost,
-                                  const std::vector<uint8_t> &grades) {
-  std::vector<bool> rows(sent.size(), true);
-  if (!spine_loss_sparse)
-    return rows;
-  std::vector<uint16_t> &last = spine_loss_grades[{rank, destination}];
-  last.resize(sent.size(), 0xffff);
+// Whether spine's row of a closed interval of a series is written, its last
+// values written kept in last: a row with a count in it (counts, other), or
+// a value other than the series' last, and spine 0's where the interval
+// would write none, which marks it closed. A reader takes a row left out as
+// no count at the series' last value.
+std::vector<bool> sparse_rows(std::vector<uint16_t> &last,
+                              const std::vector<uint32_t> &counts,
+                              const std::vector<uint32_t> &other,
+                              const std::vector<uint8_t> &values) {
+  std::vector<bool> rows(counts.size(), true);
+  last.resize(counts.size(), 0xffff);
   bool any = false;
-  for (uint32_t spine = 0; spine < sent.size(); spine++) {
-    rows[spine] = sent[spine] > 0 || lost[spine] > 0 || last[spine] != grades[spine];
-    last[spine] = grades[spine];
+  for (uint32_t spine = 0; spine < counts.size(); spine++) {
+    rows[spine] = counts[spine] > 0 || other[spine] > 0 || last[spine] != values[spine];
+    last[spine] = values[spine];
     any = any || rows[spine];
   }
   if (!any && !rows.empty())
     rows[0] = true;
   return rows;
+}
+
+// Whether spine's row of a closed interval of the host's series toward
+// destination is written: every row densely; under SPINE_LOSS_SPARSE a row
+// with a send or a loss in it, or a grade other than the series' last
+// (sparse_rows).
+std::vector<bool> spine_loss_rows(uint32_t rank, int64_t destination,
+                                  const std::vector<uint32_t> &sent,
+                                  const std::vector<uint32_t> &lost,
+                                  const std::vector<uint8_t> &grades) {
+  if (!spine_loss_sparse)
+    return std::vector<bool>(sent.size(), true);
+  return sparse_rows(spine_loss_grades[{rank, destination}], sent, lost, grades);
+}
+
+// Whether spine's row of a closed interval of the receiving host's series
+// for the sender leaf is written: every row densely; under
+// RECEIVER_HOLD_SPARSE a row with an arrival or a missing packet in it, or a
+// hold other than the series' last (sparse_rows).
+std::vector<bool> receiver_hold_rows(uint32_t rank, uint32_t leaf,
+                                     const std::vector<uint32_t> &arrivals,
+                                     const std::vector<uint32_t> &lost,
+                                     const std::vector<uint8_t> &holds) {
+  if (!receiver_hold_sparse)
+    return std::vector<bool>(arrivals.size(), true);
+  return sparse_rows(receiver_hold_scopes[{rank, leaf}], arrivals, lost, holds);
 }
 
 // A loss interval the host's pooled scores closed: one row per spine, under
@@ -2034,10 +2064,12 @@ void write_receiver_hold_interval(uint32_t rank, uint32_t leaf,
                                   const std::vector<uint32_t> &lost,
                                   const std::vector<uint8_t> &holds) {
   static const char *const scopes[] = {"none", "leaf", "host"};
+  const std::vector<bool> rows = receiver_hold_rows(rank, leaf, arrivals, lost, holds);
   for (uint32_t spine = 0; spine < arrivals.size(); spine++)
-    fprintf(receiver_hold_file, "%lu,%u,%u,%u,%u,%u,%s\n",
-            static_cast<unsigned long>(end_ns), rank, leaf, spine,
-            arrivals[spine], lost[spine], scopes[holds[spine]]);
+    if (rows[spine])
+      fprintf(receiver_hold_file, "%lu,%u,%u,%u,%u,%u,%s\n",
+              static_cast<unsigned long>(end_ns), rank, leaf, spine,
+              arrivals[spine], lost[spine], scopes[holds[spine]]);
 }
 
 void write_answer_hold(uint32_t rank, bool receiverSide, uint32_t leaf,
@@ -2878,6 +2910,14 @@ bool ReadConf(string network_configuration) {
         return false;
       }
       spine_loss_sparse = value == "on";
+    } else if (key.compare("RECEIVER_HOLD_SPARSE") == 0) {
+      std::string value;
+      conf >> value;
+      if (value != "on" && value != "off") {
+        std::cerr << "RECEIVER_HOLD_SPARSE must be on or off\n";
+        return false;
+      }
+      receiver_hold_sparse = value == "on";
     } else if (key.compare("HOLD_TRACE_HOSTS") == 0) {
       uint32_t count = 0;
       conf >> count;
