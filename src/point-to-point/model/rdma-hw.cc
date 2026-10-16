@@ -3076,8 +3076,10 @@ bool RdmaHw::EnforceProgressDeadline(Ptr<RdmaQueuePair> qp){
 void RdmaHw::ArmRetransmissionTimeout(Ptr<RdmaQueuePair> qp){
 	if (m_retransmission_timeout_ns == 0 || qp->IsFinished() || qp->IsFailed())
 		return;
+	// Removed rather than cancelled: the timer is re-armed on every send and
+	// answer, and a cancelled event stays in the scheduler until its time.
 	if (!qp->m_retransmissionTimer.IsExpired())
-		Simulator::Cancel(qp->m_retransmissionTimer);
+		Simulator::Remove(qp->m_retransmissionTimer);
 	// With send records the timer expires when the oldest outstanding send
 	// has waited out the timeout, however recently anything else was sent.
 	uint64_t delay = m_retransmission_timeout_ns;
