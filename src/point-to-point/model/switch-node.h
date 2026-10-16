@@ -1,7 +1,9 @@
 #ifndef SWITCH_NODE_H
 #define SWITCH_NODE_H
 
+#include <array>
 #include <unordered_map>
+#include <vector>
 #include <ns3/node.h>
 #include "qbb-net-device.h"
 #include "switch-mmu.h"
@@ -58,7 +60,11 @@ class SwitchNode : public Node{
 	std::unordered_map<uint32_t, std::vector<int> > m_rtTable; // map from ip address (u32) to possible ECMP port (index of dev)
 
 	// monitor of PFC
-	uint32_t m_bytes[pCnt][pCnt][qCnt]; // m_bytes[inDev][outDev][qidx] is the bytes from inDev enqueued for outDev at qidx
+	// m_bytes[inDev][outDev][qidx] is the bytes from inDev enqueued for outDev
+	// at qidx, over the ports that have enqueued (BytesOf), so that a switch
+	// keeps its own ports' and not pCnt * pCnt.
+	std::vector<std::vector<std::array<uint32_t, qCnt>>> m_bytes;
+	std::array<uint32_t, qCnt> &BytesOf(uint32_t inDev, uint32_t outDev);
 	
 	SwitchPortCounters m_portCounters[pCnt];
 

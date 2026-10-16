@@ -106,10 +106,6 @@ SwitchNode::SwitchNode(){
 	m_loadBalancing = static_cast<uint32_t>(LoadBalancingMode::Ecmp);
 	m_mmu = CreateObject<SwitchMmu>();
 	for (uint32_t i = 0; i < pCnt; i++)
-		for (uint32_t j = 0; j < pCnt; j++)
-			for (uint32_t k = 0; k < qCnt; k++)
-				m_bytes[i][j][k] = 0;
-	for (uint32_t i = 0; i < pCnt; i++)
 		m_portCounters[i] = SwitchPortCounters{};
 	for (uint32_t i = 0; i < pCnt; i++)
 		m_lastPktSize[i] = m_lastPktTs[i] = 0;
@@ -480,9 +476,9 @@ bool SwitchNode::SendToDev(Ptr<Packet>p, CustomHeader &ch){
 		}
 		CheckAndSendPfc(inDev, qIndex);
 	}
-	m_bytes[inDev][idx][qIndex] += p->GetSize();
+	BytesOf(inDev, idx)[qIndex] += p->GetSize();
 	if (!m_devices[idx]->SwitchSend(qIndex, p, ch)){
-		m_bytes[inDev][idx][qIndex] -= p->GetSize();
+		BytesOf(inDev, idx)[qIndex] -= p->GetSize();
 		if (qIndex != 0){
 			m_mmu->RemoveFromIngressAdmission(inDev, qIndex, p->GetSize());
 			m_mmu->RemoveFromEgressAdmission(idx, qIndex, p->GetSize());
@@ -608,8 +604,18 @@ uint32_t SwitchNode::ReleaseBuffer(uint32_t ifIndex, uint32_t qIndex, Ptr<const 
 	const uint32_t inDev = t.GetFlowId();
 	m_mmu->RemoveFromIngressAdmission(inDev, qIndex, p->GetSize());
 	m_mmu->RemoveFromEgressAdmission(ifIndex, qIndex, p->GetSize());
-	m_bytes[inDev][ifIndex][qIndex] -= p->GetSize();
+	BytesOf(inDev, ifIndex)[qIndex] -= p->GetSize();
 	return inDev;
+}
+
+std::array<uint32_t, SwitchNode::qCnt> &SwitchNode::BytesOf(uint32_t inDev,
+		uint32_t outDev){
+	if (inDev >= m_bytes.size())
+		m_bytes.resize(inDev + 1);
+	std::vector<std::array<uint32_t, qCnt>> &out = m_bytes[inDev];
+	if (outDev >= out.size())
+		out.resize(outDev + 1, std::array<uint32_t, qCnt>{});
+	return out[outDev];
 }
 
 void SwitchNode::DiscardQueued(uint32_t ifIndex, uint32_t qIndex, Ptr<const Packet> p){
