@@ -80,6 +80,12 @@ namespace ns3 {
 	void qbbHeader::SetProbeAnswer(){
 		flags |= 1 << FLAG_PROBE_ANSWER;
 	}
+	void qbbHeader::SetRouteProbe(){
+		flags |= 1 << FLAG_ROUTE_PROBE;
+	}
+	void qbbHeader::SetRouteProbeReply(){
+		flags |= 1 << FLAG_ROUTE_PROBE_REPLY;
+	}
 	void qbbHeader::SetPacketSeq(uint32_t seq){
 		m_packetSeq = seq;
 	}

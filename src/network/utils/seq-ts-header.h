@@ -71,6 +71,8 @@ class SeqTsHeader : public Header
     // CustomHeader::udpTailCounts is not zero: the flags (kTailCloses) and
     // the first CustomHeader::udpTailCounts of counts.
     void SetTail (uint8_t flags, const uint16_t* counts, uint32_t n);
+    // Sets flags among the tail flags SetTail wrote (kTailCopied).
+    void AddTailFlags (uint8_t flags);
     uint8_t GetTailFlags () const;
     uint16_t GetTailCount (uint32_t spine) const;
     // The route spines the sender holds for the answers of the destination's

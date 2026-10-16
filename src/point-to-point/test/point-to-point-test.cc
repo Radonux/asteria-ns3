@@ -14996,6 +14996,398 @@ class AnswerPathSeqTest : public TestCase
     }
 };
 
+/**
+ * Per-connection answer routes: AckRoute ReverseSet's set, its probes, their
+ * returns and its replacements, and AckRoute Repath's spine, drawn again at a
+ * duplicate arrival unless the send was copied.
+ */
+class AnswerRouteTest : public TestCase
+{
+  public:
+    AnswerRouteTest()
+        : TestCase("Under ACK_ROUTE reverse_set a connection's answers take a set of spines, "
+                   "probed once per base RTT while its data arrives and returned by its sender, a "
+                   "member whose probe goes unanswered for two base RTTs replaced; under repath "
+                   "they take one spine, drawn again at each duplicate data arrival that is not "
+                   "one of a copied send's packets")
+    {
+    }
+
+    void DoRun() override
+    {
+        const bool savedPacketSeq = CustomHeader::ackCarriesPacketSeq;
+        const uint32_t savedRoute = CustomHeader::ackRouteSpineBytes;
+        const uint32_t savedTail = CustomHeader::udpTailCounts;
+        CustomHeader::ackCarriesPacketSeq = true;
+        SetUnit();
+        RepathUnit();
+        Headers();
+        CustomHeader::ackRouteSpineBytes = 1;
+        ReverseSetReceiver();
+        Sender();
+        RepathReceiver();
+        Valid();
+        CustomHeader::ackRouteSpineBytes = savedRoute;
+        CustomHeader::udpTailCounts = savedTail;
+        CustomHeader::ackCarriesPacketSeq = savedPacketSeq;
+        Simulator::Destroy();
+    }
+
+  private:
+    static constexpr uint32_t kSpines = 8;
+    static constexpr uint64_t kRttNs = 1000;
+
+    // Draws from a script, the value modulo n.
+    static AnswerRouteDraw Script(std::vector<uint32_t> values)
+    {
+        auto next = std::make_shared<size_t>(0);
+        auto script = std::make_shared<std::vector<uint32_t>>(std::move(values));
+        return [next, script](uint32_t n) {
+            const uint32_t value = (*script)[*next % script->size()];
+            ++*next;
+            return value % n;
+        };
+    }
+
+    void SetUnit()
+    {
+        AnswerRouteSet set;
+        // The first two draws pick spines 2 and then, of the seven left, the
+        // fifth (5); the third, of the six left, the first (0).
+        const AnswerRouteDraw draw = Script({2, 4, 0, 1, 0, 1});
+        std::vector<uint8_t> probes;
+        std::vector<std::pair<uint8_t, uint8_t>> replaced;
+        NS_TEST_EXPECT_MSG_EQ(set.TakeRound(0, kRttNs, 2 * kRttNs, kSpines, 2, draw, probes, replaced),
+                              true,
+                              "the first arrival takes a round");
+        NS_TEST_ASSERT_MSG_EQ((set.Members() == std::vector<uint8_t>{2, 5}), true, "two members");
+        NS_TEST_EXPECT_MSG_EQ((probes == std::vector<uint8_t>{2, 5}), true, "each probed");
+        for (uint32_t i = 0; i < 20; ++i)
+        {
+            const uint8_t route = set.Route(kSpines, 2, Script({i}));
+            NS_TEST_EXPECT_MSG_EQ((route == 2 || route == 5), true, "answers take a member");
+        }
+        probes.clear();
+        NS_TEST_EXPECT_MSG_EQ(set.TakeRound(999, kRttNs, 2 * kRttNs, kSpines, 2, draw, probes, replaced),
+                              false,
+                              "no round within the interval");
+        NS_TEST_EXPECT_MSG_EQ(set.OnReply(2), true, "spine 2's probe returns");
+        NS_TEST_EXPECT_MSG_EQ(set.OnReply(4), false, "a spine outside the set is no member");
+        NS_TEST_EXPECT_MSG_EQ(set.TakeRound(1000, kRttNs, 2 * kRttNs, kSpines, 2, draw, probes, replaced),
+                              true,
+                              "a round an interval on");
+        NS_TEST_EXPECT_MSG_EQ(replaced.size(), 0u, "spine 5 unanswered for one interval stays");
+        probes.clear();
+        NS_TEST_EXPECT_MSG_EQ(set.TakeRound(2000, kRttNs, 2 * kRttNs, kSpines, 2, draw, probes, replaced),
+                              true,
+                              "the next round");
+        NS_TEST_ASSERT_MSG_EQ(replaced.size(), 1u, "spine 5, unanswered for two, is replaced");
+        NS_TEST_EXPECT_MSG_EQ((replaced[0] == std::pair<uint8_t, uint8_t>{5, 0}), true,
+                              "by a spine outside the set");
+        NS_TEST_EXPECT_MSG_EQ((set.Members() == std::vector<uint8_t>{2, 0}), true,
+                              "spine 2, unanswered for one, stays");
+        NS_TEST_EXPECT_MSG_EQ((probes == std::vector<uint8_t>{2, 0}), true, "both probed");
+        // A set of every spine replaces none.
+        AnswerRouteSet all;
+        replaced.clear();
+        all.TakeRound(0, kRttNs, 2 * kRttNs, 2, 2, Script({0}), probes, replaced);
+        all.TakeRound(5000, kRttNs, 2 * kRttNs, 2, 2, Script({0}), probes, replaced);
+        NS_TEST_EXPECT_MSG_EQ(replaced.size(), 0u, "a set of every spine keeps its members");
+    }
+
+    void RepathUnit()
+    {
+        AnswerRepath repath;
+        const AnswerRouteDraw draw = Script({3, 3, 0});
+        NS_TEST_EXPECT_MSG_EQ(uint32_t(repath.Route(kSpines, draw)), 3u, "drawn once");
+        NS_TEST_EXPECT_MSG_EQ(uint32_t(repath.Route(kSpines, draw)), 3u, "and kept");
+        // Of the seven spines but 3, the fourth.
+        NS_TEST_EXPECT_MSG_EQ(uint32_t(repath.Repath(kSpines, draw)), 4u, "another at a repath");
+        NS_TEST_EXPECT_MSG_EQ(uint32_t(repath.Repath(kSpines, draw)), 0u, "and again");
+    }
+
+    void Headers()
+    {
+        qbbHeader probe;
+        probe.SetRouteProbe();
+        probe.SetRouteSpine(6);
+        Ptr<Packet> packet = Create<Packet>(0);
+        CustomHeader::ackRouteSpineBytes = 1;
+        packet->AddHeader(probe);
+        Ipv4Header ip;
+        ip.SetProtocol(0xFC);
+        ip.SetPayloadSize(packet->GetSize());
+        packet->AddHeader(ip);
+        CustomHeader parsed(CustomHeader::L3_Header | CustomHeader::L4_Header);
+        packet->PeekHeader(parsed);
+        NS_TEST_EXPECT_MSG_EQ(((parsed.ack.flags >> qbbHeader::FLAG_ROUTE_PROBE) & 1), 1,
+                              "a route probe is flagged");
+        NS_TEST_EXPECT_MSG_EQ(uint32_t(parsed.ack.route_spine), 6u, "with its spine");
+        CustomHeader::ackRouteSpineBytes = 0;
+        CustomHeader::udpTailCounts = 2;
+        SeqTsHeader seqTs;
+        const uint16_t counts[2] = {1, 2};
+        seqTs.SetTail(kTailCloses, counts, 2);
+        seqTs.AddTailFlags(kTailCopied);
+        UdpHeader udp;
+        Ipv4Header dataIp;
+        dataIp.SetProtocol(0x11);
+        const bool savedPathSeq = CustomHeader::udpCarriesPathSeq;
+        CustomHeader::udpCarriesPathSeq = true;
+        Ptr<Packet> carried = Create<Packet>(0);
+        carried->AddHeader(seqTs);
+        carried->AddHeader(udp);
+        dataIp.SetPayloadSize(carried->GetSize());
+        carried->AddHeader(dataIp);
+        CustomHeader parsedData(CustomHeader::L3_Header | CustomHeader::L4_Header);
+        carried->PeekHeader(parsedData);
+        NS_TEST_EXPECT_MSG_EQ(uint32_t(parsedData.udp.tail_flags), uint32_t(kTailCloses | kTailCopied),
+                              "a copied send's tail flags round trip");
+        CustomHeader::udpCarriesPathSeq = savedPathSeq;
+        CustomHeader::udpTailCounts = 0;
+    }
+
+    static Ptr<UniformRandomVariable> Stream()
+    {
+        return CreateObjectWithAttributes<UniformRandomVariable>("Stream", IntegerValue(47));
+    }
+
+    // A receiving host under route, with its events counted.
+    static void Receiver(IsolatedHost& host, AckRoute route, std::map<std::string, uint32_t>& events)
+    {
+        host.hw->m_ackRoute = static_cast<uint32_t>(route);
+        host.hw->m_ackRouteRandom = Stream();
+        host.hw->m_sprayBaseRttNs = kRttNs;
+        host.hw->m_transportEventCallback = Callback<void, const char*, uint64_t>(
+            [&events](const char* event, uint64_t) { ++events[event]; });
+    }
+
+    static bool IsRouteProbe(const CustomHeader& ch)
+    {
+        return ch.l3Prot == 0xFC && ((ch.ack.flags >> qbbHeader::FLAG_ROUTE_PROBE) & 1);
+    }
+
+    // The sender's return of a probe of spine.
+    static void Reply(IsolatedHost& host, uint8_t spine)
+    {
+        CustomHeader reply;
+        reply.l3Prot = kPathProbeProtocol;
+        reply.sip = kTestSender.Get();
+        reply.dip = kTestReceiver.Get();
+        reply.ipid = SpineIdentification(spine, spine);
+        reply.ack.flags = 1 << qbbHeader::FLAG_ROUTE_PROBE_REPLY;
+        reply.ack.sport = IsolatedHost::kSenderPort;
+        reply.ack.dport = IsolatedHost::kReceiverPort;
+        reply.ack.pg = IsolatedHost::kPriorityGroup;
+        reply.ack.route_spine = spine;
+        host.hw->Receive(Create<Packet>(), reply);
+    }
+
+    void ReverseSetReceiver()
+    {
+        IsolatedHost receiver(LoadBalancingMode::SprayUniform, kTestSender, kSpines);
+        std::map<std::string, uint32_t> events;
+        Receiver(receiver, AckRoute::ReverseSet, events);
+        receiver.hw->m_ackRouteSetSize = 2;
+        std::set<uint32_t> routes;
+        std::vector<uint8_t> probed;
+        std::vector<uint8_t> members;
+        std::vector<uint8_t> after;
+        uint32_t seq = 0;
+        // One data packet per 100 ns for 4 base RTTs; spine members[0]'s
+        // probes return, the other's never do.
+        for (uint32_t i = 0; i < 40; ++i)
+        {
+            Simulator::Schedule(NanoSeconds(100 * i), [&, i]() {
+                const size_t before = receiver.emitted.size();
+                receiver.ReceiveData(kTestSender, kTestReceiver, seq, SpineIdentification(i % kSpines, i % kSpines));
+                seq += IsolatedHost::kMtu;
+                for (size_t k = before; k < receiver.emitted.size(); ++k)
+                {
+                    const CustomHeader& out = receiver.emitted[k];
+                    if (IsRouteProbe(out))
+                    {
+                        probed.push_back(out.ack.route_spine);
+                        NS_TEST_EXPECT_MSG_EQ(out.ipid,
+                                              SpineIdentification(out.ack.route_spine, out.ack.route_spine),
+                                              "a probe goes up its spine");
+                        NS_TEST_EXPECT_MSG_EQ(out.dip, kTestSender.Get(), "to the sender");
+                    }
+                    else
+                    {
+                        routes.insert(out.ack.route_spine);
+                    }
+                }
+                if (i == 0)
+                {
+                    members = receiver.hw->AnswerRoutesOf(kTestSender.Get(), IsolatedHost::kPriorityGroup)
+                                  .set.Members();
+                }
+            });
+            Simulator::Schedule(NanoSeconds(100 * i + 50), [&]() {
+                if (!members.empty())
+                {
+                    Reply(receiver, members[0]);
+                }
+            });
+        }
+        Simulator::Schedule(NanoSeconds(4000), [&]() {
+            after = receiver.hw->AnswerRoutesOf(kTestSender.Get(), IsolatedHost::kPriorityGroup).set.Members();
+        });
+        Simulator::Run();
+        Simulator::Destroy();
+        NS_TEST_ASSERT_MSG_EQ(members.size(), 2u, "a set of two");
+        NS_TEST_EXPECT_MSG_EQ(probed.size(), 8u, "a round of two probes per base RTT");
+        NS_TEST_EXPECT_MSG_EQ(events["answer_set_probe"], 8u, "each the transport event");
+        NS_TEST_EXPECT_MSG_EQ(events["answer_set_replace"], 1u, "the unanswered member is replaced once");
+        NS_TEST_ASSERT_MSG_EQ(after.size(), 2u, "the set keeps its size");
+        NS_TEST_EXPECT_MSG_EQ(after[0], members[0], "the answered member stays");
+        NS_TEST_EXPECT_MSG_NE(after[1], members[1], "the other is replaced");
+        NS_TEST_EXPECT_MSG_NE(after[1], members[0], "by a spine outside the set");
+        for (const uint32_t route : routes)
+        {
+            NS_TEST_EXPECT_MSG_EQ((route == members[0] || route == members[1] || route == after[1]),
+                                  true,
+                                  "answers take a member");
+        }
+        // A sender on this host's leaf is answered across no spine and probed
+        // not at all.
+        receiver.hw->m_ownLeafHosts = {kTestSender.Get()};
+        const size_t before = receiver.emitted.size();
+        receiver.ReceiveData(kTestSender, kTestReceiver, seq, SpineIdentification(1, 1));
+        NS_TEST_ASSERT_MSG_EQ(receiver.emitted.size(), before + 1, "one answer, no probe");
+        NS_TEST_EXPECT_MSG_EQ(uint32_t(receiver.emitted.back().ack.route_spine), uint32_t(kNoRouteSpine),
+                              "naming no route spine");
+    }
+
+    void Sender()
+    {
+        IsolatedHost sender(LoadBalancingMode::SprayUniform, kTestReceiver, kSpines);
+        sender.hw->m_ackRoute = static_cast<uint32_t>(AckRoute::ReverseSet);
+        Ptr<RdmaQueuePair> qp = sender.AddSender(kTestSender, kTestReceiver, 10 * IsolatedHost::kMtu);
+        CustomHeader probe;
+        probe.l3Prot = 0xFC;
+        probe.sip = kTestReceiver.Get();
+        probe.dip = kTestSender.Get();
+        probe.ipid = SpineIdentification(5, 5);
+        probe.ack.flags = 1 << qbbHeader::FLAG_ROUTE_PROBE;
+        probe.ack.sport = IsolatedHost::kReceiverPort;
+        probe.ack.dport = IsolatedHost::kSenderPort;
+        probe.ack.pg = IsolatedHost::kPriorityGroup;
+        probe.ack.seq = 4 * IsolatedHost::kMtu;
+        probe.ack.route_spine = 5;
+        sender.hw->ReceiveAck(Create<Packet>(), probe);
+        NS_TEST_EXPECT_MSG_EQ(qp->snd_una, 0u, "a probe acknowledges nothing");
+        NS_TEST_ASSERT_MSG_EQ(sender.emitted.size(), 1u, "and is returned");
+        const CustomHeader& reply = sender.emitted.back();
+        NS_TEST_EXPECT_MSG_EQ(reply.l3Prot, kPathProbeProtocol, "as a path probe");
+        NS_TEST_EXPECT_MSG_EQ(((reply.ack.flags >> qbbHeader::FLAG_ROUTE_PROBE_REPLY) & 1), 1,
+                              "flagged as the return");
+        NS_TEST_EXPECT_MSG_EQ(uint32_t(reply.ack.route_spine), 5u, "over the spine probed");
+        NS_TEST_EXPECT_MSG_EQ(reply.ipid, SpineIdentification(5, 5), "which it names");
+        NS_TEST_EXPECT_MSG_EQ((reply.dip == kTestReceiver.Get() &&
+                               reply.ack.sport == IsolatedHost::kSenderPort &&
+                               reply.ack.dport == IsolatedHost::kReceiverPort &&
+                               reply.ack.pg == IsolatedHost::kPriorityGroup),
+                              true,
+                              "to the probing receiver, with the data's ports");
+        // Without the queue pair, as after its completion, it is returned all
+        // the same.
+        sender.hw->m_qpMap.clear();
+        sender.hw->ReceiveAck(Create<Packet>(), probe);
+        NS_TEST_EXPECT_MSG_EQ(sender.emitted.size(), 2u, "returned without the queue pair");
+    }
+
+    // A data packet, with the tail flags given.
+    static void Data(IsolatedHost& host, uint32_t seq, uint8_t tailFlags)
+    {
+        Ptr<Packet> packet = Create<Packet>(IsolatedHost::kMtu);
+        SeqTsHeader seqTs;
+        seqTs.SetSeq(seq);
+        seqTs.SetPG(IsolatedHost::kPriorityGroup);
+        packet->AddHeader(seqTs);
+        UdpHeader udp;
+        udp.SetSourcePort(IsolatedHost::kSenderPort);
+        udp.SetDestinationPort(IsolatedHost::kReceiverPort);
+        udp.ForcePayloadSize(CustomHeader::GetUdpHeaderSize() + IsolatedHost::kMtu);
+        packet->AddHeader(udp);
+        Ipv4Header ip;
+        ip.SetSource(kTestSender);
+        ip.SetDestination(kTestReceiver);
+        ip.SetProtocol(0x11);
+        ip.SetDscp(static_cast<Ipv4Header::DscpType>(kUetDscpTrimmable));
+        ip.SetIdentification(SpineIdentification(1, 1));
+        ip.SetPayloadSize(packet->GetSize());
+        packet->AddHeader(ip);
+        PppHeader ppp;
+        ppp.SetProtocol(0x0021);
+        packet->AddHeader(ppp);
+        CustomHeader parsed(CustomHeader::L2_Header | CustomHeader::L3_Header | CustomHeader::L4_Header);
+        packet->PeekHeader(parsed);
+        parsed.udp.tail_flags = tailFlags;
+        host.hw->Receive(packet, parsed);
+    }
+
+    void RepathReceiver()
+    {
+        IsolatedHost receiver(LoadBalancingMode::SprayUniform, kTestSender, kSpines);
+        std::map<std::string, uint32_t> events;
+        Receiver(receiver, AckRoute::Repath, events);
+        for (uint32_t i = 0; i < 4; ++i)
+        {
+            Data(receiver, i * IsolatedHost::kMtu, 0);
+        }
+        const uint8_t first = receiver.emitted.back().ack.route_spine;
+        for (size_t k = 0; k < receiver.emitted.size(); ++k)
+        {
+            NS_TEST_EXPECT_MSG_EQ(uint32_t(receiver.emitted[k].ack.route_spine), uint32_t(first),
+                                  "every answer takes the connection's spine");
+        }
+        Data(receiver, IsolatedHost::kMtu, kTailCopied);
+        NS_TEST_EXPECT_MSG_EQ(events["answer_repath"], 0u, "a copied send's second packet repaths nothing");
+        NS_TEST_EXPECT_MSG_EQ(uint32_t(receiver.emitted.back().ack.route_spine), uint32_t(first),
+                              "its answer takes the same spine");
+        Data(receiver, IsolatedHost::kMtu, 0);
+        NS_TEST_EXPECT_MSG_EQ(events["answer_repath"], 1u, "a resend the receiver held repaths");
+        const uint8_t second = receiver.emitted.back().ack.route_spine;
+        NS_TEST_EXPECT_MSG_NE(uint32_t(second), uint32_t(first), "its answer takes another spine");
+        Data(receiver, 4 * IsolatedHost::kMtu, 0);
+        NS_TEST_EXPECT_MSG_EQ(uint32_t(receiver.emitted.back().ack.route_spine), uint32_t(second),
+                              "which the next answers keep");
+        NS_TEST_EXPECT_MSG_EQ(events["answer_repath"], 1u, "new data repaths nothing");
+    }
+
+    void Valid()
+    {
+        Ptr<RdmaHw> hw = CreateObject<RdmaHw>();
+        hw->m_loadBalancing = static_cast<uint32_t>(LoadBalancingMode::SprayUniform);
+        hw->m_spineCount = kSpines;
+        hw->m_ackRouteRandom = Stream();
+        for (const AckRoute route : {AckRoute::ReverseSet, AckRoute::Repath})
+        {
+            hw->m_ackRoute = static_cast<uint32_t>(route);
+            CustomHeader::ackRouteSpineBytes = 0;
+            NS_TEST_EXPECT_MSG_EQ(hw->ValidAckRoute(), false, "the route spine field is needed");
+            CustomHeader::ackRouteSpineBytes = 1;
+            NS_TEST_EXPECT_MSG_EQ(hw->ValidAckRoute(), true, "and enough with a stream");
+            hw->m_ackRouteOracle = true;
+            NS_TEST_EXPECT_MSG_EQ(hw->ValidAckRoute(), false, "the oracle is spray's alone");
+            hw->m_ackRouteOracle = false;
+        }
+        hw->m_ackRoute = static_cast<uint32_t>(AckRoute::ReverseSet);
+        NS_TEST_EXPECT_MSG_EQ(hw->m_ackRouteSetSize, 2u, "a set of two by default");
+        NS_TEST_EXPECT_MSG_EQ(hw->ValidAnswerRoutes(), true, "within the spines");
+        hw->m_ackRouteSetSize = kSpines + 1;
+        NS_TEST_EXPECT_MSG_EQ(hw->ValidAnswerRoutes(), false, "a set larger than the spines is refused");
+        hw->m_ackRouteSetSize = 2;
+        hw->m_ackRoute = static_cast<uint32_t>(AckRoute::Repath);
+        hw->m_sprayTailRecovery = false;
+        NS_TEST_EXPECT_MSG_EQ(hw->ValidAnswerRoutes(), false, "repath needs the tail flags");
+        hw->m_sprayTailRecovery = true;
+        NS_TEST_EXPECT_MSG_EQ(hw->ValidAnswerRoutes(), true, "and has them under tail recovery");
+    }
+};
+
 class AckRouteOracleTest : public TestCase
 {
   public:
@@ -15702,6 +16094,7 @@ PointToPointTestSuite::PointToPointTestSuite()
     AddTestCase(new RepsOracleTest, TestCase::Duration::QUICK);
     AddTestCase(new RepsOracleHopsTest, TestCase::Duration::QUICK);
     AddTestCase(new AnswerPathSeqTest, TestCase::Duration::QUICK);
+    AddTestCase(new AnswerRouteTest, TestCase::Duration::QUICK);
     AddTestCase(new RepsSpineTest, TestCase::Duration::QUICK);
     AddTestCase(new AckRouteHeaderTest, TestCase::Duration::QUICK);
     AddTestCase(new AckRouteReceiverTest, TestCase::Duration::QUICK);

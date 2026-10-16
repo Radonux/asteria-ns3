@@ -11,6 +11,7 @@
 #include <ns3/traced-callback.h>
 #include "qbb-net-device.h"
 #include "load-balancing.h"
+#include "answer-route.h"
 #include "nscc-window.h"
 #include "receiver-hold.h"
 #include "spine-grader.h"
@@ -277,6 +278,43 @@ public:
 	// reads its spines from it alone.
 	uint32_t m_ackRoute;
 	Ptr<UniformRandomVariable> m_ackRouteRandom;
+	// AckRoute ReverseSet and Repath keep each connection's answer routes,
+	// per sending host and priority group, in m_answerRoutes: under
+	// ReverseSet a set of AckRouteSetSize spines (AnswerRouteSet), probed
+	// once per SprayBaseRttNs while the connection's data arrives, a member
+	// replaced once a probe of it has been unanswered for
+	// kAnswerSetProbeTimeoutRtts base RTTs; under Repath one spine
+	// (AnswerRepath), drawn again at each data packet that adds nothing the
+	// receiver did not hold and whose send was not copied, which the sender's
+	// tail flags say (kTailCopied). Each probe is the host transport event
+	// answer_set_probe, each replacement answer_set_replace and each redraw
+	// answer_repath.
+	static constexpr double kAnswerSetProbeTimeoutRtts = 2;
+	uint32_t m_ackRouteSetSize;
+	struct AnswerRoutes {
+		AnswerRouteSet set;
+		AnswerRepath repath;
+	};
+	std::map<std::pair<uint32_t, uint16_t>, AnswerRoutes> m_answerRoutes;
+	AnswerRoutes &AnswerRoutesOf(uint32_t senderIp, uint16_t pg);
+	uint32_t DrawAnswerRoute(uint32_t n);
+	// Whether answers to senderIp cross a spine: it is off this host's leaf.
+	bool AnswersCrossSpine(uint32_t senderIp) const;
+	// Under ReverseSet, at a data arrival of q's connection: a round of
+	// probes when one is due, after the replacements it makes.
+	void ProbeAnswerSet(Ptr<RdmaRxQueuePair> q, const CustomHeader &ch);
+	// A probe of q's connection over spine, an acknowledgement flagged
+	// FLAG_ROUTE_PROBE and routed over spine, which moves no state at its
+	// sender.
+	void SendRouteProbe(Ptr<RdmaRxQueuePair> q, uint8_t spine);
+	// The sender's return of a route probe, a path probe flagged
+	// FLAG_ROUTE_PROBE_REPLY back over the spine probed, whether or not the
+	// queue pair it names is still open.
+	void ReplyRouteProbe(const CustomHeader &ch);
+	// Under Repath, a duplicate data arrival from senderIp: the connection's
+	// route drawn again.
+	void RepathAnswers(uint32_t senderIp, uint16_t pg);
+	bool ValidAnswerRoutes() const;
 	// AckRouteOracle, under AckRoute Spray: the draw leaves out the spines
 	// over which an answer toward the sender's leaf crosses a fault as the
 	// switches' state shows it (SwitchQueueState::ForwardFaulted), per sender
@@ -286,10 +324,11 @@ public:
 	std::unordered_map<uint32_t, FaultedSpines> m_answerFaultedSpines;
 	bool ValidAckRoute() const;
 	FaultedSpines &AnswerFaultedSpinesTo(uint32_t leaf);
-	// The route_spine field of an answer to the host at senderIp:
-	// kNoRouteSpine under DataSpine and toward a host of this leaf, one
-	// draw otherwise.
-	uint8_t AnswerRouteSpine(uint32_t senderIp);
+	// The route_spine field of an answer to the host at senderIp, of
+	// priority group pg: kNoRouteSpine under DataSpine and toward a host of
+	// this leaf, one draw under Spray, and the connection's under ReverseSet
+	// and Repath.
+	uint8_t AnswerRouteSpine(uint32_t senderIp, uint16_t pg = 0);
 	// SprayCoverageFirst, under LoadBalancing SprayUniform: a send the
 	// queue pair's coverage shows delivered is an answer loss, not a loss on
 	// its path (RdmaQueuePair::m_coverageFirst), each reported as the

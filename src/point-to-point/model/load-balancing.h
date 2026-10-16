@@ -68,6 +68,13 @@ enum class AckRoute : uint32_t {
 	// Over a spine the receiver draws uniformly per answer, named in the
 	// answer's route_spine field.
 	Spray,
+	// Over a member, drawn uniformly per answer, of a set of spines the
+	// receiver keeps per connection, probes and renews (AnswerRouteSet),
+	// named in route_spine.
+	ReverseSet,
+	// Over one spine the receiver keeps per connection and draws again at a
+	// duplicate data arrival (AnswerRepath), named in route_spine.
+	Repath,
 };
 
 // The value of an answer's route_spine field that names no spine: the

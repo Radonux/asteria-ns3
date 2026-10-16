@@ -311,10 +311,24 @@ bool spray_ack_loss_rtts_given = false;
 // identification names. spray draws a spine uniformly per answer to a sender
 // off the receiver's leaf from a stream of the receiver's own, and names it
 // in a route_spine byte every answer then carries; answers to a sender on the
-// receiver's leaf cross no spine and draw nothing. The echoed identification
-// is the same under both, and the sender reads its spines from it alone.
+// receiver's leaf cross no spine and draw nothing. reverse_set keeps per
+// connection, a sending host and priority group, a set of ACK_ROUTE_SET_SIZE
+// spines drawn once from that stream, routes each answer over a member drawn
+// uniformly, probes every member once per SPRAY_BASE_RTT_NS while the
+// connection's data arrives, with an acknowledgement the sender returns over
+// the spine probed, and replaces a member by a spine outside the set once its
+// probe has gone unanswered for two base RTTs (host transport events
+// answer_set_probe and answer_set_replace). repath keeps per connection one
+// spine drawn from that stream, and draws another at each data packet that
+// adds nothing the receiver held already, a resend, unless its send was also
+// sent as a copy, which its tail flags then say (answer_repath); it needs
+// SPRAY_TAIL_RECOVERY on. Under each but data_spine the answer names its spine
+// in route_spine. The echoed identification is the same under all, and the
+// sender reads its spines from it alone.
 std::string ack_route = "data_spine";
 bool ack_route_given = false;
+uint32_t ack_route_set_size = 2;
+bool ack_route_set_size_given = false;
 // Under ACK_ROUTE spray, ACK_ROUTE_ORACLE on: the draw leaves out the spines
 // over which an answer toward the sender's leaf crosses a fault, a loss or a
 // black hole on the receiver's leaf's uplink to the spine or on the spine's
@@ -325,6 +339,8 @@ bool ack_route_given = false;
 std::string ack_route_oracle = "off";
 bool ack_route_oracle_given = false;
 bool ack_route_spray() { return ack_route == "spray"; }
+// Whether answers name their route spine: under every ACK_ROUTE but the data's.
+bool ack_route_named() { return ack_route != "data_spine"; }
 bool ack_route_oracle_on() { return ack_route_oracle == "on"; }
 std::string spray_hold_release = "sentinels";
 bool spray_hold_release_given = false;
@@ -2479,6 +2495,9 @@ bool ReadConf(string network_configuration) {
     } else if (key.compare("ACK_ROUTE") == 0) {
       conf >> ack_route;
       ack_route_given = true;
+    } else if (key.compare("ACK_ROUTE_SET_SIZE") == 0) {
+      conf >> ack_route_set_size;
+      ack_route_set_size_given = true;
     } else if (key.compare("ACK_ROUTE_ORACLE") == 0) {
       conf >> ack_route_oracle;
       ack_route_oracle_given = true;
@@ -3001,8 +3020,22 @@ bool ReadConf(string network_configuration) {
     std::cerr << "SPRAY_ACK_LOSS_RTTS must be at least 0\n";
     return false;
   }
-  if (ack_route != "data_spine" && ack_route != "spray") {
-    std::cerr << "ACK_ROUTE must be data_spine or spray\n";
+  if (ack_route != "data_spine" && ack_route != "spray" &&
+      ack_route != "reverse_set" && ack_route != "repath") {
+    std::cerr << "ACK_ROUTE must be data_spine, spray, reverse_set or repath\n";
+    return false;
+  }
+  if (ack_route_set_size_given && ack_route != "reverse_set") {
+    std::cerr << "ACK_ROUTE_SET_SIZE is read only under ACK_ROUTE reverse_set\n";
+    return false;
+  }
+  if (ack_route_set_size == 0) {
+    std::cerr << "ACK_ROUTE_SET_SIZE must be above zero\n";
+    return false;
+  }
+  if (ack_route == "repath" && spray_tail_recovery != "on") {
+    std::cerr << "ACK_ROUTE repath tells a copied send by its tail flags and "
+                 "needs SPRAY_TAIL_RECOVERY on\n";
     return false;
   }
   if (ack_route_given && load_balancing != "spray_uniform") {
@@ -3254,7 +3287,7 @@ void SetConfig() {
   CustomHeader::udpCarriesPathSeq = spray_path_seq == "on";
   CustomHeader::ackReceiverHoldBytes = receiver_hold() ? 1 : 0;
   CustomHeader::ackTailNackBytes = tail_recovery() ? 5 : 0;
-  CustomHeader::ackRouteSpineBytes = ack_route_spray() ? 1 : 0;
+  CustomHeader::ackRouteSpineBytes = ack_route_named() ? 1 : 0;
   CustomHeader::ackAnswerSeqBytes = answer_path_seq() ? 5 : 0;
   CustomHeader::udpAnswerHoldBytes = answer_path_seq() ? 1 : 0;
 
@@ -3411,6 +3444,11 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),
     for (const char *event : {"answer_route_lost", "answer_route_hold",
                               "answer_route_release", "answer_probe"})
       transport_event_totals[{event, "control"}];
+  if (ack_route == "reverse_set")
+    for (const char *event : {"answer_set_probe", "answer_set_replace"})
+      transport_event_totals[{event, "control"}];
+  if (ack_route == "repath")
+    transport_event_totals[{"answer_repath", "control"}];
   // The totals must land even when a watchdog exits the run mid-simulation.
   std::atexit(write_transport_event_summary);
   ZSTD_CCtx_setParameter(transport_event_raw_cctx, ZSTD_c_compressionLevel, 8);
@@ -3622,6 +3660,11 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),
     return false;
   }
   CustomHeader::udpTailCounts = tail_recovery() ? spine_count : 0;
+  if (ack_route == "reverse_set" && ack_route_set_size > spine_count) {
+    std::cerr << "ACK_ROUTE_SET_SIZE is at most the fabric's " << spine_count
+              << " spines\n";
+    return false;
+  }
   if (receiver_hold() && spine_count > kReceiverHoldSpines) {
     std::cerr << "SPRAY_RECEIVER_HOLD holds at most " << kReceiverHoldSpines
               << " spines\n";
@@ -3737,11 +3780,17 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),
       rdmaHw->SetAttribute(
           "AckRoute",
           UintegerValue(static_cast<uint32_t>(
-              ack_route_spray() ? AckRoute::Spray : AckRoute::DataSpine)));
+              ack_route_spray()            ? AckRoute::Spray
+              : ack_route == "reverse_set" ? AckRoute::ReverseSet
+              : ack_route == "repath"      ? AckRoute::Repath
+                                           : AckRoute::DataSpine)));
+      rdmaHw->SetAttribute("AckRouteSetSize",
+                           UintegerValue(ack_route_set_size));
       rdmaHw->SetAttribute("AckRouteOracle",
                            BooleanValue(ack_route_oracle_on()));
-      // Made only under spray, so that data_spine allocates no stream.
-      if (ack_route_spray())
+      // Made only where answers name their spine, so that data_spine
+      // allocates no stream.
+      if (ack_route_named())
         rdmaHw->SetAttribute(
             "AckRouteRandomVariable",
             PointerValue(CreateObjectWithAttributes<UniformRandomVariable>(
@@ -3795,7 +3844,7 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),
                            UintegerValue(ack_redirect_trim_scoring_value()));
       rdmaHw->SetAttribute("AckRedirectScope",
                            UintegerValue(grade_scope_value(ack_redirect_scope)));
-      if (path_selector == "ack_redirect" || ack_route_spray())
+      if (path_selector == "ack_redirect" || ack_route_named())
         rdmaHw->m_ownLeafHosts = own_leaf_hosts(n.Get(i));
       rdmaHw->SetAttribute("SprayReportIntervalBaseRtts",
                            DoubleValue(spray_report_interval_base_rtts));
@@ -3951,7 +4000,8 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),
   printf("maxRtt=%lu maxBdp=%lu\n", maxRtt, maxBdp);
   // Known only now that every route is, and read from the first packet on.
   if (load_balancing == "spray_policy" || path_selector == "ack_redirect" ||
-      reps_oracle() || tail_recovery() || ack_route_oracle_on()) {
+      reps_oracle() || tail_recovery() || ack_route_oracle_on() ||
+      ack_route == "reverse_set") {
     for (uint32_t i = 0; i < node_num; i++)
       if (n.Get(i)->GetNodeType() == 0)
         n.Get(i)->GetObject<RdmaDriver>()->m_rdma->SetAttribute(

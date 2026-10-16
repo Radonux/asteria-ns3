@@ -686,15 +686,26 @@ TypeId RdmaHw::GetTypeId (void)
 				"answer a receiver sends over, an acknowledgement, a NACK or a "
 				"repair request: 0=the spine that carried the data packet it "
 				"answers; 1=a spine the receiver draws uniformly per answer "
-				"from AckRouteRandomVariable, named in the answer's "
-				"route_spine field, which needs "
-				"CustomHeader::ackRouteSpineBytes 1. The answer echoes the data "
-				"packet's identification either way. Default 0.",
+				"from AckRouteRandomVariable; 2=a member, drawn uniformly per "
+				"answer, of the connection's set of AckRouteSetSize spines, "
+				"probed once per SprayBaseRttNs while its data arrives and a "
+				"member replaced whose probe goes unanswered; 3=the "
+				"connection's one spine, drawn again at each duplicate data "
+				"arrival. Under 1 to 3 the spine is named in the answer's "
+				"route_spine field, which needs CustomHeader::ackRouteSpineBytes "
+				"1. The answer echoes the data packet's identification either "
+				"way. Default 0.",
 				UintegerValue(static_cast<uint32_t>(AckRoute::DataSpine)),
 				MakeUintegerAccessor(&RdmaHw::m_ackRoute),
 				MakeUintegerChecker<uint32_t>(
 					static_cast<uint32_t>(AckRoute::DataSpine),
-					static_cast<uint32_t>(AckRoute::Spray)))
+					static_cast<uint32_t>(AckRoute::Repath)))
+		.AddAttribute("AckRouteSetSize",
+				"Under AckRoute 2, the spines of each connection's set, at "
+				"most SpineCount. Default 2.",
+				UintegerValue(2),
+				MakeUintegerAccessor(&RdmaHw::m_ackRouteSetSize),
+				MakeUintegerChecker<uint32_t>(1))
 		.AddAttribute("AckRouteRandomVariable",
 				"Under AckRoute 1, the variable each answer's spine is drawn "
 				"from, a stream of this host's own. Null by default, so that "
@@ -1288,6 +1299,10 @@ void RdmaHw::Setup(QpCompleteCallback cb, QpFailureCallback failure_cb){
 		"carry the route_spine field exactly when it is set "
 		"(CustomHeader::ackRouteSpineBytes); AckRouteOracle needs AckRoute 1 "
 		"and SwitchQueueState for the hosts' leaves");
+	NS_ABORT_MSG_IF(!ValidAnswerRoutes(),
+		"AckRoute 2 draws sets of AckRouteSetSize spines, at most SpineCount, "
+		"and AckRoute 3 tells a copied send by its tail flags, which need "
+		"SprayTailRecovery");
 	NS_ABORT_MSG_IF(m_loadBalancing !=
 				static_cast<uint32_t>(LoadBalancingMode::Ecmp) && !m_pathRandom,
 		"A LoadBalancing mode other than ECMP draws the identification of every "
@@ -1540,6 +1555,8 @@ int RdmaHw::ReceiveUdp(Ptr<Packet> p, CustomHeader &ch){
 	}
 	rxQp->m_ecn_source.total++;
 	CountArrival(rxQp, ch.ipid, payload_size);
+	if (m_ackRoute == static_cast<uint32_t>(AckRoute::ReverseSet))
+		ProbeAnswerSet(rxQp, ch);
 	if (m_sprayAnswerPathSeq)
 		AnswerHoldReportsOf().Report(ch.sip, m_switchQueues->LeafOf(ch.sip),
 			ch.udp.answer_hold, Simulator::Now().GetNanoSeconds());
@@ -1562,6 +1579,12 @@ int RdmaHw::ReceiveUdp(Ptr<Packet> p, CustomHeader &ch){
 	// dropped here as any duplicate is; the budget keeps its charge, and the
 	// analyzer subtracts these to report what was actually lost.
 	const uint64_t late_forgiven = rxQp->ForgivenBytes(ch.udp.seq, range_end);
+	// A send the receiver already holds, resent, and not one of a copied
+	// send's two packets: its sender did not see the answers.
+	if (m_ackRoute == static_cast<uint32_t>(AckRoute::Repath) &&
+			accepted == 0 && late_forgiven == 0 && payload_size > 0 &&
+			!(ch.udp.tail_flags & kTailCopied))
+		RepathAnswers(ch.sip, ch.udp.pg);
 	rxQp->NoteSeen(range_end);
 	int x = ReceiverCheckSeq(ch.udp.seq, rxQp, payload_size);
 
@@ -1918,12 +1941,14 @@ bool RdmaHw::ValidCopyExpiry() const{
 
 bool RdmaHw::ValidAckRoute() const{
 	const bool spray = m_ackRoute == static_cast<uint32_t>(AckRoute::Spray);
-	if (CustomHeader::ackRouteSpineBytes != (spray ? 1 : 0))
+	// Every route but the data's names its spine in the answer.
+	const bool named = m_ackRoute != static_cast<uint32_t>(AckRoute::DataSpine);
+	if (CustomHeader::ackRouteSpineBytes != (named ? 1 : 0))
 		return false;
 	if (m_ackRouteOracle && (!spray || !m_switchQueues ||
 			m_leaf == SwitchQueueState::kNoLeaf))
 		return false;
-	return !spray || (m_loadBalancing ==
+	return !named || (m_loadBalancing ==
 			static_cast<uint32_t>(LoadBalancingMode::SprayUniform) &&
 		m_ackRouteRandom && m_spineCount < kNoRouteSpine);
 }
@@ -1939,11 +1964,16 @@ FaultedSpines &RdmaHw::AnswerFaultedSpinesTo(uint32_t leaf){
 		.first->second;
 }
 
-uint8_t RdmaHw::AnswerRouteSpine(uint32_t senderIp){
-	if (m_ackRoute != static_cast<uint32_t>(AckRoute::Spray) ||
-			std::binary_search(m_ownLeafHosts.begin(), m_ownLeafHosts.end(),
-				senderIp))
+uint8_t RdmaHw::AnswerRouteSpine(uint32_t senderIp, uint16_t pg){
+	if (m_ackRoute == static_cast<uint32_t>(AckRoute::DataSpine) ||
+			!AnswersCrossSpine(senderIp))
 		return kNoRouteSpine;
+	if (m_ackRoute == static_cast<uint32_t>(AckRoute::ReverseSet))
+		return AnswerRoutesOf(senderIp, pg).set.Route(m_spineCount,
+			m_ackRouteSetSize, [this](uint32_t n){ return DrawAnswerRoute(n); });
+	if (m_ackRoute == static_cast<uint32_t>(AckRoute::Repath))
+		return AnswerRoutesOf(senderIp, pg).repath.Route(m_spineCount,
+			[this](uint32_t n){ return DrawAnswerRoute(n); });
 	if (!m_ackRouteOracle && !m_sprayAnswerPathSeq)
 		return m_ackRouteRandom->GetInteger(0, m_spineCount - 1);
 	const uint64_t now = Simulator::Now().GetNanoSeconds();
@@ -2121,7 +2151,7 @@ void RdmaHw::SendAck(Ptr<RdmaRxQueuePair> q, uint32_t sourceIp,
 		seqh.SetSpineReport(ReportFor(q, destinationIp));
 	seqh.SetRedirect(redirect);
 	seqh.SetReceiverHold(ReceiverHoldBitmap(destinationIp));
-	seqh.SetRouteSpine(AnswerRouteSpine(destinationIp));
+	seqh.SetRouteSpine(AnswerRouteSpine(destinationIp, pg));
 	if (m_sprayAnswerPathSeq)
 		NumberAnswer(q, seqh, seqh.GetRouteSpine());
 	// The grant is this flag without the report above. A receiver that may not
@@ -2197,6 +2227,12 @@ int RdmaHw::ReceiveCnp(Ptr<Packet> p, CustomHeader &ch){
 }
 
 int RdmaHw::ReceiveAck(Ptr<Packet> p, CustomHeader &ch){
+	// A receiver's probe of its answers' route acknowledges nothing.
+	if (m_ackRoute == static_cast<uint32_t>(AckRoute::ReverseSet) &&
+			((ch.ack.flags >> qbbHeader::FLAG_ROUTE_PROBE) & 1)){
+		ReplyRouteProbe(ch);
+		return 0;
+	}
 	uint16_t qIndex = ch.ack.pg;
 	uint16_t port = ch.ack.dport;
 	uint32_t seq = ch.ack.seq;
@@ -2376,6 +2412,12 @@ int RdmaHw::Receive(Ptr<Packet> p, CustomHeader &ch){
 // dropped: the flow has finished.
 int RdmaHw::ReceivePathProbe(Ptr<Packet> p, CustomHeader &ch){
 	(void)p;
+	// A route probe of this host's answers, returned by their sender.
+	if (m_ackRoute == static_cast<uint32_t>(AckRoute::ReverseSet) &&
+			((ch.ack.flags >> qbbHeader::FLAG_ROUTE_PROBE_REPLY) & 1)){
+		AnswerRoutesOf(ch.sip, ch.ack.pg).set.OnReply(ch.ack.route_spine);
+		return 0;
+	}
 	Ptr<RdmaRxQueuePair> q = GetRxQp(ch.dip, ch.sip, ch.ack.dport, ch.ack.sport,
 		ch.ack.pg, false);
 	if (q == nullptr)
@@ -2418,7 +2460,7 @@ void RdmaHw::SendRepairRequest(const qbbHeader &header, uint32_t sourceIp,
 		uint32_t destinationIp, uint16_t identification,
 		Ptr<RdmaRxQueuePair> q){
 	qbbHeader routed = header;
-	routed.SetRouteSpine(AnswerRouteSpine(destinationIp));
+	routed.SetRouteSpine(AnswerRouteSpine(destinationIp, header.GetPG()));
 	if (m_sprayAnswerPathSeq)
 		NumberAnswer(q, routed, routed.GetRouteSpine());
 	Ptr<Packet> packet = Create<Packet>(
@@ -3330,6 +3372,8 @@ Ptr<Packet> RdmaHw::GetNxtPacket(Ptr<RdmaQueuePair> qp){
 	if (m_sprayTailRecovery)
 		SetTailFields(qp, seqTs,
 			(is_repair ? qp->snd_nxt : seq + payload_size) >= qp->m_size);
+	if (copy && m_ackRoute == static_cast<uint32_t>(AckRoute::Repath))
+		seqTs.AddTailFlags(kTailCopied);
 	if (m_sprayAnswerPathSeq)
 		seqTs.SetAnswerHold(AnswerRouteHoldTo(
 			m_switchQueues->LeafOf(qp->dip.Get())).Bitmap(

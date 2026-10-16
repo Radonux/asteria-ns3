@@ -99,6 +99,12 @@ SeqTsHeader::SetTail (uint8_t flags, const uint16_t* counts, uint32_t n)
 }
 
 void
+SeqTsHeader::AddTailFlags (uint8_t flags)
+{
+	m_tailFlags |= flags;
+}
+
+void
 SeqTsHeader::SetAnswerHold (uint8_t bitmap)
 {
 	m_answerHold = bitmap;

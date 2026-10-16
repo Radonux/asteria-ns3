@@ -47,7 +47,13 @@ public:
     // rather than a trimmed byte range.
     FLAG_TAIL_NACK = 6,
     // The answer carries its number on its route spine (SetAnswerSeq).
-    FLAG_ANSWER_NUMBERED = 7
+    FLAG_ANSWER_NUMBERED = 7,
+    // Under AckRoute ReverseSet: an acknowledgement that probes the route
+    // spine it is routed over and acknowledges nothing (SetRouteProbe), and
+    // the path probe that returns it over the same spine
+    // (SetRouteProbeReply).
+    FLAG_ROUTE_PROBE = 8,
+    FLAG_ROUTE_PROBE_REPLY = 9
   };
   qbbHeader (uint16_t pg);
   qbbHeader ();
@@ -68,6 +74,9 @@ public:
   void SetAllowanceExhausted(bool spent);
   void SetForgivenessEligible(bool eligible);
   void SetProbeAnswer();
+  // FLAG_ROUTE_PROBE and FLAG_ROUTE_PROBE_REPLY.
+  void SetRouteProbe();
+  void SetRouteProbeReply();
   // The sequence of the data packet this acknowledgement answers, serialized
   // only while CustomHeader::ackCarriesPacketSeq is set.
   void SetPacketSeq(uint32_t seq);

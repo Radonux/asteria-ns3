@@ -42,10 +42,13 @@ constexpr bool CarriesQbbHeader(uint8_t protocol){
 		protocol == kPathProbeProtocol;
 }
 
-// The most spines a data header's tail counts name (udpTailCounts), and the
-// bit of udp.tail_flags that marks a packet closing its requested spine.
+// The most spines a data header's tail counts name (udpTailCounts), the bit
+// of udp.tail_flags that marks a packet closing its requested spine, and,
+// under AckRoute Repath only, the bit that marks a send also sent as a copy,
+// both of whose packets carry it.
 constexpr uint32_t kMaxTailCounts = 8;
 constexpr uint8_t kTailCloses = 1;
+constexpr uint8_t kTailCopied = 2;
 
 // UET diffserv codepoints. UEC 1.0.3 section 3.6.4.7.1 names the codepoints
 // abstractly and section 4.1 states that "this spec does not place any
