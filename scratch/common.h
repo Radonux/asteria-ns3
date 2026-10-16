@@ -4516,7 +4516,9 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),
     sim_setting.Serialize(trace_output);
   }
 
-  Ipv4GlobalRoutingHelper::PopulateRoutingTables();
+  // Every packet is forwarded by the tables SetRoutingEntries sets, none by
+  // the IP stack, so the nodes get no global routing tables, which hold a
+  // route to every link's network on every node.
 
   NS_LOG_INFO("Create Applications.");
 
