@@ -140,8 +140,19 @@ private:
 	// The furthest expected sequence among the started paths requested up
 	// requested, in next; false, with next left as it is, where none is.
 	bool Furthest(uint8_t requested, uint16_t &next) const;
+	// An identification's hash, its requested spine in the low bits and its
+	// carrying spine above. Hashed as the identity, the path of each spine k
+	// whose requested and carrying spines are equal, identification 257 k,
+	// would take one bucket of the table's 257, which it has over more than
+	// 127 paths; this way no two of them share a bucket.
+	struct IdentificationHash {
+		size_t operator()(uint16_t identification) const{
+			return (identification >> 8) |
+				static_cast<size_t>(identification & 0xff) << 16;
+		}
+	};
 	// Keyed by the identification that names the path.
-	std::unordered_map<uint16_t, Path> m_paths;
+	std::unordered_map<uint16_t, Path, IdentificationHash> m_paths;
 	// Per requested spine, the end of the runs TakeMissing has taken.
 	std::unordered_map<uint8_t, uint16_t> m_taken;
 };
