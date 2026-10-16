@@ -245,6 +245,12 @@ public:
 	bool ValidHoldRelease() const;
 	// SentinelMode of PathSelector RepsHold, RepsFlowHold and MrcHold.
 	uint32_t m_spraySentinelMode;
+	// CopyExpiry of their copies under SentinelMode Duplicate: under Deadline
+	// every queue pair's m_copyDeadlineRtts is m_sprayTailLossRtts, set at
+	// StartPathSelection; whether Deadline is set only with copies and a
+	// guard above zero.
+	uint32_t m_sprayCopyExpiry;
+	bool ValidCopyExpiry() const;
 	// Under PathSelector RepsHold, RepsFlowHold and MrcHold, the base RTTs
 	// after which a send on a held spine (PathSelector::ChoseHeld) still
 	// outstanding is declared lost and repaired (HeldSendDue); zero waits

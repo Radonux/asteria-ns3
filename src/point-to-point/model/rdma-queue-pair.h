@@ -204,10 +204,15 @@ public:
 	// path: the acknowledgement of a newer send along that path, data or
 	// copy, finds it outstanding; and its own acknowledgement declares lost
 	// the older data sends and copies along its path as a data
-	// acknowledgement does. Once the data send of its sequence is
-	// acknowledged, by its own answer or cumulatively, a copy outstanding
-	// for more than one base RTT since it was sent is declared lost, and one
-	// younger waits for its own answer. A declared loss is told to the
+	// acknowledgement does. With m_copyDeadlineRtts zero (CopyExpiry::DataAck),
+	// once the data send of its sequence is acknowledged, by its own answer or
+	// cumulatively, a copy outstanding for more than one base RTT since it was
+	// sent is declared lost, and one younger waits for its own answer. With
+	// it above zero (CopyExpiry::Deadline), a copy outstanding for more than
+	// that many base RTTs since it was sent is declared lost, whether its data
+	// send is acknowledged or not, and one younger waits for its own answer
+	// whatever its data's acknowledgement says. Either is checked at the
+	// queue pair's acknowledgements. A declared loss is told to the
 	// selector's OnLoss, and of a trickle copy to OnTrickleAnswer, and
 	// nothing else.
 	struct ExplorationCopy {
@@ -218,6 +223,7 @@ public:
 		bool dataAcknowledged;
 	};
 	std::map<uint64_t, ExplorationCopy> m_copies;
+	double m_copyDeadlineRtts;
 	uint32_t m_exploration_copies;
 	uint32_t m_exploration_copies_lost;
 	// A copy of the send of seq along path, at sentNs. A copy of seq still
@@ -401,8 +407,7 @@ private:
 	// told.
 	uint32_t DeclareLost(uint64_t packet, bool report = true);
 	// Declare lost, for the selector alone, the copies along path sent
-	// before sentNs, and those whose data send is acknowledged and that are
-	// outstanding past one base RTT by nowNs.
+	// before sentNs, and those ExpireCopies declares by nowNs.
 	void DeclareCopiesLostOnPath(uint16_t path, uint64_t sentNs, uint64_t nowNs);
 	void ExpireCopies(uint64_t nowNs);
 	void DeclareCopyLost(std::map<uint64_t, ExplorationCopy>::iterator copy,

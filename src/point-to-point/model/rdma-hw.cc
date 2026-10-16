@@ -634,6 +634,18 @@ TypeId RdmaHw::GetTypeId (void)
 				MakeUintegerChecker<uint32_t>(
 					static_cast<uint32_t>(SentinelMode::Data),
 					static_cast<uint32_t>(SentinelMode::Duplicate)))
+		.AddAttribute("SprayCopyExpiry",
+				"Under SpraySentinelMode 1, when a copy its own acknowledgement "
+				"has not answered is declared lost for the selector: 0=once its "
+				"data send is acknowledged, more than one base RTT after the "
+				"copy was sent; 1=more than SprayTailLossRtts base RTTs after it "
+				"was sent, whether its data send is acknowledged or not. Each "
+				"is checked at the queue pair's acknowledgements. Default 0.",
+				UintegerValue(static_cast<uint32_t>(CopyExpiry::DataAck)),
+				MakeUintegerAccessor(&RdmaHw::m_sprayCopyExpiry),
+				MakeUintegerChecker<uint32_t>(
+					static_cast<uint32_t>(CopyExpiry::DataAck),
+					static_cast<uint32_t>(CopyExpiry::Deadline)))
 		.AddAttribute("SprayHeldLossRtts",
 				"Under PathSelector 6, 7 and 9, the queue pair's base RTTs "
 				"after which a data send up a spine the loss hold, or the "
@@ -1147,6 +1159,9 @@ void RdmaHw::Setup(QpCompleteCallback cb, QpFailureCallback failure_cb){
 	NS_ABORT_MSG_IF(m_spraySentinelMode !=
 				static_cast<uint32_t>(SentinelMode::Data) && !IsRepsHold(),
 		"SpraySentinelMode 1 is read only under PathSelector 6, 7 and 9");
+	NS_ABORT_MSG_IF(!ValidCopyExpiry(),
+		"SprayCopyExpiry 1 is read only under SpraySentinelMode 1, whose copies "
+		"it expires, and needs SprayTailLossRtts above zero");
 	NS_ABORT_MSG_IF(!ValidPathSeq(),
 		"SprayPathSeq is read only under LoadBalancing 2, and data "
 		"headers carry the path sequence exactly when it is set "
@@ -1784,6 +1799,12 @@ bool RdmaHw::ValidTailLoss() const{
 bool RdmaHw::ValidAckLoss() const{
 	return m_sprayAckLossRtts == 0 || m_loadBalancing ==
 		static_cast<uint32_t>(LoadBalancingMode::SprayUniform);
+}
+
+bool RdmaHw::ValidCopyExpiry() const{
+	return m_sprayCopyExpiry == static_cast<uint32_t>(CopyExpiry::DataAck) ||
+		(m_spraySentinelMode == static_cast<uint32_t>(SentinelMode::Duplicate) &&
+			m_sprayTailLossRtts > 0);
 }
 
 bool RdmaHw::ValidAckRoute() const{
@@ -3293,6 +3314,8 @@ uint32_t RdmaHw::DataFrameBytes(uint32_t payload){
 bool RdmaHw::StartPathSelection(Ptr<RdmaQueuePair> qp, uint64_t bdpBytes,
 		uint64_t baseRttNs){
 	qp->m_outstanding.SetPacketSize(m_mtu);
+	if (m_sprayCopyExpiry == static_cast<uint32_t>(CopyExpiry::Deadline))
+		qp->m_copyDeadlineRtts = m_sprayTailLossRtts;
 	if (!IsConnectionPathState()){
 		qp->m_pathSelector = MakePathSelector(qp, bdpBytes, baseRttNs);
 		return true;

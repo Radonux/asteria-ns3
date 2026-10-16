@@ -151,6 +151,19 @@ enum class SentinelMode : uint32_t {
 	Duplicate,
 };
 
+// When a copy under SentinelMode::Duplicate that its own acknowledgement has
+// not answered is declared lost for the selector (RdmaQueuePair::ExpireCopies).
+// DataAck: once the data send of its sequence is acknowledged, at the first
+// acknowledgement after one base RTT since the copy was sent, so that a copy
+// queued on its spine for longer than its data's path is lost. Deadline: at
+// the first acknowledgement after a deadline since the copy was sent, the
+// tail loss guard of SprayTailLossRtts base RTTs, whether its data send is
+// acknowledged or not.
+enum class CopyExpiry : uint32_t {
+	DataAck = 0,
+	Deadline,
+};
+
 // The copy a selector's latest Choose asked for under SentinelMode::Duplicate.
 struct PendingCopy {
 	bool pending = false;

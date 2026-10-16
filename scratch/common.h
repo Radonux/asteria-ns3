@@ -266,6 +266,17 @@ std::set<std::string> hold_test_keys_given;
 // packet sent up it.
 std::string spray_sentinel_mode = "data";
 bool spray_sentinel_mode_given = false;
+// Under SPRAY_SENTINEL_MODE duplicate, SPRAY_COPY_EXPIRY: when a copy its own
+// acknowledgement has not answered is declared lost for the hold. data_ack,
+// the default, as above: once its data send is acknowledged, more than one
+// base RTT after the copy was sent. deadline: more than SPRAY_TAIL_LOSS_RTTS
+// base RTTs after it was sent, the guard a tail repair request's declared
+// sends wait, whether its data send is acknowledged or not, so that a copy
+// queued on its spine longer than its data's path takes is not lost when its
+// data's acknowledgement comes first. Either is checked at the queue pair's
+// acknowledgements; deadline needs SPRAY_TAIL_LOSS_RTTS above 0.
+std::string spray_copy_expiry = "data_ack";
+bool spray_copy_expiry_given = false;
 // Under reps_hold, reps_flow_hold and mrc_hold, the queue pair's base RTTs
 // after which a data send up a spine held as it was chosen, by the loss hold
 // or under SPRAY_RECEIVER_HOLD by the receivers' (the sentinel or trickle send
@@ -2078,6 +2089,20 @@ bool valid_hold_rule() {
     std::cerr << "SPRAY_SENTINEL_MODE must be data or duplicate\n";
     return false;
   }
+  if (spray_copy_expiry != "data_ack" && spray_copy_expiry != "deadline") {
+    std::cerr << "SPRAY_COPY_EXPIRY must be data_ack or deadline\n";
+    return false;
+  }
+  if (spray_copy_expiry_given && spray_sentinel_mode != "duplicate") {
+    std::cerr << "SPRAY_COPY_EXPIRY is read only under SPRAY_SENTINEL_MODE "
+                 "duplicate\n";
+    return false;
+  }
+  if (spray_copy_expiry == "deadline" && !(spray_tail_loss_rtts > 0)) {
+    std::cerr << "SPRAY_COPY_EXPIRY deadline needs SPRAY_TAIL_LOSS_RTTS above "
+                 "0\n";
+    return false;
+  }
   if (spray_held_loss_rtts_given && !reps_hold()) {
     std::cerr << "SPRAY_HELD_LOSS_RTTS is read only under PATH_SELECTOR "
                  "reps_hold, reps_flow_hold or mrc_hold\n";
@@ -2362,6 +2387,9 @@ bool ReadConf(string network_configuration) {
     } else if (key.compare("SPRAY_HOLD_RULE") == 0) {
       conf >> spray_hold_rule;
       spray_hold_rule_given = true;
+    } else if (key.compare("SPRAY_COPY_EXPIRY") == 0) {
+      conf >> spray_copy_expiry;
+      spray_copy_expiry_given = true;
     } else if (key.compare("SPRAY_SENTINEL_MODE") == 0) {
       conf >> spray_sentinel_mode;
       spray_sentinel_mode_given = true;
@@ -3543,6 +3571,11 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),
       rdmaHw->SetAttribute("SprayHoldTrickle", DoubleValue(spray_hold_trickle));
       rdmaHw->SetAttribute("SpraySentinelMode",
                            UintegerValue(spray_sentinel_mode_value()));
+      rdmaHw->SetAttribute(
+          "SprayCopyExpiry",
+          UintegerValue(static_cast<uint32_t>(spray_copy_expiry == "deadline"
+                                                  ? CopyExpiry::Deadline
+                                                  : CopyExpiry::DataAck)));
       rdmaHw->SetAttribute("SprayHeldLossRtts",
                            DoubleValue(spray_held_loss_rtts));
       rdmaHw->SetAttribute("SprayAckLossRtts",

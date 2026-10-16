@@ -233,6 +233,7 @@ RdmaQueuePair::RdmaQueuePair(uint16_t pg, Ipv4Address _sip, Ipv4Address _dip, ui
 	m_held_declared_lost = 0;
 	m_ack_loss_declared = 0;
 	m_tail_nacks_ignored = 0;
+	m_copyDeadlineRtts = 0;
 	m_exploration_copies = 0;
 	m_exploration_copies_lost = 0;
 	m_timeouts = 0;
@@ -496,11 +497,16 @@ void RdmaQueuePair::DeclareCopiesLostOnPath(uint16_t path, uint64_t sentNs,
 }
 
 void RdmaQueuePair::ExpireCopies(uint64_t nowNs){
+	const uint64_t deadlineNs =
+		static_cast<uint64_t>(m_copyDeadlineRtts * m_baseRtt);
 	for (auto copy = m_copies.begin(); copy != m_copies.end();){
 		const auto next = std::next(copy);
 		const bool acknowledged = copy->second.dataAcknowledged ||
 			copy->first + copy->second.size <= snd_una;
-		if (acknowledged && nowNs > copy->second.sentNs + m_baseRtt)
+		const bool expired = m_copyDeadlineRtts > 0
+			? nowNs > copy->second.sentNs + deadlineNs
+			: acknowledged && nowNs > copy->second.sentNs + m_baseRtt;
+		if (expired)
 			DeclareCopyLost(copy, nowNs);
 		copy = next;
 	}

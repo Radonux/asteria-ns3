@@ -9239,6 +9239,147 @@ class RepsHoldDuplicateTest : public TestCase
     }
 };
 
+/**
+ * When a copy under SpraySentinelMode duplicate that its own acknowledgement
+ * has not answered is declared lost: under CopyExpiry::DataAck once its data
+ * is acknowledged past one base RTT, under CopyExpiry::Deadline past the tail
+ * loss guard whatever its data's acknowledgement.
+ */
+class CopyExpiryTest : public TestCase
+{
+  public:
+    CopyExpiryTest()
+        : TestCase("Under SprayCopyExpiry 0 a copy is declared lost at its data's acknowledgement "
+                   "more than one base RTT after it was sent; under 1 only at an acknowledgement "
+                   "more than SprayTailLossRtts base RTTs after it was sent, and a copy answered "
+                   "within that is answered clean")
+    {
+    }
+
+    void DoRun() override
+    {
+        DataAckRace(CopyExpiry::DataAck);
+        DataAckRace(CopyExpiry::Deadline);
+        Unanswered();
+        Attribute();
+        Simulator::Destroy();
+    }
+
+  private:
+    static constexpr uint64_t kBaseRtt = 1000;
+    static constexpr uint32_t kSize = 1000;
+
+    // A queue pair with a copy of its first send along path 3 and the data
+    // send along path 0, both at 0 ns, told to selector.
+    static Ptr<RdmaQueuePair> QueuePair(ScriptedSelector*& selector, double deadlineRtts)
+    {
+        Ptr<RdmaQueuePair> qp =
+            CreateObject<RdmaQueuePair>(3, kTestSender, kTestReceiver, 10000, 10001);
+        qp->m_size = 4 * kSize;
+        qp->m_baseRtt = kBaseRtt;
+        qp->m_copyDeadlineRtts = deadlineRtts;
+        qp->m_outstanding.SetPacketSize(kSize);
+        auto scripted = std::make_unique<ScriptedSelector>(std::vector<uint16_t>{0});
+        selector = scripted.get();
+        qp->m_pathSelector = std::move(scripted);
+        qp->m_outstanding.Add(0, kSize, 0, 0);
+        qp->AddCopy(0, kSize, 3, 0, false);
+        return qp;
+    }
+
+    static uint32_t Losses(const ScriptedSelector& selector, uint16_t path)
+    {
+        return std::count(selector.told.begin(), selector.told.end(), "loss " + std::to_string(path));
+    }
+
+    // The data's acknowledgement 1.5 base RTTs after both were sent, the
+    // copy's own 0.1 base RTT later: the copy queued longer than its data.
+    void DataAckRace(CopyExpiry expiry)
+    {
+        const bool deadline = expiry == CopyExpiry::Deadline;
+        ScriptedSelector* selector = nullptr;
+        Ptr<RdmaQueuePair> qp = QueuePair(selector, deadline ? 4 : 0);
+        uint32_t lostAtData = 0;
+        bool answered = false;
+        Simulator::Schedule(NanoSeconds(1500), [&]() {
+            qp->AcknowledgePacket(0, 0);
+            qp->Acknowledge(kSize);
+            lostAtData = qp->m_exploration_copies_lost;
+        });
+        Simulator::Schedule(NanoSeconds(1600), [&]() {
+            uint64_t lost = 0;
+            answered = qp->AcknowledgeCopy(0, 3, lost);
+        });
+        Simulator::Run();
+        // Each case starts its clock at 0 ns, as its sends do.
+        Simulator::Destroy();
+        NS_TEST_EXPECT_MSG_EQ(lostAtData,
+                              deadline ? 0u : 1u,
+                              "only the data acknowledgement's rule loses the copy at its data's "
+                              "acknowledgement");
+        NS_TEST_EXPECT_MSG_EQ(answered,
+                              deadline,
+                              "under the deadline the copy's own answer finds it, and answers it");
+        NS_TEST_EXPECT_MSG_EQ(Losses(*selector, 3), deadline ? 0u : 1u, "the selector hears so");
+        NS_TEST_EXPECT_MSG_EQ(qp->m_copies.size(), 0u, "either way no copy is left");
+    }
+
+    // A copy whose own acknowledgement never comes, under the deadline of 4
+    // base RTTs: kept at an acknowledgement before it, its data send
+    // unacknowledged, and declared lost at the first one after it.
+    void Unanswered()
+    {
+        ScriptedSelector* selector = nullptr;
+        Ptr<RdmaQueuePair> qp = QueuePair(selector, 4);
+        qp->m_outstanding.Add(kSize, kSize, 1, 100);
+        qp->m_outstanding.Add(2 * kSize, kSize, 2, 200);
+        uint32_t lostBefore = 1;
+        uint32_t lostAfter = 0;
+        Simulator::Schedule(NanoSeconds(3900), [&]() {
+            qp->AcknowledgePacket(kSize, 1);
+            lostBefore = qp->m_exploration_copies_lost;
+        });
+        Simulator::Schedule(NanoSeconds(4100), [&]() {
+            qp->AcknowledgePacket(2 * kSize, 2);
+            lostAfter = qp->m_exploration_copies_lost;
+        });
+        Simulator::Run();
+        Simulator::Destroy();
+        NS_TEST_EXPECT_MSG_EQ(lostBefore, 0u, "the copy waits out its deadline");
+        NS_TEST_EXPECT_MSG_EQ(lostAfter, 1u, "and is lost after it, its data unacknowledged");
+        NS_TEST_EXPECT_MSG_EQ(Losses(*selector, 3), 1u, "on its own path");
+        NS_TEST_EXPECT_MSG_EQ((qp->m_outstanding.Find(0, 0) != OutstandingPackets::kNone),
+                              true,
+                              "and its data send stays outstanding");
+    }
+
+    // The attribute sets each queue pair's deadline to the tail loss guard,
+    // and is refused without copies or a guard.
+    void Attribute()
+    {
+        IsolatedHost sender(LoadBalancingMode::SprayUniform, kTestReceiver, 4);
+        Ptr<RdmaHw> hw = sender.hw;
+        NS_TEST_EXPECT_MSG_EQ(hw->m_sprayCopyExpiry,
+                              static_cast<uint32_t>(CopyExpiry::DataAck),
+                              "the data acknowledgement's rule is the default");
+        NS_TEST_EXPECT_MSG_EQ(hw->ValidCopyExpiry(), true, "and needs nothing");
+        NS_TEST_EXPECT_MSG_EQ(sender.AddSender(kTestSender, kTestReceiver, kSize)->m_copyDeadlineRtts,
+                              0.0,
+                              "its queue pairs keep no deadline");
+        hw->m_sprayCopyExpiry = static_cast<uint32_t>(CopyExpiry::Deadline);
+        NS_TEST_EXPECT_MSG_EQ(hw->ValidCopyExpiry(), false, "the deadline needs copies");
+        hw->m_spraySentinelMode = static_cast<uint32_t>(SentinelMode::Duplicate);
+        hw->m_sprayTailLossRtts = 0;
+        NS_TEST_EXPECT_MSG_EQ(hw->ValidCopyExpiry(), false, "and a guard above zero");
+        hw->m_sprayTailLossRtts = 4;
+        NS_TEST_EXPECT_MSG_EQ(hw->ValidCopyExpiry(), true, "and has both");
+        NS_TEST_EXPECT_MSG_EQ(
+            sender.AddSender(kTestSender, kTestReceiver, kSize, 10002)->m_copyDeadlineRtts,
+            4.0,
+            "a queue pair's deadline is the tail loss guard");
+    }
+};
+
 class HeldSpineLeakTest : public TestCase
 {
   public:
@@ -14848,6 +14989,7 @@ PointToPointTestSuite::PointToPointTestSuite()
     AddTestCase(new RepsHoldLlrTest, TestCase::Duration::QUICK);
     AddTestCase(new RepsHoldTrickleTest, TestCase::Duration::QUICK);
     AddTestCase(new RepsHoldDuplicateTest, TestCase::Duration::QUICK);
+    AddTestCase(new CopyExpiryTest, TestCase::Duration::QUICK);
     AddTestCase(new RetransmissionTimeoutTraceTest, TestCase::Duration::QUICK);
     AddTestCase(new HeldSpineLeakTest, TestCase::Duration::QUICK);
     AddTestCase(new HeldSpineFastLossTest, TestCase::Duration::QUICK);
