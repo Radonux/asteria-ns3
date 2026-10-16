@@ -345,6 +345,10 @@ public:
 	// Declare lost every outstanding send made at or before sentNs and queue
 	// its range for repair. Returns the bytes declared lost.
 	uint64_t DeclareLostSentBy(uint64_t sentNs);
+	// One outstanding send (m_outstanding's packet) of DeclareLostSentBy:
+	// declared lost and its range queued for repair, its loss told, deferred
+	// or kept as SprayDuplicateReport says. Returns the bytes declared lost.
+	uint64_t DeclareTimedOutSend(uint64_t packet);
 	// Under SprayTailRecovery, a tail repair request: declare lost every
 	// outstanding send along path whose path sequence is one of the count
 	// from first, and queue its range for repair. A send already
@@ -371,6 +375,49 @@ public:
 	uint64_t DeclareHeldSendLost(uint64_t seq, uint16_t path, uint64_t sentNs);
 	// Sends on a held spine declared lost by DeclareHeldSendLost.
 	uint32_t m_held_declared_lost;
+	// SprayOverdueRepair (RdmaHw): the queue pair's latest send on a spine
+	// not held as it was chosen, seq along path at sentNs, while
+	// m_overdueTaken (not when the latest send was held, or once it is
+	// repaired), whose answer, overdue by SprayHeldLossRtts base RTTs, has it
+	// declared lost and repaired as a held send is (RdmaHw::OverdueSendDue);
+	// m_overdueTimer is set for it. One repair is sent per answer or
+	// timeout: m_overdueSpent, set by the repair, keeps any send from being
+	// taken until the queue pair's next answer or retransmission timeout
+	// clears it. Each sequence repaired waits in m_overdueRepaired, with the
+	// paths of its send and of its repair, for the answer that shows which
+	// arrived first (OverdueRepairSpurious).
+	bool m_overdueTaken;
+	uint64_t m_overdueSeq;
+	uint16_t m_overduePath;
+	uint64_t m_overdueSentNs;
+	bool m_overdueSpent;
+	EventId m_overdueTimer;
+	struct OverdueRepair {
+		uint16_t path;
+		bool repairSent;
+		uint16_t repairPath;
+	};
+	std::map<uint64_t, OverdueRepair> m_overdueRepaired;
+	uint32_t m_overdue_declared_lost;
+	uint32_t m_overdue_spurious;
+	// Declare lost the send of seq along path made at sentNs, if it is still
+	// outstanding, and queue its range for repair; its loss is evidence as a
+	// retransmission timeout's is (DeclareLostSentBy). Returns the bytes
+	// declared lost: zero when it was acknowledged or declared lost since, or
+	// seq was sent again, or under SprayCoverageFirst it is covered.
+	uint64_t DeclareOverdueSendLost(uint64_t seq, uint16_t path,
+		uint64_t sentNs);
+	// A repair of seq left along path: the first, of a sequence
+	// DeclareOverdueSendLost repaired, is the repair's path.
+	void NoteOverdueRepairSent(uint64_t seq, uint16_t path);
+	// Whether the answer to seq along path, flagged as a duplicate or not,
+	// shows a repair of DeclareOverdueSendLost spurious, the send it repaired
+	// having arrived first: flagged, or unflagged along the send's path where
+	// the repair took another, the send's own answer (m_overdue_spurious).
+	// Unflagged along the repair's path, where the send took another, it is
+	// the repair's, which arrived first; either answer ends the wait, and
+	// along one path for both an unflagged answer leaves it to a flagged one.
+	bool OverdueRepairSpurious(uint64_t seq, uint16_t path, bool duplicate);
 	// Under SprayAckLossRtts, the sends the cumulative acknowledgement
 	// covered before their own acknowledgement arrived, in the order it
 	// covered them, each with the time it was covered. Their data was

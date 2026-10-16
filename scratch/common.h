@@ -310,6 +310,19 @@ bool spray_copy_expiry_given = false;
 // resend's. 0 waits for the timeout. At least 0.
 double spray_held_loss_rtts = 2;
 bool spray_held_loss_rtts_given = false;
+// Under those selectors with SPRAY_HELD_LOSS_RTTS above 0,
+// SPRAY_OVERDUE_REPAIR on: a queue pair's latest data send up a spine not
+// held as it was chosen is declared lost and repaired as a held send is,
+// once its answer is SPRAY_HELD_LOSS_RTTS of the queue pair's base RTTs
+// overdue, whether or not any spine is held; one repair is sent until the
+// queue pair's next answer or retransmission timeout. Its loss is evidence
+// as a retransmission timeout's is, under SPRAY_DUPLICATE_REPORT too. Each is
+// counted as the host transport event overdue_repair. A receiver flags its
+// answers to duplicates as under SPRAY_DUPLICATE_REPORT, and a repair whose
+// sequence's send arrived first, its answer flagged or the send's own, is
+// counted as overdue_repair_spurious. Off, the default.
+std::string spray_overdue_repair = "off";
+bool spray_overdue_repair_given = false;
 // Under LOAD_BALANCING spray_uniform, with any PATH_SELECTOR,
 // SPRAY_ACK_LOSS_RTTS <x>: a data send that the cumulative acknowledgement
 // covers before its own acknowledgement arrives, and whose own acknowledgement
@@ -2281,6 +2294,17 @@ bool valid_hold_rule() {
     std::cerr << "SPRAY_HELD_LOSS_RTTS must be at least 0\n";
     return false;
   }
+  if (spray_overdue_repair != "on" && spray_overdue_repair != "off") {
+    std::cerr << "SPRAY_OVERDUE_REPAIR must be on or off\n";
+    return false;
+  }
+  if (spray_overdue_repair_given &&
+      (!reps_hold() || !(spray_held_loss_rtts > 0))) {
+    std::cerr << "SPRAY_OVERDUE_REPAIR is read only under PATH_SELECTOR "
+                 "reps_hold, reps_flow_hold or mrc_hold with "
+                 "SPRAY_HELD_LOSS_RTTS above 0\n";
+    return false;
+  }
   if (spray_hold_release_value() == std::numeric_limits<uint32_t>::max()) {
     std::cerr << "SPRAY_HOLD_RELEASE must be sentinels or trickle\n";
     return false;
@@ -2567,6 +2591,9 @@ bool ReadConf(string network_configuration) {
     } else if (key.compare("SPRAY_HELD_LOSS_RTTS") == 0) {
       conf >> spray_held_loss_rtts;
       spray_held_loss_rtts_given = true;
+    } else if (key.compare("SPRAY_OVERDUE_REPAIR") == 0) {
+      conf >> spray_overdue_repair;
+      spray_overdue_repair_given = true;
     } else if (key.compare("SPRAY_ACK_LOSS_RTTS") == 0) {
       conf >> spray_ack_loss_rtts;
       spray_ack_loss_rtts_given = true;
@@ -3584,6 +3611,9 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),
       transport_event_totals[{event, "control"}];
   if (spray_duplicate_report == "retract")
     transport_event_totals[{"timeout_retract_release", "control"}];
+  if (spray_overdue_repair == "on")
+    for (const char *event : {"overdue_repair", "overdue_repair_spurious"})
+      transport_event_totals[{event, "control"}];
   if (answer_path_seq())
     for (const char *event : {"answer_route_lost", "answer_route_hold",
                               "answer_route_release", "answer_probe"})
@@ -3963,6 +3993,8 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),
                                                   : CopyExpiry::DataAck)));
       rdmaHw->SetAttribute("SprayHeldLossRtts",
                            DoubleValue(spray_held_loss_rtts));
+      rdmaHw->SetAttribute("SprayOverdueRepair",
+                           BooleanValue(spray_overdue_repair == "on"));
       rdmaHw->SetAttribute("SprayAckLossRtts",
                            DoubleValue(spray_ack_loss_rtts));
       rdmaHw->SetAttribute(

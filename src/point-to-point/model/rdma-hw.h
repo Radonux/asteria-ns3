@@ -257,6 +257,16 @@ public:
 	// outstanding is declared lost and repaired (HeldSendDue); zero waits
 	// for the retransmission timeout.
 	double m_sprayHeldLossRtts;
+	// SprayOverdueRepair, under the same selectors with m_sprayHeldLossRtts
+	// above zero: the queue pair's latest send on a spine not held is
+	// declared lost and repaired as a held send is once its answer is overdue
+	// by m_sprayHeldLossRtts base RTTs, one repair per answer or timeout
+	// (RdmaQueuePair::m_overdueTaken), its loss evidence as a timed-out
+	// send's; and a receiver flags its answers to duplicates as under
+	// SprayDuplicateReport, so that a flagged answer to a repaired sequence
+	// counts the repair spurious.
+	bool m_sprayOverdueRepair;
+	bool ValidOverdueRepair() const;
 	// SprayAckLossRtts, under LoadBalancing SprayUniform with any selector:
 	// the queue pair's base RTTs after which a send the cumulative
 	// acknowledgement covered before its own acknowledgement arrived, and
@@ -879,6 +889,16 @@ public:
 	// lost if still outstanding, and its repair sent.
 	void HeldSendDue(Ptr<RdmaQueuePair> qp, uint64_t seq, uint16_t path,
 		uint64_t sentNs);
+	// Under SprayOverdueRepair: qp's send of seq along path at sentNs, on a
+	// spine not held when held is false, taken as its latest send, unless one
+	// was repaired since its last answer or timeout, and qp's timer set for
+	// it unless it is set; for a held send, none is taken.
+	void TakeOverdueSend(Ptr<RdmaQueuePair> qp, uint64_t seq, uint16_t path,
+		uint64_t sentNs, bool held);
+	// qp's timer: the send taken, once its answer is overdue, declared lost
+	// if still outstanding, and its repair sent; the timer set again for a
+	// send taken later.
+	void OverdueSendDue(Ptr<RdmaQueuePair> qp);
 	// Under SprayAckLossRtts: qp's timer set for its earliest covered send,
 	// unless it is set; and the covered sends due by now declared lost on
 	// their paths, and the timer set for the next.

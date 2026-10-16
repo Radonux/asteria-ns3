@@ -661,6 +661,20 @@ TypeId RdmaHw::GetTypeId (void)
 				DoubleValue(2),
 				MakeDoubleAccessor(&RdmaHw::m_sprayHeldLossRtts),
 				MakeDoubleChecker<double>(0))
+		.AddAttribute("SprayOverdueRepair",
+				"Under PathSelector 6, 7 and 9 with SprayHeldLossRtts above "
+				"zero, whether a queue pair's latest send on a spine not held "
+				"as it was chosen is declared lost and repaired, as a held "
+				"send is, once its answer is overdue by SprayHeldLossRtts base "
+				"RTTs: one repair until the queue pair's next answer or "
+				"retransmission timeout, its loss told, deferred or kept as "
+				"a timed-out send's under SprayDuplicateReport. A receiver "
+				"flags its answers to duplicates as under SprayDuplicateReport, "
+				"and a flagged answer to a repaired sequence counts the repair "
+				"spurious. Default false.",
+				BooleanValue(false),
+				MakeBooleanAccessor(&RdmaHw::m_sprayOverdueRepair),
+				MakeBooleanChecker())
 		.AddAttribute("SprayAckLossRtts",
 				"Under LoadBalancing 2, the queue pair's base RTTs after "
 				"which a send the cumulative acknowledgement covered before "
@@ -1291,6 +1305,9 @@ void RdmaHw::Setup(QpCompleteCallback cb, QpFailureCallback failure_cb){
 		"SprayDuplicateReport needs SprayCoverageFirst, and 2 the host's auto "
 		"loss hold (PathSelector 6 or 9 with SprayHoldScope auto) under "
 		"SprayHoldRule 0");
+	NS_ABORT_MSG_IF(!ValidOverdueRepair(),
+		"SprayOverdueRepair needs PathSelector 6, 7 or 9 and SprayHeldLossRtts "
+		"above zero");
 	NS_ABORT_MSG_IF(!ValidCoverageFirst(),
 		"SprayCoverageFirst is read only under LoadBalancing 2, where every "
 		"send has a record");
@@ -1623,8 +1640,9 @@ int RdmaHw::ReceiveUdp(Ptr<Packet> p, CustomHeader &ch){
 		SendAck(rxQp, ch.dip, ch.sip, ch.udp.dport, ch.udp.sport, ch.udp.pg,
 			ch.udp.ih, ch.udp.seq, ch.ipid, x == 2, ecnbits != 0,
 			AllowanceGone(rxQp), false, redirect,
-			m_sprayDuplicateReport !=
-					static_cast<uint32_t>(DuplicateReport::Off) &&
+			(m_sprayDuplicateReport !=
+					static_cast<uint32_t>(DuplicateReport::Off) ||
+				m_sprayOverdueRepair) &&
 				accepted == 0 && late_forgiven == 0 && payload_size > 0);
 	}
 	// After the acknowledgement, so this packet's answer carries the state
@@ -1756,6 +1774,10 @@ bool RdmaHw::CountsSprayLoss() const{
 	// the sender counts none of its own.
 	return m_sprayLossThreshold1 > 0 &&
 		((IsSprayPolicy() && !IsSwitchQueueCost()) || IsRepsHold());
+}
+
+bool RdmaHw::ValidOverdueRepair() const{
+	return !m_sprayOverdueRepair || (IsRepsHold() && m_sprayHeldLossRtts > 0);
 }
 
 bool RdmaHw::IsRepsHold() const{
@@ -2349,6 +2371,13 @@ int RdmaHw::ReceiveAck(Ptr<Packet> p, CustomHeader &ch){
 						(ch.ack.flags >> qbbHeader::FLAG_DUPLICATE) & 1,
 						ch.ack.route_spine != kNoRouteSpine ? ch.ack.route_spine
 							: CarryingSpine(ch.ipid), now);
+				// An answer lets the next overdue send be repaired.
+				if (m_sprayOverdueRepair){
+					qp->m_overdueSpent = false;
+					if (qp->OverdueRepairSpurious(ch.ack.packet_seq, path,
+							(ch.ack.flags >> qbbHeader::FLAG_DUPLICATE) & 1))
+						ReportTransportEvent("overdue_repair_spurious", 0);
+				}
 				// The destination's downlink being congested is the receiver's
 				// flow control of UEC 1.0.3 section 3.6.13.2.
 				const uint32_t rcvCwndPend = IsSprayPolicy() &&
@@ -3063,6 +3092,7 @@ void RdmaHw::HandleRetransmissionTimeout(Ptr<RdmaQueuePair> qp){
 	qp->m_recovery_retries++;
 	qp->m_timeouts++;
 	ReportTransportEvent("rto_fired", 0);
+	qp->m_overdueSpent = false;
 	{
 		// The send the timer waited for is the oldest outstanding one.
 		const uint64_t oldest = qp->m_outstanding.IsKept()
@@ -3100,6 +3130,50 @@ void RdmaHw::HeldSendDue(Ptr<RdmaQueuePair> qp, uint64_t seq, uint16_t path,
 	const uint64_t lost = qp->DeclareHeldSendLost(seq, path, sentNs);
 	if (lost == 0)
 		return;
+	if (m_cc_mode == 11 && DeliverCongestionSignal(qp)){
+		qp->Nscc().OnLoss(lost);
+		ApplyNsccWindow(qp);
+	}
+	m_nic[GetNicIdxOfQp(qp)].dev->TriggerTransmit();
+	ArmRetransmissionTimeout(qp);
+}
+
+void RdmaHw::TakeOverdueSend(Ptr<RdmaQueuePair> qp, uint64_t seq,
+		uint16_t path, uint64_t sentNs, bool held){
+	if (qp->m_overdueSpent)
+		return;
+	// A held send's own timer repairs it.
+	qp->m_overdueTaken = !held;
+	if (held)
+		return;
+	qp->m_overdueSeq = seq;
+	qp->m_overduePath = path;
+	qp->m_overdueSentNs = sentNs;
+	if (!qp->m_overdueTimer.IsPending())
+		qp->m_overdueTimer = Simulator::Schedule(NanoSeconds(
+				static_cast<uint64_t>(m_sprayHeldLossRtts * qp->m_baseRtt)),
+			&RdmaHw::OverdueSendDue, this, qp);
+}
+
+void RdmaHw::OverdueSendDue(Ptr<RdmaQueuePair> qp){
+	if (qp->IsFinished() || qp->IsFailed() || !qp->m_overdueTaken)
+		return;
+	const uint64_t dueNs = qp->m_overdueSentNs +
+		static_cast<uint64_t>(m_sprayHeldLossRtts * qp->m_baseRtt);
+	const uint64_t now = Simulator::Now().GetNanoSeconds();
+	// A later send was taken since the timer was set.
+	if (dueNs > now){
+		qp->m_overdueTimer = Simulator::Schedule(NanoSeconds(dueNs - now),
+			&RdmaHw::OverdueSendDue, this, qp);
+		return;
+	}
+	qp->m_overdueTaken = false;
+	const uint64_t lost = qp->DeclareOverdueSendLost(qp->m_overdueSeq,
+		qp->m_overduePath, qp->m_overdueSentNs);
+	if (lost == 0)
+		return;
+	qp->m_overdueSpent = true;
+	ReportTransportEvent("overdue_repair", 0);
 	if (m_cc_mode == 11 && DeliverCongestionSignal(qp)){
 		qp->Nscc().OnLoss(lost);
 		ApplyNsccWindow(qp);
@@ -3283,6 +3357,7 @@ void RdmaHw::QpComplete(Ptr<RdmaQueuePair> qp){
 	NS_ASSERT(!m_qpCompleteCallback.IsNull());
 	Simulator::Cancel(qp->m_retransmissionTimer);
 	Simulator::Cancel(qp->m_ackLossTimer);
+	Simulator::Cancel(qp->m_overdueTimer);
 	qp->m_covered.clear();
 	LeaveNsccConnection(qp);
 	// The losses of qp still waiting in m_tailLosses stay: the trim
@@ -3312,6 +3387,7 @@ void RdmaHw::QpFail(Ptr<RdmaQueuePair> qp, uint32_t reason){
 	qp->m_failure_reason = reason;
 	Simulator::Cancel(qp->m_retransmissionTimer);
 	Simulator::Cancel(qp->m_ackLossTimer);
+	Simulator::Cancel(qp->m_overdueTimer);
 	qp->m_covered.clear();
 	DropTailLosses(qp);
 	LeaveNsccConnection(qp);
@@ -3467,6 +3543,11 @@ Ptr<Packet> RdmaHw::GetNxtPacket(Ptr<RdmaQueuePair> qp){
 		if (held && heldLossNs > 0)
 			Simulator::Schedule(NanoSeconds(heldLossNs), &RdmaHw::HeldSendDue,
 				this, qp, seq, path, sentNs);
+		if (m_sprayOverdueRepair){
+			if (is_repair)
+				qp->NoteOverdueRepairSent(seq, path);
+			TakeOverdueSend(qp, seq, path, sentNs, held);
+		}
 		if (copy){
 			// The copy leaves ahead of the data packet, through the NIC's
 			// high-priority queue, outside the queue pair's pacing; switches

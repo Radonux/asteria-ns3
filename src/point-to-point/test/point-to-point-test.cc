@@ -10009,6 +10009,190 @@ class DuplicateReportTest : public TestCase
     }
 };
 
+/**
+ * SprayOverdueRepair: a queue pair's latest send on a spine not held is
+ * repaired once its answer is overdue, as a held send is, and a flagged
+ * answer to the repaired sequence counts the repair spurious.
+ */
+class OverdueRepairTest : public TestCase
+{
+  public:
+    OverdueRepairTest()
+        : TestCase("Under SprayOverdueRepair a queue pair's latest send on a spine not held is "
+                   "declared lost and repaired once its answer is SprayHeldLossRtts base RTTs "
+                   "overdue, one repair until its next answer or timeout, its loss evidence as a "
+                   "timed-out send's; a receiver flags duplicates, and the answer showing the "
+                   "send arrived first counts the repair spurious")
+    {
+    }
+
+    void DoRun() override
+    {
+        const bool savedPacketSeq = CustomHeader::ackCarriesPacketSeq;
+        CustomHeader::ackCarriesPacketSeq = true;
+        Receiver();
+        Declared();
+        Spurious();
+        Host();
+        Valid();
+        CustomHeader::ackCarriesPacketSeq = savedPacketSeq;
+        Simulator::Destroy();
+    }
+
+  private:
+    static uint32_t Told(const ScriptedSelector& selector, const std::string& told)
+    {
+        return std::count(selector.told.begin(), selector.told.end(), told);
+    }
+
+    void Receiver()
+    {
+        IsolatedHost receiver(LoadBalancingMode::SprayUniform, kTestSender, 8);
+        receiver.hw->m_sprayOverdueRepair = true;
+        receiver.ReceiveData(kTestSender, kTestReceiver, 0, SpineIdentification(1, 1));
+        NS_TEST_EXPECT_MSG_EQ(((receiver.emitted.back().ack.flags >> qbbHeader::FLAG_DUPLICATE) & 1), 0,
+                              "a first arrival is not flagged");
+        receiver.ReceiveData(kTestSender, kTestReceiver, 0, SpineIdentification(2, 2));
+        NS_TEST_EXPECT_MSG_EQ(((receiver.emitted.back().ack.flags >> qbbHeader::FLAG_DUPLICATE) & 1), 1,
+                              "a second one is, without SprayDuplicateReport");
+    }
+
+    // A queue pair with sends of seq 0 and 1000 along paths 1 and 2 at 0 and
+    // 10 ns.
+    static Ptr<RdmaQueuePair> Sends(ScriptedSelector*& selector)
+    {
+        Ptr<RdmaQueuePair> qp = CreateObject<RdmaQueuePair>(3, kTestSender, kTestReceiver, 10000, 10001);
+        qp->m_size = 8 * IsolatedHost::kMtu;
+        qp->m_outstanding.SetPacketSize(IsolatedHost::kMtu);
+        auto scripted = std::make_unique<ScriptedSelector>(std::vector<uint16_t>{1});
+        selector = scripted.get();
+        qp->m_pathSelector = std::move(scripted);
+        qp->m_outstanding.Add(0, IsolatedHost::kMtu, 1, 0);
+        qp->m_outstanding.Add(IsolatedHost::kMtu, IsolatedHost::kMtu, 2, 10);
+        return qp;
+    }
+
+    void Declared()
+    {
+        ScriptedSelector* selector = nullptr;
+        Ptr<RdmaQueuePair> qp = Sends(selector);
+        NS_TEST_EXPECT_MSG_EQ(qp->DeclareOverdueSendLost(IsolatedHost::kMtu, 2, 5), 0u,
+                              "a send made at another time is not the one taken");
+        NS_TEST_EXPECT_MSG_EQ(qp->DeclareOverdueSendLost(IsolatedHost::kMtu, 2, 10),
+                              uint64_t(IsolatedHost::kMtu),
+                              "the send taken is declared lost");
+        NS_TEST_EXPECT_MSG_EQ(qp->RepairBytesLeft(), uint64_t(IsolatedHost::kMtu), "and repaired");
+        NS_TEST_EXPECT_MSG_EQ(Told(*selector, "loss 2"), 1u, "its loss told at once without the key");
+        NS_TEST_EXPECT_MSG_EQ(qp->m_overdue_declared_lost, 1u, "and counted");
+        NS_TEST_EXPECT_MSG_EQ(qp->DeclareOverdueSendLost(IsolatedHost::kMtu, 2, 10), 0u,
+                              "a send no longer outstanding is not declared again");
+        // Under SprayDuplicateReport the loss waits as a timed-out send's.
+        ScriptedSelector* deferred = nullptr;
+        Ptr<RdmaQueuePair> defer = Sends(deferred);
+        defer->m_coverageFirst = true;
+        defer->m_deferTimeoutEvidence = true;
+        defer->DeclareOverdueSendLost(IsolatedHost::kMtu, 2, 10);
+        NS_TEST_EXPECT_MSG_EQ(Told(*deferred, "loss 2"), 0u, "under defer it is not told yet");
+        NS_TEST_EXPECT_MSG_EQ(defer->m_timedOut.count(IsolatedHost::kMtu), 1u, "it waits for an answer");
+        // A covered send is an answer loss.
+        defer->snd_una = IsolatedHost::kMtu;
+        NS_TEST_EXPECT_MSG_EQ(defer->DeclareOverdueSendLost(0, 1, 0), 0u, "a covered send is not declared");
+        NS_TEST_EXPECT_MSG_EQ(defer->m_covered_answer_losses, 1u, "it is an answer loss");
+        NS_TEST_EXPECT_MSG_EQ(defer->m_overdue_declared_lost, 1u, "and no repair");
+    }
+
+    void Spurious()
+    {
+        ScriptedSelector* selector = nullptr;
+        Ptr<RdmaQueuePair> qp = Sends(selector);
+        qp->m_outstanding.Add(2 * IsolatedHost::kMtu, IsolatedHost::kMtu, 3, 20);
+        qp->m_outstanding.Add(3 * IsolatedHost::kMtu, IsolatedHost::kMtu, 6, 30);
+        qp->DeclareOverdueSendLost(IsolatedHost::kMtu, 2, 10);
+        qp->DeclareOverdueSendLost(2 * IsolatedHost::kMtu, 3, 20);
+        qp->DeclareOverdueSendLost(3 * IsolatedHost::kMtu, 6, 30);
+        NS_TEST_EXPECT_MSG_EQ(qp->OverdueRepairSpurious(0, 1, true), false, "a sequence not repaired is not");
+        qp->NoteOverdueRepairSent(IsolatedHost::kMtu, 4);
+        qp->NoteOverdueRepairSent(IsolatedHost::kMtu, 5);
+        NS_TEST_EXPECT_MSG_EQ(qp->OverdueRepairSpurious(IsolatedHost::kMtu, 4, false), false,
+                              "the repair's own answer, unflagged: the repair arrived first");
+        NS_TEST_EXPECT_MSG_EQ(qp->OverdueRepairSpurious(IsolatedHost::kMtu, 2, true), false,
+                              "and the wait is over");
+        qp->NoteOverdueRepairSent(2 * IsolatedHost::kMtu, 5);
+        NS_TEST_EXPECT_MSG_EQ(qp->OverdueRepairSpurious(2 * IsolatedHost::kMtu, 3, false), true,
+                              "the send's own answer: the send arrived first");
+        qp->NoteOverdueRepairSent(3 * IsolatedHost::kMtu, 6);
+        NS_TEST_EXPECT_MSG_EQ(qp->OverdueRepairSpurious(3 * IsolatedHost::kMtu, 6, false), false,
+                              "along one path for both an unflagged answer tells nothing");
+        NS_TEST_EXPECT_MSG_EQ(qp->OverdueRepairSpurious(3 * IsolatedHost::kMtu, 6, true), true,
+                              "and the flagged one shows it spurious");
+        NS_TEST_EXPECT_MSG_EQ(qp->m_overdue_spurious, 2u, "two spurious repairs");
+        NS_TEST_EXPECT_MSG_EQ(qp->m_overdueRepaired.size(), 0u, "and nothing waits");
+    }
+
+    // The host's timer, at a base RTT of 100 ns and SprayHeldLossRtts 2.
+    void Host()
+    {
+        Simulator::Destroy();
+        IsolatedHost sender(LoadBalancingMode::SprayUniform, kTestReceiver, 8);
+        sender.hw->m_sprayOverdueRepair = true;
+        sender.hw->m_sprayHeldLossRtts = 2;
+        std::map<std::string, uint32_t> events;
+        sender.hw->m_transportEventCallback = Callback<void, const char*, uint64_t>(
+            [&events](const char* event, uint64_t) { ++events[event]; });
+        Ptr<RdmaQueuePair> qp = sender.AddSender(kTestSender, kTestReceiver, 8 * IsolatedHost::kMtu);
+        qp->m_baseRtt = 100;
+        qp->snd_nxt = 2 * IsolatedHost::kMtu;
+        qp->m_outstanding.Add(0, IsolatedHost::kMtu, 1, 0);
+        sender.hw->TakeOverdueSend(qp, 0, 1, 0, false);
+        Simulator::Schedule(NanoSeconds(50), [&sender, qp]() {
+            qp->m_outstanding.Add(IsolatedHost::kMtu, IsolatedHost::kMtu, 2, 50);
+            sender.hw->TakeOverdueSend(qp, IsolatedHost::kMtu, 2, 50, false);
+        });
+        Simulator::Stop(NanoSeconds(220));
+        Simulator::Run();
+        NS_TEST_EXPECT_MSG_EQ(events["overdue_repair"], 0u, "the latest send is not overdue at 200 ns");
+        Simulator::Stop(NanoSeconds(40));
+        Simulator::Run();
+        NS_TEST_EXPECT_MSG_EQ(events["overdue_repair"], 1u, "it is at 250 ns");
+        NS_TEST_EXPECT_MSG_EQ(qp->RepairBytesLeft(), uint64_t(IsolatedHost::kMtu), "only it is repaired");
+        NS_TEST_EXPECT_MSG_EQ(qp->m_overdueSpent, true, "one repair until an answer or timeout");
+        sender.hw->TakeOverdueSend(qp, 2 * IsolatedHost::kMtu, 3, 260, false);
+        NS_TEST_EXPECT_MSG_EQ(qp->m_overdueTaken, false, "so no send is taken meanwhile");
+        // The repair left along 4; the flagged answer to it.
+        qp->NoteOverdueRepairSent(IsolatedHost::kMtu, 4);
+        CustomHeader ack;
+        ack.l3Prot = 0xFC;
+        ack.sip = kTestReceiver.Get();
+        ack.ipid = SpineIdentification(4, 4);
+        ack.ack.flags = 1 << qbbHeader::FLAG_DUPLICATE;
+        ack.ack.sport = IsolatedHost::kReceiverPort;
+        ack.ack.dport = IsolatedHost::kSenderPort;
+        ack.ack.pg = IsolatedHost::kPriorityGroup;
+        ack.ack.seq = 0;
+        ack.ack.packet_seq = IsolatedHost::kMtu;
+        sender.hw->ReceiveAck(Create<Packet>(), ack);
+        NS_TEST_EXPECT_MSG_EQ(events["overdue_repair_spurious"], 1u, "a flagged answer shows it spurious");
+        NS_TEST_EXPECT_MSG_EQ(qp->m_overdueSpent, false, "and the answer lets the next repair go");
+        // A held send is left to its own timer.
+        sender.hw->TakeOverdueSend(qp, 2 * IsolatedHost::kMtu, 3, 300, true);
+        NS_TEST_EXPECT_MSG_EQ(qp->m_overdueTaken, false, "a held send is not taken");
+        Simulator::Destroy();
+    }
+
+    void Valid()
+    {
+        Ptr<RdmaHw> hw = CreateObject<RdmaHw>();
+        NS_TEST_EXPECT_MSG_EQ(hw->m_sprayOverdueRepair, false, "off by default");
+        NS_TEST_EXPECT_MSG_EQ(hw->ValidOverdueRepair(), true, "and valid so");
+        hw->m_sprayOverdueRepair = true;
+        NS_TEST_EXPECT_MSG_EQ(hw->ValidOverdueRepair(), false, "refused without a loss hold selector");
+        hw->m_pathSelectorKind = static_cast<uint32_t>(PathSelectorKind::RepsHold);
+        NS_TEST_EXPECT_MSG_EQ(hw->ValidOverdueRepair(), true, "accepted with reps_hold");
+        hw->m_sprayHeldLossRtts = 0;
+        NS_TEST_EXPECT_MSG_EQ(hw->ValidOverdueRepair(), false, "but not with SprayHeldLossRtts 0");
+    }
+};
+
 class SpineCountTest : public TestCase
 {
   public:
@@ -16825,6 +17009,7 @@ PointToPointTestSuite::PointToPointTestSuite()
     AddTestCase(new CoverageFirstTest, TestCase::Duration::QUICK);
     AddTestCase(new NsccRttSampleTest, TestCase::Duration::QUICK);
     AddTestCase(new DuplicateReportTest, TestCase::Duration::QUICK);
+    AddTestCase(new OverdueRepairTest, TestCase::Duration::QUICK);
     AddTestCase(new SpineCountTest, TestCase::Duration::QUICK);
     AddTestCase(new RetransmissionTimeoutTraceTest, TestCase::Duration::QUICK);
     AddTestCase(new HeldSpineLeakTest, TestCase::Duration::QUICK);

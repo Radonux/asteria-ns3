@@ -250,6 +250,13 @@ RdmaQueuePair::RdmaQueuePair(uint16_t pg, Ipv4Address _sip, Ipv4Address _dip, ui
 	m_duplicate_repairs = 0;
 	m_tail_declared_lost = 0;
 	m_held_declared_lost = 0;
+	m_overdueTaken = false;
+	m_overdueSeq = 0;
+	m_overduePath = 0;
+	m_overdueSentNs = 0;
+	m_overdueSpent = false;
+	m_overdue_declared_lost = 0;
+	m_overdue_spurious = 0;
 	m_ack_loss_declared = 0;
 	m_tail_nacks_ignored = 0;
 	m_copyDeadlineRtts = 0;
@@ -582,23 +589,65 @@ uint64_t RdmaQueuePair::DeclareLostSentBy(uint64_t sentNs){
 	for (uint64_t oldest = m_outstanding.Oldest();
 			oldest != OutstandingPackets::kNone &&
 				m_outstanding.SentNs(oldest) <= sentNs;
-			oldest = m_outstanding.Oldest()){
-		if (m_deferTimeoutEvidence){
-			// The first send's evidence waits for its resend's answer.
-			m_timedOut.emplace(m_outstanding.Seq(oldest), TimedOutSend{
-				m_outstanding.Path(oldest), m_outstanding.Trickle(oldest)});
-			lost += DeclareLost(oldest, false);
-		}else{
-			// Told at once, and kept until its resend's answer shows whether
-			// to take it back.
-			if (m_retractTimeoutEvidence)
-				m_timeoutLosses.emplace(m_outstanding.Seq(oldest), TimeoutLoss{
-					m_outstanding.Path(oldest),
-					static_cast<uint64_t>(Simulator::Now().GetNanoSeconds())});
-			lost += DeclareLost(oldest);
-		}
-	}
+			oldest = m_outstanding.Oldest())
+		lost += DeclareTimedOutSend(oldest);
 	return lost;
+}
+
+uint64_t RdmaQueuePair::DeclareTimedOutSend(uint64_t packet){
+	if (m_deferTimeoutEvidence){
+		// The first send's evidence waits for its resend's answer.
+		m_timedOut.emplace(m_outstanding.Seq(packet), TimedOutSend{
+			m_outstanding.Path(packet), m_outstanding.Trickle(packet)});
+		return DeclareLost(packet, false);
+	}
+	// Told at once, and kept until its resend's answer shows whether to take
+	// it back.
+	if (m_retractTimeoutEvidence)
+		m_timeoutLosses.emplace(m_outstanding.Seq(packet), TimeoutLoss{
+			m_outstanding.Path(packet),
+			static_cast<uint64_t>(Simulator::Now().GetNanoSeconds())});
+	return DeclareLost(packet);
+}
+
+uint64_t RdmaQueuePair::DeclareOverdueSendLost(uint64_t seq, uint16_t path,
+		uint64_t sentNs){
+	const uint64_t packet = m_outstanding.Find(seq, path);
+	if (packet == OutstandingPackets::kNone ||
+			m_outstanding.SentNs(packet) != sentNs)
+		return 0;
+	if (CoveredAnswerLoss(seq, m_outstanding.Size(packet))){
+		m_outstanding.Remove(packet);
+		return 0;
+	}
+	m_overdue_declared_lost++;
+	m_overdueRepaired[seq] = OverdueRepair{path, false, 0};
+	return DeclareTimedOutSend(packet);
+}
+
+void RdmaQueuePair::NoteOverdueRepairSent(uint64_t seq, uint16_t path){
+	const auto repair = m_overdueRepaired.find(seq);
+	if (repair == m_overdueRepaired.end() || repair->second.repairSent)
+		return;
+	repair->second.repairSent = true;
+	repair->second.repairPath = path;
+}
+
+bool RdmaQueuePair::OverdueRepairSpurious(uint64_t seq, uint16_t path,
+		bool duplicate){
+	const auto repair = m_overdueRepaired.find(seq);
+	if (repair == m_overdueRepaired.end())
+		return false;
+	const OverdueRepair r = repair->second;
+	const bool send = path == r.path && !(r.repairSent && r.repairPath == path);
+	const bool resend = r.repairSent && path == r.repairPath && path != r.path;
+	if (!duplicate && !send && !resend)
+		return false;
+	m_overdueRepaired.erase(repair);
+	if (resend && !duplicate)
+		return false;
+	m_overdue_spurious++;
+	return true;
 }
 
 void RdmaQueuePair::ResolveTimedOut(uint64_t seq, bool duplicate,
