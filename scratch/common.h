@@ -4454,6 +4454,11 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),
     }
   }
   printf("maxRtt=%lu maxBdp=%lu\n", maxRtt, maxBdp);
+  // Read only to set the routing tables and each pair's BDP and RTT, these
+  // grow with every node and host; TakeDownLink computes them again.
+  nextHop.clear();
+  pairDelay.clear();
+  pairTxDelay.clear();
   // Known only now that every route is, and read from the first packet on.
   if (load_balancing == "spray_policy" || path_selector == "ack_redirect" ||
       reps_oracle() || tail_recovery() || ack_route_oracle_on() ||
