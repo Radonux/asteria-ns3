@@ -121,6 +121,11 @@ std::string spine_report_output_file;
 // Each host's pooled loss intervals under SPRAY_LOSS_THRESHOLDS: one row per
 // host, closed interval and spine. Empty writes none.
 std::string spine_loss_output_file;
+// SPINE_LOSS_SPARSE on: SPINE_LOSS_OUTPUT_FILE writes a row of a closed
+// interval only where its series sent or lost in it or its grade changed,
+// and one row (spine 0's) of an interval that would write none
+// (spine_loss_rows). Off, the default, writes every row.
+bool spine_loss_sparse = false;
 // One row per retransmission timeout fired, under every mode: the time, the
 // host's rank and the destination's, the requested spine of the oldest
 // outstanding send the timer waited for (empty where no send record is kept
@@ -1912,6 +1917,37 @@ void write_spine_report(uint32_t rank, uint64_t now_ns,
   }
 }
 
+// Under SPINE_LOSS_SPARSE, each series' last grade written, by host and
+// destination (the leaf, the destination's node id, or none for the pooled
+// scores), per spine; 0xffff for none yet.
+std::map<std::pair<uint32_t, int64_t>, std::vector<uint16_t>> spine_loss_grades;
+
+// Whether spine's row of a closed interval of the host's series toward
+// destination is written: every row densely; under SPINE_LOSS_SPARSE a row
+// with a send or a loss in it, or a grade other than the series' last, and
+// spine 0's where the interval would write none, which marks it closed. A
+// reader takes a row left out as no send and no loss at the series' last
+// grade.
+std::vector<bool> spine_loss_rows(uint32_t rank, int64_t destination,
+                                  const std::vector<uint32_t> &sent,
+                                  const std::vector<uint32_t> &lost,
+                                  const std::vector<uint8_t> &grades) {
+  std::vector<bool> rows(sent.size(), true);
+  if (!spine_loss_sparse)
+    return rows;
+  std::vector<uint16_t> &last = spine_loss_grades[{rank, destination}];
+  last.resize(sent.size(), 0xffff);
+  bool any = false;
+  for (uint32_t spine = 0; spine < sent.size(); spine++) {
+    rows[spine] = sent[spine] > 0 || lost[spine] > 0 || last[spine] != grades[spine];
+    last[spine] = grades[spine];
+    any = any || rows[spine];
+  }
+  if (!any && !rows.empty())
+    rows[0] = true;
+  return rows;
+}
+
 // A loss interval the host's pooled scores closed: one row per spine, under
 // the time the interval ended at, with the sends and losses counted in it and
 // the grade its lost fraction earns.
@@ -1919,10 +1955,12 @@ void write_spine_loss_interval(uint32_t rank, uint64_t end_ns,
                                const std::vector<uint32_t> &sent,
                                const std::vector<uint32_t> &lost,
                                const std::vector<uint8_t> &grades) {
+  const std::vector<bool> rows = spine_loss_rows(rank, -1, sent, lost, grades);
   for (uint32_t spine = 0; spine < sent.size(); spine++)
-    fprintf(spine_loss_file, "%lu,%u,%u,%u,%u,%u\n",
-            static_cast<unsigned long>(end_ns), rank, spine, sent[spine],
-            lost[spine], grades[spine]);
+    if (rows[spine])
+      fprintf(spine_loss_file, "%lu,%u,%u,%u,%u,%u\n",
+              static_cast<unsigned long>(end_ns), rank, spine, sent[spine],
+              lost[spine], grades[spine]);
 }
 
 // A loss interval a destination leaf's loss hold closed under reps_hold, or
@@ -1933,10 +1971,12 @@ void write_leaf_spine_loss_interval(uint32_t rank, uint32_t leaf,
                                     const std::vector<uint32_t> &sent,
                                     const std::vector<uint32_t> &lost,
                                     const std::vector<uint8_t> &grades) {
+  const std::vector<bool> rows = spine_loss_rows(rank, leaf, sent, lost, grades);
   for (uint32_t spine = 0; spine < sent.size(); spine++)
-    fprintf(spine_loss_file, "%lu,%u,%u,%u,%u,%u,%u\n",
-            static_cast<unsigned long>(end_ns), rank, leaf, spine, sent[spine],
-            lost[spine], grades[spine]);
+    if (rows[spine])
+      fprintf(spine_loss_file, "%lu,%u,%u,%u,%u,%u,%u\n",
+              static_cast<unsigned long>(end_ns), rank, leaf, spine,
+              sent[spine], lost[spine], grades[spine]);
 }
 
 // A loss interval a destination host's loss hold closed under pair, as
@@ -2808,6 +2848,14 @@ bool ReadConf(string network_configuration) {
       conf >> spine_report_output_file;
     } else if (key.compare("SPINE_LOSS_OUTPUT_FILE") == 0) {
       conf >> spine_loss_output_file;
+    } else if (key.compare("SPINE_LOSS_SPARSE") == 0) {
+      std::string value;
+      conf >> value;
+      if (value != "on" && value != "off") {
+        std::cerr << "SPINE_LOSS_SPARSE must be on or off\n";
+        return false;
+      }
+      spine_loss_sparse = value == "on";
     } else if (key.compare("HOLD_TRACE_HOSTS") == 0) {
       uint32_t count = 0;
       conf >> count;
