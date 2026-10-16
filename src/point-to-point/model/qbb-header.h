@@ -53,7 +53,10 @@ public:
     // the path probe that returns it over the same spine
     // (SetRouteProbeReply).
     FLAG_ROUTE_PROBE = 8,
-    FLAG_ROUTE_PROBE_REPLY = 9
+    FLAG_ROUTE_PROBE_REPLY = 9,
+    // Under SprayDuplicateReport: the acknowledgement answers a data packet
+    // whose sequence the receiver held already (SetDuplicate).
+    FLAG_DUPLICATE = 10
   };
   qbbHeader (uint16_t pg);
   qbbHeader ();
@@ -77,6 +80,8 @@ public:
   // FLAG_ROUTE_PROBE and FLAG_ROUTE_PROBE_REPLY.
   void SetRouteProbe();
   void SetRouteProbeReply();
+  // FLAG_DUPLICATE.
+  void SetDuplicate();
   // The sequence of the data packet this acknowledgement answers, serialized
   // only while CustomHeader::ackCarriesPacketSeq is set.
   void SetPacketSeq(uint32_t seq);

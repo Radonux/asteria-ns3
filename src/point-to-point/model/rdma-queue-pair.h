@@ -63,6 +63,11 @@ public:
 	// lost. A send declared lost may still arrive, and the answer to it would
 	// name the resend's record.
 	bool ResendsLost(uint64_t packet) const;
+	// The packet's sends since its first, this one and its copies included
+	// (NoteCopy), at most 255: above 1, an answer to it may be any of them's.
+	uint8_t Sends(uint64_t packet) const;
+	// A copy of the outstanding send of seq went out too.
+	void NoteCopy(uint64_t seq);
 	bool Trickle(uint64_t packet) const;
 	bool Exploration(uint64_t packet) const;
 	bool Held(uint64_t packet) const;
@@ -103,6 +108,7 @@ private:
 		// end: across every path, then along this record's path.
 		uint64_t older, newer;
 		uint64_t older_on_path, newer_on_path;
+		uint8_t sends;
 	};
 	Record &At(uint64_t packet);
 	const Record &At(uint64_t packet) const;
@@ -112,6 +118,10 @@ private:
 	std::vector<Record> m_ring; // a power of two in size
 	uint64_t m_first; // every packet below it has been removed
 	uint64_t m_oldest, m_newest;
+	// The highest packet number ever sent, kNone before the first send: a
+	// slot from m_first up to it keeps its packet's record once removed, so
+	// its count of sends carries over to the packet's next send.
+	uint64_t m_highest_sent;
 	std::unordered_map<uint16_t, uint64_t> m_newest_on_path;
 	uint64_t m_bytes;
 	// The packets whose last send was declared lost and that have not been
@@ -404,6 +414,28 @@ public:
 	// covered; if so it is counted as an answer loss.
 	bool CoveredAnswerLoss(uint64_t seq, uint64_t size);
 	void CountCoveredAnswerLoss();
+	// SprayDuplicateReport (RdmaHw), under SprayCoverageFirst: the sends a
+	// retransmission timeout declares lost are repaired at once, but their
+	// loss is told to the selector only once the answer to the sequence's
+	// resend shows what became of the first send (ResolveTimedOut). An answer
+	// the receiver flags as a duplicate, of a sequence it held already, shows
+	// the first send delivered: an answer loss, counted in
+	// m_duplicate_answer_losses and told to the selector nowhere. An
+	// unflagged one, or the cumulative acknowledgement covering the sequence
+	// with no answer to its resend, tells the loss on the first send's path
+	// as the timeout would have, counted in m_timeout_data_losses. Each is
+	// told to m_timedOutResolved, with whether it was a duplicate.
+	struct TimedOutSend {
+		uint16_t path;
+		bool trickle;
+	};
+	bool m_deferTimeoutEvidence;
+	std::map<uint64_t, TimedOutSend> m_timedOut;
+	uint32_t m_duplicate_answer_losses;
+	uint32_t m_timeout_data_losses;
+	Callback<void, bool> m_timedOutResolved;
+	// The answer to a send of seq, flagged as a duplicate or not.
+	void ResolveTimedOut(uint64_t seq, bool duplicate, uint64_t nowNs);
 	// Under SprayAnswerPathSeq, the numbered answers read so far.
 	AnswerSequenceTracker m_answerTracker;
 

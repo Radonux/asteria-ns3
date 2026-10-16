@@ -23,16 +23,6 @@ namespace ns3{
 
 namespace {
 
-// The round trip an answer to the outstanding send `packet` measures, from the
-// send's record. An answer to the resend of a send declared lost may be the
-// late answer to that send, so such a resend is not timed (UEC 1.0.3 section
-// 3.6.13.1); a trimmed send is answered by its trim, so its resend is.
-uint64_t AnswerRtt(const OutstandingPackets &outstanding, uint64_t packet){
-	if (packet == OutstandingPackets::kNone || outstanding.ResendsLost(packet))
-		return NsccWindow::kNoRtt;
-	return Simulator::Now().GetNanoSeconds() - outstanding.SentNs(packet);
-}
-
 static_assert(sizeof(std::declval<CustomHeader>().ack.spine_report) ==
 		1 + SpineReport::GradeBytes(SpineReport::kMaxSpines),
 	"an acknowledgement header holds the largest spine report");
@@ -721,6 +711,17 @@ TypeId RdmaHw::GetTypeId (void)
 				BooleanValue(false),
 				MakeBooleanAccessor(&RdmaHw::m_ackRouteOracle),
 				MakeBooleanChecker())
+		.AddAttribute("SprayDuplicateReport",
+				"Under SprayCoverageFirst, whether a receiver flags its answer "
+				"to a data packet whose sequence it held already, and a sender "
+				"tells the selector the loss of a send a retransmission timeout "
+				"declares only at the answer to its resend: none where that "
+				"answer is flagged, an answer loss, and on the first send's "
+				"path where it is not or the cumulative acknowledgement covers "
+				"the sequence first. Default false.",
+				BooleanValue(false),
+				MakeBooleanAccessor(&RdmaHw::m_sprayDuplicateReport),
+				MakeBooleanChecker())
 		.AddAttribute("SprayCoverageFirst",
 				"Under LoadBalancing 2, whether the per-path rule, the held-loss "
 				"rule, a tail repair request, a copy's expiry and "
@@ -1178,6 +1179,17 @@ TypeId RdmaHw::GetTypeId (void)
 				MakeUintegerChecker<uint32_t>(
 					static_cast<uint32_t>(NsccWindowState::Message),
 					static_cast<uint32_t>(NsccWindowState::Connection)))
+		.AddAttribute("NsccRttSample",
+				"Under CC mode 11, which answers give NSCC a round trip: 0=any "
+				"but the first resend after a declared loss; 1=Karn's rule, "
+				"none of a sequence sent more than once while unacknowledged "
+				"(declared lost, trimmed and released, or copied), and each "
+				"sample at least the queue pair's base RTT. Default 0.",
+				UintegerValue(static_cast<uint32_t>(NsccRttSample::Any)),
+				MakeUintegerAccessor(&RdmaHw::m_nsccRttSample),
+				MakeUintegerChecker<uint32_t>(
+					static_cast<uint32_t>(NsccRttSample::Any),
+					static_cast<uint32_t>(NsccRttSample::Karn)))
 		.AddTraceSource("NsccWindow",
 				"Under CC mode 11, the window a queue pair may keep in flight "
 				"changed: the queue pair, then the old and the new window in "
@@ -1266,6 +1278,10 @@ void RdmaHw::Setup(QpCompleteCallback cb, QpFailureCallback failure_cb){
 		"set (CustomHeader::ackReceiverHoldBytes)");
 	NS_ABORT_MSG_IF(!ValidStrayPathSeq(),
 		"SprayStrayPathSeq 1 is read only under SprayPathSeq");
+	NS_ABORT_MSG_IF(!ValidNsccRttSample(),
+		"NsccRttSample 1 is read only under CC mode 11");
+	NS_ABORT_MSG_IF(!ValidDuplicateReport(),
+		"SprayDuplicateReport needs SprayCoverageFirst");
 	NS_ABORT_MSG_IF(!ValidCoverageFirst(),
 		"SprayCoverageFirst is read only under LoadBalancing 2, where every "
 		"send has a record");
@@ -1594,7 +1610,9 @@ int RdmaHw::ReceiveUdp(Ptr<Packet> p, CustomHeader &ch){
 	if (x == 1 || x == 2){ //generate ACK or NACK
 		SendAck(rxQp, ch.dip, ch.sip, ch.udp.dport, ch.udp.sport, ch.udp.pg,
 			ch.udp.ih, ch.udp.seq, ch.ipid, x == 2, ecnbits != 0,
-			AllowanceGone(rxQp), false, redirect);
+			AllowanceGone(rxQp), false, redirect,
+			m_sprayDuplicateReport && accepted == 0 && late_forgiven == 0 &&
+				payload_size > 0);
 	}
 	// After the acknowledgement, so this packet's answer carries the state
 	// this packet produced and anything the report below absorbs is
@@ -2134,8 +2152,11 @@ void RdmaHw::GradeTrim(Ptr<RdmaRxQueuePair> q, const CustomHeader &ch,
 void RdmaHw::SendAck(Ptr<RdmaRxQueuePair> q, uint32_t sourceIp,
 		uint32_t destinationIp, uint16_t sport, uint16_t dport, uint16_t pg,
 		const IntHeader &ih, uint32_t packetSeq, uint16_t identification,
-		bool nack, bool cnp, bool spent, bool probeAnswer, uint8_t redirect){
+		bool nack, bool cnp, bool spent, bool probeAnswer, uint8_t redirect,
+		bool duplicate){
 	qbbHeader seqh;
+	if (duplicate)
+		seqh.SetDuplicate();
 	seqh.SetSeq(q->ReceiverNextExpectedSeq);
 	seqh.SetPacketSeq(packetSeq);
 	seqh.SetPG(pg);
@@ -2306,6 +2327,11 @@ int RdmaHw::ReceiveAck(Ptr<Packet> p, CustomHeader &ch){
 						DecodeRedirect(ch.ack.redirect, m_spineCount),
 						CarryingSpine(ch.ipid), now);
 				qp->m_pathSelector->OnAck(path, cnp, now);
+				// The answer to the resend of a timed-out send, flagged where
+				// the first send had arrived.
+				if (!qp->m_timedOut.empty())
+					qp->ResolveTimedOut(ch.ack.packet_seq,
+						(ch.ack.flags >> qbbHeader::FLAG_DUPLICATE) & 1, now);
 				// The destination's downlink being congested is the receiver's
 				// flow control of UEC 1.0.3 section 3.6.13.2.
 				const uint32_t rcvCwndPend = IsSprayPolicy() &&
@@ -2614,7 +2640,7 @@ void RdmaHw::RecoverTrimmedQueue(Ptr<RdmaQueuePair> qp,
 	}
 	// Timed before the release below removes the trimmed send's record.
 	const uint64_t trimmedRtt = m_cc_mode == 11
-		? AnswerRtt(qp->m_outstanding, qp->m_outstanding.Find(trimStart, path))
+		? AnswerRtt(qp, qp->m_outstanding.Find(trimStart, path))
 		: NsccWindow::kNoRtt;
 	if (m_selective_retransmission){
 		// The notification names the exact trimmed byte range, so repair
@@ -3514,6 +3540,11 @@ bool RdmaHw::StartPathSelection(Ptr<RdmaQueuePair> qp, uint64_t bdpBytes,
 		qp->m_coveredAnswerLoss =
 			MakeCallback(&RdmaHw::ReportCoveredAnswerLoss, this);
 	}
+	if (m_sprayDuplicateReport){
+		qp->m_deferTimeoutEvidence = true;
+		qp->m_timedOutResolved =
+			MakeCallback(&RdmaHw::ReportTimedOutResolved, this);
+	}
 	if (!IsConnectionPathState()){
 		qp->m_pathSelector = MakePathSelector(qp, bdpBytes, baseRttNs);
 		return true;
@@ -4165,7 +4196,7 @@ void RdmaHw::HandleAckNscc(Ptr<RdmaQueuePair> qp, uint64_t seq, uint16_t path,
 		return;
 	// Read before the acknowledgement removes the record.
 	const uint32_t bytes = qp->m_outstanding.Size(packet);
-	const uint64_t rtt = AnswerRtt(qp->m_outstanding, packet);
+	const uint64_t rtt = AnswerRtt(qp, packet);
 	const uint64_t lost = qp->AcknowledgePacket(seq, path);
 	qp->Nscc().OnAck(bytes, marked, rtt, qp->WindowOnTheFly(),
 		Simulator::Now().GetNanoSeconds(), rcvCwndPend);
@@ -4188,6 +4219,30 @@ void RdmaHw::ApplyNsccWindow(Ptr<RdmaQueuePair> qp){
 	}
 	for (const Ptr<RdmaQueuePair> &each : qp->m_nsccConnection->queuePairs)
 		apply(each);
+}
+
+bool RdmaHw::ValidNsccRttSample() const{
+	return m_nsccRttSample == static_cast<uint32_t>(NsccRttSample::Any) ||
+		m_cc_mode == 11;
+}
+
+// The round trip an answer to the outstanding send `packet` measures, from the
+// send's record. An answer to the resend of a send declared lost may be the
+// late answer to that send, so such a resend is not timed (UEC 1.0.3 section
+// 3.6.13.1); a trimmed send is answered by its trim, so its resend is.
+uint64_t RdmaHw::AnswerRtt(Ptr<RdmaQueuePair> qp, uint64_t packet) const{
+	const OutstandingPackets &outstanding = qp->m_outstanding;
+	if (packet == OutstandingPackets::kNone || outstanding.ResendsLost(packet))
+		return NsccWindow::kNoRtt;
+	const uint64_t rtt =
+		Simulator::Now().GetNanoSeconds() - outstanding.SentNs(packet);
+	if (m_nsccRttSample != static_cast<uint32_t>(NsccRttSample::Karn))
+		return rtt;
+	// The answer may be any send's of the sequence, so its round trip is
+	// unknown.
+	if (outstanding.Sends(packet) > 1)
+		return NsccWindow::kNoRtt;
+	return std::max(rtt, qp->m_baseRtt);
 }
 
 bool RdmaHw::ValidNsccWindowState() const{

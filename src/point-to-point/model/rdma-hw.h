@@ -336,6 +336,16 @@ public:
 	bool m_sprayCoverageFirst;
 	bool ValidCoverageFirst() const;
 	void ReportCoveredAnswerLoss();
+	// SprayDuplicateReport, under SprayCoverageFirst: a receiver flags its
+	// answer to a data packet whose sequence it held already
+	// (qbbHeader::FLAG_DUPLICATE), and a sender defers the selector's
+	// evidence of the sends a retransmission timeout declares lost until the
+	// answer to their resend (RdmaQueuePair::m_deferTimeoutEvidence): each
+	// resolved as an answer loss is the host transport event
+	// answer_loss_duplicate, each told as a data loss timeout_loss_data.
+	bool m_sprayDuplicateReport;
+	bool ValidDuplicateReport() const;
+	void ReportTimedOutResolved(bool duplicate);
 	// SprayAnswerPathSeq, under AckRoute Spray with SprayPathSeq and a loss
 	// hold selector (answer-path-seq.h). As a receiver this host numbers
 	// each queue pair's answers per route spine (AnswerSequencer), every
@@ -824,7 +834,8 @@ public:
 	void SendAck(Ptr<RdmaRxQueuePair> q, uint32_t sourceIp,
 		uint32_t destinationIp, uint16_t sport, uint16_t dport, uint16_t pg,
 		const IntHeader &ih, uint32_t packetSeq, uint16_t identification,
-		bool nack, bool cnp, bool spent, bool probeAnswer, uint8_t redirect);
+		bool nack, bool cnp, bool spent, bool probeAnswer, uint8_t redirect,
+		bool duplicate = false);
 	// Read the receiver's two bits off an arriving repair request or
 	// acknowledgement and follow them: eligible with room grants the
 	// exemption and eligible with none returns the sender to its controller,
@@ -1015,6 +1026,14 @@ public:
 	std::unordered_map<uint64_t, std::shared_ptr<NsccConnection>>
 		m_nsccConnections;
 	bool ValidNsccWindowState() const;
+	// NsccRttSample, under CC mode 11 (NsccRttSample in nscc-window.h): the
+	// round trip AnswerRtt gives NSCC for the answer to the outstanding send
+	// packet of qp, or NsccWindow::kNoRtt. Any, the default, refuses only a
+	// first resend after a declared loss; Karn refuses any sequence sent more
+	// than once and floors the sample at qp's base RTT.
+	uint32_t m_nsccRttSample;
+	bool ValidNsccRttSample() const;
+	uint64_t AnswerRtt(Ptr<RdmaQueuePair> qp, uint64_t packet) const;
 	// The window of qp, its own or its connection's, opened, and qp's window
 	// set from it; bdpBytes and baseRttNs as AddQueuePair receives them.
 	void StartNscc(Ptr<RdmaQueuePair> qp, uint64_t bdpBytes,

@@ -16,7 +16,7 @@ namespace ns3 {
  *************************/
 OutstandingPackets::OutstandingPackets()
 	: m_packet_size(0), m_first(0), m_oldest(kNone), m_newest(kNone),
-	  m_bytes(0)
+	  m_highest_sent(kNone), m_bytes(0)
 {
 }
 
@@ -65,8 +65,13 @@ void OutstandingPackets::Add(uint64_t seq, uint32_t size, uint16_t path,
 	const uint64_t olderOnPath = newestOnPath == m_newest_on_path.end()
 		? kNone : newestOnPath->second;
 	const bool resendsLost = m_lost.erase(packet) > 0;
+	const bool sentBefore = m_highest_sent != kNone && packet <= m_highest_sent;
+	const uint8_t sends = sentBefore
+		? static_cast<uint8_t>(std::min<uint32_t>(record.sends + 1u, UINT8_MAX)) : 1;
+	if (!sentBefore)
+		m_highest_sent = packet;
 	record = {sentNs, size, path, pathSeq, true, resendsLost, trickle,
-		trickle || exploration, held, m_newest, kNone, olderOnPath, kNone};
+		trickle || exploration, held, m_newest, kNone, olderOnPath, kNone, sends};
 	if (m_newest != kNone)
 		At(m_newest).newer = packet;
 	else
@@ -121,6 +126,19 @@ uint16_t OutstandingPackets::PathSeq(uint64_t packet) const{
 
 bool OutstandingPackets::ResendsLost(uint64_t packet) const{
 	return At(packet).resends_lost;
+}
+
+uint8_t OutstandingPackets::Sends(uint64_t packet) const{
+	return At(packet).sends;
+}
+
+void OutstandingPackets::NoteCopy(uint64_t seq){
+	const uint64_t packet = seq / m_packet_size;
+	if (m_ring.empty() || packet < m_first || packet - m_first >= m_ring.size() ||
+			!At(packet).outstanding)
+		return;
+	Record &record = At(packet);
+	record.sends = static_cast<uint8_t>(std::min<uint32_t>(record.sends + 1u, UINT8_MAX));
 }
 
 bool OutstandingPackets::Trickle(uint64_t packet) const{
@@ -237,6 +255,9 @@ RdmaQueuePair::RdmaQueuePair(uint16_t pg, Ipv4Address _sip, Ipv4Address _dip, ui
 	m_coverageFirst = false;
 	m_answerCoverage = 0;
 	m_covered_answer_losses = 0;
+	m_deferTimeoutEvidence = false;
+	m_duplicate_answer_losses = 0;
+	m_timeout_data_losses = 0;
 	m_exploration_copies = 0;
 	m_exploration_copies_lost = 0;
 	m_timeouts = 0;
@@ -465,6 +486,7 @@ void RdmaQueuePair::AddCopy(uint64_t seq, uint32_t size, uint16_t path,
 		uint64_t sentNs, bool trickle){
 	m_copies[seq] = ExplorationCopy{size, path, sentNs, trickle, false};
 	m_exploration_copies++;
+	m_outstanding.NoteCopy(seq);
 }
 
 bool RdmaQueuePair::AcknowledgeCopy(uint64_t seq, uint16_t path,
@@ -557,9 +579,34 @@ uint64_t RdmaQueuePair::DeclareLostSentBy(uint64_t sentNs){
 	for (uint64_t oldest = m_outstanding.Oldest();
 			oldest != OutstandingPackets::kNone &&
 				m_outstanding.SentNs(oldest) <= sentNs;
-			oldest = m_outstanding.Oldest())
-		lost += DeclareLost(oldest);
+			oldest = m_outstanding.Oldest()){
+		if (m_deferTimeoutEvidence){
+			// The first send's evidence waits for its resend's answer.
+			m_timedOut.emplace(m_outstanding.Seq(oldest), TimedOutSend{
+				m_outstanding.Path(oldest), m_outstanding.Trickle(oldest)});
+			lost += DeclareLost(oldest, false);
+		}else
+			lost += DeclareLost(oldest);
+	}
 	return lost;
+}
+
+void RdmaQueuePair::ResolveTimedOut(uint64_t seq, bool duplicate,
+		uint64_t nowNs){
+	const auto send = m_timedOut.find(seq);
+	if (send == m_timedOut.end())
+		return;
+	if (duplicate){
+		m_duplicate_answer_losses++;
+	}else{
+		m_pathSelector->OnLoss(send->second.path, nowNs);
+		if (send->second.trickle)
+			m_pathSelector->OnTrickleAnswer(send->second.path, true, nowNs);
+		m_timeout_data_losses++;
+	}
+	m_timedOut.erase(send);
+	if (!m_timedOutResolved.IsNull())
+		m_timedOutResolved(duplicate);
 }
 
 uint64_t RdmaQueuePair::DeclareLostOnPathSeqs(uint16_t path, uint16_t first,
@@ -697,6 +744,10 @@ uint32_t RdmaQueuePair::GetHash(void){
 void RdmaQueuePair::Acknowledge(uint64_t ack, bool keepCovered){
 	if (ack > snd_una){
 		snd_una = ack;
+		// A timed-out sequence acknowledged with no answer to its resend.
+		while (!m_timedOut.empty() && m_timedOut.begin()->first < snd_una)
+			ResolveTimedOut(m_timedOut.begin()->first, false,
+				Simulator::Now().GetNanoSeconds());
 		if (m_outstanding.IsKept() && keepCovered){
 			std::vector<OutstandingPackets::Unanswered> unanswered;
 			m_outstanding.RemoveBelow(snd_una, &unanswered);

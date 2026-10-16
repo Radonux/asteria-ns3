@@ -86,6 +86,9 @@ namespace ns3 {
 	void qbbHeader::SetRouteProbeReply(){
 		flags |= 1 << FLAG_ROUTE_PROBE_REPLY;
 	}
+	void qbbHeader::SetDuplicate(){
+		flags |= 1 << FLAG_DUPLICATE;
+	}
 	void qbbHeader::SetPacketSeq(uint32_t seq){
 		m_packetSeq = seq;
 	}

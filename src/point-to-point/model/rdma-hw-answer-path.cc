@@ -18,6 +18,15 @@ void RdmaHw::ReportCoveredAnswerLoss(){
 	ReportTransportEvent("answer_loss_covered", 0);
 }
 
+bool RdmaHw::ValidDuplicateReport() const{
+	return !m_sprayDuplicateReport || m_sprayCoverageFirst;
+}
+
+void RdmaHw::ReportTimedOutResolved(bool duplicate){
+	ReportTransportEvent(duplicate ? "answer_loss_duplicate"
+		: "timeout_loss_data", 0);
+}
+
 bool RdmaHw::ValidAnswerPathSeq() const{
 	if (CustomHeader::ackAnswerSeqBytes != (m_sprayAnswerPathSeq ? 5u : 0u) ||
 			CustomHeader::udpAnswerHoldBytes != (m_sprayAnswerPathSeq ? 1u : 0u))

@@ -9546,6 +9546,307 @@ class CoverageFirstTest : public TestCase
     }
 };
 
+/**
+ * NsccRttSample: under Karn an answer to a sequence sent more than once gives
+ * no round trip, whatever became of the earlier sends, and every sample is
+ * floored at the queue pair's base RTT; under Any, the default, an answer to
+ * a first send that arrives once its sequence has been resent after a trim
+ * release is taken for the resend's.
+ */
+class NsccRttSampleTest : public TestCase
+{
+  public:
+    NsccRttSampleTest()
+        : TestCase("Under NsccRttSample Karn no answer to a sequence sent more than once, "
+                   "after a declared loss, trim releases or a copy, gives NSCC a round trip, "
+                   "and a sample below the base RTT is raised to it, so NSCC's base RTT stays "
+                   "the configured one; under Any the late answer of a first send is taken "
+                   "for its resend's")
+    {
+    }
+
+    void DoRun() override
+    {
+        Counts();
+        Misattributed(NsccRttSample::Any);
+        Misattributed(NsccRttSample::Karn);
+        Floor(NsccRttSample::Any);
+        Floor(NsccRttSample::Karn);
+        Copied();
+        Valid();
+        Simulator::Destroy();
+    }
+
+  private:
+    static constexpr uint64_t kBaseRttNs = 12000;
+    static constexpr uint64_t kBdp = 150000;
+
+    void Counts()
+    {
+        OutstandingPackets sends;
+        sends.SetPacketSize(1000);
+        sends.Add(0, 1000, 1, 0);
+        sends.Add(1000, 1000, 1, 10);
+        NS_TEST_EXPECT_MSG_EQ(uint32_t(sends.Sends(0)), 1u, "a first send");
+        sends.Remove(0);
+        sends.Add(0, 1000, 2, 20);
+        NS_TEST_EXPECT_MSG_EQ(uint32_t(sends.Sends(0)), 2u, "a resend after a removal counts twice");
+        sends.RemoveLost(0);
+        sends.Add(0, 1000, 2, 30);
+        NS_TEST_EXPECT_MSG_EQ(uint32_t(sends.Sends(0)), 3u, "and after a declared loss three times");
+        sends.NoteCopy(1000);
+        NS_TEST_EXPECT_MSG_EQ(uint32_t(sends.Sends(1)), 2u, "a copy counts as a send");
+        sends.Add(2000, 1000, 1, 40);
+        NS_TEST_EXPECT_MSG_EQ(uint32_t(sends.Sends(2)), 1u, "a new packet starts at one");
+        sends.RemoveBelow(3000);
+        sends.Add(3000, 1000, 1, 50);
+        NS_TEST_EXPECT_MSG_EQ(uint32_t(sends.Sends(3)), 1u, "as after the cumulative acknowledgement");
+    }
+
+    // A sender host under NSCC with one queue pair of base RTT kBaseRttNs.
+    static Ptr<RdmaQueuePair> Sender(IsolatedHost& host, NsccRttSample sample)
+    {
+        host.hw->m_cc_mode = 11;
+        host.hw->m_nsccRttSample = static_cast<uint32_t>(sample);
+        Ptr<RdmaQueuePair> qp = host.AddSender(kTestSender, kTestReceiver, 100 * IsolatedHost::kMtu);
+        qp->SetBaseRtt(kBaseRttNs);
+        host.hw->StartNscc(qp, kBdp, kBaseRttNs);
+        return qp;
+    }
+
+    // The diagnosed case: seq 0 along path 2, declared lost, resent, the
+    // resend trimmed and released and resent, twice; the first send's answer
+    // arrives 1 ns after the last resend left.
+    void Misattributed(NsccRttSample sample)
+    {
+        IsolatedHost host(LoadBalancingMode::SprayUniform, kTestReceiver, 8);
+        Ptr<RdmaQueuePair> qp = Sender(host, sample);
+        const uint64_t maxWnd = qp->Nscc().MaxWnd();
+        const uint32_t mtu = IsolatedHost::kMtu;
+        Simulator::Schedule(NanoSeconds(0), [&]() { qp->m_outstanding.Add(0, mtu, 2, 0); });
+        Simulator::Schedule(NanoSeconds(30000), [&]() { qp->DeclareLostSentBy(0); });
+        Simulator::Schedule(NanoSeconds(30100), [&]() { qp->m_outstanding.Add(0, mtu, 2, 30100); });
+        Simulator::Schedule(NanoSeconds(40000), [&]() { qp->ReleasePacket(0, 2); });
+        Simulator::Schedule(NanoSeconds(40000), [&]() { qp->m_outstanding.Add(0, mtu, 2, 40000); });
+        Simulator::Schedule(NanoSeconds(50000), [&]() { qp->ReleasePacket(0, 2); });
+        Simulator::Schedule(NanoSeconds(60000), [&]() { qp->m_outstanding.Add(0, mtu, 2, 60000); });
+        Simulator::Schedule(NanoSeconds(60001), [&]() { host.hw->HandleAckNscc(qp, 0, 2, false, 0); });
+        Simulator::Run();
+        Simulator::Destroy();
+        if (sample == NsccRttSample::Any)
+        {
+            NS_TEST_EXPECT_MSG_EQ(qp->Nscc().BaseRtt(), 1u, "under Any the 1 ns sample is taken");
+            NS_TEST_EXPECT_MSG_LT(qp->Nscc().MaxWnd(), uint64_t(mtu), "and MaxWnd falls below a packet");
+        }
+        else
+        {
+            NS_TEST_EXPECT_MSG_EQ(qp->Nscc().BaseRtt(), kBaseRttNs, "under Karn the base RTT stays");
+            NS_TEST_EXPECT_MSG_EQ(qp->Nscc().MaxWnd(), maxWnd, "and MaxWnd with it");
+        }
+    }
+
+    // A first send answered 5 ns after it left.
+    void Floor(NsccRttSample sample)
+    {
+        IsolatedHost host(LoadBalancingMode::SprayUniform, kTestReceiver, 8);
+        Ptr<RdmaQueuePair> qp = Sender(host, sample);
+        Simulator::Schedule(NanoSeconds(100), [&]() { qp->m_outstanding.Add(0, IsolatedHost::kMtu, 3, 100); });
+        Simulator::Schedule(NanoSeconds(105), [&]() { host.hw->HandleAckNscc(qp, 0, 3, false, 0); });
+        Simulator::Run();
+        Simulator::Destroy();
+        NS_TEST_EXPECT_MSG_EQ(qp->Nscc().BaseRtt(),
+                              (sample == NsccRttSample::Karn ? kBaseRttNs : uint64_t(5)),
+                              "the sample is floored at the base RTT only under Karn");
+    }
+
+    // A send whose copy went out too gives no sample under Karn.
+    void Copied()
+    {
+        IsolatedHost host(LoadBalancingMode::SprayUniform, kTestReceiver, 8);
+        Ptr<RdmaQueuePair> qp = Sender(host, NsccRttSample::Karn);
+        qp->m_outstanding.Add(0, IsolatedHost::kMtu, 3, 0);
+        qp->AddCopy(0, IsolatedHost::kMtu, 5, 0, false);
+        NS_TEST_EXPECT_MSG_EQ(host.hw->AnswerRtt(qp, qp->m_outstanding.Find(0, 3)),
+                              NsccWindow::kNoRtt,
+                              "a copied send's answer gives no round trip");
+        qp->m_outstanding.Add(IsolatedHost::kMtu, IsolatedHost::kMtu, 3, 0);
+        Simulator::Schedule(NanoSeconds(20000), [&]() {
+            NS_TEST_EXPECT_MSG_EQ(host.hw->AnswerRtt(qp, qp->m_outstanding.Find(IsolatedHost::kMtu, 3)),
+                                  20000u,
+                                  "a send's single answer does");
+        });
+        Simulator::Run();
+        Simulator::Destroy();
+    }
+
+    void Valid()
+    {
+        Ptr<RdmaHw> hw = CreateObject<RdmaHw>();
+        NS_TEST_EXPECT_MSG_EQ(hw->m_nsccRttSample, static_cast<uint32_t>(NsccRttSample::Any),
+                              "Any is the default");
+        hw->m_nsccRttSample = static_cast<uint32_t>(NsccRttSample::Karn);
+        hw->m_cc_mode = 1;
+        NS_TEST_EXPECT_MSG_EQ(hw->ValidNsccRttSample(), false, "Karn is NSCC's alone");
+        hw->m_cc_mode = 11;
+        NS_TEST_EXPECT_MSG_EQ(hw->ValidNsccRttSample(), true, "and accepted under it");
+    }
+};
+
+/**
+ * SprayDuplicateReport: the receiver flags its answer to a sequence it held
+ * already, and the sender tells the selector a timed-out send's loss only at
+ * the answer to its resend.
+ */
+class DuplicateReportTest : public TestCase
+{
+  public:
+    DuplicateReportTest()
+        : TestCase("Under SprayDuplicateReport a receiver flags the answer to a data packet it "
+                   "held already, and a sender under SprayCoverageFirst counts a timed-out send "
+                   "as an answer loss where its resend's answer is flagged, and tells its loss on "
+                   "the first send's path where the answer is not flagged or the cumulative "
+                   "acknowledgement covers it first")
+    {
+    }
+
+    void DoRun() override
+    {
+        const bool savedPacketSeq = CustomHeader::ackCarriesPacketSeq;
+        CustomHeader::ackCarriesPacketSeq = true;
+        Receiver(false);
+        Receiver(true);
+        Sender();
+        Answers();
+        Valid();
+        CustomHeader::ackCarriesPacketSeq = savedPacketSeq;
+        Simulator::Destroy();
+    }
+
+  private:
+    static bool Flagged(const CustomHeader& answer)
+    {
+        return (answer.ack.flags >> qbbHeader::FLAG_DUPLICATE) & 1;
+    }
+
+    void Receiver(bool on)
+    {
+        IsolatedHost receiver(LoadBalancingMode::SprayUniform, kTestSender, 8);
+        receiver.hw->m_sprayDuplicateReport = on;
+        receiver.ReceiveData(kTestSender, kTestReceiver, 0, SpineIdentification(1, 1));
+        NS_TEST_EXPECT_MSG_EQ(Flagged(receiver.emitted.back()), false, "a first arrival is not flagged");
+        receiver.ReceiveData(kTestSender, kTestReceiver, 0, SpineIdentification(2, 2));
+        NS_TEST_EXPECT_MSG_EQ(Flagged(receiver.emitted.back()), on, "a second one is, with the key");
+        receiver.ReceiveData(kTestSender, kTestReceiver, IsolatedHost::kMtu, SpineIdentification(3, 3));
+        NS_TEST_EXPECT_MSG_EQ(Flagged(receiver.emitted.back()), false, "a new sequence is not");
+    }
+
+    static uint32_t Losses(const ScriptedSelector& selector, const std::string& told)
+    {
+        return std::count(selector.told.begin(), selector.told.end(), told);
+    }
+
+    // A queue pair under the key with sends of seq 0, 1000 and 2000 along
+    // paths 1, 2 and 3, all timed out.
+    static Ptr<RdmaQueuePair> TimedOut(ScriptedSelector*& selector, std::vector<bool>& resolved)
+    {
+        Ptr<RdmaQueuePair> qp = CreateObject<RdmaQueuePair>(3, kTestSender, kTestReceiver, 10000, 10001);
+        qp->m_size = 8 * IsolatedHost::kMtu;
+        qp->m_coverageFirst = true;
+        qp->m_deferTimeoutEvidence = true;
+        qp->m_outstanding.SetPacketSize(IsolatedHost::kMtu);
+        auto scripted = std::make_unique<ScriptedSelector>(std::vector<uint16_t>{1});
+        selector = scripted.get();
+        qp->m_pathSelector = std::move(scripted);
+        qp->m_timedOutResolved = Callback<void, bool>([&resolved](bool duplicate) { resolved.push_back(duplicate); });
+        for (uint16_t k = 0; k < 3; ++k)
+        {
+            qp->m_outstanding.Add(k * IsolatedHost::kMtu, IsolatedHost::kMtu, k + 1, 0);
+        }
+        qp->DeclareLostSentBy(0);
+        return qp;
+    }
+
+    void Sender()
+    {
+        ScriptedSelector* selector = nullptr;
+        std::vector<bool> resolved;
+        Ptr<RdmaQueuePair> qp = TimedOut(selector, resolved);
+        NS_TEST_EXPECT_MSG_EQ(qp->RepairBytesLeft(), uint64_t(3 * IsolatedHost::kMtu), "all three are repaired");
+        NS_TEST_EXPECT_MSG_EQ(Losses(*selector, "loss 1") + Losses(*selector, "loss 2") + Losses(*selector, "loss 3"),
+                              0u,
+                              "and no loss is told yet");
+        NS_TEST_EXPECT_MSG_EQ(qp->m_timedOut.size(), 3u, "each waits for its resend's answer");
+        qp->ResolveTimedOut(0, true, 100);
+        NS_TEST_EXPECT_MSG_EQ(Losses(*selector, "loss 1"), 0u, "a flagged answer tells no loss");
+        NS_TEST_EXPECT_MSG_EQ(qp->m_duplicate_answer_losses, 1u, "and counts an answer loss");
+        qp->ResolveTimedOut(IsolatedHost::kMtu, false, 100);
+        NS_TEST_EXPECT_MSG_EQ(Losses(*selector, "loss 2"), 1u, "an unflagged one tells it on the first path");
+        NS_TEST_EXPECT_MSG_EQ(qp->m_timeout_data_losses, 1u, "as a data loss");
+        qp->Acknowledge(3 * IsolatedHost::kMtu, false);
+        NS_TEST_EXPECT_MSG_EQ(Losses(*selector, "loss 3"), 1u, "a sequence acknowledged first is told too");
+        NS_TEST_EXPECT_MSG_EQ(qp->m_timedOut.size(), 0u, "and nothing waits");
+        NS_TEST_EXPECT_MSG_EQ((resolved == std::vector<bool>{true, false, false}), true, "each told once");
+        // Without the key the timeout tells its losses at once.
+        ScriptedSelector* plain = nullptr;
+        std::vector<bool> none;
+        Ptr<RdmaQueuePair> off = CreateObject<RdmaQueuePair>(3, kTestSender, kTestReceiver, 10000, 10001);
+        off->m_size = 8 * IsolatedHost::kMtu;
+        off->m_outstanding.SetPacketSize(IsolatedHost::kMtu);
+        auto scripted = std::make_unique<ScriptedSelector>(std::vector<uint16_t>{1});
+        plain = scripted.get();
+        off->m_pathSelector = std::move(scripted);
+        off->m_outstanding.Add(0, IsolatedHost::kMtu, 4, 0);
+        off->DeclareLostSentBy(0);
+        NS_TEST_EXPECT_MSG_EQ(Losses(*plain, "loss 4"), 1u, "without the key the loss is told at once");
+        NS_TEST_EXPECT_MSG_EQ(off->m_timedOut.size(), 0u, "and nothing waits");
+    }
+
+    // The answers as the sender's host reads them.
+    void Answers()
+    {
+        IsolatedHost sender(LoadBalancingMode::SprayUniform, kTestReceiver, 8);
+        sender.hw->m_sprayCoverageFirst = true;
+        sender.hw->m_sprayDuplicateReport = true;
+        std::map<std::string, uint32_t> events;
+        sender.hw->m_transportEventCallback = Callback<void, const char*, uint64_t>(
+            [&events](const char* event, uint64_t) { ++events[event]; });
+        Ptr<RdmaQueuePair> qp = sender.AddSender(kTestSender, kTestReceiver, 8 * IsolatedHost::kMtu);
+        NS_TEST_ASSERT_MSG_EQ(qp->m_deferTimeoutEvidence, true, "the key reaches the queue pair");
+        qp->m_outstanding.Add(0, IsolatedHost::kMtu, 1, 0);
+        qp->m_outstanding.Add(IsolatedHost::kMtu, IsolatedHost::kMtu, 2, 0);
+        qp->snd_nxt = 2 * IsolatedHost::kMtu;
+        qp->DeclareLostSentBy(0);
+        const auto answer = [&](uint32_t seq, uint8_t spine, bool duplicate) {
+            CustomHeader ack;
+            ack.l3Prot = 0xFC;
+            ack.sip = kTestReceiver.Get();
+            ack.ipid = SpineIdentification(spine, spine);
+            ack.ack.flags = duplicate ? 1 << qbbHeader::FLAG_DUPLICATE : 0;
+            ack.ack.sport = IsolatedHost::kReceiverPort;
+            ack.ack.dport = IsolatedHost::kSenderPort;
+            ack.ack.pg = IsolatedHost::kPriorityGroup;
+            ack.ack.seq = 0;
+            ack.ack.packet_seq = seq;
+            sender.hw->ReceiveAck(Create<Packet>(), ack);
+        };
+        answer(0, 5, true);
+        answer(IsolatedHost::kMtu, 6, false);
+        NS_TEST_EXPECT_MSG_EQ(events["answer_loss_duplicate"], 1u, "a flagged resend answer is an answer loss");
+        NS_TEST_EXPECT_MSG_EQ(events["timeout_loss_data"], 1u, "an unflagged one a data loss");
+        NS_TEST_EXPECT_MSG_EQ(qp->m_timedOut.size(), 0u, "both resolved");
+    }
+
+    void Valid()
+    {
+        Ptr<RdmaHw> hw = CreateObject<RdmaHw>();
+        NS_TEST_EXPECT_MSG_EQ(hw->m_sprayDuplicateReport, false, "off by default");
+        hw->m_sprayDuplicateReport = true;
+        NS_TEST_EXPECT_MSG_EQ(hw->ValidDuplicateReport(), false, "refused without coverage first");
+        hw->m_sprayCoverageFirst = true;
+        NS_TEST_EXPECT_MSG_EQ(hw->ValidDuplicateReport(), true, "accepted with it");
+    }
+};
+
 class HeldSpineLeakTest : public TestCase
 {
   public:
@@ -16066,6 +16367,8 @@ PointToPointTestSuite::PointToPointTestSuite()
     AddTestCase(new RepsHoldDuplicateTest, TestCase::Duration::QUICK);
     AddTestCase(new CopyExpiryTest, TestCase::Duration::QUICK);
     AddTestCase(new CoverageFirstTest, TestCase::Duration::QUICK);
+    AddTestCase(new NsccRttSampleTest, TestCase::Duration::QUICK);
+    AddTestCase(new DuplicateReportTest, TestCase::Duration::QUICK);
     AddTestCase(new RetransmissionTimeoutTraceTest, TestCase::Duration::QUICK);
     AddTestCase(new HeldSpineLeakTest, TestCase::Duration::QUICK);
     AddTestCase(new HeldSpineFastLossTest, TestCase::Duration::QUICK);

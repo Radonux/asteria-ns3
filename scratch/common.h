@@ -70,6 +70,15 @@ uint32_t cc_mode = 1;
 // timers. The other CC modes keep their state per queue pair and refuse it.
 std::string nscc_window_state = "message";
 bool nscc_window_state_given = false;
+// Under CC_MODE 11 (NSCC), NSCC_RTT_SAMPLE any or karn: which answers give
+// NSCC a round trip. any, the default, takes every answer but that of a
+// sequence's first resend after it was declared lost, matched to the newest
+// send of its sequence along its path. karn takes Karn's rule: no answer to a
+// sequence sent more than once while unacknowledged, whatever became of the
+// earlier send (declared lost, trimmed and released, or copied), and floors
+// every sample at the queue pair's base RTT, below which no answer returns.
+std::string nscc_rtt_sample = "any";
+bool nscc_rtt_sample_given = false;
 bool enable_qcn = true, use_dynamic_pfc_threshold = true;
 uint32_t packet_payload_size = 1000, l2_chunk_size = 0, l2_ack_interval = 0;
 double pause_time = 5, simulator_stop_time = 3.01;
@@ -505,6 +514,16 @@ bool spray_stray_path_seq_given = false;
 // SPRAY_ACK_LOSS_RTTS declares are counted so too. Off, the default.
 std::string spray_coverage_first = "off";
 bool spray_coverage_first_given = false;
+// With SPRAY_COVERAGE_FIRST on, SPRAY_DUPLICATE_REPORT on: a receiver flags its
+// answer to a data packet whose sequence it held already, and a sender tells
+// the selector the loss of a send a retransmission timeout declares only at
+// the answer to its resend: none where that answer is flagged, the first send
+// having arrived, counted as the host transport event answer_loss_duplicate;
+// and on the first send's path where it is not, or the cumulative
+// acknowledgement covers the sequence first, counted as timeout_loss_data.
+// Off, the default.
+std::string spray_duplicate_report = "off";
+bool spray_duplicate_report_given = false;
 // Under ACK_ROUTE spray with SPRAY_PATH_SEQ on and a loss hold PATH_SELECTOR,
 // SPRAY_ANSWER_PATH_SEQ on: a receiving host numbers each queue pair's answers
 // per route spine, and each answer announces another route's count. The
@@ -2549,6 +2568,9 @@ bool ReadConf(string network_configuration) {
     } else if (key.compare("SPRAY_COVERAGE_FIRST") == 0) {
       conf >> spray_coverage_first;
       spray_coverage_first_given = true;
+    } else if (key.compare("SPRAY_DUPLICATE_REPORT") == 0) {
+      conf >> spray_duplicate_report;
+      spray_duplicate_report_given = true;
     } else if (key.compare("SPRAY_ANSWER_PATH_SEQ") == 0) {
       conf >> spray_answer_path_seq;
       spray_answer_path_seq_given = true;
@@ -2582,6 +2604,9 @@ bool ReadConf(string network_configuration) {
 	  conf >> trimmed_queue_bytes;
     } else if (key.compare("CC_MODE") == 0) {
       conf >> cc_mode;
+    } else if (key.compare("NSCC_RTT_SAMPLE") == 0) {
+      conf >> nscc_rtt_sample;
+      nscc_rtt_sample_given = true;
     } else if (key.compare("NSCC_WINDOW_STATE") == 0) {
       conf >> nscc_window_state;
       nscc_window_state_given = true;
@@ -3133,6 +3158,15 @@ bool ReadConf(string network_configuration) {
                  "spray_uniform\n";
     return false;
   }
+  if (spray_duplicate_report != "on" && spray_duplicate_report != "off") {
+    std::cerr << "SPRAY_DUPLICATE_REPORT must be on or off\n";
+    return false;
+  }
+  if (spray_duplicate_report_given && spray_coverage_first != "on") {
+    std::cerr << "SPRAY_DUPLICATE_REPORT is read only with SPRAY_COVERAGE_FIRST "
+                 "on\n";
+    return false;
+  }
   if (spray_answer_path_seq != "on" && spray_answer_path_seq != "off") {
     std::cerr << "SPRAY_ANSWER_PATH_SEQ must be on or off\n";
     return false;
@@ -3222,6 +3256,14 @@ bool ReadConf(string network_configuration) {
   }
   if (nscc_window_state_given && cc_mode != 11) {
     std::cerr << "NSCC_WINDOW_STATE is read only under CC_MODE 11 (NSCC)\n";
+    return false;
+  }
+  if (nscc_rtt_sample != "any" && nscc_rtt_sample != "karn") {
+    std::cerr << "NSCC_RTT_SAMPLE must be any or karn\n";
+    return false;
+  }
+  if (nscc_rtt_sample_given && cc_mode != 11) {
+    std::cerr << "NSCC_RTT_SAMPLE is read only under CC_MODE 11 (NSCC)\n";
     return false;
   }
   if (load_balancing_value() != static_cast<uint32_t>(LoadBalancingMode::Ecmp) &&
@@ -3440,6 +3482,9 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),
   // Written where their key is on.
   if (spray_coverage_first == "on")
     transport_event_totals[{"answer_loss_covered", "control"}];
+  if (spray_duplicate_report == "on")
+    for (const char *event : {"answer_loss_duplicate", "timeout_loss_data"})
+      transport_event_totals[{event, "control"}];
   if (answer_path_seq())
     for (const char *event : {"answer_route_lost", "answer_route_hold",
                               "answer_route_release", "answer_probe"})
@@ -3723,6 +3768,11 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),
           UintegerValue(static_cast<uint32_t>(
               nscc_window_state == "connection" ? NsccWindowState::Connection
                                                 : NsccWindowState::Message)));
+      rdmaHw->SetAttribute(
+          "NsccRttSample",
+          UintegerValue(static_cast<uint32_t>(nscc_rtt_sample == "karn"
+                                                  ? NsccRttSample::Karn
+                                                  : NsccRttSample::Any)));
       rdmaHw->SetAttribute("RateDecreaseInterval",
                            DoubleValue(rate_decrease_interval));
       rdmaHw->SetAttribute("MinRate", DataRateValue(DataRate(min_rate)));
@@ -3819,6 +3869,8 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),
           BooleanValue(spray_receiver_tail_missing == "on"));
       rdmaHw->SetAttribute("SprayCoverageFirst",
                            BooleanValue(spray_coverage_first == "on"));
+      rdmaHw->SetAttribute("SprayDuplicateReport",
+                           BooleanValue(spray_duplicate_report == "on"));
       rdmaHw->SetAttribute("SprayAnswerPathSeq",
                            BooleanValue(answer_path_seq()));
       rdmaHw->SetAttribute("SprayAnswerProbeIntervalNs",

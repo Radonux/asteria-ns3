@@ -5,6 +5,18 @@
 
 namespace ns3 {
 
+// Which round trips of its answers a sending host gives NSCC (RdmaHw
+// NsccRttSample). Any: the answer to any send but a resend of one declared
+// lost, the first resend after the declaration. Karn: Karn's rule, no answer
+// to a sequence sent more than once while unacknowledged, whatever became of
+// the earlier send (declared lost, trimmed and released, or copied), and
+// every sample floored at the queue pair's base RTT, the propagation and
+// serialization round trip below which no answer returns.
+enum class NsccRttSample : uint32_t {
+	Any = 0,
+	Karn,
+};
+
 // How long a sending host keeps an NSCC window: for one queue pair, which
 // carries one message, or for the connection to a destination and priority
 // group, shared by the queue pairs to it and kept past them.
