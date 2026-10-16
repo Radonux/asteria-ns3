@@ -375,7 +375,10 @@ bool spray_held_loss_rtts_given = false;
 // queue pair's base RTTs without an answer is followed by another of the
 // same send, up to SPRAY_OVERDUE_REPAIR_LIMIT repairs (at least 1, default 2)
 // until the queue pair's next answer or retransmission timeout; the limit is
-// read under reprobe alone. Off, the default.
+// read under reprobe alone. reprobe, and no other value, is also read under
+// reps_spine, reps_oracle and the uniform draw (LOAD_BALANCING spray_uniform
+// without a selector), whose sends no hold holds, after
+// SPRAY_HELD_LOSS_RTTS's wait, which only it reads there. Off, the default.
 std::string spray_overdue_repair = "off";
 bool spray_overdue_repair_given = false;
 uint32_t spray_overdue_repair_limit = 2;
@@ -2476,11 +2479,20 @@ bool valid_hold_rule() {
     std::cerr << "SPRAY_OVERDUE_REPAIR_LIMIT must be at least 1\n";
     return false;
   }
+  // Without a loss hold, reps_spine, reps_oracle and the uniform draw read
+  // reprobe alone.
+  const bool overdue_without_hold =
+      load_balancing == "spray_uniform" &&
+      (path_selector == "reps_spine" || path_selector == "reps_oracle" ||
+       path_selector == "ops") &&
+      (spray_overdue_repair == "reprobe" || spray_overdue_repair == "off");
   if (spray_overdue_repair_given &&
-      (!reps_hold() || !(spray_held_loss_rtts > 0))) {
+      ((!reps_hold() && !overdue_without_hold) ||
+       !(spray_held_loss_rtts > 0))) {
     std::cerr << "SPRAY_OVERDUE_REPAIR is read only under PATH_SELECTOR "
-                 "reps_hold, reps_flow_hold or mrc_hold with "
-                 "SPRAY_HELD_LOSS_RTTS above 0\n";
+                 "reps_hold, reps_flow_hold or mrc_hold, or as reprobe or "
+                 "off under reps_spine, reps_oracle or the uniform draw, "
+                 "with SPRAY_HELD_LOSS_RTTS above 0\n";
     return false;
   }
   if (spray_hold_release_value() == std::numeric_limits<uint32_t>::max()) {

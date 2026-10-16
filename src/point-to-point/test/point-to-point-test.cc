@@ -10339,6 +10339,27 @@ class OverdueRepairTest : public TestCase
         hw->m_sprayHeldLossRtts = 0;
         NS_TEST_EXPECT_MSG_EQ(hw->ValidOverdueRepair(), false, "but not with SprayHeldLossRtts 0");
         NS_TEST_EXPECT_MSG_EQ(hw->m_sprayOverdueRepairLimit, 2u, "two repairs under reprobe by default");
+        // Without a loss hold, reprobe alone, under REPS, the oracle and the
+        // uniform draw.
+        hw->m_sprayHeldLossRtts = 2;
+        hw->m_loadBalancing = static_cast<uint32_t>(LoadBalancingMode::SprayUniform);
+        for (const PathSelectorKind kind :
+             {PathSelectorKind::RepsSpine, PathSelectorKind::RepsOracle, PathSelectorKind::Ops})
+        {
+            hw->m_pathSelectorKind = static_cast<uint32_t>(kind);
+            hw->m_sprayOverdueRepair = static_cast<uint32_t>(OverdueRepair::Reprobe);
+            NS_TEST_EXPECT_MSG_EQ(hw->ValidOverdueRepair(), true, "reprobe accepted without a loss hold");
+            hw->m_sprayOverdueRepair = static_cast<uint32_t>(OverdueRepair::Probe);
+            NS_TEST_EXPECT_MSG_EQ(hw->ValidOverdueRepair(), false, "probe refused there");
+            hw->m_sprayOverdueRepair = static_cast<uint32_t>(OverdueRepair::Evidence);
+            NS_TEST_EXPECT_MSG_EQ(hw->ValidOverdueRepair(), false, "as is evidence");
+        }
+        hw->m_sprayOverdueRepair = static_cast<uint32_t>(OverdueRepair::Reprobe);
+        hw->m_pathSelectorKind = static_cast<uint32_t>(PathSelectorKind::AckRedirect);
+        NS_TEST_EXPECT_MSG_EQ(hw->ValidOverdueRepair(), false, "refused under ack_redirect");
+        hw->m_pathSelectorKind = static_cast<uint32_t>(PathSelectorKind::Ops);
+        hw->m_loadBalancing = static_cast<uint32_t>(LoadBalancingMode::Ecmp);
+        NS_TEST_EXPECT_MSG_EQ(hw->ValidOverdueRepair(), false, "and without spraying");
     }
 };
 

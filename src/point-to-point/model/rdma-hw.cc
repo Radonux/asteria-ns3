@@ -657,13 +657,18 @@ TypeId RdmaHw::GetTypeId (void)
 				"under SpraySentinelMode 0 or any send while every spine is "
 				"held, is declared lost if it is still unacknowledged, and "
 				"repaired, without waiting for the retransmission timeout. "
-				"0 waits for the timeout. Default 2.",
+				"0 waits for the timeout. Under SprayOverdueRepair 3 with "
+				"PathSelector 8 or 10 or the uniform draw, the wait of the "
+				"overdue repair alone. Default 2.",
 				DoubleValue(2),
 				MakeDoubleAccessor(&RdmaHw::m_sprayHeldLossRtts),
 				MakeDoubleChecker<double>(0))
 		.AddAttribute("SprayOverdueRepair",
 				"Under PathSelector 6, 7 and 9 with SprayHeldLossRtts above "
-				"zero, whether a queue pair's latest send on a spine not held "
+				"zero (3 alone also under PathSelector 8 and 10 and the "
+				"uniform draw, LoadBalancing 2 with PathSelector 0, whose "
+				"sends no hold holds), whether a queue pair's latest send on "
+				"a spine not held "
 				"as it was chosen is repaired, as a held send is, once its "
 				"answer is overdue by SprayHeldLossRtts base RTTs: one repair "
 				"until the queue pair's next answer or retransmission timeout. "
@@ -1323,8 +1328,8 @@ void RdmaHw::Setup(QpCompleteCallback cb, QpFailureCallback failure_cb){
 		"loss hold (PathSelector 6 or 9 with SprayHoldScope auto) under "
 		"SprayHoldRule 0");
 	NS_ABORT_MSG_IF(!ValidOverdueRepair(),
-		"SprayOverdueRepair needs PathSelector 6, 7 or 9 and SprayHeldLossRtts "
-		"above zero");
+		"SprayOverdueRepair needs SprayHeldLossRtts above zero and PathSelector "
+		"6, 7 or 9, or, at 3, PathSelector 8 or 10 or the uniform draw");
 	NS_ABORT_MSG_IF(!ValidCoverageFirst(),
 		"SprayCoverageFirst is read only under LoadBalancing 2, where every "
 		"send has a record");
@@ -1798,7 +1803,19 @@ bool RdmaHw::CountsSprayLoss() const{
 }
 
 bool RdmaHw::ValidOverdueRepair() const{
-	return !IsOverdueRepair() || (IsRepsHold() && m_sprayHeldLossRtts > 0);
+	if (!IsOverdueRepair())
+		return true;
+	if (m_sprayHeldLossRtts <= 0)
+		return false;
+	if (IsRepsHold())
+		return true;
+	// Without a loss hold, the repair that counts nothing alone: REPS, the
+	// oracle and the uniform draw.
+	const bool uniformDraw = m_loadBalancing ==
+			static_cast<uint32_t>(LoadBalancingMode::SprayUniform) &&
+		m_pathSelectorKind == static_cast<uint32_t>(PathSelectorKind::Ops);
+	return m_sprayOverdueRepair == static_cast<uint32_t>(OverdueRepair::Reprobe) &&
+		(IsRepsSpine() || IsRepsOracle() || uniformDraw);
 }
 
 bool RdmaHw::IsOverdueRepair() const{
