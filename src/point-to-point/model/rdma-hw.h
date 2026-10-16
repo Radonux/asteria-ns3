@@ -400,6 +400,19 @@ public:
 	// receiver's hold takes it for no arrival.
 	void CountPathSeq(Ptr<RdmaRxQueuePair> q, const CustomHeader &ch,
 		bool trimmed = false);
+	// SprayStrayPathSeq (StrayPathSeq), under SprayPathSeq. Under Closed the
+	// frontend's removal of a receive queue pair (DeleteRxQp) leaves its key
+	// in m_closedRxQps, with the removed queue pair while it has a tail run
+	// waiting or has counted a path sequence missing, so that a packet of the
+	// flow arriving after it, whose receive queue pair GetRxQp makes stray,
+	// is read against it (ReadStrayPathSeq) and not by its own.
+	uint32_t m_sprayStrayPathSeq;
+	std::unordered_map<uint64_t, Ptr<RdmaRxQueuePair>> m_closedRxQps;
+	bool ValidStrayPathSeq() const;
+	// The path sequence of the data packet or trimmed header ch arriving at
+	// the stray queue pair q, read against its flow's removed queue pair,
+	// which is let go once it has neither a run waiting nor a count.
+	void ReadStrayPathSeq(Ptr<RdmaRxQueuePair> q, const CustomHeader &ch);
 	// SprayTailRecovery, under SprayPathSeq: every data packet a queue pair
 	// sends once it has no new data left (the last packet of its data and
 	// every repair after it) is marked as closing its requested spine
@@ -686,6 +699,8 @@ public:
 	Ptr<RdmaRxQueuePair> GetRxQp(uint32_t sip, uint32_t dip, uint16_t sport, uint16_t dport, uint16_t pg, bool create); // get a rxQp
 	uint32_t GetNicIdxOfRxQp(Ptr<RdmaRxQueuePair> q); // get the NIC index of the rxQp
 	void DeleteRxQp(uint32_t dip, uint16_t pg, uint16_t dport);
+	// The key of m_rxQpMap: the sender's address, priority group and port.
+	static uint64_t GetRxQpKey(uint32_t dip, uint16_t pg, uint16_t dport);
 
 	int ReceiveUdp(Ptr<Packet> p, CustomHeader &ch);
 	void CountArrival(Ptr<RdmaRxQueuePair> q, uint16_t identification,

@@ -8,6 +8,22 @@
 
 namespace ns3 {
 
+// How a receiving host reads the path sequences of a packet that arrives
+// after the frontend removed its flow's receive queue pair at the flow's
+// completion (RdmaHw::DeleteRxQp): a copy, a repaired send or a repair still
+// in flight, which makes a receive queue pair of its own. Fresh: that queue
+// pair reads them as a new flow's, from nothing, so the tail counts of a
+// closing packet among them name as missing every send of the flow it has
+// not seen itself. Closed: they are read against the removed queue pair, the
+// flow's own: the packet takes its sequence out of that queue pair's tail
+// runs still waiting, and is reported late where that queue pair counted its
+// sequence missing, and counts no gap, asks no tail repair and counts nothing
+// in the receiver's hold.
+enum class StrayPathSeq : uint32_t {
+	Fresh = 0,
+	Closed,
+};
+
 // The sending side of a queue pair's path sequences: per requested spine, a
 // 16-bit counter of the data packets it has sent up that spine, new data or
 // repair alike. Each data packet carries the counter's value before its send

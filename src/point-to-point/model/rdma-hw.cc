@@ -779,6 +779,21 @@ TypeId RdmaHw::GetTypeId (void)
 				BooleanValue(false),
 				MakeBooleanAccessor(&RdmaHw::m_sprayReceiverTailMissing),
 				MakeBooleanChecker())
+		.AddAttribute("SprayStrayPathSeq",
+				"Under SprayPathSeq, how the path sequences of a packet that "
+				"arrives after its flow's receive queue pair was removed at "
+				"the flow's completion are read: 0=by the receive queue pair "
+				"it makes, as a new flow's; 1=against the removed one: the "
+				"packet takes its sequence out of that queue pair's waiting "
+				"tail runs and is reported receiver_tail_missing_late where "
+				"that queue pair counted it missing, and counts no gap, asks "
+				"no tail repair and counts nothing in the receiver's hold. "
+				"Default 0.",
+				UintegerValue(static_cast<uint32_t>(StrayPathSeq::Fresh)),
+				MakeUintegerAccessor(&RdmaHw::m_sprayStrayPathSeq),
+				MakeUintegerChecker<uint32_t>(
+					static_cast<uint32_t>(StrayPathSeq::Fresh),
+					static_cast<uint32_t>(StrayPathSeq::Closed)))
 		.AddAttribute("SprayPathState",
 				"Under LoadBalancing 2, how long a host keeps the path "
 				"selector of a queue pair: 0=for that queue pair alone, one "
@@ -1192,6 +1207,8 @@ void RdmaHw::Setup(QpCompleteCallback cb, QpFailureCallback failure_cb){
 		"SwitchQueueState for the hosts' leaves and at most 8 spines, and "
 		"acknowledgements carry the receiver_hold field exactly when it is "
 		"set (CustomHeader::ackReceiverHoldBytes)");
+	NS_ABORT_MSG_IF(!ValidStrayPathSeq(),
+		"SprayStrayPathSeq 1 is read only under SprayPathSeq");
 	NS_ABORT_MSG_IF(!ValidReceiverTailMissing(),
 		"SprayReceiverTailMissing needs SprayReceiverHold and "
 		"SprayTailRecovery");
@@ -1374,8 +1391,12 @@ void RdmaHw::DeleteQueuePair(Ptr<RdmaQueuePair> qp){
 	m_qpMap.erase(key);
 }
 
+uint64_t RdmaHw::GetRxQpKey(uint32_t dip, uint16_t pg, uint16_t dport){
+	return ((uint64_t)dip << 32) | ((uint64_t)pg << 16) | (uint64_t)dport;
+}
+
 Ptr<RdmaRxQueuePair> RdmaHw::GetRxQp(uint32_t sip, uint32_t dip, uint16_t sport, uint16_t dport, uint16_t pg, bool create){
-	uint64_t key = ((uint64_t)dip << 32) | ((uint64_t)pg << 16) | (uint64_t)dport;
+	uint64_t key = GetRxQpKey(dip, pg, dport);
 	auto it = m_rxQpMap.find(key);
 	if (it != m_rxQpMap.end())
 		return it->second;
@@ -1393,6 +1414,8 @@ Ptr<RdmaRxQueuePair> RdmaHw::GetRxQp(uint32_t sip, uint32_t dip, uint16_t sport,
 		// because eligibility and the step are fixed when it is created.
 		q->m_forgiveness_eligible = !m_forgivenessEligibleCallback.IsNull() &&
 			m_forgivenessEligibleCallback(dip, sip, dport, sport);
+		// Only a packet of the removed queue pair's flow comes this way.
+		q->m_stray = m_closedRxQps.count(key) > 0;
 		// store in map
 		m_rxQpMap[key] = q;
 		return q;
@@ -1408,10 +1431,16 @@ uint32_t RdmaHw::GetNicIdxOfRxQp(Ptr<RdmaRxQueuePair> q){
 	}
 }
 void RdmaHw::DeleteRxQp(uint32_t dip, uint16_t pg, uint16_t dport){
-	uint64_t key = ((uint64_t)dip << 32) | ((uint64_t)pg << 16) | (uint64_t)dport;
+	uint64_t key = GetRxQpKey(dip, pg, dport);
 	auto it = m_rxQpMap.find(key);
 	if (it == m_rxQpMap.end())
 		return;
+	if (m_sprayStrayPathSeq == static_cast<uint32_t>(StrayPathSeq::Closed)){
+		const Ptr<RdmaRxQueuePair> q = it->second;
+		m_closedRxQps[key] = !q->m_tailRuns.Empty() ||
+				!q->m_tailMissingRuns.Empty() || q->m_countedTailMissing
+			? q : nullptr;
+	}
 	m_rxQpMap.erase(it);
 }
 

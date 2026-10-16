@@ -752,6 +752,8 @@ RdmaRxQueuePair::RdmaRxQueuePair(){
 	m_highest_seen_end = 0;
 	m_data_arrivals = 0;
 	m_folded_arrivals = 0;
+	m_countedTailMissing = false;
+	m_stray = false;
 }
 
 uint32_t RdmaRxQueuePair::GetHash(void){

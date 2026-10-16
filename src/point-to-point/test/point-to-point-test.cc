@@ -12226,7 +12226,9 @@ class SprayReceiverTailMissingTest : public TestCase
         : TestCase("Under SprayReceiverTailMissing the receiver's hold counts the path sequences "
                    "a tail repair request names that are still missing a guard after it, so that "
                    "a black-holed spine is held, counts no late, trimmed or gap-counted "
-                   "packet, and reports the counted packets that arrive after all")
+                   "packet, and reports the counted packets that arrive after all; under "
+                   "SprayStrayPathSeq closed a packet arriving after its flow's receive queue "
+                   "pair was removed is read against that queue pair")
     {
     }
 
@@ -12252,6 +12254,7 @@ class SprayReceiverTailMissingTest : public TestCase
         LateAfterGuardEnds();
         TrimmedAfterRequest();
         GapsNotCountedTwice();
+        StraysAfterRemoval();
 
         CustomHeader::ackTailNackBytes = savedNack;
         CustomHeader::udpTailCounts = savedCounts;
@@ -12499,6 +12502,17 @@ class SprayReceiverTailMissingTest : public TestCase
         NS_TEST_EXPECT_MSG_EQ(hw->ValidReceiverTailMissing(),
                               false,
                               "refused without SprayReceiverHold");
+
+        UintegerValue stray;
+        hw->GetAttribute("SprayStrayPathSeq", stray);
+        NS_TEST_EXPECT_MSG_EQ(stray.Get(),
+                              static_cast<uint64_t>(StrayPathSeq::Fresh),
+                              "SprayStrayPathSeq is fresh by default");
+        NS_TEST_EXPECT_MSG_EQ(hw->ValidStrayPathSeq(), true, "and accepted so");
+        hw->m_sprayStrayPathSeq = static_cast<uint32_t>(StrayPathSeq::Closed);
+        NS_TEST_EXPECT_MSG_EQ(hw->ValidStrayPathSeq(), false, "closed refused without SprayPathSeq");
+        hw->m_sprayPathSeq = true;
+        NS_TEST_EXPECT_MSG_EQ(hw->ValidStrayPathSeq(), true, "and accepted with it");
     }
 
     // Test (a): nothing arrives up spine 3 from sender leaf 0 or leaf 1, and
@@ -12685,6 +12699,82 @@ class SprayReceiverTailMissingTest : public TestCase
                 NS_TEST_EXPECT_MSG_EQ(receiver.counted, 1u, "after it: counted");
                 NS_TEST_EXPECT_MSG_EQ(receiver.late, 1u, "and its trimmed header counted late");
             }
+            Simulator::Destroy();
+        }
+    }
+
+    // Test (f): a's message sends one packet up each of spines 0, 2 and 3
+    // and closes on spine 1; when the closing packet arrives only spine 0's
+    // has, and 2 and 3 are requested. The frontend then removes the flow's
+    // receive queue pair, as at its completion, and spine 2's packet arrives
+    // after it, inside the guard, followed by a copy of the closing packet
+    // up spine 5 after the guard ends and, later still, spine 3's packet.
+    // Each makes or finds a receive queue pair of its own. Under fresh, the
+    // default, the removed queue pair counts spine 2 missing as well as 3,
+    // the new one requests and counts spine 0 from the copy's counts, and
+    // spine 3's arrival is counted late by neither. Under closed the
+    // arrivals are read against the removed queue pair: spine 2's takes it
+    // out of its run, the copy asks nothing and counts nothing, spine 3
+    // alone is counted and its arrival is counted late.
+    void StraysAfterRemoval()
+    {
+        for (const StrayPathSeq stray : {StrayPathSeq::Fresh, StrayPathSeq::Closed})
+        {
+            Receiver receiver(true);
+            Ptr<RdmaHw> hw = receiver.host.hw;
+            hw->m_sprayStrayPathSeq = static_cast<uint32_t>(stray);
+            std::vector<uint16_t> counts(kSpines, 0);
+            counts[0] = counts[2] = counts[kLossy] = 1;
+            receiver.Deliver(kClosingNs - 100, kA, 0, 0);
+            receiver.Deliver(kClosingNs, kA, kClosing, 0, counts);
+            Simulator::Schedule(NanoSeconds(kRequestNs + 100), [hw]() {
+                hw->DeleteRxQp(kA.Get(), IsolatedHost::kPriorityGroup, IsolatedHost::kSenderPort);
+            });
+            receiver.Deliver(kRequestNs + 500, kA, 2, 0);
+            counts[5] = 1;
+            receiver.Deliver(kGuardEndNs + 1000, kA, 5, 0, counts);
+            receiver.Deliver(kGuardEndNs + 2500, kA, kLossy, 0);
+            Simulator::Run();
+            std::vector<uint32_t> requested;
+            for (const Request& request : receiver.Requests())
+            {
+                requested.push_back(request.spine);
+            }
+            ReceiverHold& hold = receiver.Hold();
+            if (stray == StrayPathSeq::Fresh)
+            {
+                NS_TEST_EXPECT_MSG_EQ((requested == std::vector<uint32_t>{2, kLossy, 0}),
+                                      true,
+                                      "fresh: the copy's counts request spine 0 again");
+                NS_TEST_EXPECT_MSG_EQ(receiver.counted, 3u, "and spines 0, 2 and 3 are counted");
+                NS_TEST_EXPECT_MSG_EQ(receiver.events["receiver_tail_missing_spine0"],
+                                      1u,
+                                      "spine 0, which arrived before the removal");
+                NS_TEST_EXPECT_MSG_EQ(receiver.events["receiver_tail_missing_spine2"],
+                                      1u,
+                                      "spine 2, which arrived after it");
+                NS_TEST_EXPECT_MSG_EQ(receiver.late, 0u, "spine 3's arrival is not counted late");
+                NS_TEST_EXPECT_MSG_EQ(hold.Holds(0, 2), true, "spine 2 is held");
+                NS_TEST_EXPECT_MSG_EQ(hold.Holds(0, 0), true, "and spine 0");
+            }
+            else
+            {
+                NS_TEST_EXPECT_MSG_EQ((requested == std::vector<uint32_t>{2, kLossy}),
+                                      true,
+                                      "closed: the flow's own requests alone");
+                NS_TEST_EXPECT_MSG_EQ(receiver.counted, 1u, "spine 3 alone is counted");
+                NS_TEST_EXPECT_MSG_EQ(receiver.events["receiver_tail_missing_spine3"],
+                                      1u,
+                                      "on spine 3");
+                NS_TEST_EXPECT_MSG_EQ(receiver.late, 1u, "and its arrival is counted late");
+                NS_TEST_EXPECT_MSG_EQ(receiver.events["receiver_tail_missing_late_spine3"],
+                                      1u,
+                                      "on spine 3");
+                NS_TEST_EXPECT_MSG_EQ(hold.Holds(0, 2), false, "spine 2 is not held");
+                NS_TEST_EXPECT_MSG_EQ(hold.Holds(0, 0), false, "nor spine 0");
+                NS_TEST_EXPECT_MSG_EQ(receiver.Gaps(5), 0u, "the copy counts no gap");
+            }
+            NS_TEST_EXPECT_MSG_EQ(hold.Holds(0, kLossy), true, "spine 3 is held either way");
             Simulator::Destroy();
         }
     }

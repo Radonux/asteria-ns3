@@ -18,6 +18,10 @@ bool RdmaHw::ValidPathSeq() const{
 
 void RdmaHw::CountPathSeq(Ptr<RdmaRxQueuePair> q, const CustomHeader &ch,
 		bool trimmed){
+	if (q->m_stray){
+		ReadStrayPathSeq(q, ch);
+		return;
+	}
 	if (m_sprayTailRecovery && (ch.udp.tail_flags & kTailCloses))
 		AskTailMissing(q, ch);
 	const uint8_t requested = RequestedSpine(ch.ipid);
@@ -51,6 +55,35 @@ void RdmaHw::CountPathSeq(Ptr<RdmaRxQueuePair> q, const CustomHeader &ch,
 		return;
 	ReceiverHoldOf().OnArrival(m_switchQueues->LeafOf(ch.sip), carrying,
 		arrival.gaps, arrival.late, Simulator::Now().GetNanoSeconds());
+}
+
+bool RdmaHw::ValidStrayPathSeq() const{
+	return m_sprayStrayPathSeq == static_cast<uint32_t>(StrayPathSeq::Fresh) ||
+		m_sprayPathSeq;
+}
+
+void RdmaHw::ReadStrayPathSeq(Ptr<RdmaRxQueuePair> q, const CustomHeader &ch){
+	// The stray queue pair's addresses and ports are the data's destination's
+	// first, as the removed one's were.
+	const auto closed = m_closedRxQps.find(
+		GetRxQpKey(q->dip, q->m_ecn_source.qIndex, q->dport));
+	if (closed == m_closedRxQps.end() || !closed->second)
+		return;
+	const Ptr<RdmaRxQueuePair> flow = closed->second;
+	const uint8_t requested = RequestedSpine(ch.ipid);
+	if (!flow->m_tailRuns.Empty())
+		flow->m_tailRuns.OnArrival(requested, ch.udp.path_seq);
+	if (!flow->m_tailMissingRuns.Empty())
+		flow->m_tailMissingRuns.OnArrival(requested, ch.udp.path_seq);
+	// A send is trimmed once and a data packet never carries a trimmed
+	// header's sequence, so a sequence the flow accounted, whether this is
+	// the data packet or its trimmed header, is one its runs counted missing
+	// (SpineSequenceReceiver::OnArrival, OnTrim).
+	if (flow->m_pathSeqReceiver.Accounted(requested, ch.udp.path_seq))
+		ReportTailMissing("receiver_tail_missing_late", requested);
+	if (flow->m_tailRuns.Empty() && flow->m_tailMissingRuns.Empty() &&
+			!flow->m_countedTailMissing)
+		closed->second = nullptr;
 }
 
 bool RdmaHw::ValidTailRecovery() const{
@@ -168,6 +201,7 @@ void RdmaHw::CountTailMissing(Ptr<RdmaRxQueuePair> q){
 			run.first, run.count);
 		if (missing == 0)
 			continue;
+		q->m_countedTailMissing = true;
 		ReceiverHoldOf().OnTailMissing(leaf, run.spine, missing, now);
 		for (uint16_t i = 0; i < missing; i++)
 			ReportTailMissing("receiver_tail_missing", run.spine);

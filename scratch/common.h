@@ -458,6 +458,20 @@ bool spray_receiver_hold_clean_given = false;
 // gaps.
 std::string spray_receiver_tail_missing = "off";
 bool spray_receiver_tail_missing_given = false;
+// Under SPRAY_PATH_SEQ on, SPRAY_STRAY_PATH_SEQ: how a receiving host reads
+// the path sequences of a packet that arrives after the frontend removed its
+// flow's receive queue pair at the flow's completion, a copy, a repaired send
+// or a repair still in flight, which makes a receive queue pair of its own.
+// fresh, the default, reads them there as a new flow's, so that the tail
+// counts of a closing packet among them name every send of the flow that
+// queue pair has not seen as missing, and SPRAY_RECEIVER_TAIL_MISSING counts
+// them. closed reads them against the removed queue pair: the packet takes
+// its sequence out of that queue pair's tail runs still waiting, is
+// receiver_tail_missing_late where that queue pair counted its sequence
+// missing, and counts no gap, asks no tail repair and counts nothing in the
+// receiver's hold.
+std::string spray_stray_path_seq = "fresh";
+bool spray_stray_path_seq_given = false;
 bool receiver_hold() { return spray_receiver_hold == "on"; }
 uint32_t reps_buffer_size = 8;
 uint64_t reps_freezing_timeout_ns = 10000000;
@@ -2458,6 +2472,9 @@ bool ReadConf(string network_configuration) {
     } else if (key.compare("SPRAY_RECEIVER_TAIL_MISSING") == 0) {
       conf >> spray_receiver_tail_missing;
       spray_receiver_tail_missing_given = true;
+    } else if (key.compare("SPRAY_STRAY_PATH_SEQ") == 0) {
+      conf >> spray_stray_path_seq;
+      spray_stray_path_seq_given = true;
     } else if (key.compare("SPRAY_HELD_EXPLORATION") == 0) {
       conf >> spray_held_exploration;
     } else if (key.compare("SPRAY_HELD_SENTINEL_INTERVAL_NS") == 0) {
@@ -2998,6 +3015,14 @@ bool ReadConf(string network_configuration) {
       (!receiver_hold() || !tail_recovery())) {
     std::cerr << "SPRAY_RECEIVER_TAIL_MISSING is read only with "
                  "SPRAY_RECEIVER_HOLD and SPRAY_TAIL_RECOVERY on\n";
+    return false;
+  }
+  if (spray_stray_path_seq != "fresh" && spray_stray_path_seq != "closed") {
+    std::cerr << "SPRAY_STRAY_PATH_SEQ must be fresh or closed\n";
+    return false;
+  }
+  if (spray_stray_path_seq_given && spray_path_seq != "on") {
+    std::cerr << "SPRAY_STRAY_PATH_SEQ is read only with SPRAY_PATH_SEQ on\n";
     return false;
   }
   if (!receiver_hold_output_file.empty() && !receiver_hold()) {
@@ -3634,6 +3659,11 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),
       rdmaHw->SetAttribute(
           "SprayReceiverTailMissing",
           BooleanValue(spray_receiver_tail_missing == "on"));
+      rdmaHw->SetAttribute(
+          "SprayStrayPathSeq",
+          UintegerValue(static_cast<uint32_t>(spray_stray_path_seq == "closed"
+                                                  ? StrayPathSeq::Closed
+                                                  : StrayPathSeq::Fresh)));
       rdmaHw->SetAttribute("UeEvSetSize", UintegerValue(ue_ev_set_size));
       rdmaHw->SetAttribute("UeSaturationFraction",
                            DoubleValue(ue_saturation_fraction));

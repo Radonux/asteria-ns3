@@ -471,6 +471,11 @@ public:
 	// not yet ended, and the one timer that counts those due.
 	PendingTailRuns m_tailMissingRuns;
 	EventId m_tailMissingTimer;
+	// Whether the runs counted any path sequence missing.
+	bool m_countedTailMissing;
+	// Under SprayStrayPathSeq Closed, whether a packet of a flow whose receive
+	// queue pair the frontend removed made this one (StrayPathSeq).
+	bool m_stray;
 	// Whether the experiment layer may forgive this flow on this step, asked
 	// once when the queue pair is created. Every acknowledgement this queue
 	// pair emits carries it, and an acknowledgement carrying it without the
