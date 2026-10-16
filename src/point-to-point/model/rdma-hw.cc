@@ -182,7 +182,8 @@ TypeId RdmaHw::GetTypeId (void)
 				"loss hold holds, 7 as 6 with a loss hold per queue pair, and 8 "
 				"is REPS over spines leaving out for good the spines "
 				"SwitchQueueState shows a fault on toward the destination's "
-				"leaf, which needs SprayGradeCostSource 1, and 9 is MRC over "
+				"leaf over RepsOracleHops' hops, which needs "
+				"SprayGradeCostSource 1, and 9 is MRC over "
 				"spines leaving out the spines 6's loss hold holds, and 10 is "
 				"REPS over spines leaving out none.",
 				UintegerValue(static_cast<uint32_t>(PathSelectorKind::Ops)),
@@ -202,6 +203,19 @@ TypeId RdmaHw::GetTypeId (void)
 				UintegerValue(10000000),
 				MakeUintegerAccessor(&RdmaHw::m_repsFreezingTimeoutNs),
 				MakeUintegerChecker<uint64_t>())
+		.AddAttribute("RepsOracleHops",
+				"Under PathSelector 8, the hops over which a spine toward the "
+				"destination's leaf is read as faulted: 0=the data's two hops "
+				"and the two its acknowledgement returns over through the same "
+				"spine, the destination leaf's uplink to it and its downlink to "
+				"the source's leaf; 1=the data's two hops alone, the source "
+				"leaf's uplink to the spine and its downlink to the "
+				"destination's leaf. Default 0.",
+				UintegerValue(static_cast<uint32_t>(OracleHops::RoundTrip)),
+				MakeUintegerAccessor(&RdmaHw::m_repsOracleHops),
+				MakeUintegerChecker<uint32_t>(
+					static_cast<uint32_t>(OracleHops::RoundTrip),
+					static_cast<uint32_t>(OracleHops::Forward)))
 		.AddAttribute("UeEvSetSize",
 				"UEC spraying: the entropy values a queue pair sprays over. "
 				"Default 256, UEC 1.0.3 section 3.6.16.3's typical size.",
@@ -1189,7 +1203,8 @@ void RdmaHw::Setup(QpCompleteCallback cb, QpFailureCallback failure_cb){
 		"identification names a spine whatever the queue pair's ports");
 	NS_ABORT_MSG_IF(!ValidRepsOracle(),
 		"PathSelector 8 reads the spines' faults from SwitchQueueState and "
-		"needs LoadBalancing 2 and SprayGradeCostSource 1");
+		"needs LoadBalancing 2 and SprayGradeCostSource 1; RepsOracleHops 1 is "
+		"read only under PathSelector 8");
 	NS_ABORT_MSG_IF(!ValidPoolHoldPropagates(),
 		"SprayPoolHoldPropagates needs SpraySenderPoolWeight above zero: "
 		"without a pool there is no pool's hold to propagate");
@@ -1659,6 +1674,9 @@ bool RdmaHw::IsRepsSpine() const{
 }
 
 bool RdmaHw::ValidRepsOracle() const{
+	if (m_repsOracleHops != static_cast<uint32_t>(OracleHops::RoundTrip) &&
+			!IsRepsOracle())
+		return false;
 	return !IsRepsOracle() ||
 		(m_loadBalancing ==
 				static_cast<uint32_t>(LoadBalancingMode::SprayUniform) &&
@@ -1674,8 +1692,13 @@ FaultedSpines &RdmaHw::FaultedSpinesTo(uint32_t leaf){
 			leaf == SwitchQueueState::kNoLeaf,
 		"PathSelector 8 reads the paths between the source's and the "
 		"destination's leaves");
+	const bool forward =
+		m_repsOracleHops == static_cast<uint32_t>(OracleHops::Forward);
 	return m_faultedSpines.try_emplace(leaf, m_spineCount, m_sprayBaseRttNs,
-		[this, leaf](){ return m_switchQueues->Faulted(m_leaf, leaf); })
+		[this, leaf, forward](){
+			return forward ? m_switchQueues->ForwardFaulted(m_leaf, leaf)
+				: m_switchQueues->Faulted(m_leaf, leaf);
+		})
 		.first->second;
 }
 
@@ -1826,7 +1849,7 @@ FaultedSpines &RdmaHw::AnswerFaultedSpinesTo(uint32_t leaf){
 		"AckRouteOracle reads the paths toward the sender's leaf");
 	return m_answerFaultedSpines.try_emplace(leaf, m_spineCount,
 		m_sprayBaseRttNs,
-		[this, leaf](){ return m_switchQueues->AnswerFaulted(m_leaf, leaf); })
+		[this, leaf](){ return m_switchQueues->ForwardFaulted(m_leaf, leaf); })
 		.first->second;
 }
 

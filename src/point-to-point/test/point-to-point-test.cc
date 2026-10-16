@@ -13953,6 +13953,88 @@ class RepsOracleTest : public TestCase
     }
 };
 
+class RepsOracleHopsTest : public TestCase
+{
+  public:
+    RepsOracleHopsTest()
+        : TestCase("Under reps_oracle with RepsOracleHops forward a spine toward a destination "
+                   "leaf is left out only for a fault on the data's own hops, the source leaf's "
+                   "uplink or the spine's downlink to the destination leaf; round_trip, the "
+                   "default, also leaves it out for a fault on the hops the ACK returns over")
+    {
+    }
+
+    void DoRun() override
+    {
+        SwitchQueueFabric fabric;
+        // Leaf 0's uplink to spine 3, a hop back from leaf 0 to leaf 1, one
+        // percent lossy; spine 2's downlink to leaf 0, a hop from leaf 1 to
+        // leaf 0, silent.
+        Ptr<RateErrorModel> gray = CreateObject<RateErrorModel>();
+        gray->SetAttribute("ErrorUnit", StringValue("ERROR_UNIT_PACKET"));
+        gray->SetRate(0.01);
+        SwitchQueueFabric::Device(fabric.spines[3], fabric.downlink[3][0])
+            ->SetAttribute("LinkErrorModel", PointerValue(gray));
+        fabric.leaves[0]->SetBlackhole(fabric.uplink[0][2]);
+        NS_TEST_EXPECT_MSG_EQ((fabric.state->Faulted(1, 0) ==
+                               std::vector<bool>{false, false, true, true}),
+                              true,
+                              "over the round trip from leaf 1 to leaf 0 both spines are faulted");
+        NS_TEST_EXPECT_MSG_EQ((fabric.state->ForwardFaulted(1, 0) ==
+                               std::vector<bool>{false, false, true, false}),
+                              true,
+                              "over the data's hops only the silent one is");
+
+        const auto sends = [&fabric](OracleHops hops) {
+            Ptr<RdmaHw> hw = Oracle(fabric);
+            hw->m_repsOracleHops = static_cast<uint32_t>(hops);
+            Ptr<RdmaQueuePair> toZero = CreateObject<RdmaQueuePair>(
+                3, SwitchQueueFabric::kOtherSender, kTestSender, 10000, 100);
+            hw->StartPathSelection(toZero, 0, 0);
+            std::vector<uint32_t> on(SwitchQueueFabric::kSpines);
+            for (uint32_t step = 0; step < 400; ++step)
+            {
+                on[LossHoldFixture::Send(*toZero->m_pathSelector, 100 * step, step, {})]++;
+            }
+            return on;
+        };
+        const std::vector<uint32_t> roundTrip = sends(OracleHops::RoundTrip);
+        NS_TEST_EXPECT_MSG_EQ(roundTrip[2], 0u, "round_trip never sends on the silent spine");
+        NS_TEST_EXPECT_MSG_EQ(roundTrip[3], 0u, "nor on the spine faulted on the way back");
+        NS_TEST_EXPECT_MSG_GT(roundTrip[0], 0u, "it sends on the others");
+        const std::vector<uint32_t> forward = sends(OracleHops::Forward);
+        NS_TEST_EXPECT_MSG_EQ(forward[2], 0u, "forward never sends on the silent spine");
+        NS_TEST_EXPECT_MSG_GT(forward[3], 0u, "and does on the spine faulted on the way back");
+
+        Ptr<RdmaHw> hw = Oracle(fabric);
+        NS_TEST_EXPECT_MSG_EQ(hw->m_repsOracleHops,
+                              static_cast<uint32_t>(OracleHops::RoundTrip),
+                              "round_trip is the default");
+        hw->m_repsOracleHops = static_cast<uint32_t>(OracleHops::Forward);
+        NS_TEST_EXPECT_MSG_EQ(hw->ValidRepsOracle(), true, "forward is read under reps_oracle");
+        hw->m_pathSelectorKind = static_cast<uint32_t>(PathSelectorKind::RepsSpine);
+        NS_TEST_EXPECT_MSG_EQ(hw->ValidRepsOracle(), false, "and refused under another selector");
+        Simulator::Destroy();
+    }
+
+  private:
+    // An RdmaHw under reps_oracle on the host of leaf 1.
+    static Ptr<RdmaHw> Oracle(SwitchQueueFabric& fabric)
+    {
+        Ptr<RdmaHw> hw = CreateObject<RdmaHw>();
+        hw->SetAttribute("Mtu", UintegerValue(1000));
+        hw->SetAttribute("PathRandomVariable", PointerValue(SelectorStream()));
+        hw->m_spineCount = SwitchQueueFabric::kSpines;
+        hw->m_loadBalancing = static_cast<uint32_t>(LoadBalancingMode::SprayUniform);
+        hw->m_pathSelectorKind = static_cast<uint32_t>(PathSelectorKind::RepsOracle);
+        hw->m_sprayGradeCostSource = static_cast<uint32_t>(GradeCostSource::SwitchQueue);
+        hw->m_switchQueues = fabric.state;
+        hw->m_sprayBaseRttNs = 1000;
+        hw->m_leaf = fabric.state->LeafOf(SwitchQueueFabric::kOtherSender.Get());
+        return hw;
+    }
+};
+
 class RepsSpineTest : public TestCase
 {
   public:
@@ -14359,12 +14441,12 @@ class AckRouteOracleTest : public TestCase
             fabric.leaves[0]->ClearBlackhole(fabric.uplink[0][3]);
         };
         fault();
-        NS_TEST_EXPECT_MSG_EQ((fabric.state->AnswerFaulted(2, 0) ==
+        NS_TEST_EXPECT_MSG_EQ((fabric.state->ForwardFaulted(2, 0) ==
                                std::vector<bool>{false, true, false, true}),
                               true,
                               "toward leaf 0 the receiver's uplink and the sender's downlink "
                               "are faulted");
-        NS_TEST_EXPECT_MSG_EQ((fabric.state->AnswerFaulted(2, 1) ==
+        NS_TEST_EXPECT_MSG_EQ((fabric.state->ForwardFaulted(2, 1) ==
                                std::vector<bool>{false, true, false, false}),
                               true,
                               "toward leaf 1 the receiver's uplink alone");
@@ -14372,7 +14454,7 @@ class AckRouteOracleTest : public TestCase
                               true,
                               "the data path's fault is a path fault");
         heal();
-        NS_TEST_EXPECT_MSG_EQ((fabric.state->AnswerFaulted(2, 0) ==
+        NS_TEST_EXPECT_MSG_EQ((fabric.state->ForwardFaulted(2, 0) ==
                                std::vector<bool>(SwitchQueueFabric::kSpines, false)),
                               true,
                               "a healed link is no fault");
@@ -15016,6 +15098,7 @@ PointToPointTestSuite::PointToPointTestSuite()
     AddTestCase(new SwitchQueueStateTest, TestCase::Duration::QUICK);
     AddTestCase(new SwitchQueueGradeTest, TestCase::Duration::QUICK);
     AddTestCase(new RepsOracleTest, TestCase::Duration::QUICK);
+    AddTestCase(new RepsOracleHopsTest, TestCase::Duration::QUICK);
     AddTestCase(new RepsSpineTest, TestCase::Duration::QUICK);
     AddTestCase(new AckRouteHeaderTest, TestCase::Duration::QUICK);
     AddTestCase(new AckRouteReceiverTest, TestCase::Duration::QUICK);

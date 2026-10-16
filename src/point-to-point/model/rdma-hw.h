@@ -279,7 +279,7 @@ public:
 	Ptr<UniformRandomVariable> m_ackRouteRandom;
 	// AckRouteOracle, under AckRoute Spray: the draw leaves out the spines
 	// over which an answer toward the sender's leaf crosses a fault as the
-	// switches' state shows it (SwitchQueueState::AnswerFaulted), per sender
+	// switches' state shows it (SwitchQueueState::ForwardFaulted), per sender
 	// leaf in m_answerFaultedSpines, made at the first answer toward that
 	// leaf and read once per base RTT, as PathSelector 8 reads its own.
 	bool m_ackRouteOracle;
@@ -313,7 +313,10 @@ public:
 	SpineScores &DestinationHold(uint32_t destination);
 	// PathSelector RepsOracle, whether it has the switches' state to read,
 	// and per destination leaf the spines it excludes, made at the first
-	// queue pair to that leaf and read once per base RTT.
+	// queue pair to that leaf and read once per base RTT over the hops
+	// m_repsOracleHops (OracleHops) names; whether OracleHops Forward is set
+	// only under RepsOracle.
+	uint32_t m_repsOracleHops;
 	bool IsRepsOracle() const;
 	bool ValidRepsOracle() const;
 	// PathSelector RepsSpine: REPS over spines under LoadBalancing 2.

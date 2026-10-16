@@ -471,6 +471,14 @@ double ack_redirect_flag = 0.1;
 double ack_redirect_validity_base_rtts = 2.0;
 std::string ack_redirect_trim_scoring = "mark";
 std::string ack_redirect_scope = "per_connection";
+// Under reps_oracle, REPS_ORACLE_HOPS: the hops over which a spine toward the
+// destination's leaf is read as faulted. round_trip, the default: the data's
+// two hops and the two its acknowledgement returns over through the same
+// spine, the destination leaf's uplink to the spine and the spine's downlink
+// to the source's leaf. forward: the data's two hops alone, the source leaf's
+// uplink to the spine and the spine's downlink to the destination's leaf, for
+// answers that do not return over the data's spine, as under ACK_ROUTE spray.
+std::string reps_oracle_hops = "round_trip";
 // The selectors each parameter belongs to. A parameter given under another
 // selector would be read by nothing, so it is refused.
 const std::map<std::string, std::set<std::string>> path_selector_parameter_owners = {
@@ -488,6 +496,7 @@ const std::map<std::string, std::set<std::string>> path_selector_parameter_owner
     {"ACK_REDIRECT_VALIDITY_BASE_RTTS", {"ack_redirect"}},
     {"ACK_REDIRECT_TRIM_SCORING", {"ack_redirect"}},
     {"ACK_REDIRECT_SCOPE", {"ack_redirect"}},
+    {"REPS_ORACLE_HOPS", {"reps_oracle"}},
 };
 // The keys of ack_redirect that only its per_connection scope reads.
 const std::set<std::string> ack_redirect_connection_keys = {
@@ -2293,6 +2302,8 @@ bool ReadConf(string network_configuration) {
       conf >> reps_buffer_size;
     } else if (key.compare("REPS_FREEZING_TIMEOUT_NS") == 0) {
       conf >> reps_freezing_timeout_ns;
+    } else if (key.compare("REPS_ORACLE_HOPS") == 0) {
+      conf >> reps_oracle_hops;
     } else if (key.compare("UE_EV_SET_SIZE") == 0) {
       conf >> ue_ev_set_size;
     } else if (key.compare("UE_SATURATION_FRACTION") == 0) {
@@ -2847,6 +2858,10 @@ bool ReadConf(string network_configuration) {
                    "SPRAY_GRADE_COST_SOURCE switch_queue\n";
       return false;
     }
+  }
+  if (reps_oracle_hops != "round_trip" && reps_oracle_hops != "forward") {
+    std::cerr << "REPS_ORACLE_HOPS must be round_trip or forward\n";
+    return false;
   }
   if (path_selector == "reps_spine" && load_balancing != "spray_uniform") {
     std::cerr << "PATH_SELECTOR " << path_selector
@@ -3556,6 +3571,11 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),
       rdmaHw->SetAttribute("RepsBufferSize", UintegerValue(reps_buffer_size));
       rdmaHw->SetAttribute("RepsFreezingTimeoutNs",
                            UintegerValue(reps_freezing_timeout_ns));
+      rdmaHw->SetAttribute(
+          "RepsOracleHops",
+          UintegerValue(static_cast<uint32_t>(reps_oracle_hops == "forward"
+                                                  ? OracleHops::Forward
+                                                  : OracleHops::RoundTrip)));
       rdmaHw->SetAttribute("SprayHoldScope",
                            UintegerValue(spray_hold_scope_value()));
       rdmaHw->SetAttribute("SprayHoldAutoLeaves",

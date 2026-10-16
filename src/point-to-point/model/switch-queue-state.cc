@@ -61,7 +61,7 @@ std::vector<bool> SwitchQueueState::Faulted(uint32_t source,
 	return FaultedOver(hops);
 }
 
-std::vector<bool> SwitchQueueState::AnswerFaulted(uint32_t source,
+std::vector<bool> SwitchQueueState::ForwardFaulted(uint32_t source,
 		uint32_t destination) const{
 	std::vector<std::array<HopValues, 2>> hops;
 	for (uint32_t k = 0; k < m_spines; k++)

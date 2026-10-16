@@ -999,6 +999,18 @@ private:
 	bool m_excluding;
 };
 
+// The hops over which PathSelectorKind::RepsOracle reads a spine toward a
+// destination leaf as faulted. RoundTrip: the four of
+// SwitchQueueState::Faulted, the data's two hops and the two its
+// acknowledgement returns over through the same spine. Forward: the data's
+// two hops alone (SwitchQueueState::ForwardFaulted), the source leaf's uplink
+// to the spine and the spine's downlink to the destination leaf, for answers
+// that do not return over the data's spine (AckRoute::Spray).
+enum class OracleHops : uint32_t {
+	RoundTrip = 0,
+	Forward,
+};
+
 // REPS (RepsSelector) over spines under SprayUniform: the cached values and
 // the fresh draws are spine indices, each sent as SpineIdentification(k, k).
 // Nothing is excluded, no sentinel is sent and no loss is counted.
