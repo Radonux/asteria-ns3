@@ -83,6 +83,10 @@ public:
   // and FLAG_TAIL_NACK; serialized only while CustomHeader::ackTailNackBytes
   // is not zero.
   void SetTailNack(uint8_t spine, uint16_t seq, uint16_t count);
+  // The spine the switches route this answer over, kNoRouteSpine (255) for
+  // the one its identification names as carrying the data, the default;
+  // serialized only while CustomHeader::ackRouteSpineBytes is not zero.
+  void SetRouteSpine(uint8_t spine);
   void SetIntHeader(const IntHeader &_ih);
 
 //Getters
@@ -107,6 +111,7 @@ public:
   uint8_t GetTailSpine() const;
   uint16_t GetTailSeq() const;
   uint16_t GetTailCount() const;
+  uint8_t GetRouteSpine() const;
 
   static TypeId GetTypeId (void);
   virtual TypeId GetInstanceTypeId (void) const;
@@ -129,6 +134,7 @@ private:
   uint8_t m_tailSpine;
   uint16_t m_tailSeq;
   uint16_t m_tailCount;
+  uint8_t m_routeSpine;
   IntHeader ih;
   
 };

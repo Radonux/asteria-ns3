@@ -15,14 +15,16 @@ namespace ns3 {
 	qbbHeader::qbbHeader(uint16_t pg)
 		: sport(0), dport(0), flags(0), m_pg(pg), m_seq(0),
 		  m_trimPayloadSize(0), m_packetSeq(0), m_redirect(0xff),
-		  m_receiverHold(0), m_tailSpine(0), m_tailSeq(0), m_tailCount(0)
+		  m_receiverHold(0), m_tailSpine(0), m_tailSeq(0), m_tailCount(0),
+		  m_routeSpine(0xff)
 	{
 	}
 
 	qbbHeader::qbbHeader()
 		: sport(0), dport(0), flags(0), m_pg(0), m_seq(0),
 		  m_trimPayloadSize(0), m_packetSeq(0), m_redirect(0xff),
-		  m_receiverHold(0), m_tailSpine(0), m_tailSeq(0), m_tailCount(0)
+		  m_receiverHold(0), m_tailSpine(0), m_tailSeq(0), m_tailCount(0),
+		  m_routeSpine(0xff)
 	{}
 
 	qbbHeader::~qbbHeader()
@@ -98,6 +100,9 @@ namespace ns3 {
 		m_tailSeq = seq;
 		m_tailCount = count;
 	}
+	void qbbHeader::SetRouteSpine(uint8_t spine){
+		m_routeSpine = spine;
+	}
 	void qbbHeader::SetIntHeader(const IntHeader &_ih){
 		ih = _ih;
 	}
@@ -159,6 +164,9 @@ namespace ns3 {
 	uint16_t qbbHeader::GetTailCount() const{
 		return m_tailCount;
 	}
+	uint8_t qbbHeader::GetRouteSpine() const{
+		return m_routeSpine;
+	}
 
 	TypeId
 		qbbHeader::GetTypeId(void)
@@ -187,7 +195,8 @@ namespace ns3 {
 		return sizeof(tmp.sport) + sizeof(tmp.dport) + sizeof(tmp.flags) + sizeof(tmp.m_pg) + sizeof(tmp.m_seq) + sizeof(tmp.m_trimPayloadSize) +
 			(CustomHeader::ackCarriesPacketSeq ? sizeof(tmp.m_packetSeq) : 0) +
 			CustomHeader::ackReportBytes + CustomHeader::ackRedirectBytes +
-			CustomHeader::ackReceiverHoldBytes + CustomHeader::ackTailNackBytes;
+			CustomHeader::ackReceiverHoldBytes + CustomHeader::ackTailNackBytes +
+			CustomHeader::ackRouteSpineBytes;
 	}
 	void qbbHeader::Serialize(Buffer::Iterator start)  const
 	{
@@ -213,6 +222,8 @@ namespace ns3 {
 			i.WriteU16(m_tailSeq);
 			i.WriteU16(m_tailCount);
 		}
+		if (CustomHeader::ackRouteSpineBytes > 0)
+			i.WriteU8(m_routeSpine);
 
 		// write IntHeader
 		ih.Serialize(i);
@@ -243,6 +254,8 @@ namespace ns3 {
 			m_tailSeq = i.ReadU16();
 			m_tailCount = i.ReadU16();
 		}
+		if (CustomHeader::ackRouteSpineBytes > 0)
+			m_routeSpine = i.ReadU8();
 
 		// read IntHeader
 		ih.Deserialize(i);

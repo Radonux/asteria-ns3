@@ -260,6 +260,30 @@ public:
 	// covered sends.
 	double m_sprayAckLossRtts;
 	bool ValidAckLoss() const;
+	// AckRoute, under LoadBalancing SprayUniform: the spine the switches route
+	// each answer this host sends as a receiver over, an acknowledgement, a
+	// NACK or a repair request. Under DataSpine it is the spine that carried
+	// the data packet it answers; under Spray each answer to a sender off
+	// this host's leaf (m_ownLeafHosts) names in its route_spine field a
+	// spine drawn uniformly below m_spineCount from m_ackRouteRandom, a
+	// stream of this host's own that nothing else draws from. The answer's
+	// identification echoes the data packet's either way, and the sender
+	// reads its spines from it alone.
+	uint32_t m_ackRoute;
+	Ptr<UniformRandomVariable> m_ackRouteRandom;
+	// AckRouteOracle, under AckRoute Spray: the draw leaves out the spines
+	// over which an answer toward the sender's leaf crosses a fault as the
+	// switches' state shows it (SwitchQueueState::AnswerFaulted), per sender
+	// leaf in m_answerFaultedSpines, made at the first answer toward that
+	// leaf and read once per base RTT, as PathSelector 8 reads its own.
+	bool m_ackRouteOracle;
+	std::unordered_map<uint32_t, FaultedSpines> m_answerFaultedSpines;
+	bool ValidAckRoute() const;
+	FaultedSpines &AnswerFaultedSpinesTo(uint32_t leaf);
+	// The route_spine field of an answer to the host at senderIp:
+	// kNoRouteSpine under DataSpine and toward a host of this leaf, one
+	// draw otherwise.
+	uint8_t AnswerRouteSpine(uint32_t senderIp);
 	// HoldScope of PathSelector RepsHold and MrcHold. Under Leaf the queue
 	// pairs to the hosts of one leaf, which m_switchQueues names, share that
 	// leaf's loss hold in m_leafHolds, made at the first of them; under Pair

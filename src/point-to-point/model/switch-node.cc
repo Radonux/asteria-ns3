@@ -131,12 +131,13 @@ int SwitchNode::GetOutDev(Ptr<const Packet> p, CustomHeader &ch){
 	const bool namesPath = IdentifiesPath(ch);
 	// A destination behind another leaf is reached through spine uplinks alone.
 	// An answer goes up the spine that carried the data packet it answers, so
-	// that the answer to data that got through returns over a working spine.
+	// that the answer to data that got through returns over a working spine,
+	// or up the spine its receiver drew for it (ReturnSpine).
 	if (NamesSpine(mode) && namesPath &&
 			IsSpineUplink(nexthops[0])){
 		if (ch.l3Prot == 0x11)
 			return RouteToRequestedSpine(ch, nexthops);
-		return m_spinePort[LiveSpineFor(ch, CarryingSpine(ch.ipid), nexthops)];
+		return m_spinePort[LiveSpineFor(ch, ReturnSpine(ch), nexthops)];
 	}
 
 	// pick one next hop based on hash
@@ -179,6 +180,18 @@ bool SwitchNode::IdentifiesPath(const CustomHeader &ch){
 	return ch.l3Prot == 0x11 || ch.l3Prot == kPathProbeProtocol ||
 		ch.l3Prot == 0xFC || ch.l3Prot == 0xFD ||
 		ch.l3Prot == kUecTrimRepairProtocol;
+}
+
+// The spine an answer or a path probe goes up: the one its route_spine field
+// names, while answers carry the field (AckRoute::Spray) and the field names
+// one, and otherwise the carrying spine its identification names. Only an
+// answer's receiver writes a spine there; every other writer of a qbbHeader
+// leaves kNoRouteSpine.
+uint8_t SwitchNode::ReturnSpine(const CustomHeader &ch){
+	if (CustomHeader::ackRouteSpineBytes > 0 && CarriesQbbHeader(ch.l3Prot) &&
+			ch.ack.route_spine != kNoRouteSpine)
+		return ch.ack.route_spine;
+	return CarryingSpine(ch.ipid);
 }
 
 // Sends the packet up the uplink of the spine it requests and records in the
@@ -576,7 +589,8 @@ bool SwitchNode::SwitchReceiveFromDevice(Ptr<NetDevice> device, Ptr<Packet> pack
 	// Control packets are lost with the data, as on a dead line card. Where the
 	// identification names a spine, an answer returns over the spine its data
 	// took (GetOutDev), so the answer to data that got through does not reach a
-	// black hole.
+	// black hole of both directions of a link, unless its receiver drew another
+	// spine for it (ReturnSpine).
 	if (!m_blackholed.empty()){
 		const uint32_t port = device->GetIfIndex();
 		if (port < m_blackholed.size() && m_blackholed[port]){

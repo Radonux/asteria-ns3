@@ -199,6 +199,10 @@ public:
 		  uint8_t tail_spine;
 		  uint16_t tail_seq;
 		  uint16_t tail_count;
+		  // The spine the switches route the answer over, or 255 for the
+		  // carrying spine its identification names. On the wire, after the
+		  // tail fields, only while ackRouteSpineBytes is not zero.
+		  uint8_t route_spine;
 		  IntHeader ih;
 	  } ack;
 	  // PauseHeader
@@ -232,6 +236,9 @@ public:
   // How many bytes the tail repair request fields take, zero or five.
   // Process-wide for the same reason.
   static uint32_t ackTailNackBytes;
+  // How many bytes the route_spine field takes, zero or one. Process-wide
+  // for the same reason.
+  static uint32_t ackRouteSpineBytes;
   static uint32_t GetUdpTailBytes(void);
 
   uint8_t GetIpv4EcnBits (void) const;

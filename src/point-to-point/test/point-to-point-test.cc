@@ -712,6 +712,7 @@ class LoadBalancingSwitchTest : public TestCase
             RouteBySpine(mode);
             ReturnOverCarryingSpine(mode);
         }
+        ReturnOverRouteSpine();
         RouteByEntropy(LoadBalancingMode::Ecmp);
         RouteByEntropy(LoadBalancingMode::EntropyHash);
         ProbeAsData();
@@ -795,7 +796,8 @@ class LoadBalancingSwitchTest : public TestCase
                 uint16_t sourcePort,
                 uint16_t identification,
                 uint8_t protocol = 0x11,
-                uint16_t pg = 0)
+                uint16_t pg = 0,
+                uint8_t routeSpine = kNoRouteSpine)
     {
         Ptr<Packet> packet = Create<Packet>(protocol == 0x11 ? 1000 : 0);
         if (protocol == 0x11)
@@ -815,6 +817,7 @@ class LoadBalancingSwitchTest : public TestCase
             control.SetPG(pg);
             control.SetSport(forward ? sourcePort : 10001);
             control.SetDport(forward ? 10001 : sourcePort);
+            control.SetRouteSpine(routeSpine);
             packet->AddHeader(control);
         }
         Ipv4Header ip;
@@ -968,6 +971,75 @@ class LoadBalancingSwitchTest : public TestCase
         NS_TEST_EXPECT_MSG_EQ(Send(m_remoteHost, 10000, SpineIdentification(3, 3), 0xFC).port,
                               moved.port,
                               "a moved answer keeps one spine while the live ones stay");
+    }
+
+    // Under AckRoute::Spray every answer carries the route_spine field: the
+    // leaf sends it up the spine the field names, whatever spine its
+    // identification names, and leaves the identification as it is. A field
+    // naming no spine, as a path probe's, routes by the identification, and
+    // data packets keep routing by their request.
+    void ReturnOverRouteSpine()
+    {
+        const uint32_t saved = CustomHeader::ackRouteSpineBytes;
+        CustomHeader::ackRouteSpineBytes = 1;
+        BuildLeaf(LoadBalancingMode::SprayUniform);
+        m_leaf->SetAttribute("AckHighPrio", UintegerValue(1));
+        for (uint8_t protocol : kAnswers)
+        {
+            for (uint32_t carrying = 0; carrying < kSpines; ++carrying)
+            {
+                for (uint8_t route = 0; route < kSpines; ++route)
+                {
+                    const Egress answer = Send(m_remoteHost,
+                                               10000,
+                                               SpineIdentification(carrying, carrying),
+                                               protocol,
+                                               0,
+                                               route);
+                    NS_TEST_EXPECT_MSG_EQ(answer.port,
+                                          m_spinePorts[route],
+                                          "an answer leaves on its route spine's uplink");
+                    NS_TEST_EXPECT_MSG_EQ(answer.identification,
+                                          SpineIdentification(carrying, carrying),
+                                          "an answer's identification is not rewritten");
+                }
+                NS_TEST_EXPECT_MSG_EQ(
+                    Send(m_remoteHost, 10000, SpineIdentification(carrying, carrying), protocol)
+                        .port,
+                    m_spinePorts[carrying],
+                    "an answer naming no route spine leaves on the carrying spine's uplink");
+            }
+        }
+        for (uint32_t spine = 0; spine < kSpines; ++spine)
+        {
+            NS_TEST_EXPECT_MSG_EQ(
+                Send(m_remoteHost, 10000, SpineIdentification(spine, spine), kPathProbeProtocol).port,
+                m_spinePorts[spine],
+                "a path probe takes the spine its identification names");
+            NS_TEST_EXPECT_MSG_EQ(Send(m_remoteHost, 10000, SpineIdentification(spine, spine)).port,
+                                  m_spinePorts[spine],
+                                  "data takes its requested spine");
+        }
+        NS_TEST_EXPECT_MSG_EQ(Send(m_localHost, 10000, SpineIdentification(1, 1), 0xFC, 0, 2).port,
+                              m_hostPort,
+                              "an answer to a host of this leaf crosses no spine");
+
+        // Spine 2 has no route to the cut-off host's leaf, and spine 3's uplink
+        // goes down: an answer for either is moved to a live spine, the same
+        // one each time while the live spines stay the same.
+        const Egress unrouted =
+            Send(m_cutOffHost, 10000, SpineIdentification(0, 0), 0xFC, 0, 2);
+        NS_TEST_EXPECT_MSG_NE(unrouted.port, m_spinePorts[2], "an unrouted route spine is moved");
+        NS_TEST_EXPECT_MSG_EQ(unrouted.identification,
+                              SpineIdentification(0, 0),
+                              "a moved answer keeps the identification it echoes");
+        DynamicCast<QbbNetDevice>(m_leaf->GetDevice(m_spinePorts[3]))->TakeDown();
+        const Egress moved = Send(m_remoteHost, 10000, SpineIdentification(1, 1), 0xFC, 0, 3);
+        NS_TEST_EXPECT_MSG_NE(moved.port, m_spinePorts[3], "a dead route spine is moved");
+        NS_TEST_EXPECT_MSG_EQ(Send(m_remoteHost, 10000, SpineIdentification(1, 1), 0xFC, 0, 3).port,
+                              moved.port,
+                              "and keeps one spine while the live ones stay");
+        CustomHeader::ackRouteSpineBytes = saved;
     }
 
     // A probe of an entropy value takes the path data with that value takes,
@@ -13789,6 +13861,447 @@ class RepsSpineTest : public TestCase
     }
 };
 
+/**
+ * The route_spine field of an answer, after the tail repair request's fields.
+ */
+class AckRouteHeaderTest : public TestCase
+{
+  public:
+    AckRouteHeaderTest()
+        : TestCase("An answer carries the route_spine field after the tail fields only while "
+                   "CustomHeader::ackRouteSpineBytes is 1, naming no spine by default")
+    {
+    }
+
+    void DoRun() override
+    {
+        const IntHeader::Mode savedIntMode = IntHeader::mode;
+        const bool savedPacketSeq = CustomHeader::ackCarriesPacketSeq;
+        const uint32_t savedTail = CustomHeader::ackTailNackBytes;
+        const uint32_t savedRoute = CustomHeader::ackRouteSpineBytes;
+        IntHeader::mode = IntHeader::NONE;
+        CustomHeader::ackCarriesPacketSeq = true;
+        CustomHeader::ackTailNackBytes = 5;
+
+        NS_TEST_EXPECT_MSG_EQ(uint32_t(qbbHeader().GetRouteSpine()),
+                              uint32_t(kNoRouteSpine),
+                              "a header names no route spine unless set");
+        CustomHeader::ackRouteSpineBytes = 0;
+        NS_TEST_EXPECT_MSG_EQ(qbbHeader().GetSerializedSize(),
+                              25,
+                              "without the field the header keeps its size");
+        CustomHeader::ackRouteSpineBytes = 1;
+        NS_TEST_EXPECT_MSG_EQ(qbbHeader().GetSerializedSize(), 26, "the field adds one byte");
+        NS_TEST_EXPECT_MSG_EQ(CustomHeader::GetAckSerializedSize(),
+                              26,
+                              "the parser agrees on the size with the field");
+
+        for (uint32_t bytes : {0u, 1u})
+        {
+            CustomHeader::ackRouteSpineBytes = bytes;
+            qbbHeader answer;
+            answer.SetSeq(3000);
+            answer.SetPacketSeq(7000);
+            answer.SetTailNack(5, 11, 3);
+            answer.SetRouteSpine(6);
+            Ptr<Packet> packet = Create<Packet>(0);
+            packet->AddHeader(answer);
+            Ipv4Header ip;
+            ip.SetSource(Ipv4Address("11.0.2.1"));
+            ip.SetDestination(Ipv4Address("11.0.1.1"));
+            ip.SetProtocol(kUecTrimRepairProtocol);
+            ip.SetIdentification(SpineIdentification(2, 4));
+            ip.SetPayloadSize(packet->GetSize());
+            packet->AddHeader(ip);
+            PppHeader ppp;
+            ppp.SetProtocol(0x0021);
+            packet->AddHeader(ppp);
+            CustomHeader parsed(CustomHeader::L2_Header | CustomHeader::L3_Header |
+                                CustomHeader::L4_Header);
+            packet->PeekHeader(parsed);
+            NS_TEST_EXPECT_MSG_EQ(parsed.GetSerializedSize(),
+                                  packet->GetSize(),
+                                  "the parser consumes exactly the header written");
+            NS_TEST_EXPECT_MSG_EQ(parsed.ipid,
+                                  SpineIdentification(2, 4),
+                                  "the identification is the data packet's either way");
+            NS_TEST_EXPECT_MSG_EQ(parsed.ack.packet_seq, 7000, "the packet sequence keeps its place");
+            NS_TEST_EXPECT_MSG_EQ(uint32_t(parsed.ack.tail_spine), 5, "the tail fields keep theirs");
+            NS_TEST_EXPECT_MSG_EQ(parsed.ack.tail_count, 3, "the tail fields keep theirs");
+
+            qbbHeader read;
+            Ptr<Packet> copy = packet->Copy();
+            copy->RemoveHeader(ppp);
+            copy->RemoveHeader(ip);
+            copy->RemoveHeader(read);
+            NS_TEST_EXPECT_MSG_EQ(uint32_t(read.GetRouteSpine()),
+                                  bytes ? 6u : uint32_t(kNoRouteSpine),
+                                  "the field survives the wire only while it is on it");
+            NS_TEST_EXPECT_MSG_EQ(read.GetTailCount(), 3, "and the fields before it are read");
+            if (bytes)
+            {
+                NS_TEST_EXPECT_MSG_EQ(uint32_t(parsed.ack.route_spine), 6, "the parser reads it");
+                // From the IPv4 header on, which the parser writes as it reads.
+                parsed.headerType = CustomHeader::L3_Header | CustomHeader::L4_Header;
+                Ptr<Packet> again = Create<Packet>(0);
+                again->AddHeader(parsed);
+                CustomHeader reparsed(CustomHeader::L3_Header | CustomHeader::L4_Header);
+                again->PeekHeader(reparsed);
+                NS_TEST_EXPECT_MSG_EQ(uint32_t(reparsed.ack.route_spine),
+                                      6,
+                                      "the parsed header writes it back");
+                NS_TEST_EXPECT_MSG_EQ(reparsed.ack.tail_count, 3, "after the tail fields");
+            }
+        }
+
+        CustomHeader::ackRouteSpineBytes = savedRoute;
+        CustomHeader::ackTailNackBytes = savedTail;
+        CustomHeader::ackCarriesPacketSeq = savedPacketSeq;
+        IntHeader::mode = savedIntMode;
+    }
+};
+
+/**
+ * The route spine a receiver names in each answer, under ACK_ROUTE data_spine
+ * and spray.
+ */
+class AckRouteReceiverTest : public TestCase
+{
+  public:
+    AckRouteReceiverTest()
+        : TestCase("Under ACK_ROUTE spray a receiver draws the route spine of every answer to a "
+                   "sender off its leaf uniformly from its own stream, and every answer echoes "
+                   "its data packet's identification; under data_spine it draws nothing")
+    {
+    }
+
+    void DoRun() override
+    {
+        const bool savedPacketSeq = CustomHeader::ackCarriesPacketSeq;
+        const uint32_t savedTail = CustomHeader::ackTailNackBytes;
+        const uint32_t savedRoute = CustomHeader::ackRouteSpineBytes;
+        CustomHeader::ackCarriesPacketSeq = true;
+        DataSpine();
+        Spray();
+        Valid();
+        CustomHeader::ackRouteSpineBytes = savedRoute;
+        CustomHeader::ackTailNackBytes = savedTail;
+        CustomHeader::ackCarriesPacketSeq = savedPacketSeq;
+        Simulator::Destroy();
+    }
+
+  private:
+    static constexpr uint32_t kSpines = 8;
+
+    static Ptr<UniformRandomVariable> Stream()
+    {
+        return CreateObjectWithAttributes<UniformRandomVariable>("Stream", IntegerValue(41));
+    }
+
+    // The next draws of a stream, which a stream left untouched shares with a
+    // fresh one.
+    static std::vector<uint32_t> Draws(Ptr<UniformRandomVariable> stream)
+    {
+        std::vector<uint32_t> draws;
+        for (uint32_t i = 0; i < 16; ++i)
+        {
+            draws.push_back(stream->GetInteger(0, kSpines - 1));
+        }
+        return draws;
+    }
+
+    // A data packet trimmed on spine, which the receiver answers with a
+    // repair request.
+    static void Trim(IsolatedHost& receiver, uint32_t seq, uint8_t spine)
+    {
+        CustomHeader trimmed;
+        trimmed.l3Prot = 0x11;
+        trimmed.m_tos = kUetDscpTrimmed << 2;
+        trimmed.sip = kTestSender.Get();
+        trimmed.dip = kTestReceiver.Get();
+        trimmed.ipid = SpineIdentification(spine, spine);
+        trimmed.udp.sport = IsolatedHost::kSenderPort;
+        trimmed.udp.dport = IsolatedHost::kReceiverPort;
+        trimmed.udp.pg = IsolatedHost::kPriorityGroup;
+        trimmed.udp.seq = seq;
+        trimmed.udp.payload_size = CustomHeader::GetUdpHeaderSize() + IsolatedHost::kMtu;
+        receiver.hw->Receive(Create<Packet>(), trimmed);
+    }
+
+    // The default: no route_spine field, no draw and no stream allocated.
+    void DataSpine()
+    {
+        CustomHeader::ackRouteSpineBytes = 0;
+        IsolatedHost receiver(LoadBalancingMode::SprayUniform, kTestSender, kSpines);
+        NS_TEST_EXPECT_MSG_EQ(receiver.hw->m_ackRoute,
+                              static_cast<uint32_t>(AckRoute::DataSpine),
+                              "data_spine is the default");
+        receiver.hw->m_ackRouteRandom = Stream();
+        const uint64_t before = RngSeedManager::GetNextStreamIndex();
+        for (uint32_t i = 0; i < 20; ++i)
+        {
+            receiver.ReceiveData(kTestSender,
+                                 kTestReceiver,
+                                 i * IsolatedHost::kMtu,
+                                 SpineIdentification(i % kSpines, i % kSpines));
+        }
+        Trim(receiver, 20 * IsolatedHost::kMtu, 3);
+        NS_TEST_EXPECT_MSG_EQ(RngSeedManager::GetNextStreamIndex(),
+                              before + 1,
+                              "answers allocate no automatic stream");
+        NS_TEST_ASSERT_MSG_EQ(receiver.emitted.size(), 21, "every packet is answered");
+        for (uint32_t i = 0; i < 20; ++i)
+        {
+            NS_TEST_EXPECT_MSG_EQ(receiver.emitted[i].ipid,
+                                  SpineIdentification(i % kSpines, i % kSpines),
+                                  "the answer echoes the data packet's identification");
+        }
+        NS_TEST_EXPECT_MSG_EQ((Draws(receiver.hw->m_ackRouteRandom) == Draws(Stream())),
+                              true,
+                              "nothing is drawn from the stream");
+    }
+
+    void Spray()
+    {
+        CustomHeader::ackRouteSpineBytes = 1;
+        IsolatedHost receiver(LoadBalancingMode::SprayUniform, kTestSender, kSpines);
+        receiver.hw->m_ackRoute = static_cast<uint32_t>(AckRoute::Spray);
+        receiver.hw->m_ackRouteRandom = Stream();
+        Ptr<UniformRandomVariable> reference = Stream();
+        constexpr uint32_t kPackets = 8000;
+        std::vector<uint32_t> perSpine(kSpines, 0);
+        uint32_t seq = 0;
+        for (uint32_t i = 0; i < kPackets; ++i)
+        {
+            // Moved by its leaf from the requested spine to the next one.
+            const uint16_t identification = SpineIdentification(i % kSpines, (i + 1) % kSpines);
+            receiver.ReceiveData(kTestSender, kTestReceiver, seq, identification);
+            seq += IsolatedHost::kMtu;
+            const CustomHeader& ack = receiver.emitted.back();
+            NS_TEST_ASSERT_MSG_EQ(ack.ipid,
+                                  identification,
+                                  "the answer echoes the data packet's identification");
+            NS_TEST_ASSERT_MSG_EQ(uint32_t(ack.ack.route_spine),
+                                  reference->GetInteger(0, kSpines - 1),
+                                  "the route spine is the stream's next draw");
+            ++perSpine[ack.ack.route_spine];
+        }
+        // 1000 expected per spine with a standard deviation of 30.
+        for (uint32_t spine = 0; spine < kSpines; ++spine)
+        {
+            NS_TEST_EXPECT_MSG_GT(perSpine[spine], 850, "the route spine draw is uniform");
+            NS_TEST_EXPECT_MSG_LT(perSpine[spine], 1150, "the route spine draw is uniform");
+        }
+
+        // A repair request for a trimmed packet, and a tail repair request,
+        // draw theirs too.
+        Trim(receiver, seq, 5);
+        seq += IsolatedHost::kMtu;
+        const CustomHeader& repair = receiver.emitted.back();
+        NS_TEST_EXPECT_MSG_EQ(repair.l3Prot, kUecTrimRepairProtocol, "a trim is answered");
+        NS_TEST_EXPECT_MSG_EQ(repair.ipid,
+                              SpineIdentification(5, 5),
+                              "with the trimmed packet's identification");
+        NS_TEST_EXPECT_MSG_EQ(uint32_t(repair.ack.route_spine),
+                              reference->GetInteger(0, kSpines - 1),
+                              "and the stream's next draw");
+        CustomHeader::ackTailNackBytes = 5;
+        Ptr<RdmaRxQueuePair> flow = receiver.hw->GetRxQp(kTestReceiver.Get(),
+                                                         kTestSender.Get(),
+                                                         IsolatedHost::kReceiverPort,
+                                                         IsolatedHost::kSenderPort,
+                                                         IsolatedHost::kPriorityGroup,
+                                                         false);
+        NS_TEST_ASSERT_MSG_EQ(bool(flow), true, "the flow is known");
+        receiver.hw->SendTailNack(flow, 6, 3, 2);
+        const CustomHeader& tail = receiver.emitted.back();
+        NS_TEST_EXPECT_MSG_EQ(((tail.ack.flags >> qbbHeader::FLAG_TAIL_NACK) & 1),
+                              1,
+                              "a tail repair request is sent");
+        NS_TEST_EXPECT_MSG_EQ(tail.ipid,
+                              SpineIdentification(6, 6),
+                              "naming its spine in the identification");
+        NS_TEST_EXPECT_MSG_EQ(uint32_t(tail.ack.route_spine),
+                              reference->GetInteger(0, kSpines - 1),
+                              "and routed by the stream's next draw");
+        CustomHeader::ackTailNackBytes = 0;
+
+        // An answer to a sender on this host's leaf crosses no spine.
+        receiver.hw->m_ownLeafHosts = {kTestSender.Get()};
+        receiver.ReceiveData(kTestSender, kTestReceiver, seq, SpineIdentification(2, 2));
+        NS_TEST_EXPECT_MSG_EQ(uint32_t(receiver.emitted.back().ack.route_spine),
+                              uint32_t(kNoRouteSpine),
+                              "an answer within the leaf names no route spine");
+        NS_TEST_EXPECT_MSG_EQ((Draws(receiver.hw->m_ackRouteRandom) == Draws(reference)),
+                              true,
+                              "and draws nothing");
+    }
+
+    void Valid()
+    {
+        Ptr<RdmaHw> hw = CreateObject<RdmaHw>();
+        hw->m_loadBalancing = static_cast<uint32_t>(LoadBalancingMode::SprayUniform);
+        hw->m_spineCount = kSpines;
+        CustomHeader::ackRouteSpineBytes = 0;
+        NS_TEST_EXPECT_MSG_EQ(hw->ValidAckRoute(), true, "data_spine needs nothing");
+        CustomHeader::ackRouteSpineBytes = 1;
+        NS_TEST_EXPECT_MSG_EQ(hw->ValidAckRoute(),
+                              false,
+                              "data_spine refuses the route_spine field");
+        hw->m_ackRoute = static_cast<uint32_t>(AckRoute::Spray);
+        NS_TEST_EXPECT_MSG_EQ(hw->ValidAckRoute(), false, "spray is refused without a stream");
+        hw->m_ackRouteRandom = Stream();
+        NS_TEST_EXPECT_MSG_EQ(hw->ValidAckRoute(), true, "and accepted with one");
+        CustomHeader::ackRouteSpineBytes = 0;
+        NS_TEST_EXPECT_MSG_EQ(hw->ValidAckRoute(), false, "spray needs the route_spine field");
+        CustomHeader::ackRouteSpineBytes = 1;
+        hw->m_loadBalancing = static_cast<uint32_t>(LoadBalancingMode::EntropyHash);
+        NS_TEST_EXPECT_MSG_EQ(hw->ValidAckRoute(), false, "spray needs named spines");
+        hw->m_loadBalancing = static_cast<uint32_t>(LoadBalancingMode::SprayUniform);
+        hw->m_ackRouteOracle = true;
+        NS_TEST_EXPECT_MSG_EQ(hw->ValidAckRoute(),
+                              false,
+                              "the oracle needs the switches' state");
+        SwitchQueueFabric fabric;
+        hw->m_switchQueues = fabric.state;
+        hw->m_leaf = fabric.state->LeafOf(kTestReceiver.Get());
+        NS_TEST_EXPECT_MSG_EQ(hw->ValidAckRoute(), true, "and has it");
+        hw->m_ackRoute = static_cast<uint32_t>(AckRoute::DataSpine);
+        CustomHeader::ackRouteSpineBytes = 0;
+        NS_TEST_EXPECT_MSG_EQ(hw->ValidAckRoute(), false, "the oracle needs spray");
+    }
+};
+
+class AckRouteOracleTest : public TestCase
+{
+  public:
+    AckRouteOracleTest()
+        : TestCase("Under ACK_ROUTE_ORACLE a receiver's answers leave out, from the first read of "
+                   "the switches' state after a fault's onset and for the run, every spine over "
+                   "which an answer toward the sender's leaf crosses the fault: the receiver's "
+                   "leaf's uplink to it, or its downlink to the sender's leaf")
+    {
+    }
+
+    void DoRun() override
+    {
+        const uint32_t saved = CustomHeader::ackRouteSpineBytes;
+        CustomHeader::ackRouteSpineBytes = 1;
+        SwitchQueueFabric fabric;
+        Ptr<RdmaHw> hw = CreateObject<RdmaHw>();
+        hw->m_loadBalancing = static_cast<uint32_t>(LoadBalancingMode::SprayUniform);
+        hw->m_spineCount = SwitchQueueFabric::kSpines;
+        hw->m_ackRoute = static_cast<uint32_t>(AckRoute::Spray);
+        hw->m_ackRouteOracle = true;
+        hw->m_ackRouteRandom =
+            CreateObjectWithAttributes<UniformRandomVariable>("Stream", IntegerValue(43));
+        hw->m_switchQueues = fabric.state;
+        hw->m_sprayBaseRttNs = 1000;
+        // The receiving host is on leaf 2; the senders on leaves 0 and 1.
+        hw->m_leaf = fabric.state->LeafOf(kTestReceiver.Get());
+        NS_TEST_ASSERT_MSG_EQ(hw->ValidAckRoute(), true, "the oracle has what it needs");
+
+        // One percent lost where leaf 2's uplink to spine 1 is received;
+        // spine 3's downlink to leaf 0 silent; and one percent lost where
+        // leaf 0's uplink to spine 2 is received, which no answer from leaf 2
+        // crosses.
+        Ptr<RateErrorModel> up = Gray(fabric.spines[1], fabric.downlink[1][2]);
+        Ptr<RateErrorModel> data = Gray(fabric.spines[2], fabric.downlink[2][0]);
+        const auto fault = [&]() {
+            up->Enable();
+            data->Enable();
+            fabric.leaves[0]->SetBlackhole(fabric.uplink[0][3]);
+        };
+        const auto heal = [&]() {
+            up->Disable();
+            data->Disable();
+            fabric.leaves[0]->ClearBlackhole(fabric.uplink[0][3]);
+        };
+        fault();
+        NS_TEST_EXPECT_MSG_EQ((fabric.state->AnswerFaulted(2, 0) ==
+                               std::vector<bool>{false, true, false, true}),
+                              true,
+                              "toward leaf 0 the receiver's uplink and the sender's downlink "
+                              "are faulted");
+        NS_TEST_EXPECT_MSG_EQ((fabric.state->AnswerFaulted(2, 1) ==
+                               std::vector<bool>{false, true, false, false}),
+                              true,
+                              "toward leaf 1 the receiver's uplink alone");
+        NS_TEST_EXPECT_MSG_EQ(fabric.state->Faulted(0, 2)[2],
+                              true,
+                              "the data path's fault is a path fault");
+        heal();
+        NS_TEST_EXPECT_MSG_EQ((fabric.state->AnswerFaulted(2, 0) ==
+                               std::vector<bool>(SwitchQueueFabric::kSpines, false)),
+                              true,
+                              "a healed link is no fault");
+
+        using Counts = std::vector<uint32_t>;
+        Counts zeroBefore(SwitchQueueFabric::kSpines), oneBefore(SwitchQueueFabric::kSpines);
+        Counts zeroUnread(SwitchQueueFabric::kSpines);
+        Counts zeroAfter(SwitchQueueFabric::kSpines), oneAfter(SwitchQueueFabric::kSpines);
+        Counts zeroHealed(SwitchQueueFabric::kSpines);
+        const auto answer = [&](Ipv4Address sender, Counts& counts) {
+            for (uint32_t i = 0; i < 400; ++i)
+            {
+                const uint8_t spine = hw->AnswerRouteSpine(sender.Get());
+                NS_TEST_ASSERT_MSG_LT(uint32_t(spine),
+                                      SwitchQueueFabric::kSpines,
+                                      "every answer names a spine");
+                counts[spine]++;
+            }
+        };
+        // Read first at 0 ns, then once per base RTT: the fault at 500 ns is
+        // read at 1000 ns.
+        Simulator::Schedule(NanoSeconds(0), [&]() {
+            answer(kTestSender, zeroBefore);
+            answer(SwitchQueueFabric::kOtherSender, oneBefore);
+        });
+        Simulator::Schedule(NanoSeconds(500), fault);
+        Simulator::Schedule(NanoSeconds(600), [&]() { answer(kTestSender, zeroUnread); });
+        Simulator::Schedule(NanoSeconds(1500), [&]() {
+            answer(kTestSender, zeroAfter);
+            answer(SwitchQueueFabric::kOtherSender, oneAfter);
+        });
+        Simulator::Schedule(NanoSeconds(2000), heal);
+        Simulator::Schedule(NanoSeconds(3500), [&]() { answer(kTestSender, zeroHealed); });
+        Simulator::Run();
+
+        for (uint32_t spine = 0; spine < SwitchQueueFabric::kSpines; ++spine)
+        {
+            NS_TEST_EXPECT_MSG_GT(zeroBefore[spine], 0u, "before the fault every spine is drawn");
+            NS_TEST_EXPECT_MSG_GT(oneBefore[spine], 0u, "toward either leaf");
+            NS_TEST_EXPECT_MSG_GT(zeroUnread[spine], 0u, "and until the next read");
+        }
+        for (uint32_t spine : {1u, 3u})
+        {
+            NS_TEST_EXPECT_MSG_EQ(zeroAfter[spine], 0u, "toward leaf 0 spines 1 and 3 are left out");
+            NS_TEST_EXPECT_MSG_EQ(zeroHealed[spine], 0u, "for the run");
+        }
+        NS_TEST_EXPECT_MSG_EQ(oneAfter[1], 0u, "toward leaf 1 spine 1 is left out");
+        NS_TEST_EXPECT_MSG_GT(oneAfter[3], 0u, "and spine 3 is not");
+        for (uint32_t spine : {0u, 2u})
+        {
+            NS_TEST_EXPECT_MSG_GT(zeroAfter[spine], 0u, "the other spines are drawn");
+            NS_TEST_EXPECT_MSG_GT(oneAfter[spine], 0u, "the other spines are drawn");
+        }
+        CustomHeader::ackRouteSpineBytes = saved;
+        Simulator::Destroy();
+    }
+
+  private:
+    // A loss of one percent where sw's port receives, disabled.
+    static Ptr<RateErrorModel> Gray(Ptr<SwitchNode> sw, uint32_t port)
+    {
+        Ptr<RateErrorModel> gray = CreateObject<RateErrorModel>();
+        gray->SetAttribute("ErrorUnit", StringValue("ERROR_UNIT_PACKET"));
+        gray->SetRate(0.01);
+        gray->Disable();
+        SwitchQueueFabric::Device(sw, port)->SetAttribute("LinkErrorModel", PointerValue(gray));
+        return gray;
+    }
+};
+
 class SwitchQueueGradeTest : public TestCase
 {
   public:
@@ -14362,6 +14875,9 @@ PointToPointTestSuite::PointToPointTestSuite()
     AddTestCase(new SwitchQueueGradeTest, TestCase::Duration::QUICK);
     AddTestCase(new RepsOracleTest, TestCase::Duration::QUICK);
     AddTestCase(new RepsSpineTest, TestCase::Duration::QUICK);
+    AddTestCase(new AckRouteHeaderTest, TestCase::Duration::QUICK);
+    AddTestCase(new AckRouteReceiverTest, TestCase::Duration::QUICK);
+    AddTestCase(new AckRouteOracleTest, TestCase::Duration::QUICK);
 }
 
 static PointToPointTestSuite g_pointToPointTestSuite; //!< The testsuite

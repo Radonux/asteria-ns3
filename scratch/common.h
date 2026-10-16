@@ -24,6 +24,7 @@
 #include "ns3/integer.h"
 #include "ns3/internet-module.h"
 #include "ns3/ipv4-static-routing-helper.h"
+#include "ns3/flow-id-tag.h"
 #include "ns3/packet.h"
 #include "ns3/point-to-point-helper.h"
 #include "ns3/qbb-helper.h"
@@ -133,6 +134,9 @@ enum class DeviceRngBlock : int64_t {
   LinkError = 1,
   EcnMarking = 2,
   PfcIdentification = 3,
+  // A host's draw of its answers' spines under ACK_ROUTE spray, on the
+  // stream of its first NIC.
+  AckRoute = 4,
 };
 
 int64_t device_rng_stream(DeviceRngBlock block, Ptr<NetDevice> dev) {
@@ -283,6 +287,28 @@ bool spray_held_loss_rtts_given = false;
 // declares nothing. At least 0.
 double spray_ack_loss_rtts = 0;
 bool spray_ack_loss_rtts_given = false;
+// Under LOAD_BALANCING spray_uniform, with any PATH_SELECTOR, ACK_ROUTE: the
+// spine the switches route each answer a receiver sends to a sender over, an
+// acknowledgement, a NACK or a repair request. data_spine, the default, is the
+// spine that carried the data packet it answers, which the answer's echoed
+// identification names. spray draws a spine uniformly per answer to a sender
+// off the receiver's leaf from a stream of the receiver's own, and names it
+// in a route_spine byte every answer then carries; answers to a sender on the
+// receiver's leaf cross no spine and draw nothing. The echoed identification
+// is the same under both, and the sender reads its spines from it alone.
+std::string ack_route = "data_spine";
+bool ack_route_given = false;
+// Under ACK_ROUTE spray, ACK_ROUTE_ORACLE on: the draw leaves out the spines
+// over which an answer toward the sender's leaf crosses a fault, a loss or a
+// black hole on the receiver's leaf's uplink to the spine or on the spine's
+// downlink to the sender's leaf, or a port slower than another spine's, as
+// the switches' state shows it from the fault's onset, read once per
+// SPRAY_BASE_RTT_NS as reps_oracle reads its own; a spine once left out stays
+// out. Off, the default.
+std::string ack_route_oracle = "off";
+bool ack_route_oracle_given = false;
+bool ack_route_spray() { return ack_route == "spray"; }
+bool ack_route_oracle_on() { return ack_route_oracle == "on"; }
 std::string spray_hold_release = "sentinels";
 bool spray_hold_release_given = false;
 double spray_hold_trickle = 0.01;
@@ -908,6 +934,39 @@ void get_queue_event(const char *event, Ptr<QbbNetDevice> dev,
                         static_cast<int32_t>(queue));
 }
 
+// The receiving end of every leaf-spine link, by node id and device index:
+// the spine's index, by the rank of its node id as AssignSpinePorts indexes
+// it, and whether the link goes up, from the leaf to the spine.
+std::map<std::pair<uint32_t, uint32_t>, std::pair<uint32_t, bool>>
+    spine_link_receivers;
+
+// An answer a receiver sends to a sender, an acknowledgement, a NACK or a
+// repair request, lost where node's device port receives it: if that device
+// ends a leaf-spine link, counted as answer_drop_up or answer_drop_down by
+// the link's direction, and again with _spine<k> appended for its spine k,
+// the breakdown by spine. The losses are those switch_blackhole_drop and
+// link_error_drop count already.
+void count_answer_drop(uint32_t node, uint32_t port, uint8_t protocol,
+                       uint64_t bytes) {
+  if (protocol != 0xFC && protocol != 0xFD &&
+      protocol != kUecTrimRepairProtocol)
+    return;
+  const auto link = spine_link_receivers.find({node, port});
+  if (link == spine_link_receivers.end())
+    return;
+  const string event =
+      string("answer_drop_") + (link->second.second ? "up" : "down");
+  accumulate_transport_event(event, "control", bytes);
+  accumulate_transport_event(event + "_spine" + std::to_string(link->second.first),
+                             "control", bytes);
+}
+
+void get_answer_link_error_drop(Ptr<QbbNetDevice> dev, Ptr<const Packet> packet,
+                                uint32_t protocol) {
+  count_answer_drop(dev->GetNode()->GetId(), dev->GetIfIndex(), protocol,
+                    packet->GetSize());
+}
+
 void get_switch_drop(Ptr<SwitchNode> sw,
                      Ptr<const Packet> packet, uint32_t reason) {
   CustomHeader ch(CustomHeader::L2_Header | CustomHeader::L3_Header |
@@ -938,6 +997,12 @@ void get_switch_drop(Ptr<SwitchNode> sw,
   }
   accumulate_transport_event(event, (udp || trimmed) ? "data" : "control",
                              packet->GetSize());
+  // A black hole drops what arrives on its port, which the device tagged.
+  FlowIdTag port;
+  if (static_cast<SwitchDropReason>(reason) == SwitchDropReason::Blackhole &&
+      packet->PeekPacketTag(port))
+    count_answer_drop(sw->GetId(), port.GetFlowId(), ch.l3Prot,
+                      packet->GetSize());
   if (transport_event_raw_cctx == nullptr)
     return;
   const uint16_t source_port =
@@ -1243,6 +1308,8 @@ void connect_transport_traces(Ptr<QbbNetDevice> dev) {
   dev->TraceConnectWithoutContext(
       "LinkErrorDrop", MakeBoundCallback(&get_transport_event,
                                          "link_error_drop", dev));
+  dev->TraceConnectWithoutContext(
+      "LinkErrorDrop", MakeBoundCallback(&get_answer_link_error_drop, dev));
 }
 
 struct QlenDistribution {
@@ -1435,6 +1502,22 @@ uint32_t AssignSpinePorts(NodeContainer &n) {
     DynamicCast<SwitchNode>(leaf)->SetSpinePorts(ports);
   }
   return spines.size();
+}
+
+// spine_link_receivers, for a fabric of leaves and spines.
+void FindSpineLinkReceivers(NodeContainer &n) {
+  vector<Ptr<Node>> leaves, spines;
+  LeavesAndSpines(n, leaves, spines);
+  for (Ptr<Node> leaf : leaves) {
+    for (uint32_t k = 0; k < spines.size(); k++) {
+      const auto link = nbr2if[leaf].find(spines[k]);
+      if (link == nbr2if[leaf].end())
+        continue;
+      spine_link_receivers[{spines[k]->GetId(),
+                            nbr2if[spines[k]][leaf].idx}] = {k, true};
+      spine_link_receivers[{leaf->GetId(), link->second.idx}] = {k, false};
+    }
+  }
 }
 
 // Simulation only: every hop of every leaf-spine path, for a receiver that
@@ -2288,6 +2371,12 @@ bool ReadConf(string network_configuration) {
     } else if (key.compare("SPRAY_ACK_LOSS_RTTS") == 0) {
       conf >> spray_ack_loss_rtts;
       spray_ack_loss_rtts_given = true;
+    } else if (key.compare("ACK_ROUTE") == 0) {
+      conf >> ack_route;
+      ack_route_given = true;
+    } else if (key.compare("ACK_ROUTE_ORACLE") == 0) {
+      conf >> ack_route_oracle;
+      ack_route_oracle_given = true;
     } else if (key.compare("SPRAY_HOLD_RELEASE") == 0) {
       conf >> spray_hold_release;
       spray_hold_release_given = true;
@@ -2786,6 +2875,22 @@ bool ReadConf(string network_configuration) {
     std::cerr << "SPRAY_ACK_LOSS_RTTS must be at least 0\n";
     return false;
   }
+  if (ack_route != "data_spine" && ack_route != "spray") {
+    std::cerr << "ACK_ROUTE must be data_spine or spray\n";
+    return false;
+  }
+  if (ack_route_given && load_balancing != "spray_uniform") {
+    std::cerr << "ACK_ROUTE is read only under LOAD_BALANCING spray_uniform\n";
+    return false;
+  }
+  if (ack_route_oracle != "on" && ack_route_oracle != "off") {
+    std::cerr << "ACK_ROUTE_ORACLE must be on or off\n";
+    return false;
+  }
+  if (ack_route_oracle_given && !ack_route_spray()) {
+    std::cerr << "ACK_ROUTE_ORACLE is read only under ACK_ROUTE spray\n";
+    return false;
+  }
   if (spray_tail_recovery != "on" && spray_tail_recovery != "off") {
     std::cerr << "SPRAY_TAIL_RECOVERY must be on or off\n";
     return false;
@@ -2981,6 +3086,7 @@ void SetConfig() {
   CustomHeader::udpCarriesPathSeq = spray_path_seq == "on";
   CustomHeader::ackReceiverHoldBytes = receiver_hold() ? 1 : 0;
   CustomHeader::ackTailNackBytes = tail_recovery() ? 5 : 0;
+  CustomHeader::ackRouteSpineBytes = ack_route_spray() ? 1 : 0;
 
   // Set Pint
   if (cc_mode == 10) {
@@ -3124,6 +3230,10 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),
   // their breakdowns by spine only where a spine has one.
   transport_event_totals[{"receiver_tail_missing", "control"}];
   transport_event_totals[{"receiver_tail_missing_late", "control"}];
+  // Written under every mode; their breakdowns by spine only where a spine
+  // has one.
+  transport_event_totals[{"answer_drop_up", "control"}];
+  transport_event_totals[{"answer_drop_down", "control"}];
   // The totals must land even when a watchdog exits the run mid-simulation.
   std::atexit(write_transport_event_summary);
   ZSTD_CCtx_setParameter(transport_event_raw_cctx, ZSTD_c_compressionLevel, 8);
@@ -3300,6 +3410,7 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),
     }
   }
 
+  FindSpineLinkReceivers(n);
   uint32_t spine_count = 0;
   if (names_spine()) {
     spine_count = AssignSpinePorts(n);
@@ -3342,7 +3453,8 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),
   // The switches' state, which leaf_hold and receiver_hold read only for the
   // hosts' leaves.
   const Ptr<SwitchQueueState> switch_queues =
-      switch_queue_cost() || leaf_hold() || reps_oracle() || receiver_hold()
+      switch_queue_cost() || leaf_hold() || reps_oracle() || receiver_hold() ||
+              ack_route_oracle_on()
           ? BuildSwitchQueueState(n)
           : nullptr;
   // One variable for every host, so the draw consumes a single fixed stream.
@@ -3436,6 +3548,20 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),
       rdmaHw->SetAttribute("SprayAckLossRtts",
                            DoubleValue(spray_ack_loss_rtts));
       rdmaHw->SetAttribute(
+          "AckRoute",
+          UintegerValue(static_cast<uint32_t>(
+              ack_route_spray() ? AckRoute::Spray : AckRoute::DataSpine)));
+      rdmaHw->SetAttribute("AckRouteOracle",
+                           BooleanValue(ack_route_oracle_on()));
+      // Made only under spray, so that data_spine allocates no stream.
+      if (ack_route_spray())
+        rdmaHw->SetAttribute(
+            "AckRouteRandomVariable",
+            PointerValue(CreateObjectWithAttributes<UniformRandomVariable>(
+                "Stream", IntegerValue(device_rng_stream(
+                              DeviceRngBlock::AckRoute,
+                              n.Get(i)->GetDevice(1))))));
+      rdmaHw->SetAttribute(
           "SprayPathState",
           UintegerValue(static_cast<uint32_t>(spray_path_state == "connection"
                                                   ? PathState::Connection
@@ -3469,7 +3595,7 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),
                            UintegerValue(ack_redirect_trim_scoring_value()));
       rdmaHw->SetAttribute("AckRedirectScope",
                            UintegerValue(grade_scope_value(ack_redirect_scope)));
-      if (path_selector == "ack_redirect")
+      if (path_selector == "ack_redirect" || ack_route_spray())
         rdmaHw->m_ownLeafHosts = own_leaf_hosts(n.Get(i));
       rdmaHw->SetAttribute("SprayReportIntervalBaseRtts",
                            DoubleValue(spray_report_interval_base_rtts));
@@ -3625,7 +3751,7 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),
   printf("maxRtt=%lu maxBdp=%lu\n", maxRtt, maxBdp);
   // Known only now that every route is, and read from the first packet on.
   if (load_balancing == "spray_policy" || path_selector == "ack_redirect" ||
-      reps_oracle() || tail_recovery()) {
+      reps_oracle() || tail_recovery() || ack_route_oracle_on()) {
     for (uint32_t i = 0; i < node_num; i++)
       if (n.Get(i)->GetNodeType() == 0)
         n.Get(i)->GetObject<RdmaDriver>()->m_rdma->SetAttribute(

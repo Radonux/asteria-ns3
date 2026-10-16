@@ -57,6 +57,23 @@ inline uint16_t PathOf(LoadBalancingMode mode, uint16_t identification){
 	return NamesSpine(mode) ? RequestedSpine(identification) : identification;
 }
 
+// How the receiver of a data packet picks the spine of each packet it sends
+// back to the sender: an acknowledgement, a NACK or a repair request. Under
+// both the answer returns the data packet's identification, whose spines the
+// sender reads; only the spine the switches route it over differs.
+enum class AckRoute : uint32_t {
+	// Over the spine that carried the data packet it answers, which the
+	// identification names.
+	DataSpine = 0,
+	// Over a spine the receiver draws uniformly per answer, named in the
+	// answer's route_spine field.
+	Spray,
+};
+
+// The value of an answer's route_spine field that names no spine: the
+// answer is routed by the carrying spine its identification names.
+constexpr uint8_t kNoRouteSpine = 255;
+
 // The value of an acknowledgement's redirect field that names no spine.
 constexpr uint8_t kNoRedirect = 255;
 

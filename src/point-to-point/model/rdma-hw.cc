@@ -655,6 +655,35 @@ TypeId RdmaHw::GetTypeId (void)
 				DoubleValue(0),
 				MakeDoubleAccessor(&RdmaHw::m_sprayAckLossRtts),
 				MakeDoubleChecker<double>(0))
+		.AddAttribute("AckRoute",
+				"Under LoadBalancing 2, the spine the switches route each "
+				"answer a receiver sends over, an acknowledgement, a NACK or a "
+				"repair request: 0=the spine that carried the data packet it "
+				"answers; 1=a spine the receiver draws uniformly per answer "
+				"from AckRouteRandomVariable, named in the answer's "
+				"route_spine field, which needs "
+				"CustomHeader::ackRouteSpineBytes 1. The answer echoes the data "
+				"packet's identification either way. Default 0.",
+				UintegerValue(static_cast<uint32_t>(AckRoute::DataSpine)),
+				MakeUintegerAccessor(&RdmaHw::m_ackRoute),
+				MakeUintegerChecker<uint32_t>(
+					static_cast<uint32_t>(AckRoute::DataSpine),
+					static_cast<uint32_t>(AckRoute::Spray)))
+		.AddAttribute("AckRouteRandomVariable",
+				"Under AckRoute 1, the variable each answer's spine is drawn "
+				"from, a stream of this host's own. Null by default, so that "
+				"AckRoute 0 allocates no stream.",
+				PointerValue(),
+				MakePointerAccessor(&RdmaHw::m_ackRouteRandom),
+				MakePointerChecker<UniformRandomVariable>())
+		.AddAttribute("AckRouteOracle",
+				"Under AckRoute 1, whether the draw leaves out the spines over "
+				"which an answer toward the sender's leaf crosses a fault as "
+				"SwitchQueueState shows it, read once per SprayBaseRttNs; a "
+				"spine once left out stays out. Default false.",
+				BooleanValue(false),
+				MakeBooleanAccessor(&RdmaHw::m_ackRouteOracle),
+				MakeBooleanChecker())
 		.AddAttribute("SprayPathSeq",
 				"Under LoadBalancing 2, whether every data packet carries "
 				"its queue pair's count of the data packets sent before it up "
@@ -1152,6 +1181,12 @@ void RdmaHw::Setup(QpCompleteCallback cb, QpFailureCallback failure_cb){
 	NS_ABORT_MSG_IF(!ValidAckLoss(),
 		"SprayAckLossRtts is read only under LoadBalancing 2, where every "
 		"send has a record and every acknowledgement names its path");
+	NS_ABORT_MSG_IF(!ValidAckRoute(),
+		"AckRoute 1 is read only under LoadBalancing 2, draws from "
+		"AckRouteRandomVariable a spine index below kNoRouteSpine, and answers "
+		"carry the route_spine field exactly when it is set "
+		"(CustomHeader::ackRouteSpineBytes); AckRouteOracle needs AckRoute 1 "
+		"and SwitchQueueState for the hosts' leaves");
 	NS_ABORT_MSG_IF(m_loadBalancing !=
 				static_cast<uint32_t>(LoadBalancingMode::Ecmp) && !m_pathRandom,
 		"A LoadBalancing mode other than ECMP draws the identification of every "
@@ -1751,6 +1786,48 @@ bool RdmaHw::ValidAckLoss() const{
 		static_cast<uint32_t>(LoadBalancingMode::SprayUniform);
 }
 
+bool RdmaHw::ValidAckRoute() const{
+	const bool spray = m_ackRoute == static_cast<uint32_t>(AckRoute::Spray);
+	if (CustomHeader::ackRouteSpineBytes != (spray ? 1 : 0))
+		return false;
+	if (m_ackRouteOracle && (!spray || !m_switchQueues ||
+			m_leaf == SwitchQueueState::kNoLeaf))
+		return false;
+	return !spray || (m_loadBalancing ==
+			static_cast<uint32_t>(LoadBalancingMode::SprayUniform) &&
+		m_ackRouteRandom && m_spineCount < kNoRouteSpine);
+}
+
+FaultedSpines &RdmaHw::AnswerFaultedSpinesTo(uint32_t leaf){
+	NS_ABORT_MSG_IF(m_sprayBaseRttNs == 0,
+		"AckRouteOracle reads the switches once per SprayBaseRttNs");
+	NS_ABORT_MSG_IF(leaf == SwitchQueueState::kNoLeaf,
+		"AckRouteOracle reads the paths toward the sender's leaf");
+	return m_answerFaultedSpines.try_emplace(leaf, m_spineCount,
+		m_sprayBaseRttNs,
+		[this, leaf](){ return m_switchQueues->AnswerFaulted(m_leaf, leaf); })
+		.first->second;
+}
+
+uint8_t RdmaHw::AnswerRouteSpine(uint32_t senderIp){
+	if (m_ackRoute != static_cast<uint32_t>(AckRoute::Spray) ||
+			std::binary_search(m_ownLeafHosts.begin(), m_ownLeafHosts.end(),
+				senderIp))
+		return kNoRouteSpine;
+	if (!m_ackRouteOracle)
+		return m_ackRouteRandom->GetInteger(0, m_spineCount - 1);
+	FaultedSpines &faulted =
+		AnswerFaultedSpinesTo(m_switchQueues->LeafOf(senderIp));
+	faulted.Read(Simulator::Now().GetNanoSeconds());
+	uint8_t allowed[UINT8_MAX + 1];
+	uint32_t count = 0;
+	for (uint32_t spine = 0; spine < m_spineCount; spine++){
+		if (!faulted.Excludes(spine))
+			allowed[count++] = spine;
+	}
+	return allowed[m_ackRouteRandom->GetInteger(0, count - 1)];
+}
+
 std::optional<std::array<double, 3>> RdmaHw::SprayLossThresholds() const{
 	if (m_sprayLossThreshold1 == 0)
 		return std::nullopt;
@@ -1891,6 +1968,7 @@ void RdmaHw::SendAck(Ptr<RdmaRxQueuePair> q, uint32_t sourceIp,
 		seqh.SetSpineReport(ReportFor(q, destinationIp));
 	seqh.SetRedirect(redirect);
 	seqh.SetReceiverHold(ReceiverHoldBitmap(destinationIp));
+	seqh.SetRouteSpine(AnswerRouteSpine(destinationIp));
 	// The grant is this flag without the report above. A receiver that may not
 	// forgive this flow, or a step that is critical, never sets it, so those
 	// senders obey their controller throughout.
@@ -2177,9 +2255,11 @@ void RdmaHw::SendTrimNack(Ptr<RdmaRxQueuePair> q, const CustomHeader &ch,
 
 void RdmaHw::SendRepairRequest(const qbbHeader &header, uint32_t sourceIp,
 		uint32_t destinationIp, uint16_t identification){
+	qbbHeader routed = header;
+	routed.SetRouteSpine(AnswerRouteSpine(destinationIp));
 	Ptr<Packet> packet = Create<Packet>(
-		std::max(60 - 14 - 20 - static_cast<int>(header.GetSerializedSize()), 0));
-	packet->AddHeader(header);
+		std::max(60 - 14 - 20 - static_cast<int>(routed.GetSerializedSize()), 0));
+	packet->AddHeader(routed);
 
 	Ipv4Header ipHeader;
 	ipHeader.SetSource(Ipv4Address(sourceIp));
