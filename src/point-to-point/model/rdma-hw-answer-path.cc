@@ -19,12 +19,26 @@ void RdmaHw::ReportCoveredAnswerLoss(){
 }
 
 bool RdmaHw::ValidDuplicateReport() const{
-	return !m_sprayDuplicateReport || m_sprayCoverageFirst;
+	if (m_sprayDuplicateReport == static_cast<uint32_t>(DuplicateReport::Off))
+		return true;
+	return m_sprayCoverageFirst &&
+		(m_sprayDuplicateReport != static_cast<uint32_t>(DuplicateReport::Retract) ||
+			(IsAutoHold() &&
+				m_sprayHoldRule == static_cast<uint32_t>(HoldRule::Count)));
 }
 
 void RdmaHw::ReportTimedOutResolved(bool duplicate){
 	ReportTransportEvent(duplicate ? "answer_loss_duplicate"
 		: "timeout_loss_data", 0);
+}
+
+void RdmaHw::ReportTimeoutLossRetracted(uint16_t route, bool released){
+	if (route == kNoRouteSpine)
+		ReportTransportEvent("answer_loss_duplicate", 0);
+	else
+		ReportTailMissing("answer_loss_duplicate", static_cast<uint8_t>(route));
+	if (released)
+		ReportTransportEvent("timeout_retract_release", 0);
 }
 
 bool RdmaHw::ValidAnswerPathSeq() const{

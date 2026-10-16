@@ -521,7 +521,15 @@ bool spray_coverage_first_given = false;
 // having arrived, counted as the host transport event answer_loss_duplicate;
 // and on the first send's path where it is not, or the cumulative
 // acknowledgement covers the sequence first, counted as timeout_loss_data.
-// Off, the default.
+// retract: the receiver flags as under on, and the sender tells each loss a
+// retransmission timeout declares at once, as with off, a sequence timed out
+// again told once more; the flagged answer to the sequence takes each back
+// from the host's auto loss hold, regrading without it the hold it began,
+// counted as answer_loss_duplicate, by the route spine the answer came back
+// over, and timeout_retract_release where the hold was released; a loss
+// left standing is timeout_loss_data. retract needs PATH_SELECTOR reps_hold or
+// mrc_hold under SPRAY_HOLD_SCOPE auto and SPRAY_HOLD_RULE count. Off, the
+// default.
 std::string spray_duplicate_report = "off";
 bool spray_duplicate_report_given = false;
 // Under ACK_ROUTE spray with SPRAY_PATH_SEQ on and a loss hold PATH_SELECTOR,
@@ -3158,8 +3166,17 @@ bool ReadConf(string network_configuration) {
                  "spray_uniform\n";
     return false;
   }
-  if (spray_duplicate_report != "on" && spray_duplicate_report != "off") {
-    std::cerr << "SPRAY_DUPLICATE_REPORT must be on or off\n";
+  if (spray_duplicate_report != "on" && spray_duplicate_report != "off" &&
+      spray_duplicate_report != "retract") {
+    std::cerr << "SPRAY_DUPLICATE_REPORT must be on, off or retract\n";
+    return false;
+  }
+  if (spray_duplicate_report == "retract" &&
+      (!hold_scope_read() || spray_hold_scope != "auto" ||
+       spray_hold_rule != "count")) {
+    std::cerr << "SPRAY_DUPLICATE_REPORT retract takes losses back from "
+                 "PATH_SELECTOR reps_hold's or mrc_hold's loss hold under "
+                 "SPRAY_HOLD_SCOPE auto and SPRAY_HOLD_RULE count\n";
     return false;
   }
   if (spray_duplicate_report_given && spray_coverage_first != "on") {
@@ -3482,9 +3499,11 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),
   // Written where their key is on.
   if (spray_coverage_first == "on")
     transport_event_totals[{"answer_loss_covered", "control"}];
-  if (spray_duplicate_report == "on")
+  if (spray_duplicate_report != "off")
     for (const char *event : {"answer_loss_duplicate", "timeout_loss_data"})
       transport_event_totals[{event, "control"}];
+  if (spray_duplicate_report == "retract")
+    transport_event_totals[{"timeout_retract_release", "control"}];
   if (answer_path_seq())
     for (const char *event : {"answer_route_lost", "answer_route_hold",
                               "answer_route_release", "answer_probe"})
@@ -3869,8 +3888,12 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),
           BooleanValue(spray_receiver_tail_missing == "on"));
       rdmaHw->SetAttribute("SprayCoverageFirst",
                            BooleanValue(spray_coverage_first == "on"));
-      rdmaHw->SetAttribute("SprayDuplicateReport",
-                           BooleanValue(spray_duplicate_report == "on"));
+      rdmaHw->SetAttribute(
+          "SprayDuplicateReport",
+          UintegerValue(static_cast<uint32_t>(
+              spray_duplicate_report == "retract" ? DuplicateReport::Retract
+              : spray_duplicate_report == "on"    ? DuplicateReport::Defer
+                                                  : DuplicateReport::Off)));
       rdmaHw->SetAttribute("SprayAnswerPathSeq",
                            BooleanValue(answer_path_seq()));
       rdmaHw->SetAttribute("SprayAnswerProbeIntervalNs",

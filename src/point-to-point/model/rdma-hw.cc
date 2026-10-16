@@ -713,15 +713,21 @@ TypeId RdmaHw::GetTypeId (void)
 				MakeBooleanChecker())
 		.AddAttribute("SprayDuplicateReport",
 				"Under SprayCoverageFirst, whether a receiver flags its answer "
-				"to a data packet whose sequence it held already, and a sender "
-				"tells the selector the loss of a send a retransmission timeout "
-				"declares only at the answer to its resend: none where that "
-				"answer is flagged, an answer loss, and on the first send's "
-				"path where it is not or the cumulative acknowledgement covers "
-				"the sequence first. Default false.",
-				BooleanValue(false),
-				MakeBooleanAccessor(&RdmaHw::m_sprayDuplicateReport),
-				MakeBooleanChecker())
+				"to a data packet whose sequence it held already, and what a "
+				"sender makes of the flag on the answer to the resend of a send "
+				"a retransmission timeout declared lost: 0=no flag; 1=defer, "
+				"the timeout's loss told to the selector only at that answer, "
+				"none where it is flagged, an answer loss, and on the first "
+				"send's path where it is not or the cumulative acknowledgement "
+				"covers the sequence first; 2=retract, each loss told at once "
+				"and taken back where the answer is flagged, the hold it began "
+				"graded again without it, which needs the host's auto loss "
+				"hold under SprayHoldRule 0. Default 0.",
+				UintegerValue(static_cast<uint32_t>(DuplicateReport::Off)),
+				MakeUintegerAccessor(&RdmaHw::m_sprayDuplicateReport),
+				MakeUintegerChecker<uint32_t>(
+					static_cast<uint32_t>(DuplicateReport::Off),
+					static_cast<uint32_t>(DuplicateReport::Retract)))
 		.AddAttribute("SprayCoverageFirst",
 				"Under LoadBalancing 2, whether the per-path rule, the held-loss "
 				"rule, a tail repair request, a copy's expiry and "
@@ -1281,7 +1287,9 @@ void RdmaHw::Setup(QpCompleteCallback cb, QpFailureCallback failure_cb){
 	NS_ABORT_MSG_IF(!ValidNsccRttSample(),
 		"NsccRttSample 1 is read only under CC mode 11");
 	NS_ABORT_MSG_IF(!ValidDuplicateReport(),
-		"SprayDuplicateReport needs SprayCoverageFirst");
+		"SprayDuplicateReport needs SprayCoverageFirst, and 2 the host's auto "
+		"loss hold (PathSelector 6 or 9 with SprayHoldScope auto) under "
+		"SprayHoldRule 0");
 	NS_ABORT_MSG_IF(!ValidCoverageFirst(),
 		"SprayCoverageFirst is read only under LoadBalancing 2, where every "
 		"send has a record");
@@ -1611,8 +1619,9 @@ int RdmaHw::ReceiveUdp(Ptr<Packet> p, CustomHeader &ch){
 		SendAck(rxQp, ch.dip, ch.sip, ch.udp.dport, ch.udp.sport, ch.udp.pg,
 			ch.udp.ih, ch.udp.seq, ch.ipid, x == 2, ecnbits != 0,
 			AllowanceGone(rxQp), false, redirect,
-			m_sprayDuplicateReport && accepted == 0 && late_forgiven == 0 &&
-				payload_size > 0);
+			m_sprayDuplicateReport !=
+					static_cast<uint32_t>(DuplicateReport::Off) &&
+				accepted == 0 && late_forgiven == 0 && payload_size > 0);
 	}
 	// After the acknowledgement, so this packet's answer carries the state
 	// this packet produced and anything the report below absorbs is
@@ -2329,9 +2338,11 @@ int RdmaHw::ReceiveAck(Ptr<Packet> p, CustomHeader &ch){
 				qp->m_pathSelector->OnAck(path, cnp, now);
 				// The answer to the resend of a timed-out send, flagged where
 				// the first send had arrived.
-				if (!qp->m_timedOut.empty())
+				if (!qp->m_timedOut.empty() || !qp->m_timeoutLosses.empty())
 					qp->ResolveTimedOut(ch.ack.packet_seq,
-						(ch.ack.flags >> qbbHeader::FLAG_DUPLICATE) & 1, now);
+						(ch.ack.flags >> qbbHeader::FLAG_DUPLICATE) & 1,
+						ch.ack.route_spine != kNoRouteSpine ? ch.ack.route_spine
+							: CarryingSpine(ch.ipid), now);
 				// The destination's downlink being congested is the receiver's
 				// flow control of UEC 1.0.3 section 3.6.13.2.
 				const uint32_t rcvCwndPend = IsSprayPolicy() &&
@@ -3540,8 +3551,15 @@ bool RdmaHw::StartPathSelection(Ptr<RdmaQueuePair> qp, uint64_t bdpBytes,
 		qp->m_coveredAnswerLoss =
 			MakeCallback(&RdmaHw::ReportCoveredAnswerLoss, this);
 	}
-	if (m_sprayDuplicateReport){
-		qp->m_deferTimeoutEvidence = true;
+	if (m_sprayDuplicateReport != static_cast<uint32_t>(DuplicateReport::Off)){
+		if (m_sprayDuplicateReport ==
+				static_cast<uint32_t>(DuplicateReport::Defer))
+			qp->m_deferTimeoutEvidence = true;
+		else {
+			qp->m_retractTimeoutEvidence = true;
+			qp->m_timeoutLossRetracted =
+				MakeCallback(&RdmaHw::ReportTimeoutLossRetracted, this);
+		}
 		qp->m_timedOutResolved =
 			MakeCallback(&RdmaHw::ReportTimedOutResolved, this);
 	}

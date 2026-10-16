@@ -61,6 +61,18 @@ inline uint16_t PathOf(LoadBalancingMode mode, uint16_t identification){
 // back to the sender: an acknowledgement, a NACK or a repair request. Under
 // both the answer returns the data packet's identification, whose spines the
 // sender reads; only the spine the switches route it over differs.
+// SprayDuplicateReport, under SprayCoverageFirst: a receiver flags its answer
+// to a data packet whose sequence it held already (qbbHeader::FLAG_DUPLICATE),
+// and a sender reads the flag on the answer to a timed-out send's resend.
+// Defer tells the selector a timeout's loss only at that answer, none where it
+// is flagged; Retract tells it at once and takes it back where the answer is
+// flagged (RdmaQueuePair::m_retractTimeoutEvidence).
+enum class DuplicateReport : uint32_t {
+	Off = 0,
+	Defer,
+	Retract,
+};
+
 enum class AckRoute : uint32_t {
 	// Over the spine that carried the data packet it answers, which the
 	// identification names.

@@ -343,9 +343,18 @@ public:
 	// answer to their resend (RdmaQueuePair::m_deferTimeoutEvidence): each
 	// resolved as an answer loss is the host transport event
 	// answer_loss_duplicate, each told as a data loss timeout_loss_data.
-	bool m_sprayDuplicateReport;
+	// Under Retract (DuplicateReport) the timeout tells each loss at once
+	// and the flagged answer takes it back (RdmaQueuePair::
+	// m_retractTimeoutEvidence): each taken back is answer_loss_duplicate,
+	// by the route spine the answer came back over as
+	// answer_loss_duplicate_spine<k>, and timeout_retract_release where it
+	// released the hold it began; each left a data loss timeout_loss_data.
+	// Retract needs the host's AutoLossHold under HoldRule::Count, which
+	// takes a loss back.
+	uint32_t m_sprayDuplicateReport;
 	bool ValidDuplicateReport() const;
 	void ReportTimedOutResolved(bool duplicate);
+	void ReportTimeoutLossRetracted(uint16_t route, bool released);
 	// SprayAnswerPathSeq, under AckRoute Spray with SprayPathSeq and a loss
 	// hold selector (answer-path-seq.h). As a receiver this host numbers
 	// each queue pair's answers per route spine (AnswerSequencer), every

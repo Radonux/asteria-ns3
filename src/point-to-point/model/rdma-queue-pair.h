@@ -434,8 +434,29 @@ public:
 	uint32_t m_duplicate_answer_losses;
 	uint32_t m_timeout_data_losses;
 	Callback<void, bool> m_timedOutResolved;
-	// The answer to a send of seq, flagged as a duplicate or not.
-	void ResolveTimedOut(uint64_t seq, bool duplicate, uint64_t nowNs);
+	// Under SprayDuplicateReport's retract instead, a retransmission timeout
+	// tells the loss of each send it declares at once, as without the key,
+	// and keeps each in m_timeoutLosses, a sequence timed out again kept
+	// once more. An answer to the sequence flagged as a duplicate takes each
+	// back (PathSelector::RetractLoss), the first send having arrived:
+	// counted in m_duplicate_answer_losses and m_retracted_timeout_losses,
+	// and told to m_timeoutLossRetracted with the route spine the answer came
+	// back over and whether the hold the loss began was released. An
+	// unflagged answer, or the cumulative acknowledgement covering the
+	// sequence first, leaves each a data loss, counted in
+	// m_timeout_data_losses and told to m_timedOutResolved.
+	struct TimeoutLoss {
+		uint16_t path;
+		uint64_t countedNs;
+	};
+	bool m_retractTimeoutEvidence;
+	std::multimap<uint64_t, TimeoutLoss> m_timeoutLosses;
+	uint32_t m_retracted_timeout_losses;
+	Callback<void, uint16_t, bool> m_timeoutLossRetracted;
+	// The answer to a send of seq over route spine route, kNoRouteSpine for
+	// none, flagged as a duplicate or not.
+	void ResolveTimedOut(uint64_t seq, bool duplicate, uint16_t route,
+		uint64_t nowNs);
 	// Under SprayAnswerPathSeq, the numbered answers read so far.
 	AnswerSequenceTracker m_answerTracker;
 

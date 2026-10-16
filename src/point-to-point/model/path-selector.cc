@@ -18,6 +18,10 @@ void PathSelector::OnTrim(uint16_t, bool, bool, uint64_t){
 void PathSelector::OnLoss(uint16_t, uint64_t){
 }
 
+bool PathSelector::RetractLoss(uint16_t, uint64_t, uint64_t){
+	return false;
+}
+
 void PathSelector::OnTimeout(uint64_t){
 }
 
@@ -104,6 +108,11 @@ void SharedPathSelector::OnTrim(uint16_t path, bool lastHop, bool marked,
 
 void SharedPathSelector::OnLoss(uint16_t path, uint64_t nowNs){
 	m_shared->OnLoss(path, nowNs);
+}
+
+bool SharedPathSelector::RetractLoss(uint16_t path, uint64_t countedNs,
+		uint64_t nowNs){
+	return m_shared->RetractLoss(path, countedNs, nowNs);
 }
 
 void SharedPathSelector::OnTimeout(uint64_t nowNs){
@@ -1053,7 +1062,8 @@ AutoLossHold::Leaf::Leaf(uint32_t spines,
 		const LossLikelihoodRatio::Parameters &likelihood)
 	: sent(spines), lost(spines), answered(spines), held(spines), clean(spines),
 	  sentinelNs(spines), likelihood(spines, LossLikelihoodRatio(likelihood)),
-	  trickle(spines, TrickleRelease(likelihood))
+	  trickle(spines, TrickleRelease(likelihood)), heldEndNs(spines),
+	  heldSent(spines), heldLost(spines)
 {
 }
 
@@ -1075,7 +1085,8 @@ AutoLossHold::AutoLossHold(uint32_t spines,
 	  m_sentinelMode(parameters.sentinelMode),
 	  m_lossLeaves(spines), m_hostHeld(spines),
 	  m_hostClean(spines), m_hostSentinelNs(spines),
-	  m_hostTrickle(spines, TrickleRelease(parameters.likelihood))
+	  m_hostTrickle(spines, TrickleRelease(parameters.likelihood)),
+	  m_hostEvidence(spines)
 {
 	NS_ASSERT_MSG(spines > 0 && spines <= SpineReport::kMaxSpines,
 		"a hold names at most SpineReport::kMaxSpines spines");
@@ -1118,6 +1129,51 @@ void AutoLossHold::CountLoss(uint32_t leaf, uint32_t spine, uint64_t nowNs){
 			counts.likelihood[spine].WindowLost()));
 }
 
+bool AutoLossHold::RetractLoss(uint32_t leaf, uint32_t spine,
+		uint64_t countedNs, uint64_t nowNs){
+	NS_ASSERT_MSG(spine < m_spines, "a loss is on a held spine's range");
+	AdvanceLossInterval(nowNs);
+	const auto found = m_leaves.find(leaf);
+	if (found == m_leaves.end())
+		return false;
+	Leaf &counts = found->second;
+	// The intervals end at the multiples of the loss interval.
+	const uint64_t countedEndNs =
+		(countedNs / m_lossIntervalNs + 1) * m_lossIntervalNs;
+	if (countedEndNs == m_lossIntervalEndNs){
+		if (counts.lost[spine] > 0)
+			counts.lost[spine]--;
+		return false;
+	}
+	Evidence &host = m_hostEvidence[spine];
+	if (m_hostHeld[spine] && host.endNs == countedEndNs && host.leaf == leaf){
+		if (host.lost > 0)
+			host.lost--;
+		if (LossGrade(host.sent, host.lost) == 0)
+			return false;
+		m_hostHeld[spine] = false;
+		m_hostClean[spine] = 0;
+		host = Evidence{};
+		m_lossLeaves[spine].clear();
+		ResetLikelihood(spine);
+		return true;
+	}
+	if (counts.held[spine] && counts.heldEndNs[spine] == countedEndNs){
+		if (counts.heldLost[spine] > 0)
+			counts.heldLost[spine]--;
+		if (LossGrade(counts.heldSent[spine], counts.heldLost[spine]) == 0)
+			return false;
+		counts.held[spine] = false;
+		counts.clean[spine] = 0;
+		counts.heldEndNs[spine] = 0;
+		counts.likelihood[spine].Reset();
+		if (!LeafHolds(spine))
+			m_lossLeaves[spine].clear();
+		return true;
+	}
+	return false;
+}
+
 void AutoLossHold::CountAnswer(uint32_t leaf, uint32_t spine, uint64_t nowNs){
 	NS_ASSERT_MSG(spine < m_spines, "an answer is on a held spine's range");
 	AdvanceLossInterval(nowNs);
@@ -1130,6 +1186,7 @@ void AutoLossHold::Hold(Leaf &counts, uint32_t spine, double rate){
 	else {
 		counts.held[spine] = true;
 		counts.clean[spine] = 0;
+		counts.heldEndNs[spine] = 0;
 		if (Trickle())
 			counts.trickle[spine].Begin(rate);
 	}
@@ -1304,10 +1361,20 @@ void AutoLossHold::CloseLossInterval(){
 					grade = SpineReport::kTopGrade;
 					released = true;
 				}
-			} else if (grade == 0 && m_holdRule == HoldRule::Count)
+			} else if (grade == 0 && m_holdRule == HoldRule::Count){
 				// Under Llr the test holds a spine as its losses are declared.
 				Hold(counts, k,
 					TrickleRelease::Rate(counts.sent[k], counts.lost[k]));
+				// What RetractLoss grades again.
+				if (m_hostHeld[k])
+					m_hostEvidence[k] = Evidence{m_lossIntervalEndNs, leaf,
+						counts.sent[k], counts.lost[k]};
+				else {
+					counts.heldEndNs[k] = m_lossIntervalEndNs;
+					counts.heldSent[k] = counts.sent[k];
+					counts.heldLost[k] = counts.lost[k];
+				}
+			}
 		}
 		if (m_hostHeld[k]){
 			for (auto &[leaf, leafGrades] : grades)
@@ -1338,6 +1405,7 @@ uint8_t AutoLossHold::LossGrade(uint32_t sent, uint32_t lost) const{
 void AutoLossHold::HoldHost(uint32_t spine, double rate){
 	m_hostHeld[spine] = true;
 	m_hostClean[spine] = 0;
+	m_hostEvidence[spine] = Evidence{};
 	for (auto &[leaf, counts] : m_leaves){
 		if (counts.held[spine])
 			rate = std::max(rate, counts.trickle[spine].P1());
@@ -1452,6 +1520,12 @@ void LossHoldExploration::OnLoss(uint32_t spine, uint64_t nowNs){
 		m_scores->CountIntervalLoss(spine, nowNs);
 }
 
+bool LossHoldExploration::RetractLoss(uint32_t spine, uint64_t countedNs,
+		uint64_t nowNs){
+	return m_autoHold &&
+		m_autoHold->RetractLoss(m_leaf, spine, countedNs, nowNs);
+}
+
 void LossHoldExploration::OnTrickleAnswer(uint32_t spine, bool lost,
 		uint64_t nowNs){
 	if (m_autoHold)
@@ -1530,6 +1604,11 @@ void RepsHoldSelector::OnAck(uint16_t path, bool marked, uint64_t nowNs){
 
 void RepsHoldSelector::OnLoss(uint16_t path, uint64_t nowNs){
 	m_exploration.OnLoss(path, nowNs);
+}
+
+bool RepsHoldSelector::RetractLoss(uint16_t path, uint64_t countedNs,
+		uint64_t nowNs){
+	return m_exploration.RetractLoss(path, countedNs, nowNs);
 }
 
 bool RepsHoldSelector::ChoseTrickle() const{
@@ -1829,6 +1908,11 @@ void MrcHoldSelector::OnAck(uint16_t path, bool marked, uint64_t nowNs){
 void MrcHoldSelector::OnLoss(uint16_t path, uint64_t nowNs){
 	m_exploration.OnLoss(path, nowNs);
 	MrcSelector::OnLoss(path, nowNs);
+}
+
+bool MrcHoldSelector::RetractLoss(uint16_t path, uint64_t countedNs,
+		uint64_t nowNs){
+	return m_exploration.RetractLoss(path, countedNs, nowNs);
 }
 
 // A probe is sent up the spine it probes, which its answer names back.

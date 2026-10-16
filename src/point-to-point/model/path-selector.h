@@ -238,6 +238,10 @@ public:
 	virtual void OnTrim(uint16_t path, bool lastHop, bool marked, uint64_t nowNs);
 	// A send along path declared lost.
 	virtual void OnLoss(uint16_t path, uint64_t nowNs);
+	// The loss of a send along path told to OnLoss at countedNs, taken back:
+	// the send had arrived. Whether that took back the hold the loss began;
+	// a selector without a loss hold that can take a loss back keeps it.
+	virtual bool RetractLoss(uint16_t path, uint64_t countedNs, uint64_t nowNs);
 	// The retransmission timeout expired and declared lost the sends it had
 	// waited for, which no switch trimmed: a trimmed send's record is released
 	// by its repair request.
@@ -293,6 +297,7 @@ public:
 	void OnAck(uint16_t path, bool marked, uint64_t nowNs) override;
 	void OnTrim(uint16_t path, bool lastHop, bool marked, uint64_t nowNs) override;
 	void OnLoss(uint16_t path, uint64_t nowNs) override;
+	bool RetractLoss(uint16_t path, uint64_t countedNs, uint64_t nowNs) override;
 	void OnTimeout(uint64_t nowNs) override;
 	bool TakeProbe(uint64_t nowNs, uint16_t &path) override;
 	void OnProbeAnswer(uint16_t path, bool marked, uint64_t nowNs) override;
@@ -795,6 +800,16 @@ public:
 	// interval in progress once those ended by now are closed.
 	void CountSend(uint32_t leaf, uint32_t spine, uint64_t nowNs);
 	void CountLoss(uint32_t leaf, uint32_t spine, uint64_t nowNs);
+	// The loss toward leaf on spine that CountLoss counted at countedNs,
+	// taken back once the loss intervals ended by now are closed. In the
+	// interval in progress the count is taken out. In one closed since, the
+	// hold that interval's close began on spine toward leaf, at leaf or at
+	// host scope, under HoldRule::Count, is graded again without the count
+	// and released where the grade is no longer 0; whether it was. A clean
+	// count the loss restarted, a scope its leaf widened and the trace of a
+	// closed interval stay as they were.
+	bool RetractLoss(uint32_t leaf, uint32_t spine, uint64_t countedNs,
+		uint64_t nowNs);
 	// The acknowledgement of a send toward leaf on spine, counted likewise;
 	// under cleanOnAnswers these are a hold's clean sends.
 	void CountAnswer(uint32_t leaf, uint32_t spine, uint64_t nowNs);
@@ -836,6 +851,19 @@ private:
 		std::vector<uint64_t> sentinelNs;
 		std::vector<LossLikelihoodRatio> likelihood;
 		std::vector<TrickleRelease> trickle;
+		// Of a leaf-scope hold an interval's close began: the end of that
+		// interval and its counts toward the leaf; 0 for any other hold.
+		std::vector<uint64_t> heldEndNs;
+		std::vector<uint32_t> heldSent;
+		std::vector<uint32_t> heldLost;
+	};
+	// The interval close's evidence of the hold it began on spine
+	// (Leaf::heldEndNs), of a leaf's counts.
+	struct Evidence {
+		uint64_t endNs = 0;
+		uint32_t leaf = 0;
+		uint32_t sent = 0;
+		uint32_t lost = 0;
 	};
 	// Hold spine toward leaf by the auto scope's choice, on evidence of the
 	// rate given.
@@ -872,6 +900,8 @@ private:
 	std::vector<uint32_t> m_hostClean;
 	std::vector<uint64_t> m_hostSentinelNs;
 	std::vector<TrickleRelease> m_hostTrickle;
+	// Of each host-scope hold an interval's close began, as Leaf::heldEndNs.
+	std::vector<Evidence> m_hostEvidence;
 	LeafLossIntervalCallback m_onLossInterval;
 };
 
@@ -905,6 +935,10 @@ public:
 	// spine declared lost.
 	void OnAck(uint32_t spine, uint64_t nowNs);
 	void OnLoss(uint32_t spine, uint64_t nowNs);
+	// The loss told to OnLoss at countedNs taken back, of the host's
+	// AutoLossHold alone (AutoLossHold::RetractLoss); a SpineScores hold
+	// keeps it.
+	bool RetractLoss(uint32_t spine, uint64_t countedNs, uint64_t nowNs);
 	void OnTrickleAnswer(uint32_t spine, bool lost, uint64_t nowNs);
 	// Under SprayReceiverHold: the spines the receivers hold toward leaf, in
 	// marks, are held as the loss hold holds them, and sent marks'
@@ -959,6 +993,7 @@ public:
 	// REPS's own answer, and the acknowledgement counted in the hold.
 	void OnAck(uint16_t path, bool marked, uint64_t nowNs) override;
 	void OnLoss(uint16_t path, uint64_t nowNs) override;
+	bool RetractLoss(uint16_t path, uint64_t countedNs, uint64_t nowNs) override;
 	bool ChoseTrickle() const override;
 	bool ChoseExploration() const override;
 	bool ChoseHeld() const override;
@@ -1160,6 +1195,8 @@ public:
 	// MRC's own answer, and the acknowledgement counted in the hold.
 	void OnAck(uint16_t path, bool marked, uint64_t nowNs) override;
 	void OnLoss(uint16_t path, uint64_t nowNs) override;
+	// The hold's count taken back; MRC's own state keeps the loss.
+	bool RetractLoss(uint16_t path, uint64_t countedNs, uint64_t nowNs) override;
 	bool TakeProbe(uint64_t nowNs, uint16_t &path) override;
 	bool ChoseTrickle() const override;
 	bool ChoseExploration() const override;

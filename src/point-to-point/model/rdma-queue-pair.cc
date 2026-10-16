@@ -6,6 +6,7 @@
 #include <ns3/simulator.h>
 #include "ns3/ppp-header.h"
 #include "rdma-queue-pair.h"
+#include "load-balancing.h"
 #include <algorithm>
 #include <iterator>
 
@@ -256,6 +257,8 @@ RdmaQueuePair::RdmaQueuePair(uint16_t pg, Ipv4Address _sip, Ipv4Address _dip, ui
 	m_answerCoverage = 0;
 	m_covered_answer_losses = 0;
 	m_deferTimeoutEvidence = false;
+	m_retractTimeoutEvidence = false;
+	m_retracted_timeout_losses = 0;
 	m_duplicate_answer_losses = 0;
 	m_timeout_data_losses = 0;
 	m_exploration_copies = 0;
@@ -585,14 +588,37 @@ uint64_t RdmaQueuePair::DeclareLostSentBy(uint64_t sentNs){
 			m_timedOut.emplace(m_outstanding.Seq(oldest), TimedOutSend{
 				m_outstanding.Path(oldest), m_outstanding.Trickle(oldest)});
 			lost += DeclareLost(oldest, false);
-		}else
+		}else{
+			// Told at once, and kept until its resend's answer shows whether
+			// to take it back.
+			if (m_retractTimeoutEvidence)
+				m_timeoutLosses.emplace(m_outstanding.Seq(oldest), TimeoutLoss{
+					m_outstanding.Path(oldest),
+					static_cast<uint64_t>(Simulator::Now().GetNanoSeconds())});
 			lost += DeclareLost(oldest);
+		}
 	}
 	return lost;
 }
 
 void RdmaQueuePair::ResolveTimedOut(uint64_t seq, bool duplicate,
-		uint64_t nowNs){
+		uint16_t route, uint64_t nowNs){
+	const auto losses = m_timeoutLosses.equal_range(seq);
+	for (auto loss = losses.first; loss != losses.second; ++loss){
+		if (!duplicate){
+			m_timeout_data_losses++;
+			if (!m_timedOutResolved.IsNull())
+				m_timedOutResolved(false);
+			continue;
+		}
+		const bool released = m_pathSelector->RetractLoss(loss->second.path,
+			loss->second.countedNs, nowNs);
+		m_retracted_timeout_losses++;
+		m_duplicate_answer_losses++;
+		if (!m_timeoutLossRetracted.IsNull())
+			m_timeoutLossRetracted(route, released);
+	}
+	m_timeoutLosses.erase(losses.first, losses.second);
 	const auto send = m_timedOut.find(seq);
 	if (send == m_timedOut.end())
 		return;
@@ -746,8 +772,12 @@ void RdmaQueuePair::Acknowledge(uint64_t ack, bool keepCovered){
 		snd_una = ack;
 		// A timed-out sequence acknowledged with no answer to its resend.
 		while (!m_timedOut.empty() && m_timedOut.begin()->first < snd_una)
-			ResolveTimedOut(m_timedOut.begin()->first, false,
+			ResolveTimedOut(m_timedOut.begin()->first, false, kNoRouteSpine,
 				Simulator::Now().GetNanoSeconds());
+		while (!m_timeoutLosses.empty() &&
+				m_timeoutLosses.begin()->first < snd_una)
+			ResolveTimedOut(m_timeoutLosses.begin()->first, false,
+				kNoRouteSpine, Simulator::Now().GetNanoSeconds());
 		if (m_outstanding.IsKept() && keepCovered){
 			std::vector<OutstandingPackets::Unanswered> unanswered;
 			m_outstanding.RemoveBelow(snd_una, &unanswered);

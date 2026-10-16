@@ -2647,6 +2647,12 @@ class ScriptedSelector : public PathSelector
         told.push_back("loss " + std::to_string(path));
     }
 
+    bool RetractLoss(uint16_t path, uint64_t countedNs, uint64_t) override
+    {
+        told.push_back("retract " + std::to_string(path) + " at " + std::to_string(countedNs));
+        return false;
+    }
+
     void OnTimeout(uint64_t nowNs) override
     {
         told.push_back("timeout at " + std::to_string(nowNs));
@@ -9705,7 +9711,9 @@ class DuplicateReportTest : public TestCase
                    "held already, and a sender under SprayCoverageFirst counts a timed-out send "
                    "as an answer loss where its resend's answer is flagged, and tells its loss on "
                    "the first send's path where the answer is not flagged or the cumulative "
-                   "acknowledgement covers it first")
+                   "acknowledgement covers it first; under retract it tells each timed-out "
+                   "send's loss at once and takes it back from the auto loss hold, regrading "
+                   "the hold the loss began, where the answer is flagged")
     {
     }
 
@@ -9717,6 +9725,9 @@ class DuplicateReportTest : public TestCase
         Receiver(true);
         Sender();
         Answers();
+        Retract();
+        RetractAnswers();
+        HoldRetract();
         Valid();
         CustomHeader::ackCarriesPacketSeq = savedPacketSeq;
         Simulator::Destroy();
@@ -9731,7 +9742,8 @@ class DuplicateReportTest : public TestCase
     void Receiver(bool on)
     {
         IsolatedHost receiver(LoadBalancingMode::SprayUniform, kTestSender, 8);
-        receiver.hw->m_sprayDuplicateReport = on;
+        receiver.hw->m_sprayDuplicateReport =
+            static_cast<uint32_t>(on ? DuplicateReport::Defer : DuplicateReport::Off);
         receiver.ReceiveData(kTestSender, kTestReceiver, 0, SpineIdentification(1, 1));
         NS_TEST_EXPECT_MSG_EQ(Flagged(receiver.emitted.back()), false, "a first arrival is not flagged");
         receiver.ReceiveData(kTestSender, kTestReceiver, 0, SpineIdentification(2, 2));
@@ -9776,10 +9788,10 @@ class DuplicateReportTest : public TestCase
                               0u,
                               "and no loss is told yet");
         NS_TEST_EXPECT_MSG_EQ(qp->m_timedOut.size(), 3u, "each waits for its resend's answer");
-        qp->ResolveTimedOut(0, true, 100);
+        qp->ResolveTimedOut(0, true, 5, 100);
         NS_TEST_EXPECT_MSG_EQ(Losses(*selector, "loss 1"), 0u, "a flagged answer tells no loss");
         NS_TEST_EXPECT_MSG_EQ(qp->m_duplicate_answer_losses, 1u, "and counts an answer loss");
-        qp->ResolveTimedOut(IsolatedHost::kMtu, false, 100);
+        qp->ResolveTimedOut(IsolatedHost::kMtu, false, 5, 100);
         NS_TEST_EXPECT_MSG_EQ(Losses(*selector, "loss 2"), 1u, "an unflagged one tells it on the first path");
         NS_TEST_EXPECT_MSG_EQ(qp->m_timeout_data_losses, 1u, "as a data loss");
         qp->Acknowledge(3 * IsolatedHost::kMtu, false);
@@ -9806,7 +9818,7 @@ class DuplicateReportTest : public TestCase
     {
         IsolatedHost sender(LoadBalancingMode::SprayUniform, kTestReceiver, 8);
         sender.hw->m_sprayCoverageFirst = true;
-        sender.hw->m_sprayDuplicateReport = true;
+        sender.hw->m_sprayDuplicateReport = static_cast<uint32_t>(DuplicateReport::Defer);
         std::map<std::string, uint32_t> events;
         sender.hw->m_transportEventCallback = Callback<void, const char*, uint64_t>(
             [&events](const char* event, uint64_t) { ++events[event]; });
@@ -9836,14 +9848,164 @@ class DuplicateReportTest : public TestCase
         NS_TEST_EXPECT_MSG_EQ(qp->m_timedOut.size(), 0u, "both resolved");
     }
 
+    // Under retract, the three sends of TimedOut, the first timed out twice.
+    void Retract()
+    {
+        // The earlier hosts' timers go with them.
+        Simulator::Destroy();
+        Ptr<RdmaQueuePair> qp = CreateObject<RdmaQueuePair>(3, kTestSender, kTestReceiver, 10000, 10001);
+        qp->m_size = 8 * IsolatedHost::kMtu;
+        qp->m_coverageFirst = true;
+        qp->m_retractTimeoutEvidence = true;
+        qp->m_outstanding.SetPacketSize(IsolatedHost::kMtu);
+        auto scripted = std::make_unique<ScriptedSelector>(std::vector<uint16_t>{1});
+        ScriptedSelector* selector = scripted.get();
+        qp->m_pathSelector = std::move(scripted);
+        std::vector<bool> resolved;
+        std::vector<std::pair<uint16_t, bool>> retracted;
+        qp->m_timedOutResolved = Callback<void, bool>([&resolved](bool duplicate) { resolved.push_back(duplicate); });
+        qp->m_timeoutLossRetracted = Callback<void, uint16_t, bool>(
+            [&retracted](uint16_t route, bool released) { retracted.emplace_back(route, released); });
+        for (uint16_t k = 0; k < 3; ++k)
+        {
+            qp->m_outstanding.Add(k * IsolatedHost::kMtu, IsolatedHost::kMtu, k + 1, 0);
+        }
+        qp->DeclareLostSentBy(0);
+        NS_TEST_EXPECT_MSG_EQ(Losses(*selector, "loss 1") + Losses(*selector, "loss 2") + Losses(*selector, "loss 3"),
+                              3u,
+                              "each timed-out send's loss is told at once");
+        // The resend of seq 0 times out too, along path 4.
+        qp->m_outstanding.Add(0, IsolatedHost::kMtu, 4, 0);
+        Simulator::Schedule(NanoSeconds(50), [qp]() { qp->DeclareLostSentBy(0); });
+        Simulator::Run();
+        NS_TEST_EXPECT_MSG_EQ(Losses(*selector, "loss 4"), 1u, "and so is the resend's");
+        NS_TEST_EXPECT_MSG_EQ(qp->m_timeoutLosses.size(), 4u, "each kept apart, seq 0 twice");
+        qp->ResolveTimedOut(0, true, 6, 100);
+        NS_TEST_EXPECT_MSG_EQ(Losses(*selector, "retract 1 at 0"), 1u, "a flagged answer takes the first back");
+        NS_TEST_EXPECT_MSG_EQ(Losses(*selector, "retract 4 at 50"), 1u, "and the resend's, as each was counted");
+        NS_TEST_EXPECT_MSG_EQ((qp->m_retracted_timeout_losses == 2 && qp->m_duplicate_answer_losses == 2), true,
+                              "two answer losses");
+        NS_TEST_EXPECT_MSG_EQ((retracted == std::vector<std::pair<uint16_t, bool>>{{6, false}, {6, false}}), true,
+                              "each told with the route the answer came back over");
+        qp->ResolveTimedOut(IsolatedHost::kMtu, false, 6, 100);
+        NS_TEST_EXPECT_MSG_EQ(Losses(*selector, "retract 2 at 0"), 0u, "an unflagged answer leaves the loss");
+        qp->Acknowledge(3 * IsolatedHost::kMtu, false);
+        NS_TEST_EXPECT_MSG_EQ(Losses(*selector, "retract 3 at 0"), 0u, "as does the cumulative acknowledgement");
+        NS_TEST_EXPECT_MSG_EQ(qp->m_timeout_data_losses, 2u, "each a data loss");
+        NS_TEST_EXPECT_MSG_EQ((resolved == std::vector<bool>{false, false}), true, "told as such");
+        NS_TEST_EXPECT_MSG_EQ(qp->m_timeoutLosses.size(), 0u, "and nothing is kept");
+        NS_TEST_EXPECT_MSG_EQ(qp->RepairBytesLeft(), uint64_t(0), "every sequence acknowledged");
+        Simulator::Destroy();
+    }
+
+    // The answers as the sender's host reads them under retract.
+    void RetractAnswers()
+    {
+        IsolatedHost sender(LoadBalancingMode::SprayUniform, kTestReceiver, 8);
+        sender.hw->m_sprayCoverageFirst = true;
+        sender.hw->m_sprayDuplicateReport = static_cast<uint32_t>(DuplicateReport::Retract);
+        std::map<std::string, uint32_t> events;
+        sender.hw->m_transportEventCallback = Callback<void, const char*, uint64_t>(
+            [&events](const char* event, uint64_t) { ++events[event]; });
+        Ptr<RdmaQueuePair> qp = sender.AddSender(kTestSender, kTestReceiver, 8 * IsolatedHost::kMtu);
+        NS_TEST_ASSERT_MSG_EQ((qp->m_retractTimeoutEvidence && !qp->m_deferTimeoutEvidence), true,
+                              "the value reaches the queue pair");
+        qp->m_outstanding.Add(0, IsolatedHost::kMtu, 1, 0);
+        qp->m_outstanding.Add(IsolatedHost::kMtu, IsolatedHost::kMtu, 2, 0);
+        qp->snd_nxt = 2 * IsolatedHost::kMtu;
+        qp->DeclareLostSentBy(0);
+        const auto answer = [&](uint32_t seq, uint8_t spine, bool duplicate) {
+            CustomHeader ack;
+            ack.l3Prot = 0xFC;
+            ack.sip = kTestReceiver.Get();
+            ack.ipid = SpineIdentification(spine, spine);
+            ack.ack.flags = duplicate ? 1 << qbbHeader::FLAG_DUPLICATE : 0;
+            ack.ack.sport = IsolatedHost::kReceiverPort;
+            ack.ack.dport = IsolatedHost::kSenderPort;
+            ack.ack.pg = IsolatedHost::kPriorityGroup;
+            ack.ack.seq = 0;
+            ack.ack.packet_seq = seq;
+            ack.ack.route_spine = kNoRouteSpine;
+            sender.hw->ReceiveAck(Create<Packet>(), ack);
+        };
+        answer(0, 5, true);
+        answer(IsolatedHost::kMtu, 6, false);
+        NS_TEST_EXPECT_MSG_EQ(events["answer_loss_duplicate"], 1u, "a flagged resend answer is an answer loss");
+        NS_TEST_EXPECT_MSG_EQ(events["answer_loss_duplicate_spine5"], 1u, "on the route it came back over");
+        NS_TEST_EXPECT_MSG_EQ(events["timeout_loss_data"], 1u, "an unflagged one leaves a data loss");
+        NS_TEST_EXPECT_MSG_EQ(qp->m_timeoutLosses.size(), 0u, "both resolved");
+    }
+
+    // AutoLossHold::RetractLoss: the count in the interval in progress, and
+    // the hold an interval's close began, at leaf and at host scope.
+    void HoldRetract()
+    {
+        constexpr uint32_t kSpines = LossHoldFixture::kSpines;
+        constexpr uint64_t kInterval = LossHoldFixture::kInterval;
+        Ptr<RdmaHw> hw = LossHoldFixture::Hw();
+        hw->m_sprayHoldScope = static_cast<uint32_t>(HoldScope::Auto);
+        {
+            AutoLossHold hold(kSpines, hw->LossHoldParameters(), 2);
+            hold.AddLeaf(0);
+            hold.CountLoss(0, 3, 20);
+            NS_TEST_EXPECT_MSG_EQ(hold.RetractLoss(0, 3, 20, 30), false, "a count in progress is taken out");
+            hold.CountSend(0, 2, kInterval + 10);
+            NS_TEST_EXPECT_MSG_EQ(hold.Holds(0, 3), false, "so its interval holds nothing");
+        }
+        {
+            AutoLossHold hold(kSpines, hw->LossHoldParameters(), 2);
+            hold.AddLeaf(0);
+            hold.CountLoss(0, 3, 20);
+            hold.CountLoss(0, 4, 20);
+            hold.CountLoss(0, 4, 30);
+            hold.CountSend(0, 2, kInterval + 10);
+            NS_TEST_EXPECT_MSG_EQ((hold.Holds(0, 3) && hold.Holds(0, 4)), true, "the losses hold 3 and 4");
+            NS_TEST_EXPECT_MSG_EQ(hold.RetractLoss(0, 3, 20, kInterval + 20), true,
+                                  "the one loss that held 3, taken back, releases it");
+            NS_TEST_EXPECT_MSG_EQ(hold.Holds(0, 3), false, "toward its leaf");
+            NS_TEST_EXPECT_MSG_EQ(hold.RetractLoss(0, 4, 20, kInterval + 20), false,
+                                  "one of the two that held 4 leaves it held");
+            NS_TEST_EXPECT_MSG_EQ(hold.Holds(0, 4), true, "graded 0 without it");
+            NS_TEST_EXPECT_MSG_EQ(hold.RetractLoss(0, 4, 30, kInterval + 20), true, "and the second releases it");
+            NS_TEST_EXPECT_MSG_EQ(hold.RetractLoss(0, 5, 20, kInterval + 20), false, "a spine not held keeps");
+        }
+        {
+            AutoLossHold hold(kSpines, hw->LossHoldParameters(), 2);
+            hold.AddLeaf(0);
+            hold.AddLeaf(1);
+            // Leaf 1's loss grades nothing 0 but takes the hold to host scope.
+            for (uint32_t i = 0; i < 20; ++i)
+            {
+                hold.CountSend(1, 3, 10);
+            }
+            hold.CountLoss(1, 3, 10);
+            hold.CountLoss(0, 3, 20);
+            hold.CountSend(0, 2, kInterval + 10);
+            NS_TEST_EXPECT_MSG_EQ(hold.HostHolds(3), true, "two leaves' losses hold 3 for the host");
+            NS_TEST_EXPECT_MSG_EQ(hold.RetractLoss(0, 3, 20, kInterval + 20), true,
+                                  "the loss of the leaf whose interval held it, taken back, releases it");
+            NS_TEST_EXPECT_MSG_EQ((hold.HostHolds(3) || hold.Holds(0, 3) || hold.Holds(1, 3)), false,
+                                  "at every scope");
+        }
+    }
+
     void Valid()
     {
         Ptr<RdmaHw> hw = CreateObject<RdmaHw>();
-        NS_TEST_EXPECT_MSG_EQ(hw->m_sprayDuplicateReport, false, "off by default");
-        hw->m_sprayDuplicateReport = true;
+        NS_TEST_EXPECT_MSG_EQ(hw->m_sprayDuplicateReport, static_cast<uint32_t>(DuplicateReport::Off),
+                              "off by default");
+        hw->m_sprayDuplicateReport = static_cast<uint32_t>(DuplicateReport::Defer);
         NS_TEST_EXPECT_MSG_EQ(hw->ValidDuplicateReport(), false, "refused without coverage first");
         hw->m_sprayCoverageFirst = true;
         NS_TEST_EXPECT_MSG_EQ(hw->ValidDuplicateReport(), true, "accepted with it");
+        hw->m_sprayDuplicateReport = static_cast<uint32_t>(DuplicateReport::Retract);
+        hw->m_pathSelectorKind = static_cast<uint32_t>(PathSelectorKind::RepsHold);
+        hw->m_sprayHoldScope = static_cast<uint32_t>(HoldScope::Host);
+        NS_TEST_EXPECT_MSG_EQ(hw->ValidDuplicateReport(), false, "retract refused without the auto hold");
+        hw->m_sprayHoldScope = static_cast<uint32_t>(HoldScope::Auto);
+        NS_TEST_EXPECT_MSG_EQ(hw->ValidDuplicateReport(), true, "and accepted with it");
+        hw->m_sprayHoldRule = static_cast<uint32_t>(HoldRule::Llr);
+        NS_TEST_EXPECT_MSG_EQ(hw->ValidDuplicateReport(), false, "but not under llr");
     }
 };
 
