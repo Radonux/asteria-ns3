@@ -32,6 +32,10 @@ void RdmaHw::ReportTimedOutResolved(bool duplicate){
 		: "timeout_loss_data", 0);
 }
 
+void RdmaHw::ReportTimedOutCovered(){
+	ReportTransportEvent("timeout_loss_data_covered", 0);
+}
+
 void RdmaHw::ReportTimeoutLossRetracted(uint16_t route, bool released){
 	if (route == kNoRouteSpine)
 		ReportTransportEvent("answer_loss_duplicate", 0);

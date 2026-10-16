@@ -10033,6 +10033,7 @@ class OverdueRepairTest : public TestCase
         Receiver();
         Declared();
         Spurious();
+        Probe();
         Host();
         Valid();
         CustomHeader::ackCarriesPacketSeq = savedPacketSeq;
@@ -10048,7 +10049,7 @@ class OverdueRepairTest : public TestCase
     void Receiver()
     {
         IsolatedHost receiver(LoadBalancingMode::SprayUniform, kTestSender, 8);
-        receiver.hw->m_sprayOverdueRepair = true;
+        receiver.hw->m_sprayOverdueRepair = static_cast<uint32_t>(OverdueRepair::Evidence);
         receiver.ReceiveData(kTestSender, kTestReceiver, 0, SpineIdentification(1, 1));
         NS_TEST_EXPECT_MSG_EQ(((receiver.emitted.back().ack.flags >> qbbHeader::FLAG_DUPLICATE) & 1), 0,
                               "a first arrival is not flagged");
@@ -10110,23 +10111,79 @@ class OverdueRepairTest : public TestCase
         qp->DeclareOverdueSendLost(IsolatedHost::kMtu, 2, 10);
         qp->DeclareOverdueSendLost(2 * IsolatedHost::kMtu, 3, 20);
         qp->DeclareOverdueSendLost(3 * IsolatedHost::kMtu, 6, 30);
-        NS_TEST_EXPECT_MSG_EQ(qp->OverdueRepairSpurious(0, 1, true), false, "a sequence not repaired is not");
+        NS_TEST_EXPECT_MSG_EQ(qp->OverdueRepairSpurious(0, 1, true, 0), false, "a sequence not repaired is not");
         qp->NoteOverdueRepairSent(IsolatedHost::kMtu, 4);
         qp->NoteOverdueRepairSent(IsolatedHost::kMtu, 5);
-        NS_TEST_EXPECT_MSG_EQ(qp->OverdueRepairSpurious(IsolatedHost::kMtu, 4, false), false,
+        NS_TEST_EXPECT_MSG_EQ(qp->OverdueRepairSpurious(IsolatedHost::kMtu, 4, false, 0), false,
                               "the repair's own answer, unflagged: the repair arrived first");
-        NS_TEST_EXPECT_MSG_EQ(qp->OverdueRepairSpurious(IsolatedHost::kMtu, 2, true), false,
+        NS_TEST_EXPECT_MSG_EQ(qp->OverdueRepairSpurious(IsolatedHost::kMtu, 2, true, 0), false,
                               "and the wait is over");
         qp->NoteOverdueRepairSent(2 * IsolatedHost::kMtu, 5);
-        NS_TEST_EXPECT_MSG_EQ(qp->OverdueRepairSpurious(2 * IsolatedHost::kMtu, 3, false), true,
+        NS_TEST_EXPECT_MSG_EQ(qp->OverdueRepairSpurious(2 * IsolatedHost::kMtu, 3, false, 0), true,
                               "the send's own answer: the send arrived first");
         qp->NoteOverdueRepairSent(3 * IsolatedHost::kMtu, 6);
-        NS_TEST_EXPECT_MSG_EQ(qp->OverdueRepairSpurious(3 * IsolatedHost::kMtu, 6, false), false,
+        NS_TEST_EXPECT_MSG_EQ(qp->OverdueRepairSpurious(3 * IsolatedHost::kMtu, 6, false, 0), false,
                               "along one path for both an unflagged answer tells nothing");
-        NS_TEST_EXPECT_MSG_EQ(qp->OverdueRepairSpurious(3 * IsolatedHost::kMtu, 6, true), true,
+        NS_TEST_EXPECT_MSG_EQ(qp->OverdueRepairSpurious(3 * IsolatedHost::kMtu, 6, true, 0), true,
                               "and the flagged one shows it spurious");
         NS_TEST_EXPECT_MSG_EQ(qp->m_overdue_spurious, 2u, "two spurious repairs");
         NS_TEST_EXPECT_MSG_EQ(qp->m_overdueRepaired.size(), 0u, "and nothing waits");
+    }
+
+    // Under probe the repair counts nothing; under defer its answer settles
+    // the send, and a covered sequence counts nothing.
+    void Probe()
+    {
+        ScriptedSelector* selector = nullptr;
+        Ptr<RdmaQueuePair> qp = Sends(selector);
+        qp->m_overdueProbe = true;
+        NS_TEST_EXPECT_MSG_EQ(qp->DeclareOverdueSendLost(IsolatedHost::kMtu, 2, 10),
+                              uint64_t(IsolatedHost::kMtu),
+                              "a probe repairs the send");
+        NS_TEST_EXPECT_MSG_EQ(Told(*selector, "loss 2"), 0u, "and tells no loss");
+        qp->NoteOverdueRepairSent(IsolatedHost::kMtu, 4);
+        qp->OverdueRepairSpurious(IsolatedHost::kMtu, 4, false, 100);
+        NS_TEST_EXPECT_MSG_EQ(Told(*selector, "loss 2"), 0u, "without the report its answer tells none");
+        // Under defer: the repair's unflagged answer is a data loss on the
+        // send's path, a flagged one an answer loss, a covered one nothing.
+        ScriptedSelector* deferred = nullptr;
+        Ptr<RdmaQueuePair> defer = Sends(deferred);
+        defer->m_overdueProbe = true;
+        defer->m_coverageFirst = true;
+        defer->m_deferTimeoutEvidence = true;
+        std::vector<bool> resolved;
+        defer->m_timedOutResolved =
+            Callback<void, bool>([&resolved](bool duplicate) { resolved.push_back(duplicate); });
+        defer->m_outstanding.Add(2 * IsolatedHost::kMtu, IsolatedHost::kMtu, 3, 20);
+        defer->m_outstanding.Add(3 * IsolatedHost::kMtu, IsolatedHost::kMtu, 6, 30);
+        defer->DeclareOverdueSendLost(IsolatedHost::kMtu, 2, 10);
+        defer->DeclareOverdueSendLost(2 * IsolatedHost::kMtu, 3, 20);
+        defer->DeclareOverdueSendLost(3 * IsolatedHost::kMtu, 6, 30);
+        NS_TEST_EXPECT_MSG_EQ(defer->m_timedOut.size(), 0u, "a probe keeps no timed-out send");
+        defer->NoteOverdueRepairSent(IsolatedHost::kMtu, 4);
+        defer->OverdueRepairSpurious(IsolatedHost::kMtu, 4, false, 100);
+        NS_TEST_EXPECT_MSG_EQ(Told(*deferred, "loss 2"), 1u, "the repair arrived first: a data loss on the send's path");
+        NS_TEST_EXPECT_MSG_EQ(Told(*deferred, "loss 4"), 0u, "not on the repair's");
+        defer->NoteOverdueRepairSent(2 * IsolatedHost::kMtu, 5);
+        defer->OverdueRepairSpurious(2 * IsolatedHost::kMtu, 5, true, 100);
+        NS_TEST_EXPECT_MSG_EQ(Told(*deferred, "loss 3"), 0u, "a flagged answer tells no loss");
+        NS_TEST_EXPECT_MSG_EQ(defer->m_duplicate_answer_losses, 1u, "it is an answer loss");
+        defer->Acknowledge(4 * IsolatedHost::kMtu, false);
+        NS_TEST_EXPECT_MSG_EQ(Told(*deferred, "loss 6"), 0u, "a covered sequence tells nothing");
+        NS_TEST_EXPECT_MSG_EQ(defer->m_overdueRepaired.size(), 0u, "and waits no more");
+        NS_TEST_EXPECT_MSG_EQ(defer->m_timeout_data_losses, 1u, "one data loss");
+        NS_TEST_EXPECT_MSG_EQ((resolved == std::vector<bool>{false, true}), true, "each told once");
+        NS_TEST_EXPECT_MSG_EQ(defer->m_timeout_covered_losses, 0u, "no timed-out send was covered");
+        // A timed-out send covered first is counted apart.
+        ScriptedSelector* timed = nullptr;
+        Ptr<RdmaQueuePair> timedOut = Sends(timed);
+        timedOut->m_deferTimeoutEvidence = true;
+        uint32_t covered = 0;
+        timedOut->m_timedOutCovered = Callback<void>([&covered]() { covered++; });
+        timedOut->DeclareLostSentBy(10);
+        timedOut->Acknowledge(2 * IsolatedHost::kMtu, false);
+        NS_TEST_EXPECT_MSG_EQ(timedOut->m_timeout_covered_losses, 2u, "both timed-out sends covered first");
+        NS_TEST_EXPECT_MSG_EQ(covered, 2u, "and told");
     }
 
     // The host's timer, at a base RTT of 100 ns and SprayHeldLossRtts 2.
@@ -10134,7 +10191,7 @@ class OverdueRepairTest : public TestCase
     {
         Simulator::Destroy();
         IsolatedHost sender(LoadBalancingMode::SprayUniform, kTestReceiver, 8);
-        sender.hw->m_sprayOverdueRepair = true;
+        sender.hw->m_sprayOverdueRepair = static_cast<uint32_t>(OverdueRepair::Evidence);
         sender.hw->m_sprayHeldLossRtts = 2;
         std::map<std::string, uint32_t> events;
         sender.hw->m_transportEventCallback = Callback<void, const char*, uint64_t>(
@@ -10182,9 +10239,10 @@ class OverdueRepairTest : public TestCase
     void Valid()
     {
         Ptr<RdmaHw> hw = CreateObject<RdmaHw>();
-        NS_TEST_EXPECT_MSG_EQ(hw->m_sprayOverdueRepair, false, "off by default");
+        NS_TEST_EXPECT_MSG_EQ(hw->m_sprayOverdueRepair, static_cast<uint32_t>(OverdueRepair::Off),
+                              "off by default");
         NS_TEST_EXPECT_MSG_EQ(hw->ValidOverdueRepair(), true, "and valid so");
-        hw->m_sprayOverdueRepair = true;
+        hw->m_sprayOverdueRepair = static_cast<uint32_t>(OverdueRepair::Probe);
         NS_TEST_EXPECT_MSG_EQ(hw->ValidOverdueRepair(), false, "refused without a loss hold selector");
         hw->m_pathSelectorKind = static_cast<uint32_t>(PathSelectorKind::RepsHold);
         NS_TEST_EXPECT_MSG_EQ(hw->ValidOverdueRepair(), true, "accepted with reps_hold");

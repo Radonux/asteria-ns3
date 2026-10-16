@@ -257,15 +257,18 @@ public:
 	// outstanding is declared lost and repaired (HeldSendDue); zero waits
 	// for the retransmission timeout.
 	double m_sprayHeldLossRtts;
-	// SprayOverdueRepair, under the same selectors with m_sprayHeldLossRtts
-	// above zero: the queue pair's latest send on a spine not held is
-	// declared lost and repaired as a held send is once its answer is overdue
-	// by m_sprayHeldLossRtts base RTTs, one repair per answer or timeout
-	// (RdmaQueuePair::m_overdueTaken), its loss evidence as a timed-out
-	// send's; and a receiver flags its answers to duplicates as under
-	// SprayDuplicateReport, so that a flagged answer to a repaired sequence
-	// counts the repair spurious.
-	bool m_sprayOverdueRepair;
+	// SprayOverdueRepair (OverdueRepair), under the same selectors with
+	// m_sprayHeldLossRtts above zero: the queue pair's latest send on a spine
+	// not held is repaired as a held send is once its answer is overdue by
+	// m_sprayHeldLossRtts base RTTs, one repair per answer or timeout
+	// (RdmaQueuePair::m_overdueTaken). Under Evidence it is declared lost, its
+	// loss evidence as a timed-out send's; under Probe it counts no loss, and
+	// under SprayDuplicateReport the repair's answer settles it
+	// (RdmaQueuePair::m_overdueProbe). Either way a receiver flags its
+	// answers to duplicates as under SprayDuplicateReport, so that the
+	// answer showing the send arrived first counts the repair spurious.
+	uint32_t m_sprayOverdueRepair;
+	bool IsOverdueRepair() const;
 	bool ValidOverdueRepair() const;
 	// SprayAckLossRtts, under LoadBalancing SprayUniform with any selector:
 	// the queue pair's base RTTs after which a send the cumulative
@@ -364,6 +367,10 @@ public:
 	uint32_t m_sprayDuplicateReport;
 	bool ValidDuplicateReport() const;
 	void ReportTimedOutResolved(bool duplicate);
+	// Under SprayOverdueRepair with SprayDuplicateReport, a timed-out send
+	// left a data loss by the cumulative acknowledgement covering its
+	// sequence first.
+	void ReportTimedOutCovered();
 	void ReportTimeoutLossRetracted(uint16_t route, bool released);
 	// SprayAnswerPathSeq, under AckRoute Spray with SprayPathSeq and a loss
 	// hold selector (answer-path-seq.h). As a receiver this host numbers

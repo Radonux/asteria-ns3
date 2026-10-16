@@ -664,17 +664,24 @@ TypeId RdmaHw::GetTypeId (void)
 		.AddAttribute("SprayOverdueRepair",
 				"Under PathSelector 6, 7 and 9 with SprayHeldLossRtts above "
 				"zero, whether a queue pair's latest send on a spine not held "
-				"as it was chosen is declared lost and repaired, as a held "
-				"send is, once its answer is overdue by SprayHeldLossRtts base "
-				"RTTs: one repair until the queue pair's next answer or "
-				"retransmission timeout, its loss told, deferred or kept as "
-				"a timed-out send's under SprayDuplicateReport. A receiver "
-				"flags its answers to duplicates as under SprayDuplicateReport, "
-				"and a flagged answer to a repaired sequence counts the repair "
-				"spurious. Default false.",
-				BooleanValue(false),
-				MakeBooleanAccessor(&RdmaHw::m_sprayOverdueRepair),
-				MakeBooleanChecker())
+				"as it was chosen is repaired, as a held send is, once its "
+				"answer is overdue by SprayHeldLossRtts base RTTs: one repair "
+				"until the queue pair's next answer or retransmission timeout. "
+				"0=no; 1=evidence: the send is declared lost, its loss told, "
+				"deferred or kept as a timed-out send's under "
+				"SprayDuplicateReport; 2=probe: the repair counts no loss, and "
+				"under SprayDuplicateReport the repair's answer settles the "
+				"send, unflagged a data loss on its path, flagged an answer "
+				"loss, and none when it is lost or the cumulative "
+				"acknowledgement covers the sequence first. A receiver flags "
+				"its answers to duplicates as under SprayDuplicateReport, and "
+				"the answer showing the send arrived first counts the repair "
+				"spurious. Default 0.",
+				UintegerValue(static_cast<uint32_t>(OverdueRepair::Off)),
+				MakeUintegerAccessor(&RdmaHw::m_sprayOverdueRepair),
+				MakeUintegerChecker<uint32_t>(
+					static_cast<uint32_t>(OverdueRepair::Off),
+					static_cast<uint32_t>(OverdueRepair::Probe)))
 		.AddAttribute("SprayAckLossRtts",
 				"Under LoadBalancing 2, the queue pair's base RTTs after "
 				"which a send the cumulative acknowledgement covered before "
@@ -1646,7 +1653,7 @@ int RdmaHw::ReceiveUdp(Ptr<Packet> p, CustomHeader &ch){
 			AllowanceGone(rxQp), false, redirect,
 			(m_sprayDuplicateReport !=
 					static_cast<uint32_t>(DuplicateReport::Off) ||
-				m_sprayOverdueRepair) &&
+				IsOverdueRepair()) &&
 				accepted == 0 && late_forgiven == 0 && payload_size > 0);
 	}
 	// After the acknowledgement, so this packet's answer carries the state
@@ -1781,7 +1788,11 @@ bool RdmaHw::CountsSprayLoss() const{
 }
 
 bool RdmaHw::ValidOverdueRepair() const{
-	return !m_sprayOverdueRepair || (IsRepsHold() && m_sprayHeldLossRtts > 0);
+	return !IsOverdueRepair() || (IsRepsHold() && m_sprayHeldLossRtts > 0);
+}
+
+bool RdmaHw::IsOverdueRepair() const{
+	return m_sprayOverdueRepair != static_cast<uint32_t>(OverdueRepair::Off);
 }
 
 bool RdmaHw::IsRepsHold() const{
@@ -2376,10 +2387,10 @@ int RdmaHw::ReceiveAck(Ptr<Packet> p, CustomHeader &ch){
 						ch.ack.route_spine != kNoRouteSpine ? ch.ack.route_spine
 							: CarryingSpine(ch.ipid), now);
 				// An answer lets the next overdue send be repaired.
-				if (m_sprayOverdueRepair){
+				if (IsOverdueRepair()){
 					qp->m_overdueSpent = false;
 					if (qp->OverdueRepairSpurious(ch.ack.packet_seq, path,
-							(ch.ack.flags >> qbbHeader::FLAG_DUPLICATE) & 1))
+							(ch.ack.flags >> qbbHeader::FLAG_DUPLICATE) & 1, now))
 						ReportTransportEvent("overdue_repair_spurious", 0);
 				}
 				// The destination's downlink being congested is the receiver's
@@ -3547,7 +3558,7 @@ Ptr<Packet> RdmaHw::GetNxtPacket(Ptr<RdmaQueuePair> qp){
 		if (held && heldLossNs > 0)
 			Simulator::Schedule(NanoSeconds(heldLossNs), &RdmaHw::HeldSendDue,
 				this, qp, seq, path, sentNs);
-		if (m_sprayOverdueRepair){
+		if (IsOverdueRepair()){
 			if (is_repair)
 				qp->NoteOverdueRepairSent(seq, path);
 			TakeOverdueSend(qp, seq, path, sentNs, held);
@@ -3654,7 +3665,12 @@ bool RdmaHw::StartPathSelection(Ptr<RdmaQueuePair> qp, uint64_t bdpBytes,
 		}
 		qp->m_timedOutResolved =
 			MakeCallback(&RdmaHw::ReportTimedOutResolved, this);
+		if (IsOverdueRepair())
+			qp->m_timedOutCovered =
+				MakeCallback(&RdmaHw::ReportTimedOutCovered, this);
 	}
+	qp->m_overdueProbe =
+		m_sprayOverdueRepair == static_cast<uint32_t>(OverdueRepair::Probe);
 	if (!IsConnectionPathState()){
 		qp->m_pathSelector = MakePathSelector(qp, bdpBytes, baseRttNs);
 		return true;

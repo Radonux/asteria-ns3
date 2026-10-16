@@ -324,16 +324,24 @@ bool spray_copy_expiry_given = false;
 double spray_held_loss_rtts = 2;
 bool spray_held_loss_rtts_given = false;
 // Under those selectors with SPRAY_HELD_LOSS_RTTS above 0,
-// SPRAY_OVERDUE_REPAIR on: a queue pair's latest data send up a spine not
-// held as it was chosen is declared lost and repaired as a held send is,
+// SPRAY_OVERDUE_REPAIR evidence: a queue pair's latest data send up a spine
+// not held as it was chosen is declared lost and repaired as a held send is,
 // once its answer is SPRAY_HELD_LOSS_RTTS of the queue pair's base RTTs
 // overdue, whether or not any spine is held; one repair is sent until the
 // queue pair's next answer or retransmission timeout. Its loss is evidence
-// as a retransmission timeout's is, under SPRAY_DUPLICATE_REPORT too. Each is
-// counted as the host transport event overdue_repair. A receiver flags its
-// answers to duplicates as under SPRAY_DUPLICATE_REPORT, and a repair whose
-// sequence's send arrived first, its answer flagged or the send's own, is
-// counted as overdue_repair_spurious. Off, the default.
+// as a retransmission timeout's is, under SPRAY_DUPLICATE_REPORT too. probe:
+// the repair is sent alike but counts no loss; under SPRAY_DUPLICATE_REPORT
+// the repair's answer settles the send: unflagged, a data loss on the send's
+// path, counted as timeout_loss_data; flagged, an answer loss, counted as
+// answer_loss_duplicate; none when it is lost or the cumulative
+// acknowledgement covers the sequence first. Each repair is counted as the
+// host transport event overdue_repair. A receiver flags its answers to
+// duplicates as under SPRAY_DUPLICATE_REPORT, and a repair whose sequence's
+// send arrived first, its answer flagged or the send's own, is counted as
+// overdue_repair_spurious. With either value under SPRAY_DUPLICATE_REPORT, a
+// timed-out send the cumulative acknowledgement leaves a data loss by
+// covering its sequence first is also counted as timeout_loss_data_covered.
+// Off, the default.
 std::string spray_overdue_repair = "off";
 bool spray_overdue_repair_given = false;
 // Under LOAD_BALANCING spray_uniform, with any PATH_SELECTOR,
@@ -2316,8 +2324,9 @@ bool valid_hold_rule() {
     std::cerr << "SPRAY_HELD_LOSS_RTTS must be at least 0\n";
     return false;
   }
-  if (spray_overdue_repair != "on" && spray_overdue_repair != "off") {
-    std::cerr << "SPRAY_OVERDUE_REPAIR must be on or off\n";
+  if (spray_overdue_repair != "evidence" && spray_overdue_repair != "probe" &&
+      spray_overdue_repair != "off") {
+    std::cerr << "SPRAY_OVERDUE_REPAIR must be evidence, probe or off\n";
     return false;
   }
   if (spray_overdue_repair_given &&
@@ -3644,9 +3653,11 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),
       transport_event_totals[{event, "control"}];
   if (spray_duplicate_report == "retract")
     transport_event_totals[{"timeout_retract_release", "control"}];
-  if (spray_overdue_repair == "on")
+  if (spray_overdue_repair != "off")
     for (const char *event : {"overdue_repair", "overdue_repair_spurious"})
       transport_event_totals[{event, "control"}];
+  if (spray_overdue_repair != "off" && spray_duplicate_report != "off")
+    transport_event_totals[{"timeout_loss_data_covered", "control"}];
   if (answer_path_seq())
     for (const char *event : {"answer_route_lost", "answer_route_hold",
                               "answer_route_release", "answer_probe"})
@@ -4026,8 +4037,12 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),
                                                   : CopyExpiry::DataAck)));
       rdmaHw->SetAttribute("SprayHeldLossRtts",
                            DoubleValue(spray_held_loss_rtts));
-      rdmaHw->SetAttribute("SprayOverdueRepair",
-                           BooleanValue(spray_overdue_repair == "on"));
+      rdmaHw->SetAttribute(
+          "SprayOverdueRepair",
+          UintegerValue(static_cast<uint32_t>(
+              spray_overdue_repair == "probe"      ? OverdueRepair::Probe
+              : spray_overdue_repair == "evidence" ? OverdueRepair::Evidence
+                                                   : OverdueRepair::Off)));
       rdmaHw->SetAttribute("SprayAckLossRtts",
                            DoubleValue(spray_ack_loss_rtts));
       rdmaHw->SetAttribute(

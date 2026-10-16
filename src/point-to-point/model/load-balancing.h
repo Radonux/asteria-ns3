@@ -67,6 +67,17 @@ inline uint16_t PathOf(LoadBalancingMode mode, uint16_t identification){
 // Defer tells the selector a timeout's loss only at that answer, none where it
 // is flagged; Retract tells it at once and takes it back where the answer is
 // flagged (RdmaQueuePair::m_retractTimeoutEvidence).
+// SprayOverdueRepair, under a loss hold selector: a queue pair's latest send
+// on a spine not held, its answer SprayHeldLossRtts base RTTs overdue, is
+// repaired. Evidence declares it lost as a timed-out send is; Probe counts no
+// loss as it repairs, and under SprayDuplicateReport the repair's answer
+// settles the send (RdmaQueuePair::m_overdueProbe).
+enum class OverdueRepair : uint32_t {
+	Off = 0,
+	Evidence,
+	Probe,
+};
+
 enum class DuplicateReport : uint32_t {
 	Off = 0,
 	Defer,

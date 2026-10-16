@@ -396,15 +396,25 @@ public:
 		uint16_t path;
 		bool repairSent;
 		uint16_t repairPath;
+		bool trickle;
 	};
 	std::map<uint64_t, OverdueRepair> m_overdueRepaired;
 	uint32_t m_overdue_declared_lost;
 	uint32_t m_overdue_spurious;
+	// SprayOverdueRepair probe: the repair counts no loss as it goes out, and
+	// under SprayDuplicateReport the answer that ends a repaired sequence's
+	// wait settles the send (OverdueRepairSpurious): the repair's, unflagged,
+	// a data loss on the send's path, told to the selector and counted in
+	// m_timeout_data_losses; a flagged one an answer loss, counted in
+	// m_duplicate_answer_losses; the send's own nothing. A sequence the
+	// cumulative acknowledgement covers first counts nothing.
+	bool m_overdueProbe;
 	// Declare lost the send of seq along path made at sentNs, if it is still
 	// outstanding, and queue its range for repair; its loss is evidence as a
-	// retransmission timeout's is (DeclareLostSentBy). Returns the bytes
-	// declared lost: zero when it was acknowledged or declared lost since, or
-	// seq was sent again, or under SprayCoverageFirst it is covered.
+	// retransmission timeout's is (DeclareLostSentBy), or under m_overdueProbe
+	// none. Returns the bytes declared lost: zero when it was acknowledged or
+	// declared lost since, or seq was sent again, or under SprayCoverageFirst
+	// it is covered.
 	uint64_t DeclareOverdueSendLost(uint64_t seq, uint16_t path,
 		uint64_t sentNs);
 	// A repair of seq left along path: the first, of a sequence
@@ -417,7 +427,9 @@ public:
 	// Unflagged along the repair's path, where the send took another, it is
 	// the repair's, which arrived first; either answer ends the wait, and
 	// along one path for both an unflagged answer leaves it to a flagged one.
-	bool OverdueRepairSpurious(uint64_t seq, uint16_t path, bool duplicate);
+	// Under m_overdueProbe the answer that ends the wait settles the send.
+	bool OverdueRepairSpurious(uint64_t seq, uint16_t path, bool duplicate,
+		uint64_t nowNs);
 	// Under SprayAckLossRtts, the sends the cumulative acknowledgement
 	// covered before their own acknowledgement arrived, in the order it
 	// covered them, each with the time it was covered. Their data was
@@ -481,6 +493,12 @@ public:
 	uint32_t m_duplicate_answer_losses;
 	uint32_t m_timeout_data_losses;
 	Callback<void, bool> m_timedOutResolved;
+	// Of m_timeout_data_losses, those the cumulative acknowledgement left
+	// data losses by covering their sequence first, each told to
+	// m_timedOutCovered.
+	uint32_t m_timeout_covered_losses;
+	Callback<void> m_timedOutCovered;
+	void CountTimedOutCovered(uint32_t losses);
 	// Under SprayDuplicateReport's retract instead, a retransmission timeout
 	// tells the loss of each send it declares at once, as without the key,
 	// and keeps each in m_timeoutLosses, a sequence timed out again kept

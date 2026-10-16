@@ -257,6 +257,8 @@ RdmaQueuePair::RdmaQueuePair(uint16_t pg, Ipv4Address _sip, Ipv4Address _dip, ui
 	m_overdueSpent = false;
 	m_overdue_declared_lost = 0;
 	m_overdue_spurious = 0;
+	m_overdueProbe = false;
+	m_timeout_covered_losses = 0;
 	m_ack_loss_declared = 0;
 	m_tail_nacks_ignored = 0;
 	m_copyDeadlineRtts = 0;
@@ -621,8 +623,19 @@ uint64_t RdmaQueuePair::DeclareOverdueSendLost(uint64_t seq, uint16_t path,
 		return 0;
 	}
 	m_overdue_declared_lost++;
-	m_overdueRepaired[seq] = OverdueRepair{path, false, 0};
+	m_overdueRepaired[seq] =
+		OverdueRepair{path, false, 0, m_outstanding.Trickle(packet)};
+	// A probe is recovery alone.
+	if (m_overdueProbe)
+		return DeclareLost(packet, false);
 	return DeclareTimedOutSend(packet);
+}
+
+void RdmaQueuePair::CountTimedOutCovered(uint32_t losses){
+	m_timeout_covered_losses += losses;
+	if (!m_timedOutCovered.IsNull())
+		for (uint32_t k = 0; k < losses; k++)
+			m_timedOutCovered();
 }
 
 void RdmaQueuePair::NoteOverdueRepairSent(uint64_t seq, uint16_t path){
@@ -634,7 +647,7 @@ void RdmaQueuePair::NoteOverdueRepairSent(uint64_t seq, uint16_t path){
 }
 
 bool RdmaQueuePair::OverdueRepairSpurious(uint64_t seq, uint16_t path,
-		bool duplicate){
+		bool duplicate, uint64_t nowNs){
 	const auto repair = m_overdueRepaired.find(seq);
 	if (repair == m_overdueRepaired.end())
 		return false;
@@ -644,6 +657,22 @@ bool RdmaQueuePair::OverdueRepairSpurious(uint64_t seq, uint16_t path,
 	if (!duplicate && !send && !resend)
 		return false;
 	m_overdueRepaired.erase(repair);
+	if (m_overdueProbe && (m_deferTimeoutEvidence || m_retractTimeoutEvidence)){
+		if (duplicate){
+			// Only the answer was lost.
+			m_duplicate_answer_losses++;
+			if (!m_timedOutResolved.IsNull())
+				m_timedOutResolved(true);
+		}else if (resend){
+			// The repair arrived first: the send was lost.
+			m_pathSelector->OnLoss(r.path, nowNs);
+			if (r.trickle)
+				m_pathSelector->OnTrickleAnswer(r.path, true, nowNs);
+			m_timeout_data_losses++;
+			if (!m_timedOutResolved.IsNull())
+				m_timedOutResolved(false);
+		}
+	}
 	if (resend && !duplicate)
 		return false;
 	m_overdue_spurious++;
@@ -820,13 +849,22 @@ void RdmaQueuePair::Acknowledge(uint64_t ack, bool keepCovered){
 	if (ack > snd_una){
 		snd_una = ack;
 		// A timed-out sequence acknowledged with no answer to its resend.
-		while (!m_timedOut.empty() && m_timedOut.begin()->first < snd_una)
+		while (!m_timedOut.empty() && m_timedOut.begin()->first < snd_una){
+			CountTimedOutCovered(1);
 			ResolveTimedOut(m_timedOut.begin()->first, false, kNoRouteSpine,
 				Simulator::Now().GetNanoSeconds());
+		}
 		while (!m_timeoutLosses.empty() &&
-				m_timeoutLosses.begin()->first < snd_una)
+				m_timeoutLosses.begin()->first < snd_una){
+			CountTimedOutCovered(
+				m_timeoutLosses.count(m_timeoutLosses.begin()->first));
 			ResolveTimedOut(m_timeoutLosses.begin()->first, false,
 				kNoRouteSpine, Simulator::Now().GetNanoSeconds());
+		}
+		// A probed sequence covered before its repair's answer counts nothing.
+		if (m_overdueProbe)
+			m_overdueRepaired.erase(m_overdueRepaired.begin(),
+				m_overdueRepaired.lower_bound(snd_una));
 		if (m_outstanding.IsKept() && keepCovered){
 			std::vector<OutstandingPackets::Unanswered> unanswered;
 			m_outstanding.RemoveBelow(snd_una, &unanswered);
