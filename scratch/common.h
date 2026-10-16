@@ -149,6 +149,18 @@ bool hold_trace_hosts_given = false;
 bool hold_traced(uint32_t i) {
   return !hold_trace_hosts_given || hold_trace_hosts.count(i) > 0;
 }
+// TRANSPORT_EVENT_HOSTS <n> <node>...: the hosts, by node id, whose packets'
+// rows TRANSPORT_EVENT_OUTPUT_FILE writes, those from or to one of them;
+// absent, every packet's. TRANSPORT_EVENT_SUMMARY_OUTPUT_FILE counts every
+// packet either way.
+std::set<uint32_t> transport_event_hosts;
+bool transport_event_hosts_given = false;
+// Whether the row of a packet from node source to node destination is written.
+bool transport_event_traced(uint32_t source, uint32_t destination) {
+  return !transport_event_hosts_given ||
+         transport_event_hosts.count(source) > 0 ||
+         transport_event_hosts.count(destination) > 0;
+}
 // Under SPRAY_ANSWER_PATH_SEQ on, ANSWER_HOLD_OUTPUT_FILE: one row per change
 // of a hold, time_ns,side,rank,leaf,spine,held: side sender for a route spine
 // of the answers of receiver leaf leaf held at sender rank, receiver for a
@@ -1078,6 +1090,10 @@ void write_transport_event(const char *event, Ptr<QbbNetDevice> dev,
                              packet->GetSize());
   if (transport_event_raw_cctx == nullptr)
     return;
+  const uint32_t source = ip_to_node_id(Ipv4Address(ch.sip));
+  const uint32_t destination = ip_to_node_id(Ipv4Address(ch.dip));
+  if (!transport_event_traced(source, destination))
+    return;
   uint16_t source_port = 0;
   uint32_t sequence = 0;
   if (protocol == 0x11) {
@@ -1093,8 +1109,7 @@ void write_transport_event(const char *event, Ptr<QbbNetDevice> dev,
       Simulator::Now().GetNanoSeconds(), event,
       payload_bearing ? "data" : "control", protocol,
       dev->GetNode()->GetId(), dev->GetNode()->GetNodeType(),
-      dev->GetIfIndex(), ip_to_node_id(Ipv4Address(ch.sip)),
-      ip_to_node_id(Ipv4Address(ch.dip)), source_port, sequence,
+      dev->GetIfIndex(), source, destination, source_port, sequence,
       packet->GetSize(), queue);
   append_transport_event_raw(row, length);
 }
@@ -1185,6 +1200,10 @@ void get_switch_drop(Ptr<SwitchNode> sw,
                       packet->GetSize());
   if (transport_event_raw_cctx == nullptr)
     return;
+  const uint32_t source = ip_to_node_id(Ipv4Address(ch.sip));
+  const uint32_t destination = ip_to_node_id(Ipv4Address(ch.dip));
+  if (!transport_event_traced(source, destination))
+    return;
   const uint16_t source_port =
       udp ? ch.udp.sport : (trimmed ? ch.ack.sport : 0);
   const uint32_t sequence = udp ? ch.udp.seq : (trimmed ? ch.ack.seq : 0);
@@ -1193,8 +1212,7 @@ void get_switch_drop(Ptr<SwitchNode> sw,
       row, sizeof(row), "%lu,%s,%s,%u,%u,%u,-1,%u,%u,%u,%u,%u,-1\n",
       Simulator::Now().GetNanoSeconds(), event,
       (udp || trimmed) ? "data" : "control", ch.l3Prot, sw->GetId(),
-      sw->GetNodeType(), ip_to_node_id(Ipv4Address(ch.sip)),
-      ip_to_node_id(Ipv4Address(ch.dip)), source_port, sequence,
+      sw->GetNodeType(), source, destination, source_port, sequence,
       packet->GetSize());
   append_transport_event_raw(row, length);
 }
@@ -1236,13 +1254,17 @@ void get_switch_trim(Ptr<SwitchNode> sw,
                              trimmed_payload);
   if (transport_event_raw_cctx == nullptr)
     return;
+  const uint32_t source =
+      ip_to_node_id(Ipv4Address(forwardToDestination ? ch.sip : ch.dip));
+  const uint32_t destination =
+      ip_to_node_id(Ipv4Address(forwardToDestination ? ch.dip : ch.sip));
+  if (!transport_event_traced(source, destination))
+    return;
   char row[224];
   const int length = snprintf(
       row, sizeof(row), "%lu,trim_%s_%s,data,%u,%u,%u,-1,%u,%u,%u,%u,%u,-1\n",
       Simulator::Now().GetNanoSeconds(), mode, reason, ch.l3Prot, sw->GetId(),
-      sw->GetNodeType(),
-      ip_to_node_id(Ipv4Address(forwardToDestination ? ch.sip : ch.dip)),
-      ip_to_node_id(Ipv4Address(forwardToDestination ? ch.dip : ch.sip)),
+      sw->GetNodeType(), source, destination,
       forwardToDestination ? ch.udp.sport : ch.ack.dport,
       forwardToDestination ? ch.udp.seq : ch.ack.seq, trimmed_payload);
   append_transport_event_raw(row, length);
@@ -2865,6 +2887,15 @@ bool ReadConf(string network_configuration) {
         hold_trace_hosts.insert(node);
       }
       hold_trace_hosts_given = true;
+    } else if (key.compare("TRANSPORT_EVENT_HOSTS") == 0) {
+      uint32_t count = 0;
+      conf >> count;
+      for (uint32_t k = 0; k < count; k++) {
+        uint32_t node = 0;
+        conf >> node;
+        transport_event_hosts.insert(node);
+      }
+      transport_event_hosts_given = true;
     } else if (key.compare("RTO_EVENT_OUTPUT_FILE") == 0) {
       conf >> rto_event_output_file;
     } else if (key.compare("RECEIVER_HOLD_OUTPUT_FILE") == 0) {
