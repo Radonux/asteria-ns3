@@ -104,6 +104,11 @@ std::string transport_event_summary_output_file = "transport_summary.csv";
 // carrying spine, written when a link fails and at the end of the run. Empty
 // writes neither.
 std::string port_counter_output_file, spine_arrival_output_file;
+// PORT_COUNTER_INTERVAL_NS <ns>: the switch port counters of
+// PORT_COUNTER_OUTPUT_FILE written also at every multiple of it; 0, the
+// default, writes them (and SPINE_ARRIVAL_OUTPUT_FILE's) at the link events
+// and at the end alone.
+uint64_t port_counter_interval_ns = 0;
 std::string spine_report_output_file;
 // Each host's pooled loss intervals under SPRAY_LOSS_THRESHOLDS: one row per
 // host, closed interval and spine. Empty writes none.
@@ -123,6 +128,14 @@ std::string rto_event_output_file;
 // SPINE_LOSS_OUTPUT_FILE have other columns under each SPRAY_HOLD_SCOPE.
 // Empty writes none.
 std::string receiver_hold_output_file;
+// HOLD_TRACE_HOSTS <n> <node>...: the hosts whose rows SPINE_LOSS_OUTPUT_FILE
+// and RECEIVER_HOLD_OUTPUT_FILE write, by node id; absent, every host's.
+std::set<uint32_t> hold_trace_hosts;
+bool hold_trace_hosts_given = false;
+// Whether host node i's hold rows are written.
+bool hold_traced(uint32_t i) {
+  return !hold_trace_hosts_given || hold_trace_hosts.count(i) > 0;
+}
 // Under SPRAY_ANSWER_PATH_SEQ on, ANSWER_HOLD_OUTPUT_FILE: one row per change
 // of a hold, time_ns,side,rank,leaf,spine,held: side sender for a route spine
 // of the answers of receiver leaf leaf held at sender rank, receiver for a
@@ -1776,9 +1789,9 @@ uint32_t neighbour_of(Ptr<NetDevice> dev) {
   return peer->GetNode()->GetId();
 }
 
-// The counters as they stand now, one row per switch port and one per host
-// and spine, under the current time.
-void write_fabric_counters() {
+// The counters as they stand now, one row per switch port and, unless
+// ports_only, one per host and spine, under the current time.
+void write_fabric_counters(bool ports_only = false) {
   const unsigned long now = Simulator::Now().GetNanoSeconds();
   for (uint32_t i = 0; i < n.GetN(); i++) {
     Ptr<Node> node = n.Get(i);
@@ -1793,7 +1806,8 @@ void write_fabric_counters() {
                 static_cast<unsigned long>(sent.dataPackets),
                 static_cast<unsigned long>(sent.ecnMarks));
       }
-    } else if (node->GetNodeType() == 0 && spine_arrival_file != nullptr) {
+    } else if (node->GetNodeType() == 0 && spine_arrival_file != nullptr &&
+               !ports_only) {
       Ptr<RdmaHw> hw = node->GetObject<RdmaDriver>()->m_rdma;
       for (uint32_t spine = 0; spine < hw->m_spineCount; spine++) {
         const SpineArrivals arrived = spine < hw->m_spineArrivals.size()
@@ -1811,6 +1825,14 @@ void write_fabric_counters() {
                      answer_hold_file})
     if (file != nullptr)
       fflush(file);
+}
+
+// Under PORT_COUNTER_INTERVAL_NS, the counters at each multiple of it, for as
+// long as the simulation runs.
+void write_periodic_fabric_counters() {
+  write_fabric_counters(true);
+  Simulator::Schedule(NanoSeconds(port_counter_interval_ns),
+                      &write_periodic_fabric_counters);
 }
 
 // A report graded from the switches' state for one source leaf: one row per
@@ -2744,12 +2766,23 @@ bool ReadConf(string network_configuration) {
       conf >> transport_event_summary_output_file;
     } else if (key.compare("PORT_COUNTER_OUTPUT_FILE") == 0) {
       conf >> port_counter_output_file;
+    } else if (key.compare("PORT_COUNTER_INTERVAL_NS") == 0) {
+      conf >> port_counter_interval_ns;
     } else if (key.compare("SPINE_ARRIVAL_OUTPUT_FILE") == 0) {
       conf >> spine_arrival_output_file;
     } else if (key.compare("SPINE_REPORT_OUTPUT_FILE") == 0) {
       conf >> spine_report_output_file;
     } else if (key.compare("SPINE_LOSS_OUTPUT_FILE") == 0) {
       conf >> spine_loss_output_file;
+    } else if (key.compare("HOLD_TRACE_HOSTS") == 0) {
+      uint32_t count = 0;
+      conf >> count;
+      for (uint32_t k = 0; k < count; k++) {
+        uint32_t node = 0;
+        conf >> node;
+        hold_trace_hosts.insert(node);
+      }
+      hold_trace_hosts_given = true;
     } else if (key.compare("RTO_EVENT_OUTPUT_FILE") == 0) {
       conf >> rto_event_output_file;
     } else if (key.compare("RECEIVER_HOLD_OUTPUT_FILE") == 0) {
@@ -4361,7 +4394,7 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),
             : leaf_hold() ? "destination_leaf,"
                           : "");
     for (uint32_t i = 0; i < node_num; i++)
-      if (n.Get(i)->GetNodeType() == 0) {
+      if (n.Get(i)->GetNodeType() == 0 && hold_traced(i)) {
         Ptr<RdmaHw> hw = n.Get(i)->GetObject<RdmaDriver>()->m_rdma;
         if (pair_hold())
           hw->TraceConnectWithoutContext(
@@ -4411,7 +4444,7 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),
     fprintf(receiver_hold_file,
             "time_ns,rank,sender_leaf,spine,arrivals,lost,hold\n");
     for (uint32_t i = 0; i < node_num; i++)
-      if (n.Get(i)->GetNodeType() == 0)
+      if (n.Get(i)->GetNodeType() == 0 && hold_traced(i))
         n.Get(i)->GetObject<RdmaDriver>()->m_rdma->TraceConnectWithoutContext(
             "ReceiverHoldInterval",
             MakeBoundCallback(&write_receiver_hold_interval, i));
@@ -4444,7 +4477,10 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),
   // Scheduled first, so that each set of counters is what stood before the
   // failures and restores at its time.
   for (uint64_t time_ns : event_times)
-    Simulator::Schedule(NanoSeconds(time_ns), &write_fabric_counters);
+    Simulator::Schedule(NanoSeconds(time_ns), &write_fabric_counters, false);
+  if (port_counter_interval_ns > 0)
+    Simulator::Schedule(NanoSeconds(port_counter_interval_ns),
+                        &write_periodic_fabric_counters);
   // In order, which events at one time keep, a restore before a failure.
   for (const LinkEvent &event : link_events)
     Simulator::Schedule(NanoSeconds(event.timeNs), &ApplyLinkEvent, n, event);

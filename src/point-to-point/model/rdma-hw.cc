@@ -1438,7 +1438,7 @@ Ptr<RdmaQueuePair> RdmaHw::GetQp(uint32_t dip, uint16_t sport, uint16_t pg){
 		return it->second;
 	return NULL;
 }
-void RdmaHw::AddQueuePair(uint32_t src, uint32_t dest, uint64_t tag, uint64_t size, uint16_t pg, Ipv4Address sip, Ipv4Address dip, uint16_t sport, uint16_t dport, uint32_t win, uint64_t baseRtt, Callback<void> notifyAppFinish, Callback<void> notifyAppSent){
+void RdmaHw::AddQueuePair(uint32_t src, uint32_t dest, uint64_t tag, uint64_t size, uint16_t pg, Ipv4Address sip, Ipv4Address dip, uint16_t sport, uint16_t dport, uint32_t win, uint64_t baseRtt, Callback<void> notifyAppFinish, Callback<void> notifyAppSent, DataRate maxRate){
 	// create qp
 	Ptr<RdmaQueuePair> qp = CreateObject<RdmaQueuePair>(pg, sip, dip, sport, dport);
 	qp->SetSrc(src);
@@ -1470,6 +1470,10 @@ void RdmaHw::AddQueuePair(uint32_t src, uint32_t dest, uint64_t tag, uint64_t si
 
 	// set init variables
 	DataRate m_bps = m_nic[nic_idx].dev->GetDataRate();
+	// A cap below the line rate paces the queue pair at it, through the
+	// NIC's next-send time (UpdateNextAvail) as any rate does.
+	if (maxRate.GetBitRate() > 0 && maxRate < m_bps)
+		m_bps = maxRate;
 	qp->m_rate = m_bps;
 	qp->m_max_rate = m_bps;
 	if (m_cc_mode == 1){

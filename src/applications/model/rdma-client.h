@@ -27,6 +27,7 @@
 #include "ns3/event-id.h"
 #include "ns3/ptr.h"
 #include "ns3/ipv4-address.h"
+#include "ns3/data-rate.h"
 #include <ns3/rdma.h>
 
 namespace ns3 {
@@ -78,6 +79,8 @@ private:
   uint16_t m_sport, m_dport;
   uint32_t m_win; // bound of on-the-fly packets
   uint64_t m_baseRtt; // base Rtt
+  // The queue pair's pacing rate cap; zero for none, the NIC's line rate.
+  DataRate m_maxRate;
   void (*msg_handler)(void* fun_arg);
   void* fun_arg;
   uint64_t tag; 
