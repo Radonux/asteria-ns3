@@ -34,6 +34,9 @@ namespace ns3 {
 		memset(ingress_bytes, 0, sizeof(ingress_bytes));
 		memset(paused, 0, sizeof(paused));
 		memset(egress_bytes, 0, sizeof(egress_bytes));
+		memset(max_egress_bytes, 0, sizeof(max_egress_bytes));
+		memset(ingress_refused, 0, sizeof(ingress_refused));
+		memset(egress_refused, 0, sizeof(egress_refused));
 		memset(egress_threshold, 0, sizeof(egress_threshold));
 	}
 	bool SwitchMmu::CheckIngressAdmission(uint32_t port, uint32_t qIndex, uint32_t psize){
@@ -68,6 +71,8 @@ namespace ns3 {
 	}
 	void SwitchMmu::UpdateEgressAdmission(uint32_t port, uint32_t qIndex, uint32_t psize){
 		egress_bytes[port][qIndex] += psize;
+		if (egress_bytes[port][qIndex] > max_egress_bytes[port][qIndex])
+			max_egress_bytes[port][qIndex] = egress_bytes[port][qIndex];
 	}
 	void SwitchMmu::RemoveFromIngressAdmission(uint32_t port, uint32_t qIndex, uint32_t psize){
 		uint32_t from_hdrm = std::min(hdrm_bytes[port][qIndex], psize);

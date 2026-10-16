@@ -104,6 +104,14 @@ std::string transport_event_summary_output_file = "transport_summary.csv";
 // carrying spine, written when a link fails and at the end of the run. Empty
 // writes neither.
 std::string port_counter_output_file, spine_arrival_output_file;
+// SWITCH_QUEUE_OUTPUT_FILE: per switch port and queue that has held a byte,
+// the most bytes the queue has held, its static egress threshold (0 for
+// none), the port's ECN minimum and maximum, and the packets admission
+// refused by the shared buffer's check and by the static threshold's, a
+// packet refused by both counted in each; written at the link events and at
+// the end, as the port counters are. Empty writes none.
+std::string switch_queue_output_file;
+FILE *switch_queue_file = nullptr;
 // PORT_COUNTER_INTERVAL_NS <ns>: the switch port counters of
 // PORT_COUNTER_OUTPUT_FILE written also at every multiple of it; 0, the
 // default, writes them (and SPINE_ARRIVAL_OUTPUT_FILE's) at the link events
@@ -1814,6 +1822,21 @@ void write_fabric_counters(bool ports_only = false) {
                 static_cast<unsigned long>(sent.dataPackets),
                 static_cast<unsigned long>(sent.ecnMarks));
       }
+      if (switch_queue_file != nullptr && !ports_only)
+        for (uint32_t port = 1; port < sw->GetNDevices(); port++)
+          for (uint32_t q = 0; q < SwitchMmu::qCnt; q++) {
+            const SwitchMmu &mmu = *sw->m_mmu;
+            if (mmu.max_egress_bytes[port][q] == 0 &&
+                mmu.ingress_refused[port][q] == 0 &&
+                mmu.egress_refused[port][q] == 0)
+              continue;
+            fprintf(switch_queue_file, "%lu,%u,%u,%u,%u,%u,%u,%u,%lu,%lu\n",
+                    now, i, port, q, mmu.max_egress_bytes[port][q],
+                    mmu.egress_threshold[port][q], mmu.kmin[port],
+                    mmu.kmax[port],
+                    static_cast<unsigned long>(mmu.ingress_refused[port][q]),
+                    static_cast<unsigned long>(mmu.egress_refused[port][q]));
+          }
     } else if (node->GetNodeType() == 0 && spine_arrival_file != nullptr &&
                !ports_only) {
       Ptr<RdmaHw> hw = node->GetObject<RdmaDriver>()->m_rdma;
@@ -1830,7 +1853,7 @@ void write_fabric_counters(bool ports_only = false) {
   }
   for (FILE *file : {port_counter_file, spine_arrival_file, spine_report_file,
                      spine_loss_file, rto_event_file, receiver_hold_file,
-                     answer_hold_file})
+                     answer_hold_file, switch_queue_file})
     if (file != nullptr)
       fflush(file);
 }
@@ -2777,6 +2800,8 @@ bool ReadConf(string network_configuration) {
       conf >> port_counter_output_file;
     } else if (key.compare("PORT_COUNTER_INTERVAL_NS") == 0) {
       conf >> port_counter_interval_ns;
+    } else if (key.compare("SWITCH_QUEUE_OUTPUT_FILE") == 0) {
+      conf >> switch_queue_output_file;
     } else if (key.compare("SPINE_ARRIVAL_OUTPUT_FILE") == 0) {
       conf >> spine_arrival_output_file;
     } else if (key.compare("SPINE_REPORT_OUTPUT_FILE") == 0) {
@@ -4354,6 +4379,16 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),
     Simulator::Schedule(Seconds(2) + MicroSeconds(link_down_time),
                         &TakeDownLink, n, n.Get(link_down_A),
                         n.Get(link_down_B));
+  }
+  if (!switch_queue_output_file.empty()) {
+    switch_queue_file = fopen(switch_queue_output_file.c_str(), "w");
+    if (switch_queue_file == nullptr) {
+      std::cerr << "Error: cannot open " << switch_queue_output_file << "\n";
+      return false;
+    }
+    fprintf(switch_queue_file,
+            "time_ns,switch,port,queue,max_bytes,egress_threshold_bytes,"
+            "kmin_bytes,kmax_bytes,shared_refused,threshold_refused\n");
   }
   if (!port_counter_output_file.empty()) {
     port_counter_file = fopen(port_counter_output_file.c_str(), "w");

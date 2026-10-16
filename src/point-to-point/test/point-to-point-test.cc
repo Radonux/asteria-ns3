@@ -10542,6 +10542,13 @@ class SpineCountTest : public TestCase
         NS_TEST_EXPECT_MSG_EQ(mmu->CheckEgressAdmission(9, 3, 1001), false, "and no more");
         NS_TEST_EXPECT_MSG_EQ(mmu->CheckEgressAdmission(8, 3, 32000), true, "another port keeps the queue's");
         NS_TEST_EXPECT_MSG_EQ(mmu->CheckEgressAdmission(9, 4, 64000), true, "and another queue its own, none");
+        // The most bytes a queue held, kept across its drains.
+        mmu->UpdateEgressAdmission(9, 3, 600);
+        mmu->UpdateEgressAdmission(9, 3, 400);
+        mmu->RemoveFromEgressAdmission(9, 3, 600);
+        mmu->UpdateEgressAdmission(9, 3, 300);
+        NS_TEST_EXPECT_MSG_EQ(mmu->max_egress_bytes[9][3], 1000u, "a queue's maximum is its deepest");
+        NS_TEST_EXPECT_MSG_EQ(mmu->max_egress_bytes[8][3], 0u, "and another's its own");
     }
 };
 

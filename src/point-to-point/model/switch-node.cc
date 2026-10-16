@@ -465,10 +465,14 @@ bool SwitchNode::SendToDev(Ptr<Packet>p, CustomHeader &ch){
 	p->PeekPacketTag(t);
 	uint32_t inDev = t.GetFlowId();
 	if (qIndex != 0){ //not highest priority
-		if (m_mmu->CheckIngressAdmission(inDev, qIndex, p->GetSize()) && m_mmu->CheckEgressAdmission(idx, qIndex, p->GetSize())){			// Admission control
+		const bool ingress = m_mmu->CheckIngressAdmission(inDev, qIndex, p->GetSize());
+		const bool egress = m_mmu->CheckEgressAdmission(idx, qIndex, p->GetSize());
+		if (ingress && egress){			// Admission control
 			m_mmu->UpdateIngressAdmission(inDev, qIndex, p->GetSize());
 			m_mmu->UpdateEgressAdmission(idx, qIndex, p->GetSize());
 		}else{
+			m_mmu->ingress_refused[idx][qIndex] += !ingress;
+			m_mmu->egress_refused[idx][qIndex] += !egress;
 			if (PacketTrimEnabledFor(ch) &&
 				TrimAndForward(p, ch, idx, PacketTrimTrigger::Admission)){
 				return false; // the original data packet was consumed by trimming

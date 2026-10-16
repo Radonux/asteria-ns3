@@ -76,6 +76,12 @@ public:
 	uint32_t ingress_bytes[pCnt][qCnt];
 	uint32_t paused[pCnt][qCnt];
 	uint32_t egress_bytes[pCnt][qCnt];
+	// The most bytes each egress queue has held, and the packets its
+	// admission refused by the ingress (shared buffer) check and by the
+	// egress (static threshold) check, a packet failing both counted in each.
+	uint32_t max_egress_bytes[pCnt][qCnt];
+	uint64_t ingress_refused[pCnt][qCnt];
+	uint64_t egress_refused[pCnt][qCnt];
 };
 
 } /* namespace ns3 */
