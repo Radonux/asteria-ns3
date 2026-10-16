@@ -1,12 +1,13 @@
 #ifndef ANSWER_PATH_SEQ_H
 #define ANSWER_PATH_SEQ_H
 
-#include <array>
 #include <cstdint>
 #include <functional>
 #include <map>
 #include <unordered_map>
 #include <vector>
+
+#include "ns3/spine-bitmap.h"
 
 namespace ns3 {
 
@@ -18,8 +19,9 @@ namespace ns3 {
 // many answers another route has carried, so that a route on which nothing
 // arrives still shows its answers missing.
 
-// The announcement route of an answer that announces none.
-constexpr uint8_t kNoAnswerRoute = 255;
+// The announcement route of an answer that announces none; in a field of one
+// byte (SpineFieldBytes), 255.
+constexpr uint16_t kNoAnswerRoute = 0xffff;
 
 // The receiving side, per receive queue pair: the count of the answers sent
 // over each route spine.
@@ -31,16 +33,16 @@ public:
 		// Another route the queue pair has answered over and its count of
 		// answers so far, round robin over those routes; kNoAnswerRoute for
 		// none.
-		uint8_t announceRoute;
+		uint16_t announceRoute;
 		uint16_t announceSeq;
 	};
 	// The number of the next answer routed over route, after which route's
 	// count moves on, wrapping at 2^16.
-	Number Next(uint8_t route);
+	Number Next(uint16_t route);
 
 private:
 	std::vector<uint16_t> m_sent;
-	uint8_t m_announceNext = 0;
+	uint16_t m_announceNext = 0;
 };
 
 // The sending side, per queue pair: the next number expected on each route
@@ -48,7 +50,7 @@ private:
 class AnswerSequenceTracker {
 public:
 	struct Outcome {
-		uint8_t route;
+		uint16_t route;
 		// The answers over route found lost.
 		uint16_t lost;
 		// Whether this outcome is an answer received over route, after its
@@ -64,7 +66,7 @@ public:
 	// an announcement, which changes nothing). An announcement of answers
 	// not yet received is held for guardNs from the first that showed them,
 	// as answers over another route can still be on their way.
-	void OnAnswer(uint8_t route, uint16_t seq, uint8_t announceRoute,
+	void OnAnswer(uint16_t route, uint16_t seq, uint16_t announceRoute,
 		uint16_t announceSeq, uint64_t nowNs, uint64_t guardNs,
 		std::vector<Outcome> &outcomes);
 
@@ -75,7 +77,7 @@ private:
 		uint16_t announced = 0;
 		uint64_t dueNs = 0;
 	};
-	Route &At(uint8_t route);
+	Route &At(uint16_t route);
 	std::vector<Route> m_routes;
 };
 
@@ -99,7 +101,7 @@ public:
 	void OnLost(uint32_t route, uint32_t lost, uint64_t nowNs);
 	// The routes held, bit k for route k, once the intervals ended by now
 	// are closed.
-	uint8_t Bitmap(uint64_t nowNs);
+	SpineBitmap Bitmap(uint64_t nowNs);
 	bool Held(uint32_t route) const;
 
 private:
@@ -129,9 +131,9 @@ public:
 		bool held, uint64_t nowNs)>;
 	explicit AnswerHoldReports(uint32_t spines);
 	void SetChangeCallback(ChangeCallback callback);
-	void Report(uint32_t senderIp, uint32_t leaf, uint8_t bitmap,
+	void Report(uint32_t senderIp, uint32_t leaf, const SpineBitmap &bitmap,
 		uint64_t nowNs);
-	uint8_t Held(uint32_t leaf) const;
+	SpineBitmap Held(uint32_t leaf) const;
 	// Whether a probe answer toward leaf is due over a spine held toward it,
 	// intervalNs or more since its hold began or its last probe, and which;
 	// the lowest such spine is taken and its interval restarts now.
@@ -140,9 +142,9 @@ public:
 
 private:
 	struct Leaf {
-		std::map<uint32_t, uint8_t> senders;
-		uint8_t held = 0;
-		std::array<uint64_t, 8> lastProbeNs{};
+		std::map<uint32_t, SpineBitmap> senders;
+		SpineBitmap held;
+		std::vector<uint64_t> lastProbeNs;
 	};
 	uint32_t m_spines;
 	std::unordered_map<uint32_t, Leaf> m_leaves;

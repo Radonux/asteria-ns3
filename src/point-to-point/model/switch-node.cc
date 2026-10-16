@@ -294,7 +294,9 @@ bool SwitchNode::TrimInPlace(Ptr<Packet> p, const CustomHeader &ch, bool lastHop
 	// identify the original packet, and the frame must stay a legal minimum-size
 	// Ethernet frame.
 	const uint32_t kMinEthernetPayload = 60 - 14 - 20;
-	uint32_t trimmedIpPayload = std::max(m_minTrimSize, CustomHeader::GetUdpHeaderSize());
+	// A closing header over more than kFixedTailCounts spines carries its
+	// counts too (CustomHeader::UdpHeaderBytes).
+	uint32_t trimmedIpPayload = std::max(m_minTrimSize, ch.UdpHeaderBytes());
 	trimmedIpPayload = std::max(trimmedIpPayload, kMinEthernetPayload);
 	// "The trimmed packet size MUST NOT be larger than the original packet size."
 	if (originalIpPayload <= trimmedIpPayload)

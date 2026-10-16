@@ -104,7 +104,7 @@ uint32_t CustomHeader::GetSerializedSize (void) const{
 		if (l3Prot == 0x6) // TCP
 			len += tcp.length * 4;
 		else if (l3Prot == 0x11) // UDP
-			len += GetUdpHeaderSize();
+			len += UdpHeaderBytes();
 		else if (CarriesQbbHeader(l3Prot))
 			len += GetAckSerializedSize();
 		else if (l3Prot == 0xFF)
@@ -180,11 +180,12 @@ void CustomHeader::Serialize (Buffer::Iterator start) const{
 			  // The tail fields follow the path sequence, which they need.
 			  if (udpTailCounts > 0){
 				  i.WriteU8(udp.tail_flags);
-				  for (uint32_t k = 0; k < udpTailCounts; k++)
-					  i.WriteHtonU16(udp.tail_counts[k]);
+				  if (CarriesTailCounts(udp.tail_flags))
+					  for (uint32_t k = 0; k < udpTailCounts; k++)
+						  i.WriteHtonU16(udp.tail_counts[k]);
 			  }
 			  if (udpAnswerHoldBytes > 0)
-				  i.WriteU8(udp.answer_hold);
+				  i.Write(udp.answer_hold, udpAnswerHoldBytes);
 		  }
 	  }else if (l3Prot == 0xFF){ // CNP
 		  i.WriteU8(cnp.qIndex);
@@ -203,20 +204,28 @@ void CustomHeader::Serialize (Buffer::Iterator start) const{
 			  i.WriteU32(ack.packet_seq);
 		  if (ackReportBytes > 0)
 			  i.Write(ack.spine_report, ackReportBytes);
-		  if (ackRedirectBytes > 0)
-			  i.WriteU8(ack.redirect);
+		  if (ackRedirectBytes == 1)
+			  i.WriteU8(ack.redirect == 0xffff ? 0xff : static_cast<uint8_t>(ack.redirect));
+		  else if (ackRedirectBytes == 2)
+			  i.WriteU16(ack.redirect);
 		  if (ackReceiverHoldBytes > 0)
-			  i.WriteU8(ack.receiver_hold);
+			  i.Write(ack.receiver_hold, ackReceiverHoldBytes);
 		  if (ackTailNackBytes > 0){
 			  i.WriteU8(ack.tail_spine);
 			  i.WriteU16(ack.tail_seq);
 			  i.WriteU16(ack.tail_count);
 		  }
-		  if (ackRouteSpineBytes > 0)
-			  i.WriteU8(ack.route_spine);
+		  if (ackRouteSpineBytes == 1)
+			  i.WriteU8(ack.route_spine == 0xffff ? 0xff : static_cast<uint8_t>(ack.route_spine));
+		  else if (ackRouteSpineBytes == 2)
+			  i.WriteU16(ack.route_spine);
 		  if (ackAnswerSeqBytes > 0){
 			  i.WriteU16(ack.answer_seq);
-			  i.WriteU8(ack.announce_route);
+			  if (ackAnswerSeqBytes == 5)
+				  i.WriteU8(ack.announce_route == 0xffff ? 0xff
+					  : static_cast<uint8_t>(ack.announce_route));
+			  else
+				  i.WriteU16(ack.announce_route);
 			  i.WriteU16(ack.announce_seq);
 		  }
 		  ack.ih.Serialize(i);
@@ -348,14 +357,15 @@ CustomHeader::Deserialize (Buffer::Iterator start)
 			  udp.path_seq = i.ReadNtohU16();
 			  if (udpTailCounts > 0){
 				  udp.tail_flags = i.ReadU8();
-				  for (uint32_t k = 0; k < udpTailCounts; k++)
-					  udp.tail_counts[k] = i.ReadNtohU16();
+				  if (CarriesTailCounts(udp.tail_flags))
+					  for (uint32_t k = 0; k < udpTailCounts; k++)
+						  udp.tail_counts[k] = i.ReadNtohU16();
 			  }
 			  if (udpAnswerHoldBytes > 0)
-				  udp.answer_hold = i.ReadU8();
+				  i.Read(udp.answer_hold, udpAnswerHoldBytes);
 		  }
 
-		  l4Size = GetUdpHeaderSize();
+		  l4Size = UdpHeaderBytes();
 	  }else if (l3Prot == 0xFF){
 		  cnp.qIndex = i.ReadU8();
 		  cnp.fid = i.ReadU16();
@@ -374,20 +384,30 @@ CustomHeader::Deserialize (Buffer::Iterator start)
 			  ack.packet_seq = i.ReadU32();
 		  if (ackReportBytes > 0)
 			  i.Read(ack.spine_report, ackReportBytes);
-		  if (ackRedirectBytes > 0)
-			  ack.redirect = i.ReadU8();
+		  if (ackRedirectBytes == 1){
+			  const uint8_t redirect = i.ReadU8();
+			  ack.redirect = redirect == 0xff ? 0xffff : redirect;
+		  }else if (ackRedirectBytes == 2)
+			  ack.redirect = i.ReadU16();
 		  if (ackReceiverHoldBytes > 0)
-			  ack.receiver_hold = i.ReadU8();
+			  i.Read(ack.receiver_hold, ackReceiverHoldBytes);
 		  if (ackTailNackBytes > 0){
 			  ack.tail_spine = i.ReadU8();
 			  ack.tail_seq = i.ReadU16();
 			  ack.tail_count = i.ReadU16();
 		  }
-		  if (ackRouteSpineBytes > 0)
-			  ack.route_spine = i.ReadU8();
+		  if (ackRouteSpineBytes == 1){
+			  const uint8_t route = i.ReadU8();
+			  ack.route_spine = route == 0xff ? 0xffff : route;
+		  }else if (ackRouteSpineBytes == 2)
+			  ack.route_spine = i.ReadU16();
 		  if (ackAnswerSeqBytes > 0){
 			  ack.answer_seq = i.ReadU16();
-			  ack.announce_route = i.ReadU8();
+			  if (ackAnswerSeqBytes == 5){
+				  const uint8_t route = i.ReadU8();
+				  ack.announce_route = route == 0xff ? 0xffff : route;
+			  }else
+				  ack.announce_route = i.ReadU16();
 			  ack.announce_seq = i.ReadU16();
 		  }
 		  if (getInt)
@@ -417,11 +437,29 @@ uint32_t CustomHeader::GetAckSerializedSize(void){
 }
 
 uint32_t CustomHeader::GetUdpHeaderSize(void){
-	return 8 + sizeof(udp.pg) + sizeof(udp.seq) + IntHeader::GetStaticSize() + (udpCarriesPathSeq ? sizeof(udp.path_seq) + udpAnswerHoldBytes : 0) + GetUdpTailBytes();
+	return GetUdpHeaderSize(0);
+}
+
+uint32_t CustomHeader::GetUdpHeaderSize(uint8_t flags){
+	return 8 + sizeof(udp.pg) + sizeof(udp.seq) + IntHeader::GetStaticSize() + (udpCarriesPathSeq ? sizeof(udp.path_seq) + udpAnswerHoldBytes : 0) + GetUdpTailBytes(flags);
 }
 
 uint32_t CustomHeader::GetUdpTailBytes(void){
-	return udpTailCounts > 0 ? 1 + 2 * udpTailCounts : 0;
+	return GetUdpTailBytes(0);
+}
+
+bool CustomHeader::CarriesTailCounts(uint8_t flags){
+	return udpTailCounts <= kFixedTailCounts || (flags & kTailCloses);
+}
+
+uint32_t CustomHeader::GetUdpTailBytes(uint8_t flags){
+	if (udpTailCounts == 0)
+		return 0;
+	return 1 + (CarriesTailCounts(flags) ? 2 * udpTailCounts : 0);
+}
+
+uint32_t CustomHeader::UdpHeaderBytes(void) const{
+	return GetUdpHeaderSize(udpTailCounts > 0 ? udp.tail_flags : 0);
 }
 
 uint32_t CustomHeader::GetStaticWholeHeaderSize(void){

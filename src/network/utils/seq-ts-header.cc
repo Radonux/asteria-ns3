@@ -25,6 +25,8 @@
 #include "ns3/log.h"
 #include "ns3/simulator.h"
 
+#include <algorithm>
+
 namespace ns3
 {
 
@@ -37,8 +39,7 @@ SeqTsHeader::SeqTsHeader()
       m_ts(Simulator::Now().GetTimeStep()),
       m_pathSeq(0),
       m_tailFlags(0),
-      m_tailCounts{},
-      m_answerHold(0)
+      m_tailCounts{}
 {
     NS_LOG_FUNCTION(this);
     if (IntHeader::mode == 1)
@@ -94,7 +95,9 @@ void
 SeqTsHeader::SetTail (uint8_t flags, const uint16_t* counts, uint32_t n)
 {
 	m_tailFlags = flags;
-	for (uint32_t k = 0; k < kMaxTailCounts; k++)
+	const uint32_t written = std::min(kMaxTailCounts,
+		std::max(n, CustomHeader::udpTailCounts));
+	for (uint32_t k = 0; k < written; k++)
 		m_tailCounts[k] = k < n ? counts[k] : 0;
 }
 
@@ -105,12 +108,12 @@ SeqTsHeader::AddTailFlags (uint8_t flags)
 }
 
 void
-SeqTsHeader::SetAnswerHold (uint8_t bitmap)
+SeqTsHeader::SetAnswerHold (const SpineBitmap &bitmap)
 {
 	m_answerHold = bitmap;
 }
 
-uint8_t
+SpineBitmap
 SeqTsHeader::GetAnswerHold (void) const
 {
 	return m_answerHold;
@@ -125,7 +128,8 @@ SeqTsHeader::GetTailFlags (void) const
 uint16_t
 SeqTsHeader::GetTailCount (uint32_t spine) const
 {
-	return spine < kMaxTailCounts ? m_tailCounts[spine] : 0;
+	return spine < std::min(kMaxTailCounts, CustomHeader::udpTailCounts)
+		? m_tailCounts[spine] : 0;
 }
 
 TypeId
@@ -155,7 +159,10 @@ uint32_t
 SeqTsHeader::GetSerializedSize() const
 {
     NS_LOG_FUNCTION(this);
-	return GetHeaderSize();
+	return 6 + IntHeader::GetStaticSize() +
+		(CustomHeader::udpCarriesPathSeq
+			? sizeof(uint16_t) + CustomHeader::udpAnswerHoldBytes : 0) +
+		CustomHeader::GetUdpTailBytes(m_tailFlags);
 }
 
 uint32_t SeqTsHeader::GetHeaderSize(void){
@@ -182,11 +189,13 @@ SeqTsHeader::Serialize(Buffer::Iterator start) const
         if (CustomHeader::udpTailCounts > 0)
         {
             i.WriteU8(m_tailFlags);
-            for (uint32_t k = 0; k < CustomHeader::udpTailCounts; k++)
-                i.WriteHtonU16(m_tailCounts[k]);
+            if (CustomHeader::CarriesTailCounts(m_tailFlags))
+                for (uint32_t k = 0; k < CustomHeader::udpTailCounts; k++)
+                    i.WriteHtonU16(m_tailCounts[k]);
         }
         if (CustomHeader::udpAnswerHoldBytes > 0)
-            i.WriteU8(m_answerHold);
+            for (uint32_t b = 0; b < CustomHeader::udpAnswerHoldBytes; b++)
+                i.WriteU8(m_answerHold.Byte(b));
     }
 }
 
@@ -207,11 +216,17 @@ SeqTsHeader::Deserialize(Buffer::Iterator start)
         if (CustomHeader::udpTailCounts > 0)
         {
             m_tailFlags = i.ReadU8();
-            for (uint32_t k = 0; k < CustomHeader::udpTailCounts; k++)
-                m_tailCounts[k] = i.ReadNtohU16();
+            if (CustomHeader::CarriesTailCounts(m_tailFlags))
+                for (uint32_t k = 0; k < CustomHeader::udpTailCounts; k++)
+                    m_tailCounts[k] = i.ReadNtohU16();
         }
         if (CustomHeader::udpAnswerHoldBytes > 0)
-            m_answerHold = i.ReadU8();
+        {
+            uint8_t bytes[kSpineBitmapBytes] = {};
+            for (uint32_t b = 0; b < CustomHeader::udpAnswerHoldBytes; b++)
+                bytes[b] = i.ReadU8();
+            m_answerHold = SpineBitmap::FromBytes(bytes, CustomHeader::udpAnswerHoldBytes);
+        }
     }
     return GetSerializedSize ();
 }

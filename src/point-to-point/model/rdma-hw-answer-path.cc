@@ -42,13 +42,16 @@ void RdmaHw::ReportTimeoutLossRetracted(uint16_t route, bool released){
 }
 
 bool RdmaHw::ValidAnswerPathSeq() const{
-	if (CustomHeader::ackAnswerSeqBytes != (m_sprayAnswerPathSeq ? 5u : 0u) ||
-			CustomHeader::udpAnswerHoldBytes != (m_sprayAnswerPathSeq ? 1u : 0u))
+	if (CustomHeader::ackAnswerSeqBytes != (m_sprayAnswerPathSeq
+				? 4 + SpineFieldBytes(m_spineCount) : 0u) ||
+			CustomHeader::udpAnswerHoldBytes != (m_sprayAnswerPathSeq
+				? SpineBitmapBytes(m_spineCount) : 0u))
 		return false;
 	return !m_sprayAnswerPathSeq ||
 		(m_ackRoute == static_cast<uint32_t>(AckRoute::Spray) &&
 			m_sprayPathSeq && IsRepsHold() && m_switchQueues &&
-			m_leaf != SwitchQueueState::kNoLeaf && m_spineCount <= 8);
+			m_leaf != SwitchQueueState::kNoLeaf &&
+			m_spineCount <= kMaxSpineCount);
 }
 
 AnswerRouteHold &RdmaHw::AnswerRouteHoldTo(uint32_t leaf){
@@ -79,7 +82,7 @@ AnswerHoldReports &RdmaHw::AnswerHoldReportsOf(){
 }
 
 void RdmaHw::NumberAnswer(Ptr<RdmaRxQueuePair> q, qbbHeader &header,
-		uint8_t route){
+		uint16_t route){
 	if (!q || route == kNoRouteSpine)
 		return;
 	const AnswerSequencer::Number number = q->m_answerSequencer.Next(route);

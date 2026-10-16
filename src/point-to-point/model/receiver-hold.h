@@ -9,11 +9,13 @@
 #include <unordered_map>
 #include <vector>
 
+#include "ns3/spine-bitmap.h"
+
 namespace ns3 {
 
 // The spines an acknowledgement's receiver_hold bitmap can name: bit k is
 // spine k.
-constexpr uint32_t kReceiverHoldSpines = 8;
+constexpr uint32_t kReceiverHoldSpines = kMaxSpineCount;
 
 // The receiving host's pooled hold under SprayReceiverHold. Per sender leaf
 // and spine it counts the data packets that arrived and the packets the
@@ -71,7 +73,7 @@ public:
 	// Whether spine is held for sender leaf leaf, at either scope; and the
 	// bitmap of the spines held for it, bit k for spine k.
 	bool Holds(uint32_t leaf, uint32_t spine) const;
-	uint8_t Bitmap(uint32_t leaf) const;
+	SpineBitmap Bitmap(uint32_t leaf) const;
 	// Whether spine is held in host scope, the sender leaves with a missing
 	// packet on it, and the clean arrivals the hold that holds it for leaf
 	// has counted.
@@ -121,7 +123,7 @@ public:
 	ReceiverHoldMarks(uint32_t spines, uint64_t sentinelIntervalNs);
 	// The receiver_hold bitmap of an acknowledgement from receiver, a host on
 	// leaf.
-	void OnBitmap(uint32_t leaf, uint32_t receiver, uint8_t bitmap);
+	void OnBitmap(uint32_t leaf, uint32_t receiver, const SpineBitmap &bitmap);
 	bool Holds(uint32_t leaf, uint32_t spine) const;
 	// Whether a sentinel toward leaf is due on a spine held for it and not
 	// held by localHolds, and which; the lowest such spine is taken and its
@@ -148,7 +150,7 @@ public:
 	void Set(std::shared_ptr<ReceiverHoldMarks> marks, uint32_t leaf);
 	// Whether it is set.
 	bool Active() const;
-	void OnBitmap(uint32_t receiver, uint8_t bitmap);
+	void OnBitmap(uint32_t receiver, const SpineBitmap &bitmap);
 	bool Holds(uint32_t spine) const;
 	// Whether every spine is held by the marks or by localHolds.
 	bool HoldsEvery(const std::function<bool(uint32_t)> &localHolds) const;

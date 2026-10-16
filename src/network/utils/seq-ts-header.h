@@ -77,9 +77,9 @@ class SeqTsHeader : public Header
     uint16_t GetTailCount (uint32_t spine) const;
     // The route spines the sender holds for the answers of the destination's
     // leaf, bit k for spine k, serialized after the tail fields only while
-    // CustomHeader::udpAnswerHoldBytes is not zero.
-    void SetAnswerHold (uint8_t bitmap);
-    uint8_t GetAnswerHold () const;
+    // CustomHeader::udpAnswerHoldBytes is not zero, in that many bytes.
+    void SetAnswerHold (const SpineBitmap &bitmap);
+    SpineBitmap GetAnswerHold () const;
 
     /**
      * \brief Get the type ID.
@@ -90,6 +90,8 @@ class SeqTsHeader : public Header
     TypeId GetInstanceTypeId() const override;
     void Print(std::ostream& os) const override;
     uint32_t GetSerializedSize() const override;
+    // The header's bytes without the per-spine counts that only a closing
+    // header carries over more than kFixedTailCounts spines.
     static uint32_t GetHeaderSize(void);
     void Serialize(Buffer::Iterator start) const override;
     uint32_t Deserialize(Buffer::Iterator start) override;
@@ -101,7 +103,7 @@ class SeqTsHeader : public Header
     uint16_t m_pathSeq;
     uint8_t m_tailFlags;
     uint16_t m_tailCounts[kMaxTailCounts];
-    uint8_t m_answerHold;
+    SpineBitmap m_answerHold;
   public:
     IntHeader ih;
 };

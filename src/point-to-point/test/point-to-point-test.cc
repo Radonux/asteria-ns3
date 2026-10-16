@@ -797,7 +797,7 @@ class LoadBalancingSwitchTest : public TestCase
                 uint16_t identification,
                 uint8_t protocol = 0x11,
                 uint16_t pg = 0,
-                uint8_t routeSpine = kNoRouteSpine)
+                uint16_t routeSpine = kNoRouteSpine)
     {
         Ptr<Packet> packet = Create<Packet>(protocol == 0x11 ? 1000 : 0);
         if (protocol == 0x11)
@@ -7803,7 +7803,7 @@ class MrcHoldExplorationTest : public TestCase
         MrcHoldSelector selector(SelectorStream(), kSpines, 1000, 2000, hold);
         selector.SetReceiverHold(std::make_shared<ReceiverHoldMarks>(kSpines, kSentinelNs),
                                  kReceiverLeaf);
-        selector.OnReceiverHold(100, 0x08, 0);
+        selector.OnReceiverHold(100, SpineBitmap::FromByte(0x08), 0);
         Sends sends = Draw(selector, 0, 400);
         NS_TEST_EXPECT_MSG_EQ(sends.live[3], 0u, which + "the held spine leaves MRC's choices");
         NS_TEST_EXPECT_MSG_EQ(sends.explorations, 0u, which + "no sentinel before its interval");
@@ -7813,7 +7813,7 @@ class MrcHoldExplorationTest : public TestCase
         NS_TEST_EXPECT_MSG_EQ(sends.live[3], duplicate ? 0u : 1u, which + "one sentinel on 3");
         NS_TEST_EXPECT_MSG_EQ(sends.copies[3], duplicate ? 1u : 0u, which + "a copy under duplicate");
         NS_TEST_EXPECT_MSG_EQ(sends.explorations, duplicate ? 0u : 1u, which + "the data's flag");
-        selector.OnReceiverHold(100, 0x00, 2 * kSentinelNs);
+        selector.OnReceiverHold(100, SpineBitmap(), 2 * kSentinelNs);
         sends = Draw(selector, 2 * kSentinelNs, 400);
         NS_TEST_EXPECT_MSG_GT(sends.live[3], 10u, which + "a clear bit returns it to MRC");
     }
@@ -10009,6 +10009,300 @@ class DuplicateReportTest : public TestCase
     }
 };
 
+class SpineCountTest : public TestCase
+{
+  public:
+    SpineCountTest()
+        : TestCase("Over 256 spines the spine fields of an answer take two bytes and its bitmaps "
+                   "a bit per spine, a data header carries its tail counts only where it closes "
+                   "its spine, and the holds, reports and answer routes tell spine 255 from none; "
+                   "over 8 spines every field keeps its one byte")
+    {
+    }
+
+    void DoRun() override
+    {
+        Sizes();
+        Answer();
+        Data();
+        Holds();
+        PortThresholds();
+        Simulator::Destroy();
+    }
+
+  private:
+    // The process-wide header sizes of a fabric of spines spines with every
+    // spine field and bitmap on, as SetupNetwork sets them, restored at the
+    // end of the scope.
+    class HeaderSizes
+    {
+      public:
+        explicit HeaderSizes(uint32_t spines)
+            : m_packetSeq(CustomHeader::ackCarriesPacketSeq),
+              m_report(CustomHeader::ackReportBytes),
+              m_redirect(CustomHeader::ackRedirectBytes),
+              m_pathSeq(CustomHeader::udpCarriesPathSeq),
+              m_receiverHold(CustomHeader::ackReceiverHoldBytes),
+              m_tailCounts(CustomHeader::udpTailCounts),
+              m_tailNack(CustomHeader::ackTailNackBytes),
+              m_routeSpine(CustomHeader::ackRouteSpineBytes),
+              m_answerSeq(CustomHeader::ackAnswerSeqBytes),
+              m_answerHold(CustomHeader::udpAnswerHoldBytes)
+        {
+            CustomHeader::ackCarriesPacketSeq = true;
+            CustomHeader::ackReportBytes = 1 + SpineReport::GradeBytes(spines);
+            CustomHeader::ackRedirectBytes = SpineFieldBytes(spines);
+            CustomHeader::udpCarriesPathSeq = true;
+            CustomHeader::ackReceiverHoldBytes = SpineBitmapBytes(spines);
+            CustomHeader::udpTailCounts = spines;
+            CustomHeader::ackTailNackBytes = 5;
+            CustomHeader::ackRouteSpineBytes = SpineFieldBytes(spines);
+            CustomHeader::ackAnswerSeqBytes = 4 + SpineFieldBytes(spines);
+            CustomHeader::udpAnswerHoldBytes = SpineBitmapBytes(spines);
+        }
+
+        ~HeaderSizes()
+        {
+            CustomHeader::ackCarriesPacketSeq = m_packetSeq;
+            CustomHeader::ackReportBytes = m_report;
+            CustomHeader::ackRedirectBytes = m_redirect;
+            CustomHeader::udpCarriesPathSeq = m_pathSeq;
+            CustomHeader::ackReceiverHoldBytes = m_receiverHold;
+            CustomHeader::udpTailCounts = m_tailCounts;
+            CustomHeader::ackTailNackBytes = m_tailNack;
+            CustomHeader::ackRouteSpineBytes = m_routeSpine;
+            CustomHeader::ackAnswerSeqBytes = m_answerSeq;
+            CustomHeader::udpAnswerHoldBytes = m_answerHold;
+        }
+
+      private:
+        bool m_packetSeq;
+        uint32_t m_report;
+        uint32_t m_redirect;
+        bool m_pathSeq;
+        uint32_t m_receiverHold;
+        uint32_t m_tailCounts;
+        uint32_t m_tailNack;
+        uint32_t m_routeSpine;
+        uint32_t m_answerSeq;
+        uint32_t m_answerHold;
+    };
+
+    static SpineBitmap Of(std::initializer_list<uint32_t> spines)
+    {
+        SpineBitmap bitmap;
+        for (uint32_t spine : spines)
+        {
+            bitmap.Set(spine);
+        }
+        return bitmap;
+    }
+
+    // header as a switch or host parses it, carried in an IPv4 packet of
+    // protocol.
+    template <typename H>
+    static CustomHeader Parsed(const H& header, uint8_t protocol, uint32_t payload = 0)
+    {
+        Ptr<Packet> packet = Create<Packet>(payload);
+        packet->AddHeader(header);
+        if (protocol == 0x11)
+        {
+            UdpHeader udp;
+            packet->AddHeader(udp);
+        }
+        Ipv4Header ip;
+        ip.SetProtocol(protocol);
+        ip.SetPayloadSize(packet->GetSize());
+        packet->AddHeader(ip);
+        CustomHeader parsed(CustomHeader::L3_Header | CustomHeader::L4_Header);
+        packet->PeekHeader(parsed);
+        return parsed;
+    }
+
+    void Sizes()
+    {
+        NS_TEST_EXPECT_MSG_EQ(SpineFieldBytes(8), 1u, "a byte names one of 8 spines or none");
+        NS_TEST_EXPECT_MSG_EQ(SpineFieldBytes(255), 1u, "and of 255, none being 255");
+        NS_TEST_EXPECT_MSG_EQ(SpineFieldBytes(256), 2u, "two bytes from 256");
+        NS_TEST_EXPECT_MSG_EQ(SpineBitmapBytes(8), 1u, "a byte for 8 spines' bits");
+        NS_TEST_EXPECT_MSG_EQ(SpineBitmapBytes(9), 2u, "two for 9");
+        NS_TEST_EXPECT_MSG_EQ(SpineBitmapBytes(256), 32u, "32 for 256");
+        SpineBitmap bitmap = Of({0, 9, 255});
+        NS_TEST_EXPECT_MSG_EQ((bitmap.Test(0) && bitmap.Test(9) && bitmap.Test(255) &&
+                               !bitmap.Test(8) && !bitmap.Test(254)),
+                              true, "a bitmap holds the spines set");
+        NS_TEST_EXPECT_MSG_EQ(uint32_t(bitmap.Byte(1)), 0x02u, "spine 9 in bit 1 of byte 1");
+        NS_TEST_EXPECT_MSG_EQ(uint32_t(bitmap.Byte(31)), 0x80u, "spine 255 in bit 7 of byte 31");
+        uint8_t bytes[kSpineBitmapBytes] = {};
+        bitmap.ToBytes(bytes, 2);
+        NS_TEST_EXPECT_MSG_EQ((SpineBitmap::FromBytes(bytes, 2) == Of({0, 9})), true,
+                              "the first bytes alone carry the first spines");
+        bitmap.Set(255, false);
+        NS_TEST_EXPECT_MSG_EQ((bitmap == Of({0, 9})), true, "and a spine is cleared");
+        NS_TEST_EXPECT_MSG_EQ(SpineBitmap().Any(), false, "an empty bitmap holds none");
+    }
+
+    void Answer()
+    {
+        uint32_t eightBytes = 0;
+        {
+            HeaderSizes sizes(8);
+            qbbHeader none;
+            eightBytes = none.GetSerializedSize();
+            const CustomHeader parsed = Parsed(none, 0xFC);
+            NS_TEST_EXPECT_MSG_EQ((parsed.ack.redirect == kNoRedirect &&
+                                   parsed.ack.route_spine == kNoRouteSpine &&
+                                   parsed.ack.announce_route == kNoAnswerRoute),
+                                  true, "over 8 spines none round trips in a byte");
+            qbbHeader named;
+            named.SetRedirect(7);
+            named.SetRouteSpine(7);
+            named.SetAnswerSeq(3, 7, 4);
+            named.SetReceiverHold(Of({7}));
+            NS_TEST_EXPECT_MSG_EQ(named.GetSerializedSize(), eightBytes, "named in the same bytes");
+            const CustomHeader read = Parsed(named, 0xFC);
+            NS_TEST_EXPECT_MSG_EQ((read.ack.redirect == 7 && read.ack.route_spine == 7 &&
+                                   read.ack.announce_route == 7 && read.ack.receiver_hold[0] == 0x80),
+                                  true, "and spine 7 round trips");
+        }
+        HeaderSizes sizes(256);
+        qbbHeader answer;
+        answer.SetRedirect(255);
+        answer.SetRouteSpine(255);
+        answer.SetAnswerSeq(513, 255, 70);
+        answer.SetReceiverHold(Of({3, 255}));
+        SpineReport report;
+        report.SetGrade(255, 1);
+        answer.SetSpineReport(report);
+        // The report's 64 grade bytes more, a byte more for each of the
+        // three spine fields and 31 more of the receiver_hold bitmap.
+        NS_TEST_EXPECT_MSG_EQ(answer.GetSerializedSize(), eightBytes + 62 + 3 + 31,
+                              "the fields are charged at their size over 256 spines");
+        const CustomHeader parsed = Parsed(answer, 0xFC);
+        NS_TEST_EXPECT_MSG_EQ((parsed.ack.redirect == 255 && parsed.ack.route_spine == 255 &&
+                               parsed.ack.announce_route == 255 && parsed.ack.answer_seq == 513 &&
+                               parsed.ack.announce_seq == 70),
+                              true, "spine 255 round trips in the two-byte fields");
+        NS_TEST_EXPECT_MSG_EQ(
+            (SpineBitmap::FromBytes(parsed.ack.receiver_hold, CustomHeader::ackReceiverHoldBytes) ==
+             Of({3, 255})),
+            true,
+            "and the bitmap");
+        NS_TEST_EXPECT_MSG_EQ(uint32_t((parsed.ack.spine_report[1 + 255 / 4] >> 6) & 3), 1u,
+                              "and spine 255's grade");
+        qbbHeader none;
+        const CustomHeader noneParsed = Parsed(none, 0xFC);
+        NS_TEST_EXPECT_MSG_EQ((noneParsed.ack.redirect == kNoRedirect &&
+                               noneParsed.ack.route_spine == kNoRouteSpine &&
+                               noneParsed.ack.announce_route == kNoAnswerRoute &&
+                               DecodeRedirect(noneParsed.ack.redirect, 256) == kNoRedirect),
+                              true, "none stays apart from spine 255");
+    }
+
+    void Data()
+    {
+        uint16_t counts[kMaxTailCounts];
+        for (uint32_t k = 0; k < kMaxTailCounts; k++)
+        {
+            counts[k] = static_cast<uint16_t>(k + 1);
+        }
+        {
+            HeaderSizes sizes(8);
+            SeqTsHeader open;
+            open.SetTail(0, nullptr, 0);
+            SeqTsHeader closing;
+            closing.SetTail(kTailCloses, counts, 8);
+            NS_TEST_EXPECT_MSG_EQ(open.GetSerializedSize(), closing.GetSerializedSize(),
+                                  "over 8 spines every data header carries the counts");
+            NS_TEST_EXPECT_MSG_EQ(CustomHeader::GetUdpTailBytes(), 1u + 2 * 8, "the flags and 8");
+            const CustomHeader read = Parsed(open, 0x11, 100);
+            NS_TEST_EXPECT_MSG_EQ(read.UdpHeaderBytes(), CustomHeader::GetUdpHeaderSize(),
+                                  "and is parsed at that size");
+        }
+        HeaderSizes sizes(256);
+        SeqTsHeader open;
+        open.SetPathSeq(9);
+        open.SetTail(0, nullptr, 0);
+        open.SetAnswerHold(Of({200}));
+        SeqTsHeader closing = open;
+        closing.SetTail(kTailCloses, counts, 256);
+        NS_TEST_EXPECT_MSG_EQ(closing.GetSerializedSize() - open.GetSerializedSize(), 2u * 256,
+                              "only the closing header carries the 256 counts");
+        NS_TEST_EXPECT_MSG_EQ(CustomHeader::GetUdpHeaderSize(kTailCloses) -
+                                  CustomHeader::GetUdpHeaderSize(),
+                              2u * 256,
+                              "as the data header's size says");
+        const CustomHeader openRead = Parsed(open, 0x11, 100);
+        NS_TEST_EXPECT_MSG_EQ(openRead.UdpHeaderBytes(), CustomHeader::GetUdpHeaderSize(),
+                              "the open header is parsed without them");
+        NS_TEST_EXPECT_MSG_EQ((openRead.udp.path_seq == 9 && openRead.udp.tail_flags == 0 &&
+                               SpineBitmap::FromBytes(openRead.udp.answer_hold,
+                                                      CustomHeader::udpAnswerHoldBytes) == Of({200})),
+                              true, "and its fields after the flags round trip");
+        const CustomHeader closingRead = Parsed(closing, 0x11, 100);
+        NS_TEST_EXPECT_MSG_EQ(closingRead.UdpHeaderBytes(), CustomHeader::GetUdpHeaderSize(kTailCloses),
+                              "the closing header with them");
+        NS_TEST_EXPECT_MSG_EQ((closingRead.udp.tail_counts[0] == 1 &&
+                               closingRead.udp.tail_counts[255] == 256 &&
+                               SpineBitmap::FromBytes(closingRead.udp.answer_hold,
+                                                      CustomHeader::udpAnswerHoldBytes) == Of({200})),
+                              true, "and every count round trips");
+    }
+
+    void Holds()
+    {
+        ReceiverHold hold(256, 2, 3, 0);
+        hold.OnArrival(0, 255, 1, false, 0);
+        NS_TEST_EXPECT_MSG_EQ((hold.Bitmap(0) == Of({255})), true, "a receiver holds spine 255");
+        ReceiverHoldMarks marks(256, 1000);
+        marks.OnBitmap(4, 100, Of({255}));
+        NS_TEST_EXPECT_MSG_EQ(marks.Holds(4, 255), true, "and its sender reads the hold");
+        marks.OnBitmap(4, 100, SpineBitmap());
+        NS_TEST_EXPECT_MSG_EQ(marks.Holds(4, 255), false, "and its release");
+
+        AnswerHoldReports reports(256);
+        reports.Report(1, 0, Of({255}), 0);
+        uint8_t probe = 0;
+        NS_TEST_EXPECT_MSG_EQ((reports.Held(0) == Of({255}) &&
+                               reports.TakeProbe(0, 1000, 1000, probe) && probe == 255),
+                              true, "a receiver probes a held spine 255");
+        AnswerRouteHold routes(256, 1000, 0.05, 2);
+        routes.OnLost(255, 1, 0);
+        NS_TEST_EXPECT_MSG_EQ((routes.Bitmap(1000) == Of({255})), true, "a sender holds route 255");
+
+        AnswerSequencer sequencer;
+        sequencer.Next(255);
+        const AnswerSequencer::Number number = sequencer.Next(3);
+        NS_TEST_EXPECT_MSG_EQ((number.announceRoute == 255 && number.announceSeq == 1), true,
+                              "an answer announces route 255");
+
+        AnswerRepath repath;
+        const AnswerRouteDraw last = [](uint32_t n) { return n - 1; };
+        NS_TEST_EXPECT_MSG_EQ(uint32_t(repath.Route(256, last)), 255u, "a repath route of 255");
+        NS_TEST_EXPECT_MSG_EQ(uint32_t(repath.Route(256, [](uint32_t) { return 0u; })), 255u,
+                              "kept as a route, not taken for none");
+        NS_TEST_EXPECT_MSG_EQ(uint32_t(repath.Repath(256, last)), 254u, "and left at a duplicate");
+
+        SpineReport report;
+        report.SetGrade(255, 1);
+        NS_TEST_EXPECT_MSG_EQ((report.Grade(255) == 1 && report.Grade(254) == SpineReport::kTopGrade),
+                              true, "a report grades spine 255");
+    }
+
+    // A port's egress thresholds of its own, as DATA_QUEUE_BYTES_MAP gives a
+    // slower spine port, beside every other port's.
+    void PortThresholds()
+    {
+        Ptr<SwitchMmu> mmu = CreateObject<SwitchMmu>();
+        mmu->ConfigEgressThreshold(3, 32000);
+        mmu->ConfigEgressThreshold(9, 3, 1000);
+        NS_TEST_EXPECT_MSG_EQ(mmu->CheckEgressAdmission(9, 3, 1000), true, "port 9 admits to its threshold");
+        NS_TEST_EXPECT_MSG_EQ(mmu->CheckEgressAdmission(9, 3, 1001), false, "and no more");
+        NS_TEST_EXPECT_MSG_EQ(mmu->CheckEgressAdmission(8, 3, 32000), true, "another port keeps the queue's");
+        NS_TEST_EXPECT_MSG_EQ(mmu->CheckEgressAdmission(9, 4, 64000), true, "and another queue its own, none");
+    }
+};
+
 class HeldSpineLeakTest : public TestCase
 {
   public:
@@ -10927,7 +11221,7 @@ class SprayReceiverHoldTest : public TestCase
         hold.OnArrival(0, 3, 1, false, 0);
         NS_TEST_EXPECT_MSG_EQ(hold.Holds(0, 3), true, "a loss holds the spine for its leaf");
         NS_TEST_EXPECT_MSG_EQ(hold.Holds(1, 3), false, "and not for another");
-        NS_TEST_EXPECT_MSG_EQ(hold.Bitmap(0), 0x08, "bit 3 for leaf 0");
+        NS_TEST_EXPECT_MSG_EQ(hold.Bitmap(0).Byte(0), 0x08, "bit 3 for leaf 0");
         hold.OnArrival(0, 3, 0, false, 0);
         hold.OnArrival(0, 3, 0, true, 0);
         NS_TEST_EXPECT_MSG_EQ(hold.Clean(0, 3), 1u, "a late arrival counts nothing");
@@ -10945,7 +11239,7 @@ class SprayReceiverHoldTest : public TestCase
         hold.OnArrival(0, 5, 1, false, 0);
         hold.OnArrival(2, 5, 1, false, 0);
         NS_TEST_EXPECT_MSG_EQ(hold.HostHolds(5), true, "a second leaf widens to every leaf");
-        NS_TEST_EXPECT_MSG_EQ(hold.Bitmap(7), 0x20, "even toward a leaf that lost nothing");
+        NS_TEST_EXPECT_MSG_EQ(hold.Bitmap(7).Byte(0), 0x20, "even toward a leaf that lost nothing");
         hold.OnArrival(7, 5, 0, false, 0);
         hold.OnArrival(0, 5, 0, false, 0);
         hold.OnArrival(2, 5, 0, false, 0);
@@ -10953,11 +11247,11 @@ class SprayReceiverHoldTest : public TestCase
         NS_TEST_EXPECT_MSG_EQ(hold.LossLeaves(5), 0u, "and clear its leaves");
 
         ReceiverHoldMarks marks(kSpines, kSentinelNs);
-        marks.OnBitmap(4, 100, 0x08);
-        marks.OnBitmap(4, 101, 0x08);
-        marks.OnBitmap(4, 100, 0x00);
+        marks.OnBitmap(4, 100, SpineBitmap::FromByte(0x08));
+        marks.OnBitmap(4, 101, SpineBitmap::FromByte(0x08));
+        marks.OnBitmap(4, 100, SpineBitmap());
         NS_TEST_EXPECT_MSG_EQ(marks.Holds(4, 3), true, "held while one receiver holds it");
-        marks.OnBitmap(4, 101, 0x00);
+        marks.OnBitmap(4, 101, SpineBitmap());
         NS_TEST_EXPECT_MSG_EQ(marks.Holds(4, 3), false, "and released by the last of them");
     }
 
@@ -11030,7 +11324,7 @@ class SprayReceiverHoldTest : public TestCase
         CustomHeader answer = ack;
         answer.ack.seq = 0;
         sender.host.hw->ReceiveAck(Create<Packet>(), answer);
-        return ack.ack.receiver_hold;
+        return ack.ack.receiver_hold[0];
     }
 
     // Spines chosen by the queue pair at times from nowNs, one per 2 ns, so
@@ -11159,12 +11453,12 @@ class SprayReceiverHoldTest : public TestCase
             }
             Ptr<RdmaQueuePair> flow = sender.host.AddSender(a1, r, 1000000000);
             hw->AttachReceiverHold(flow);
-            flow->m_pathSelector->OnReceiverHold(r.Get(), 0x08, 0);
+            flow->m_pathSelector->OnReceiverHold(r.Get(), SpineBitmap::FromByte(0x08), 0);
             drawn = Draws(flow, 0, 400);
             NS_TEST_EXPECT_MSG_EQ(drawn[3], 0u, "a set bit holds the spine under every scope");
             drawn = Draws(flow, 1000000, 400);
             NS_TEST_EXPECT_MSG_EQ(drawn[3], 1u, "and sends it one sentinel per interval");
-            flow->m_pathSelector->OnReceiverHold(r.Get(), 0x00, 2000000);
+            flow->m_pathSelector->OnReceiverHold(r.Get(), SpineBitmap(), 2000000);
             drawn = Draws(flow, 2000000, 400);
             NS_TEST_EXPECT_MSG_GT(drawn[3], 10u, "a clear bit releases it");
         }
@@ -11502,7 +11796,7 @@ class SprayPathSeqTrimTest : public TestCase
         {
             outcome.lossLeaves.push_back(hold.LossLeaves(spine));
         }
-        outcome.bitmap = hold.Bitmap(0);
+        outcome.bitmap = hold.Bitmap(0).Byte(0);
         return outcome;
     }
 };
@@ -11588,12 +11882,12 @@ class ForcedChoiceSelector : public PathSelector
         m_inner->OnReport(report, nowNs);
     }
 
-    void OnRedirect(uint8_t spine, uint8_t carrying, uint64_t nowNs) override
+    void OnRedirect(uint16_t spine, uint8_t carrying, uint64_t nowNs) override
     {
         m_inner->OnRedirect(spine, carrying, nowNs);
     }
 
-    void OnReceiverHold(uint32_t receiver, uint8_t bitmap, uint64_t nowNs) override
+    void OnReceiverHold(uint32_t receiver, const SpineBitmap& bitmap, uint64_t nowNs) override
     {
         m_inner->OnReceiverHold(receiver, bitmap, nowNs);
     }
@@ -13049,7 +13343,7 @@ class SprayReceiverTailMissingTest : public TestCase
             {
                 if (sent->l3Prot == 0xFC)
                 {
-                    return sent->ack.receiver_hold;
+                    return sent->ack.receiver_hold[0];
                 }
             }
             return 0;
@@ -13260,8 +13554,8 @@ class SprayReceiverTailMissingTest : public TestCase
         for (size_t i = 0; i < emitted[true].size(); ++i)
         {
             NS_TEST_EXPECT_MSG_EQ(emitted[true][i].l3Prot, emitted[false][i].l3Prot, "in kind");
-            NS_TEST_EXPECT_MSG_EQ(static_cast<uint32_t>(emitted[true][i].ack.receiver_hold),
-                                  static_cast<uint32_t>(emitted[false][i].ack.receiver_hold),
+            NS_TEST_EXPECT_MSG_EQ(static_cast<uint32_t>(emitted[true][i].ack.receiver_hold[0]),
+                                  static_cast<uint32_t>(emitted[false][i].ack.receiver_hold[0]),
                                   "and in the spines they hold");
         }
     }
@@ -13927,8 +14221,8 @@ class AckRedirectTransportTest : public TestCase
         const std::vector<uint8_t> bytes = Bytes(redirected);
         NS_TEST_EXPECT_MSG_EQ(uint32_t(bytes[20]), 4u, "the redirect is at offset 20");
         NS_TEST_EXPECT_MSG_EQ(uint32_t(Bytes(plain)[20]),
-                              uint32_t(kNoRedirect),
-                              "and names no spine unless set");
+                              0xffu,
+                              "and names no spine unless set, 255 in one byte");
         Ptr<Packet> packet = Create<Packet>(0);
         packet->AddHeader(redirected);
         Ipv4Header ip;
@@ -14114,7 +14408,7 @@ class AckRedirectTransportTest : public TestCase
             drawn &= window.back() == uniform.Choose(0);
         }
         NS_TEST_EXPECT_MSG_EQ(drawn, true, "the first window's spines are drawn");
-        auto answer = [&](uint32_t packetSeq, uint16_t identification, uint8_t redirect) {
+        auto answer = [&](uint32_t packetSeq, uint16_t identification, uint16_t redirect) {
             CustomHeader ack;
             ack.l3Prot = 0xFC;
             ack.sip = kTestReceiver.Get();
@@ -15218,9 +15512,9 @@ class AnswerPathSeqTest : public TestCase
         hold.OnLost(4, 1, 200);
         hold.OnReceived(4, 210);
         hold.OnReceived(4, 220);
-        NS_TEST_EXPECT_MSG_EQ(hold.Bitmap(999), 0u, "nothing is held within the interval");
+        NS_TEST_EXPECT_MSG_EQ(uint32_t(hold.Bitmap(999).Byte(0)), 0u, "nothing is held within the interval");
         // Route 3: 1 lost of 10, at the threshold; route 4: 1 of 12, below it.
-        NS_TEST_EXPECT_MSG_EQ(uint32_t(hold.Bitmap(1000)), 1u << 3, "route 3 is held at its end");
+        NS_TEST_EXPECT_MSG_EQ(uint32_t(hold.Bitmap(1000).Byte(0)), 1u << 3, "route 3 is held at its end");
         hold.OnReceived(3, 1100);
         hold.OnReceived(3, 1200);
         hold.OnLost(3, 1, 1300);
@@ -15231,7 +15525,7 @@ class AnswerPathSeqTest : public TestCase
         NS_TEST_EXPECT_MSG_EQ(hold.Held(3), false, "three clean answers in a row release it");
         NS_TEST_EXPECT_MSG_EQ((changes == std::vector<std::pair<uint32_t, bool>>{{3, true}, {3, false}}),
                               true, "each change is told");
-        NS_TEST_EXPECT_MSG_EQ(uint32_t(hold.Bitmap(2100)), 0u,
+        NS_TEST_EXPECT_MSG_EQ(uint32_t(hold.Bitmap(2100).Byte(0)), 0u,
                               "the interval with the loss in hold holds nothing again");
     }
 
@@ -15242,12 +15536,12 @@ class AnswerPathSeqTest : public TestCase
         reports.SetChangeCallback([&changes](uint32_t leaf, uint32_t spine, bool held, uint64_t) {
             changes.emplace_back(leaf, spine, held);
         });
-        reports.Report(1, 4, 1u << 3, 1000);
-        reports.Report(2, 4, ((1u << 3) | (1u << 6)), 1000);
-        reports.Report(3, 5, 1u << 2, 1000);
-        NS_TEST_EXPECT_MSG_EQ(uint32_t(reports.Held(4)), ((1u << 3) | (1u << 6)),
+        reports.Report(1, 4, SpineBitmap::FromByte(1u << 3), 1000);
+        reports.Report(2, 4, SpineBitmap::FromByte((1u << 3) | (1u << 6)), 1000);
+        reports.Report(3, 5, SpineBitmap::FromByte(1u << 2), 1000);
+        NS_TEST_EXPECT_MSG_EQ(uint32_t(reports.Held(4).Byte(0)), ((1u << 3) | (1u << 6)),
                               "a leaf's held spines are any of its senders'");
-        NS_TEST_EXPECT_MSG_EQ(uint32_t(reports.Held(5)), 1u << 2, "per sender leaf");
+        NS_TEST_EXPECT_MSG_EQ(uint32_t(reports.Held(5).Byte(0)), 1u << 2, "per sender leaf");
         uint8_t spine = 0;
         NS_TEST_EXPECT_MSG_EQ(reports.TakeProbe(4, 1500, 1000, spine), false,
                               "no probe within an interval of the hold's start");
@@ -15256,11 +15550,11 @@ class AnswerPathSeqTest : public TestCase
         NS_TEST_EXPECT_MSG_EQ(reports.TakeProbe(4, 2000, 1000, spine), true, "then the next");
         NS_TEST_EXPECT_MSG_EQ(uint32_t(spine), 6u, "spine 6");
         NS_TEST_EXPECT_MSG_EQ(reports.TakeProbe(4, 2500, 1000, spine), false, "each once an interval");
-        reports.Report(1, 4, 0, 3000);
-        NS_TEST_EXPECT_MSG_EQ(uint32_t(reports.Held(4)), ((1u << 3) | (1u << 6)),
+        reports.Report(1, 4, SpineBitmap(), 3000);
+        NS_TEST_EXPECT_MSG_EQ(uint32_t(reports.Held(4).Byte(0)), ((1u << 3) | (1u << 6)),
                               "held while one sender still sets the bit");
-        reports.Report(2, 4, 1u << 6, 3000);
-        NS_TEST_EXPECT_MSG_EQ(uint32_t(reports.Held(4)), 1u << 6, "let go once none does");
+        reports.Report(2, 4, SpineBitmap::FromByte(1u << 6), 3000);
+        NS_TEST_EXPECT_MSG_EQ(uint32_t(reports.Held(4).Byte(0)), 1u << 6, "let go once none does");
         NS_TEST_EXPECT_MSG_EQ(changes.size(), 4u, "three holds and one release told");
         NS_TEST_EXPECT_MSG_EQ((changes.back() == std::make_tuple(4u, 3u, false)), true,
                               "the release of spine 3 toward leaf 4");
@@ -15297,7 +15591,7 @@ class AnswerPathSeqTest : public TestCase
                                ((parsed.ack.flags >> qbbHeader::FLAG_ANSWER_NUMBERED) & 1)),
                               true, "and parse as the switches and hosts read them");
         SeqTsHeader seqTs;
-        seqTs.SetAnswerHold(0x48);
+        seqTs.SetAnswerHold(SpineBitmap::FromByte(0x48));
         Ptr<Packet> data = Create<Packet>(0);
         data->AddHeader(seqTs);
         UdpHeader udp;
@@ -15308,7 +15602,7 @@ class AnswerPathSeqTest : public TestCase
         data->AddHeader(dataIp);
         CustomHeader parsedData(CustomHeader::L3_Header | CustomHeader::L4_Header);
         data->PeekHeader(parsedData);
-        NS_TEST_EXPECT_MSG_EQ(uint32_t(parsedData.udp.answer_hold), 0x48u,
+        NS_TEST_EXPECT_MSG_EQ(uint32_t(parsedData.udp.answer_hold[0]), 0x48u,
                               "the data packet's bitmap round trips");
         CustomHeader::ackAnswerSeqBytes = savedSeq;
         CustomHeader::udpAnswerHoldBytes = savedHold;
@@ -15345,7 +15639,7 @@ class AnswerPathSeqTest : public TestCase
             "AnswerHold", Callback<void, bool, uint32_t, uint32_t, bool, uint64_t>(
                               [&traced](bool receiver, uint32_t leaf, uint32_t spine, bool held,
                                         uint64_t) { traced.emplace_back(receiver, leaf, spine, held); }));
-        hw->AnswerHoldReportsOf().Report(kTestSender.Get(), 0, 1u << 3, 0);
+        hw->AnswerHoldReportsOf().Report(kTestSender.Get(), 0, SpineBitmap::FromByte(1u << 3), 0);
         std::vector<uint32_t> toLeaf0(kSpines, 0);
         std::vector<uint32_t> toLeaf1(kSpines, 0);
         for (uint32_t i = 0; i < 4000; ++i)
@@ -15395,7 +15689,7 @@ class AnswerPathSeqTest : public TestCase
         Ptr<RdmaQueuePair> qp =
             host.AddSender(kTestSender, SwitchQueueFabric::kOtherSender, 100 * IsolatedHost::kMtu);
         qp->m_baseRtt = 1000;
-        const auto answer = [&](uint8_t route, uint16_t seq, uint8_t announceRoute,
+        const auto answer = [&](uint16_t route, uint16_t seq, uint16_t announceRoute,
                                 uint16_t announceSeq) {
             CustomHeader ch;
             ch.l3Prot = 0xFC;
@@ -15414,7 +15708,7 @@ class AnswerPathSeqTest : public TestCase
         Simulator::Schedule(NanoSeconds(300), [&]() { answer(6, 0, 2, 2); });
         Simulator::Schedule(NanoSeconds(3000), [&]() { answer(6, 1, 5, 4); });
         Simulator::Schedule(NanoSeconds(10000), [&]() {
-            heldAtEnd = hw->AnswerRouteHoldTo(1).Bitmap(10000);
+            heldAtEnd = hw->AnswerRouteHoldTo(1).Bitmap(10000).Byte(0);
         });
         // The receiver's probes over the held routes, clean.
         Simulator::Schedule(NanoSeconds(11000), [&]() { answer(5, 4, kNoAnswerRoute, 0); });
@@ -15422,7 +15716,7 @@ class AnswerPathSeqTest : public TestCase
         Simulator::Schedule(NanoSeconds(13000), [&]() { answer(2, 2, kNoAnswerRoute, 0); });
         Simulator::Schedule(NanoSeconds(14000), [&]() { answer(2, 3, kNoAnswerRoute, 0); });
         Simulator::Schedule(NanoSeconds(15000), [&]() {
-            heldAfterProbes = hw->AnswerRouteHoldTo(1).Bitmap(15000);
+            heldAfterProbes = hw->AnswerRouteHoldTo(1).Bitmap(15000).Byte(0);
         });
         Simulator::Run();
         Simulator::Destroy();
@@ -16531,6 +16825,7 @@ PointToPointTestSuite::PointToPointTestSuite()
     AddTestCase(new CoverageFirstTest, TestCase::Duration::QUICK);
     AddTestCase(new NsccRttSampleTest, TestCase::Duration::QUICK);
     AddTestCase(new DuplicateReportTest, TestCase::Duration::QUICK);
+    AddTestCase(new SpineCountTest, TestCase::Duration::QUICK);
     AddTestCase(new RetransmissionTimeoutTraceTest, TestCase::Duration::QUICK);
     AddTestCase(new HeldSpineLeakTest, TestCase::Duration::QUICK);
     AddTestCase(new HeldSpineFastLossTest, TestCase::Duration::QUICK);

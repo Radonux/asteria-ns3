@@ -10,31 +10,31 @@ bool Ahead(uint16_t a, uint16_t b){
 }
 } // namespace
 
-AnswerSequencer::Number AnswerSequencer::Next(uint8_t route){
+AnswerSequencer::Number AnswerSequencer::Next(uint16_t route){
 	if (route >= m_sent.size())
 		m_sent.resize(route + 1, 0);
 	Number number{m_sent[route]++, kNoAnswerRoute, 0};
 	const uint32_t routes = m_sent.size();
 	for (uint32_t step = 0; step < routes; step++){
-		const uint8_t other = static_cast<uint8_t>((m_announceNext + step) % routes);
+		const uint16_t other = static_cast<uint16_t>((m_announceNext + step) % routes);
 		if (other == route || m_sent[other] == 0)
 			continue;
 		number.announceRoute = other;
 		number.announceSeq = m_sent[other];
-		m_announceNext = static_cast<uint8_t>((other + 1) % routes);
+		m_announceNext = static_cast<uint16_t>((other + 1) % routes);
 		break;
 	}
 	return number;
 }
 
-AnswerSequenceTracker::Route &AnswerSequenceTracker::At(uint8_t route){
+AnswerSequenceTracker::Route &AnswerSequenceTracker::At(uint16_t route){
 	if (route >= m_routes.size())
 		m_routes.resize(route + 1);
 	return m_routes[route];
 }
 
-void AnswerSequenceTracker::OnAnswer(uint8_t route, uint16_t seq,
-		uint8_t announceRoute, uint16_t announceSeq, uint64_t nowNs,
+void AnswerSequenceTracker::OnAnswer(uint16_t route, uint16_t seq,
+		uint16_t announceRoute, uint16_t announceSeq, uint64_t nowNs,
 		uint64_t guardNs, std::vector<Outcome> &outcomes){
 	At(route);
 	if (announceRoute != kNoAnswerRoute)
@@ -45,7 +45,7 @@ void AnswerSequenceTracker::OnAnswer(uint8_t route, uint16_t seq,
 			continue;
 		due.pending = false;
 		if (Ahead(due.announced, due.next)){
-			outcomes.push_back(Outcome{static_cast<uint8_t>(k),
+			outcomes.push_back(Outcome{static_cast<uint16_t>(k),
 				static_cast<uint16_t>(due.announced - due.next), false});
 			due.next = due.announced;
 		}
@@ -140,12 +140,12 @@ void AnswerRouteHold::OnLost(uint32_t route, uint32_t lost, uint64_t nowNs){
 	m_cleanCount[route] = 0;
 }
 
-uint8_t AnswerRouteHold::Bitmap(uint64_t nowNs){
+SpineBitmap AnswerRouteHold::Bitmap(uint64_t nowNs){
 	Advance(nowNs);
-	uint8_t bitmap = 0;
-	for (uint32_t k = 0; k < m_held.size() && k < 8; k++)
+	SpineBitmap bitmap;
+	for (uint32_t k = 0; k < m_held.size() && k < kMaxSpineCount; k++)
 		if (m_held[k])
-			bitmap |= static_cast<uint8_t>(1u << k);
+			bitmap.Set(k);
 	return bitmap;
 }
 
@@ -162,25 +162,27 @@ void AnswerHoldReports::SetChangeCallback(ChangeCallback callback){
 }
 
 void AnswerHoldReports::Report(uint32_t senderIp, uint32_t leaf,
-		uint8_t bitmap, uint64_t nowNs){
+		const SpineBitmap &bitmap, uint64_t nowNs){
 	Leaf &state = m_leaves[leaf];
+	if (state.lastProbeNs.empty())
+		state.lastProbeNs.assign(m_spines, 0);
 	auto sender = state.senders.find(senderIp);
 	if (sender == state.senders.end()){
-		if (bitmap == 0)
+		if (!bitmap.Any())
 			return;
 		sender = state.senders.emplace(senderIp, bitmap).first;
 	}else if (sender->second == bitmap)
 		return;
 	sender->second = bitmap;
-	uint8_t held = 0;
+	SpineBitmap held;
 	for (const auto &reported : state.senders)
 		held |= reported.second;
-	const uint8_t changed = held ^ state.held;
+	const SpineBitmap changed = held ^ state.held;
 	state.held = held;
-	for (uint32_t k = 0; k < m_spines && k < 8; k++){
-		if (!((changed >> k) & 1))
+	for (uint32_t k = 0; k < m_spines && k < kMaxSpineCount; k++){
+		if (!changed.Test(k))
 			continue;
-		const bool now = (held >> k) & 1;
+		const bool now = held.Test(k);
 		// The first probe of a hold is due an interval after it begins.
 		if (now)
 			state.lastProbeNs[k] = nowNs;
@@ -189,18 +191,18 @@ void AnswerHoldReports::Report(uint32_t senderIp, uint32_t leaf,
 	}
 }
 
-uint8_t AnswerHoldReports::Held(uint32_t leaf) const{
+SpineBitmap AnswerHoldReports::Held(uint32_t leaf) const{
 	const auto state = m_leaves.find(leaf);
-	return state == m_leaves.end() ? 0 : state->second.held;
+	return state == m_leaves.end() ? SpineBitmap() : state->second.held;
 }
 
 bool AnswerHoldReports::TakeProbe(uint32_t leaf, uint64_t nowNs,
 		uint64_t intervalNs, uint8_t &spine){
 	const auto state = m_leaves.find(leaf);
-	if (state == m_leaves.end() || state->second.held == 0)
+	if (state == m_leaves.end() || !state->second.held.Any())
 		return false;
-	for (uint32_t k = 0; k < m_spines && k < 8; k++){
-		if (!((state->second.held >> k) & 1) ||
+	for (uint32_t k = 0; k < m_spines && k < kMaxSpineCount; k++){
+		if (!state->second.held.Test(k) ||
 				nowNs < state->second.lastProbeNs[k] + intervalNs)
 			continue;
 		state->second.lastProbeNs[k] = nowNs;

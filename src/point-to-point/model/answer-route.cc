@@ -75,14 +75,14 @@ const std::vector<uint8_t> &AnswerRouteSet::Members() const{
 uint8_t AnswerRepath::Route(uint32_t spines, const AnswerRouteDraw &draw){
 	if (m_route == kNone)
 		m_route = static_cast<uint8_t>(draw(spines));
-	return m_route;
+	return static_cast<uint8_t>(m_route);
 }
 
 uint8_t AnswerRepath::Repath(uint32_t spines, const AnswerRouteDraw &draw){
 	if (m_route == kNone || spines < 2)
 		return Route(spines, draw);
-	m_route = DrawOutside({m_route}, spines, draw);
-	return m_route;
+	m_route = DrawOutside({static_cast<uint8_t>(m_route)}, spines, draw);
+	return static_cast<uint8_t>(m_route);
 }
 
 } // namespace ns3

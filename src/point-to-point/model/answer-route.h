@@ -61,8 +61,9 @@ public:
 	uint8_t Repath(uint32_t spines, const AnswerRouteDraw &draw);
 
 private:
-	static constexpr uint8_t kNone = UINT8_MAX;
-	uint8_t m_route = kNone;
+	// Wider than a spine's index, which spans a byte.
+	static constexpr uint16_t kNone = UINT16_MAX;
+	uint16_t m_route = kNone;
 };
 
 } // namespace ns3

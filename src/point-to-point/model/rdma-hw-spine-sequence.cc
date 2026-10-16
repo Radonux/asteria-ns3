@@ -242,7 +242,8 @@ bool RdmaHw::IsReceiverHold() const{
 }
 
 bool RdmaHw::ValidReceiverHold() const{
-	return CustomHeader::ackReceiverHoldBytes == (m_sprayReceiverHold ? 1u : 0u) &&
+	return CustomHeader::ackReceiverHoldBytes ==
+			(m_sprayReceiverHold ? SpineBitmapBytes(m_spineCount) : 0u) &&
 		(!m_sprayReceiverHold ||
 			(m_sprayPathSeq && IsRepsHold() && m_switchQueues &&
 				m_spineCount > 0 && m_spineCount <= kReceiverHoldSpines));
@@ -266,9 +267,9 @@ ReceiverHold &RdmaHw::ReceiverHoldOf(){
 	return *m_receiverHold;
 }
 
-uint8_t RdmaHw::ReceiverHoldBitmap(uint32_t senderIp) const{
+SpineBitmap RdmaHw::ReceiverHoldBitmap(uint32_t senderIp) const{
 	if (!IsReceiverHold() || !m_receiverHold)
-		return 0;
+		return SpineBitmap();
 	return m_receiverHold->Bitmap(m_switchQueues->LeafOf(senderIp));
 }
 

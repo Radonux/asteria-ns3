@@ -78,10 +78,10 @@ uint32_t TrickleEvery(double fraction){
 void PathSelector::OnReport(const SpineReport &, uint64_t){
 }
 
-void PathSelector::OnRedirect(uint8_t, uint8_t, uint64_t){
+void PathSelector::OnRedirect(uint16_t, uint8_t, uint64_t){
 }
 
-void PathSelector::OnReceiverHold(uint32_t, uint8_t, uint64_t){
+void PathSelector::OnReceiverHold(uint32_t, const SpineBitmap &, uint64_t){
 }
 
 void PathSelector::SetReceiverHold(std::shared_ptr<ReceiverHoldMarks>,
@@ -153,13 +153,13 @@ void SharedPathSelector::OnReport(const SpineReport &report, uint64_t nowNs){
 	m_shared->OnReport(report, nowNs);
 }
 
-void SharedPathSelector::OnRedirect(uint8_t spine, uint8_t carrying,
+void SharedPathSelector::OnRedirect(uint16_t spine, uint8_t carrying,
 		uint64_t nowNs){
 	m_shared->OnRedirect(spine, carrying, nowNs);
 }
 
-void SharedPathSelector::OnReceiverHold(uint32_t receiver, uint8_t bitmap,
-		uint64_t nowNs){
+void SharedPathSelector::OnReceiverHold(uint32_t receiver,
+		const SpineBitmap &bitmap, uint64_t nowNs){
 	m_shared->OnReceiverHold(receiver, bitmap, nowNs);
 }
 
@@ -189,10 +189,11 @@ AckRedirectSelector::AckRedirectSelector(Ptr<UniformRandomVariable> random,
 uint16_t AckRedirectSelector::Choose(uint64_t nowNs){
 	if (m_spine == kNoRedirect)
 		return m_uniform.Choose(nowNs);
-	return SpineIdentification(m_spine, m_spine);
+	const uint8_t spine = static_cast<uint8_t>(m_spine);
+	return SpineIdentification(spine, spine);
 }
 
-void AckRedirectSelector::OnRedirect(uint8_t spine, uint8_t carrying, uint64_t){
+void AckRedirectSelector::OnRedirect(uint16_t spine, uint8_t carrying, uint64_t){
 	m_spine = spine != kNoRedirect ? spine : carrying;
 }
 
@@ -1539,7 +1540,8 @@ void LossHoldExploration::SetReceiverHold(
 	m_receiverHold.Set(std::move(marks), leaf);
 }
 
-void LossHoldExploration::OnReceiverHold(uint32_t receiver, uint8_t bitmap){
+void LossHoldExploration::OnReceiverHold(uint32_t receiver,
+		const SpineBitmap &bitmap){
 	m_receiverHold.OnBitmap(receiver, bitmap);
 }
 
@@ -1637,8 +1639,8 @@ void RepsHoldSelector::SetReceiverHold(
 	m_exploration.SetReceiverHold(std::move(marks), leaf);
 }
 
-void RepsHoldSelector::OnReceiverHold(uint32_t receiver, uint8_t bitmap,
-		uint64_t){
+void RepsHoldSelector::OnReceiverHold(uint32_t receiver,
+		const SpineBitmap &bitmap, uint64_t){
 	m_exploration.OnReceiverHold(receiver, bitmap);
 }
 
@@ -1950,8 +1952,8 @@ void MrcHoldSelector::SetReceiverHold(
 	m_exploration.SetReceiverHold(std::move(marks), leaf);
 }
 
-void MrcHoldSelector::OnReceiverHold(uint32_t receiver, uint8_t bitmap,
-		uint64_t){
+void MrcHoldSelector::OnReceiverHold(uint32_t receiver,
+		const SpineBitmap &bitmap, uint64_t){
 	m_exploration.OnReceiverHold(receiver, bitmap);
 }
 

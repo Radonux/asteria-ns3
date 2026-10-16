@@ -118,7 +118,7 @@ public:
 	// The redirect field of the answer to the data packet or trimmed header of
 	// ch arriving at q, which is scored unless its sender is on this host's
 	// leaf.
-	uint8_t ScoreForRedirect(Ptr<RdmaRxQueuePair> q, const CustomHeader &ch,
+	uint16_t ScoreForRedirect(Ptr<RdmaRxQueuePair> q, const CustomHeader &ch,
 		bool marked);
 	// SprayPolicy. Times are in units of m_sprayBaseRttNs, the fabric's base
 	// RTT, which AckRedirect also counts in; the receiver's parameters are
@@ -328,7 +328,7 @@ public:
 	// priority group pg: kNoRouteSpine under DataSpine and toward a host of
 	// this leaf, one draw under Spray, and the connection's under ReverseSet
 	// and Repath.
-	uint8_t AnswerRouteSpine(uint32_t senderIp, uint16_t pg = 0);
+	uint16_t AnswerRouteSpine(uint32_t senderIp, uint16_t pg = 0);
 	// SprayCoverageFirst, under LoadBalancing SprayUniform: a send the
 	// queue pair's coverage shows delivered is an answer loss, not a loss on
 	// its path (RdmaQueuePair::m_coverageFirst), each reported as the
@@ -384,7 +384,7 @@ public:
 	AnswerHoldReports &AnswerHoldReportsOf();
 	// The number of q's next answer over route into header, under
 	// SprayAnswerPathSeq for a route spine.
-	void NumberAnswer(Ptr<RdmaRxQueuePair> q, qbbHeader &header, uint8_t route);
+	void NumberAnswer(Ptr<RdmaRxQueuePair> q, qbbHeader &header, uint16_t route);
 	// The numbered answer ch to qp read and its outcomes counted.
 	void ReadAnswerSeq(Ptr<RdmaQueuePair> qp, const CustomHeader &ch);
 	// The AnswerHold trace source: a hold changed, at this host as a sender
@@ -671,7 +671,7 @@ public:
 	bool ValidReceiverHold() const;
 	ReceiverHold &ReceiverHoldOf();
 	// The receiver_hold field of an answer to the host at senderIp.
-	uint8_t ReceiverHoldBitmap(uint32_t senderIp) const;
+	SpineBitmap ReceiverHoldBitmap(uint32_t senderIp) const;
 	// Give qp's selector the marks it holds by.
 	void AttachReceiverHold(Ptr<RdmaQueuePair> qp);
 	// The ReceiverHoldInterval trace source: the host's ReceiverHold closed an
@@ -843,7 +843,7 @@ public:
 	void SendAck(Ptr<RdmaRxQueuePair> q, uint32_t sourceIp,
 		uint32_t destinationIp, uint16_t sport, uint16_t dport, uint16_t pg,
 		const IntHeader &ih, uint32_t packetSeq, uint16_t identification,
-		bool nack, bool cnp, bool spent, bool probeAnswer, uint8_t redirect,
+		bool nack, bool cnp, bool spent, bool probeAnswer, uint16_t redirect,
 		bool duplicate = false);
 	// Read the receiver's two bits off an arriving repair request or
 	// acknowledgement and follow them: eligible with room grants the

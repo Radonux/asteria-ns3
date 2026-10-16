@@ -79,6 +79,15 @@ bool nscc_window_state_given = false;
 // every sample at the queue pair's base RTT, below which no answer returns.
 std::string nscc_rtt_sample = "any";
 bool nscc_rtt_sample_given = false;
+// PAIR_BANDWIDTH path or spines: the bandwidth of a pair of hosts (pairBw),
+// which with its base RTT gives the pair's BDP, the link speed and MaxWnd of
+// NSCC's window and REPS's buffer. path, the default, is the bottleneck of the
+// best shortest path (CalculateRoute). spines, under a LOAD_BALANCING mode
+// that names spines, is that of a pair whose packets are sprayed over every
+// spine, for hosts on two leaves: the sum over the spines of the lesser of
+// the source leaf's uplink to it and its downlink to the destination leaf, at
+// most either host's link (SprayPairBandwidth).
+std::string pair_bandwidth = "path";
 bool enable_qcn = true, use_dynamic_pfc_threshold = true;
 uint32_t packet_payload_size = 1000, l2_chunk_size = 0, l2_ack_interval = 0;
 double pause_time = 5, simulator_stop_time = 3.01;
@@ -718,6 +727,11 @@ uint32_t enable_pfc = 1;
 // queue_trimmable and queue_trimmed drop thresholds of section 4.1.
 uint32_t data_queue_bytes = 0;
 uint32_t trimmed_queue_bytes = 0;
+// DATA_QUEUE_BYTES_MAP and TRIMMED_QUEUE_BYTES_MAP, as KMAX_MAP: the two
+// thresholds of a switch port by its link speed, in place of DATA_QUEUE_BYTES
+// and TRIMMED_QUEUE_BYTES; each needs the other and a row for every switch
+// port's speed.
+map<uint64_t, uint32_t> rate2data_queue_bytes, rate2trimmed_queue_bytes;
 uint32_t has_win = 1;
 uint32_t global_t = 1;
 uint32_t mi_thresh = 5;
@@ -1151,8 +1165,8 @@ void get_switch_trim(Ptr<SwitchNode> sw,
   // payload that the trim replaced.
   const uint32_t trimmed_payload =
       forwardToDestination
-          ? (ch.udp.payload_size > CustomHeader::GetUdpHeaderSize()
-                 ? ch.udp.payload_size - CustomHeader::GetUdpHeaderSize()
+          ? (ch.udp.payload_size > ch.UdpHeaderBytes()
+                 ? ch.udp.payload_size - ch.UdpHeaderBytes()
                  : 0)
           : ch.ack.trim_payload_size;
   const char *mode = forwardToDestination ? "ftd" : "bts";
@@ -1607,6 +1621,41 @@ void LeavesAndSpines(NodeContainer &n, vector<Ptr<Node>> &leaves,
             [](Ptr<Node> a, Ptr<Node> b) { return a->GetId() < b->GetId(); });
 }
 
+// PAIR_BANDWIDTH spines: every pair of hosts on two leaves of a leaf-spine
+// fabric gets the bandwidth of its packets sprayed over every spine, the sum
+// over the spines of the lesser of the source leaf's link up to it and its
+// link down to the destination leaf, links taken down left out, at most
+// either host's link. A pair on one leaf keeps CalculateRoute's.
+void SprayPairBandwidth(NodeContainer &n) {
+  vector<Ptr<Node>> leaves, spines;
+  LeavesAndSpines(n, leaves, spines);
+  // Each host's leaf and its link's bandwidth.
+  map<Ptr<Node>, std::pair<Ptr<Node>, uint64_t>> attached;
+  for (Ptr<Node> leaf : leaves)
+    for (const auto &link : nbr2if[leaf])
+      if (link.first->GetNodeType() == 0)
+        attached[link.first] = {leaf, link.second.bw};
+  for (const auto &source : attached) {
+    for (const auto &destination : attached) {
+      const Ptr<Node> from = source.second.first;
+      const Ptr<Node> to = destination.second.first;
+      if (from == to)
+        continue;
+      uint64_t sprayed = 0;
+      for (Ptr<Node> spine : spines) {
+        const auto up = nbr2if[from].find(spine);
+        const auto down = nbr2if[spine].find(to);
+        if (up == nbr2if[from].end() || down == nbr2if[spine].end() ||
+            !up->second.up || !down->second.up)
+          continue;
+        sprayed += std::min(up->second.bw, down->second.bw);
+      }
+      pairBw[source.first->GetId()][destination.first->GetId()] = std::min(
+          {source.second.second, destination.second.second, sprayed});
+    }
+  }
+}
+
 uint32_t AssignSpinePorts(NodeContainer &n) {
   vector<Ptr<Node>> leaves, spines;
   LeavesAndSpines(n, leaves, spines);
@@ -1685,6 +1734,8 @@ void TakeDownLink(NodeContainer n, Ptr<Node> a, Ptr<Node> b) {
   nbr2if[a][b].up = nbr2if[b][a].up = false;
   nextHop.clear();
   CalculateRoutes(n);
+  if (pair_bandwidth == "spines")
+    SprayPairBandwidth(n);
   // clear routing tables
   for (uint32_t i = 0; i < n.GetN(); i++) {
     if (n.Get(i)->GetNodeType() == 1)
@@ -2615,6 +2666,8 @@ bool ReadConf(string network_configuration) {
     } else if (key.compare("NSCC_RTT_SAMPLE") == 0) {
       conf >> nscc_rtt_sample;
       nscc_rtt_sample_given = true;
+    } else if (key.compare("PAIR_BANDWIDTH") == 0) {
+      conf >> pair_bandwidth;
     } else if (key.compare("NSCC_WINDOW_STATE") == 0) {
       conf >> nscc_window_state;
       nscc_window_state_given = true;
@@ -2769,6 +2822,19 @@ bool ReadConf(string network_configuration) {
       link_events.push_back(restore);
     } else if (key.compare("ENABLE_TRACE") == 0) {
       conf >> enable_trace;
+    } else if (key.compare("DATA_QUEUE_BYTES_MAP") == 0 ||
+               key.compare("TRIMMED_QUEUE_BYTES_MAP") == 0) {
+      map<uint64_t, uint32_t> &rows = key.compare("DATA_QUEUE_BYTES_MAP") == 0
+                                          ? rate2data_queue_bytes
+                                          : rate2trimmed_queue_bytes;
+      int n_k;
+      conf >> n_k;
+      for (int i = 0; i < n_k; i++) {
+        uint64_t rate;
+        uint32_t bytes;
+        conf >> rate >> bytes;
+        rows[rate] = bytes;
+      }
     } else if (key.compare("KMAX_MAP") == 0) {
       int n_k;
       conf >> n_k;
@@ -2913,6 +2979,11 @@ bool ReadConf(string network_configuration) {
       enable_pfc != 0) {
     std::cerr << "packet trimming requires ENABLE_PFC 0; UEC 1.0.3 section "
                  "3.6.4.5 excludes PFC from best-effort networks\n";
+    return false;
+  }
+  if (rate2data_queue_bytes.empty() != rate2trimmed_queue_bytes.empty()) {
+    std::cerr << "DATA_QUEUE_BYTES_MAP and TRIMMED_QUEUE_BYTES_MAP are read "
+                 "together\n";
     return false;
   }
   if (packet_trim_mode_value() !=
@@ -3281,6 +3352,15 @@ bool ReadConf(string network_configuration) {
   }
   if (nscc_rtt_sample_given && cc_mode != 11) {
     std::cerr << "NSCC_RTT_SAMPLE is read only under CC_MODE 11 (NSCC)\n";
+    return false;
+  }
+  if (pair_bandwidth != "path" && pair_bandwidth != "spines") {
+    std::cerr << "PAIR_BANDWIDTH must be path or spines\n";
+    return false;
+  }
+  if (pair_bandwidth == "spines" && !names_spine()) {
+    std::cerr << "PAIR_BANDWIDTH spines needs a LOAD_BALANCING mode that "
+                 "names spines\n";
     return false;
   }
   if (load_balancing_value() != static_cast<uint32_t>(LoadBalancingMode::Ecmp) &&
@@ -3685,6 +3765,25 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),
         sw->m_mmu->ConfigEgressThreshold(q, data_queue_bytes);
       }
       sw->m_mmu->ConfigEgressThreshold(packet_trim_queue, trimmed_queue_bytes);
+      // Under the maps each port's thresholds are its link speed's.
+      for (uint32_t j = 1; j < sw->GetNDevices() && !rate2data_queue_bytes.empty();
+           j++) {
+        const uint64_t rate = DynamicCast<QbbNetDevice>(sw->GetDevice(j))
+                                  ->GetDataRate()
+                                  .GetBitRate();
+        if (rate2data_queue_bytes.count(rate) == 0 ||
+            rate2trimmed_queue_bytes.count(rate) == 0) {
+          std::cerr << "DATA_QUEUE_BYTES_MAP and TRIMMED_QUEUE_BYTES_MAP have "
+                       "no row for a switch port of "
+                    << rate << " bps\n";
+          return false;
+        }
+        for (uint32_t q = 1; q < 8; q++) {
+          sw->m_mmu->ConfigEgressThreshold(j, q, rate2data_queue_bytes[rate]);
+        }
+        sw->m_mmu->ConfigEgressThreshold(j, packet_trim_queue,
+                                         rate2trimmed_queue_bytes[rate]);
+      }
       sw->m_mmu->node_id = sw->GetId();
     }
   }
@@ -3697,6 +3796,12 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),
       std::cerr << "LOAD_BALANCING " << load_balancing
                 << " needs a leaf-spine fabric in which every leaf links to "
                    "every spine\n";
+      return false;
+    }
+    if (spine_count > kMaxSpineCount) {
+      std::cerr << "LOAD_BALANCING " << load_balancing
+                << " names a spine in a byte of the identification, at most "
+                << kMaxSpineCount << " spines\n";
       return false;
     }
   }
@@ -3733,6 +3838,20 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),
     std::cerr << "SPRAY_RECEIVER_HOLD holds at most " << kReceiverHoldSpines
               << " spines\n";
     return false;
+  }
+  // SetConfig sized the spine fields and bitmaps in a byte; they take the
+  // bytes the fabric's spines need, one up to 8 spines.
+  if (spine_count > 0) {
+    if (CustomHeader::ackRedirectBytes > 0)
+      CustomHeader::ackRedirectBytes = SpineFieldBytes(spine_count);
+    if (CustomHeader::ackReceiverHoldBytes > 0)
+      CustomHeader::ackReceiverHoldBytes = SpineBitmapBytes(spine_count);
+    if (CustomHeader::ackRouteSpineBytes > 0)
+      CustomHeader::ackRouteSpineBytes = SpineFieldBytes(spine_count);
+    if (CustomHeader::ackAnswerSeqBytes > 0)
+      CustomHeader::ackAnswerSeqBytes = 4 + SpineFieldBytes(spine_count);
+    if (CustomHeader::udpAnswerHoldBytes > 0)
+      CustomHeader::udpAnswerHoldBytes = SpineBitmapBytes(spine_count);
   }
   // The switches' state, which leaf_hold, receiver_hold and
   // SPRAY_ANSWER_PATH_SEQ read only for the hosts' leaves.
@@ -4047,6 +4166,8 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),
 
   // setup routing
   CalculateRoutes(n);
+  if (pair_bandwidth == "spines")
+    SprayPairBandwidth(n);
   SetRoutingEntries();
 
   //

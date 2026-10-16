@@ -23,6 +23,7 @@
 
 #include "ns3/header.h"
 #include "ns3/int-header.h"
+#include "ns3/spine-bitmap.h"
 
 namespace ns3 {
 
@@ -45,8 +46,11 @@ constexpr bool CarriesQbbHeader(uint8_t protocol){
 // The most spines a data header's tail counts name (udpTailCounts), the bit
 // of udp.tail_flags that marks a packet closing its requested spine, and,
 // under AckRoute Repath only, the bit that marks a send also sent as a copy,
-// both of whose packets carry it.
-constexpr uint32_t kMaxTailCounts = 8;
+// both of whose packets carry it. Over at most kFixedTailCounts spines every
+// data header carries the counts; over more, only a header that closes its
+// spine does, and every other one the flags byte alone.
+constexpr uint32_t kMaxTailCounts = kMaxSpineCount;
+constexpr uint32_t kFixedTailCounts = 8;
 constexpr uint8_t kTailCloses = 1;
 constexpr uint8_t kTailCopied = 2;
 
@@ -166,8 +170,9 @@ public:
 		  uint16_t tail_counts[kMaxTailCounts];
 		  // Under answer path sequences, after the tail fields, only while
 		  // udpAnswerHoldBytes is not zero: the route spines the sender holds
-		  // for the answers of the destination's leaf, bit k for spine k.
-		  uint8_t answer_hold;
+		  // for the answers of the destination's leaf, bit k of byte k / 8
+		  // for spine k, udpAnswerHoldBytes of it on the wire.
+		  uint8_t answer_hold[kSpineBitmapBytes];
 	  } udp;
 	  // CnHeader
 	  struct {
@@ -190,15 +195,16 @@ public:
 		  // The receiving host's latest report on the spines: its sequence,
 		  // then two bits per spine. On the wire, ackReportBytes of it, only
 		  // while that is not zero.
-		  uint8_t spine_report[9];
-		  // The spine the receiver asks the sender to move to, or 255 for
+		  uint8_t spine_report[1 + kMaxSpineCount / 4];
+		  // The spine the receiver asks the sender to move to, or 0xffff for
 		  // none. On the wire, after the report, only while ackRedirectBytes
-		  // is not zero.
-		  uint8_t redirect;
+		  // is not zero, SpineFieldBytes of the spines: in one byte, 255 for
+		  // none.
+		  uint16_t redirect;
 		  // The spines the receiving host holds for the sender's leaf, bit k
-		  // for spine k. On the wire, after the redirect field, only while
-		  // ackReceiverHoldBytes is not zero.
-		  uint8_t receiver_hold;
+		  // of byte k / 8 for spine k. On the wire, after the redirect field,
+		  // ackReceiverHoldBytes of it, only while that is not zero.
+		  uint8_t receiver_hold[kSpineBitmapBytes];
 		  // A tail repair request (qbbHeader::FLAG_TAIL_NACK): the spine,
 		  // the first path sequence missing on it and how many from there.
 		  // On the wire, after receiver_hold, only while ackTailNackBytes is
@@ -206,16 +212,18 @@ public:
 		  uint8_t tail_spine;
 		  uint16_t tail_seq;
 		  uint16_t tail_count;
-		  // The spine the switches route the answer over, or 255 for the
+		  // The spine the switches route the answer over, or 0xffff for the
 		  // carrying spine its identification names. On the wire, after the
-		  // tail fields, only while ackRouteSpineBytes is not zero.
-		  uint8_t route_spine;
+		  // tail fields, only while ackRouteSpineBytes is not zero,
+		  // SpineFieldBytes of the spines: in one byte, 255 for none.
+		  uint16_t route_spine;
 		  // Under answer path sequences, after route_spine, only while
 		  // ackAnswerSeqBytes is not zero: the answer's number on its route
 		  // spine, and another route spine and its count of the queue pair's
-		  // answers (255 for none).
+		  // answers (0xffff for none; in one byte, 255, while
+		  // ackAnswerSeqBytes is five).
 		  uint16_t answer_seq;
-		  uint8_t announce_route;
+		  uint16_t announce_route;
 		  uint16_t announce_seq;
 		  IntHeader ih;
 	  } ack;
@@ -234,38 +242,51 @@ public:
   // How many bytes of ack.spine_report acknowledgement headers carry, zero
   // for none. Process-wide for the same reason.
   static uint32_t ackReportBytes;
-  // How many bytes the redirect field takes, zero or one. Process-wide for
-  // the same reason.
+  // How many bytes the redirect field takes, zero or SpineFieldBytes of the
+  // spines: one up to 255 spines, two at 256. Process-wide for the same
+  // reason.
   static uint32_t ackRedirectBytes;
   // Whether data headers carry udp.path_seq. Process-wide for the same
   // reason.
   static bool udpCarriesPathSeq;
-  // How many bytes the receiver_hold field takes, zero or one. Process-wide
-  // for the same reason.
+  // How many bytes the receiver_hold field takes, zero or SpineBitmapBytes
+  // of the spines. Process-wide for the same reason.
   static uint32_t ackReceiverHoldBytes;
   // How many per-spine counts the tail fields of data headers carry, zero
-  // for none; the fields take 1 + 2 * udpTailCounts bytes. Process-wide for
-  // the same reason.
+  // for none; the fields take 1 + 2 * udpTailCounts bytes, or over more
+  // than kFixedTailCounts spines the flags byte alone where they do not
+  // close the spine. Process-wide for the same reason.
   static uint32_t udpTailCounts;
   // How many bytes the tail repair request fields take, zero or five.
   // Process-wide for the same reason.
   static uint32_t ackTailNackBytes;
-  // How many bytes the route_spine field takes, zero or one. Process-wide
-  // for the same reason.
+  // How many bytes the route_spine field takes, zero or SpineFieldBytes of
+  // the spines. Process-wide for the same reason.
   static uint32_t ackRouteSpineBytes;
-  // How many bytes the answer path sequence fields take, zero or five.
-  // Process-wide for the same reason.
+  // How many bytes the answer path sequence fields take, zero or four and
+  // announce_route's SpineFieldBytes of the spines. Process-wide for the
+  // same reason.
   static uint32_t ackAnswerSeqBytes;
-  // How many bytes the answer_hold field of data headers takes, zero or one;
-  // it follows the path sequence, which it needs. Process-wide for the same
-  // reason.
+  // How many bytes the answer_hold field of data headers takes, zero or
+  // SpineBitmapBytes of the spines; it follows the path sequence, which it
+  // needs. Process-wide for the same reason.
   static uint32_t udpAnswerHoldBytes;
+  // The tail fields' bytes of a data header whose tail flags are flags, and
+  // without an argument of one that does not close its spine.
   static uint32_t GetUdpTailBytes(void);
+  static uint32_t GetUdpTailBytes(uint8_t flags);
+  // Whether a data header with tail flags flags carries the counts.
+  static bool CarriesTailCounts(uint8_t flags);
+  // The data header's bytes, of this parsed header: with the counts where
+  // its tail flags close its spine.
+  uint32_t UdpHeaderBytes(void) const;
 
   uint8_t GetIpv4EcnBits (void) const;
   uint8_t GetIpv4Dscp (void) const;
   static uint32_t GetAckSerializedSize(void);
   static uint32_t GetUdpHeaderSize(void); // include udp, seqTs, INT
+  // The same of a data header with tail flags flags.
+  static uint32_t GetUdpHeaderSize(uint8_t flags);
   static uint32_t GetStaticWholeHeaderSize(void); // ppp + ip + udp + int
 };
 

@@ -48,9 +48,9 @@ namespace ns3 {
 	// that queue's drop threshold. Trimmable and trimmed classes carry separate
 	// thresholds so a shallow data queue can coexist with a bounded trimmed queue.
 	bool SwitchMmu::CheckEgressAdmission(uint32_t port, uint32_t qIndex, uint32_t psize){
-		if (qIndex >= qCnt || egress_threshold[qIndex] == 0)
+		if (qIndex >= qCnt || egress_threshold[port][qIndex] == 0)
 			return true;
-		return egress_bytes[port][qIndex] + psize <= egress_threshold[qIndex];
+		return egress_bytes[port][qIndex] + psize <= egress_threshold[port][qIndex];
 	}
 	void SwitchMmu::UpdateIngressAdmission(uint32_t port, uint32_t qIndex, uint32_t psize){
 		uint32_t new_bytes = ingress_bytes[port][qIndex] + psize;
@@ -145,7 +145,12 @@ namespace ns3 {
 		buffer_size = size;
 	}
 	void SwitchMmu::ConfigEgressThreshold(uint32_t qIndex, uint32_t bytes){
-		if (qIndex < qCnt)
-			egress_threshold[qIndex] = bytes;
+		for (uint32_t port = 0; port < pCnt; port++)
+			ConfigEgressThreshold(port, qIndex, bytes);
+	}
+	void SwitchMmu::ConfigEgressThreshold(uint32_t port, uint32_t qIndex,
+			uint32_t bytes){
+		if (port < pCnt && qIndex < qCnt)
+			egress_threshold[port][qIndex] = bytes;
 	}
 }

@@ -90,16 +90,18 @@ enum class AckRoute : uint32_t {
 };
 
 // The value of an answer's route_spine field that names no spine: the
-// answer is routed by the carrying spine its identification names.
-constexpr uint8_t kNoRouteSpine = 255;
+// answer is routed by the carrying spine its identification names. Spine
+// indices stay below 256, the identification naming each in a byte; a field
+// of one byte (SpineFieldBytes) writes it as 255.
+constexpr uint16_t kNoRouteSpine = 0xffff;
 
 // The value of an acknowledgement's redirect field that names no spine.
-constexpr uint8_t kNoRedirect = 255;
+constexpr uint16_t kNoRedirect = 0xffff;
 
 // The spine an acknowledgement's redirect field names among spines, or
 // kNoRedirect. A receiver writes only a spine's index or kNoRedirect, so any
 // other value names no spine.
-inline uint8_t DecodeRedirect(uint8_t field, uint32_t spines){
+inline uint16_t DecodeRedirect(uint16_t field, uint32_t spines){
 	return field < spines ? field : kNoRedirect;
 }
 

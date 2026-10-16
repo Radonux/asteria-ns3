@@ -15,7 +15,7 @@ bool SpineRedirect::Redirects(double best, double score, double flag){
 	return best - score > flag * best;
 }
 
-uint8_t SpineRedirect::OnArrival(uint8_t spine, uint64_t delayNs, bool marked,
+uint16_t SpineRedirect::OnArrival(uint8_t spine, uint64_t delayNs, bool marked,
 		uint64_t nowNs, const Parameters &parameters){
 	const double score = Score(parameters.omega, delayNs,
 		parameters.baseOneWayDelayNs, marked ? 1 : 0);
@@ -33,7 +33,7 @@ uint8_t SpineRedirect::OnArrival(uint8_t spine, uint64_t delayNs, bool marked,
 	return Redirects(m_bestScore, score, parameters.flag) ? m_best : kNoRedirect;
 }
 
-uint8_t SpineRedirect::Best() const{
+uint16_t SpineRedirect::Best() const{
 	return m_best;
 }
 
@@ -60,14 +60,14 @@ void HostSpineRedirect::OnClose(
 	// Starting from the current best and replacing it only by a strictly
 	// higher score keeps it on a tie, and otherwise takes the lowest index of
 	// the highest.
-	uint8_t best = m_best;
+	uint16_t best = m_best;
 	for (uint32_t k = 0; k < m_scores.size(); k++)
 		if (best == kNoRedirect || m_scores[k] > m_scores[best])
 			best = k;
 	m_best = best;
 }
 
-uint8_t HostSpineRedirect::OnArrival(uint8_t spine,
+uint16_t HostSpineRedirect::OnArrival(uint8_t spine,
 		const Parameters &parameters) const{
 	if (m_best == kNoRedirect || spine == m_best)
 		return kNoRedirect;
@@ -75,7 +75,7 @@ uint8_t HostSpineRedirect::OnArrival(uint8_t spine,
 		parameters.flag) ? m_best : kNoRedirect;
 }
 
-uint8_t HostSpineRedirect::Best() const{
+uint16_t HostSpineRedirect::Best() const{
 	return m_best;
 }
 

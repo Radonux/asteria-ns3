@@ -8,6 +8,7 @@
 #include "ns3/buffer.h"
 #include "ns3/int-header.h"
 #include "spine-report.h"
+#include "ns3/spine-bitmap.h"
 
 namespace ns3 {
 
@@ -88,25 +89,26 @@ public:
   // The receiving host's latest spine report, serialized only while
   // CustomHeader::ackReportBytes is not zero; its edge bit is a flag.
   void SetSpineReport(const SpineReport &report);
-  // The spine the receiver asks the sender to move to, 255 for none, the
-  // default; serialized only while CustomHeader::ackRedirectBytes is not zero.
-  void SetRedirect(uint8_t spine);
+  // The spine the receiver asks the sender to move to, kNoRedirect for none,
+  // the default; serialized only while CustomHeader::ackRedirectBytes is not
+  // zero.
+  void SetRedirect(uint16_t spine);
   // The spines the receiving host holds for the sender's leaf, bit k for
-  // spine k, zero by default; serialized only while
-  // CustomHeader::ackReceiverHoldBytes is not zero.
-  void SetReceiverHold(uint8_t bitmap);
+  // spine k, none by default; serialized only while
+  // CustomHeader::ackReceiverHoldBytes is not zero, in that many bytes.
+  void SetReceiverHold(const SpineBitmap &bitmap);
   // The count path sequences from seq on spine that the receiver misses,
   // and FLAG_TAIL_NACK; serialized only while CustomHeader::ackTailNackBytes
   // is not zero.
   void SetTailNack(uint8_t spine, uint16_t seq, uint16_t count);
-  // The spine the switches route this answer over, kNoRouteSpine (255) for
-  // the one its identification names as carrying the data, the default;
+  // The spine the switches route this answer over, kNoRouteSpine for the
+  // one its identification names as carrying the data, the default;
   // serialized only while CustomHeader::ackRouteSpineBytes is not zero.
-  void SetRouteSpine(uint8_t spine);
+  void SetRouteSpine(uint16_t spine);
   // The answer's number on its route spine and the count of answers another
-  // route carried (kNoAnswerRoute, 255, for none), and FLAG_ANSWER_NUMBERED;
+  // route carried (kNoAnswerRoute for none), and FLAG_ANSWER_NUMBERED;
   // serialized only while CustomHeader::ackAnswerSeqBytes is not zero.
-  void SetAnswerSeq(uint16_t seq, uint8_t announceRoute, uint16_t announceSeq);
+  void SetAnswerSeq(uint16_t seq, uint16_t announceRoute, uint16_t announceSeq);
   void SetIntHeader(const IntHeader &_ih);
 
 //Getters
@@ -125,16 +127,16 @@ public:
   bool IsAllowanceExhausted() const;
   uint32_t GetPacketSeq() const;
   const SpineReport &GetSpineReport() const;
-  uint8_t GetRedirect() const;
-  uint8_t GetReceiverHold() const;
+  uint16_t GetRedirect() const;
+  SpineBitmap GetReceiverHold() const;
   bool IsTailNack() const;
   uint8_t GetTailSpine() const;
   uint16_t GetTailSeq() const;
   uint16_t GetTailCount() const;
-  uint8_t GetRouteSpine() const;
+  uint16_t GetRouteSpine() const;
   bool IsAnswerNumbered() const;
   uint16_t GetAnswerSeq() const;
-  uint8_t GetAnnounceRoute() const;
+  uint16_t GetAnnounceRoute() const;
   uint16_t GetAnnounceSeq() const;
 
   static TypeId GetTypeId (void);
@@ -153,14 +155,14 @@ private:
   uint32_t m_trimPayloadSize;
   uint32_t m_packetSeq;
   SpineReport m_spineReport;
-  uint8_t m_redirect;
-  uint8_t m_receiverHold;
+  uint16_t m_redirect;
+  SpineBitmap m_receiverHold;
   uint8_t m_tailSpine;
   uint16_t m_tailSeq;
   uint16_t m_tailCount;
-  uint8_t m_routeSpine;
+  uint16_t m_routeSpine;
   uint16_t m_answerSeq;
-  uint8_t m_announceRoute;
+  uint16_t m_announceRoute;
   uint16_t m_announceSeq;
   IntHeader ih;
   

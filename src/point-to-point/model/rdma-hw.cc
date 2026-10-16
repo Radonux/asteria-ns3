@@ -683,8 +683,8 @@ TypeId RdmaHw::GetTypeId (void)
 				"connection's one spine, drawn again at each duplicate data "
 				"arrival. Under 1 to 3 the spine is named in the answer's "
 				"route_spine field, which needs CustomHeader::ackRouteSpineBytes "
-				"1. The answer echoes the data packet's identification either "
-				"way. Default 0.",
+				"SpineFieldBytes of SpineCount. The answer echoes the data "
+				"packet's identification either way. Default 0.",
 				UintegerValue(static_cast<uint32_t>(AckRoute::DataSpine)),
 				MakeUintegerAccessor(&RdmaHw::m_ackRoute),
 				MakeUintegerChecker<uint32_t>(
@@ -748,8 +748,9 @@ TypeId RdmaHw::GetTypeId (void)
 				"packets, and the receiver leaves the spines its senders hold "
 				"out of its draw but for a probe answer per "
 				"SprayAnswerProbeIntervalNs. Needs "
-				"CustomHeader::ackAnswerSeqBytes 5 and "
-				"CustomHeader::udpAnswerHoldBytes 1. Default false.",
+				"CustomHeader::ackAnswerSeqBytes 4 plus SpineFieldBytes and "
+				"CustomHeader::udpAnswerHoldBytes SpineBitmapBytes of "
+				"SpineCount. Default false.",
 				BooleanValue(false),
 				MakeBooleanAccessor(&RdmaHw::m_sprayAnswerPathSeq),
 				MakeBooleanChecker())
@@ -813,9 +814,9 @@ TypeId RdmaHw::GetTypeId (void)
 				"receiver holds spines by the packets missing on them per "
 				"sender leaf (ReceiverHold) and reports them in every "
 				"acknowledgement, whose senders hold them toward its leaf. "
-				"Needs SwitchQueueState for the hosts' leaves, at most 8 "
-				"spines and CustomHeader::ackReceiverHoldBytes 1. Default "
-				"false.",
+				"Needs SwitchQueueState for the hosts' leaves and "
+				"CustomHeader::ackReceiverHoldBytes SpineBitmapBytes of "
+				"SpineCount. Default false.",
 				BooleanValue(false),
 				MakeBooleanAccessor(&RdmaHw::m_sprayReceiverHold),
 				MakeBooleanChecker())
@@ -1279,9 +1280,9 @@ void RdmaHw::Setup(QpCompleteCallback cb, QpFailureCallback failure_cb){
 		"SprayTailLossRtts is read only under SprayTailRecovery");
 	NS_ABORT_MSG_IF(!ValidReceiverHold(),
 		"SprayReceiverHold needs SprayPathSeq, PathSelector 6, 7 or 9, "
-		"SwitchQueueState for the hosts' leaves and at most 8 spines, and "
-		"acknowledgements carry the receiver_hold field exactly when it is "
-		"set (CustomHeader::ackReceiverHoldBytes)");
+		"SwitchQueueState for the hosts' leaves, and acknowledgements carry "
+		"the receiver_hold field over the spines exactly when it is set "
+		"(CustomHeader::ackReceiverHoldBytes)");
 	NS_ABORT_MSG_IF(!ValidStrayPathSeq(),
 		"SprayStrayPathSeq 1 is read only under SprayPathSeq");
 	NS_ABORT_MSG_IF(!ValidNsccRttSample(),
@@ -1295,8 +1296,8 @@ void RdmaHw::Setup(QpCompleteCallback cb, QpFailureCallback failure_cb){
 		"send has a record");
 	NS_ABORT_MSG_IF(!ValidAnswerPathSeq(),
 		"SprayAnswerPathSeq needs AckRoute 1, SprayPathSeq, PathSelector 6, 7 "
-		"or 9, SwitchQueueState for the hosts' leaves and at most 8 spines, and "
-		"answers and data headers carry its fields exactly when it is set "
+		"or 9 and SwitchQueueState for the hosts' leaves, and answers and data "
+		"headers carry its fields over the spines exactly when it is set "
 		"(CustomHeader::ackAnswerSeqBytes, CustomHeader::udpAnswerHoldBytes)");
 	NS_ABORT_MSG_IF(!ValidReceiverTailMissing(),
 		"SprayReceiverTailMissing needs SprayReceiverHold and "
@@ -1369,7 +1370,8 @@ void RdmaHw::Setup(QpCompleteCallback cb, QpFailureCallback failure_cb){
 		"timestamp of IntHeader::mode TS");
 	NS_ABORT_MSG_IF(IsAckRedirect() && m_spineCount >= kNoRedirect,
 		"PathSelector 5 names a spine by an index below kNoRedirect");
-	NS_ABORT_MSG_IF(CustomHeader::ackRedirectBytes != (IsAckRedirect() ? 1 : 0),
+	NS_ABORT_MSG_IF(CustomHeader::ackRedirectBytes !=
+			(IsAckRedirect() ? SpineFieldBytes(m_spineCount) : 0),
 		"PathSelector 5 and only it carries the redirect field in every "
 		"acknowledgement");
 	NS_ABORT_MSG_IF((m_pathSelectorKind ==
@@ -1583,7 +1585,9 @@ int RdmaHw::ReceiveUdp(Ptr<Packet> p, CustomHeader &ch){
 		ProbeAnswerSet(rxQp, ch);
 	if (m_sprayAnswerPathSeq)
 		AnswerHoldReportsOf().Report(ch.sip, m_switchQueues->LeafOf(ch.sip),
-			ch.udp.answer_hold, Simulator::Now().GetNanoSeconds());
+			SpineBitmap::FromBytes(ch.udp.answer_hold,
+				CustomHeader::udpAnswerHoldBytes),
+			Simulator::Now().GetNanoSeconds());
 	if (m_sprayPathSeq)
 		CountPathSeq(rxQp, ch);
 	if (IsGrading())
@@ -1613,7 +1617,7 @@ int RdmaHw::ReceiveUdp(Ptr<Packet> p, CustomHeader &ch){
 	int x = ReceiverCheckSeq(ch.udp.seq, rxQp, payload_size);
 
 	// Scored whether or not it is answered, as the grader counts it.
-	const uint8_t redirect = IsAckRedirect()
+	const uint16_t redirect = IsAckRedirect()
 		? ScoreForRedirect(rxQp, ch, ecnbits != 0) : kNoRedirect;
 	if (x == 1 || x == 2){ //generate ACK or NACK
 		SendAck(rxQp, ch.dip, ch.sip, ch.udp.dport, ch.udp.sport, ch.udp.pg,
@@ -1664,7 +1668,7 @@ bool RdmaHw::IsAckRedirect() const{
 		static_cast<uint32_t>(PathSelectorKind::AckRedirect);
 }
 
-uint8_t RdmaHw::ScoreForRedirect(Ptr<RdmaRxQueuePair> q,
+uint16_t RdmaHw::ScoreForRedirect(Ptr<RdmaRxQueuePair> q,
 		const CustomHeader &ch, bool marked){
 	if (std::binary_search(m_ownLeafHosts.begin(), m_ownLeafHosts.end(), ch.sip))
 		return kNoRedirect;
@@ -1683,7 +1687,7 @@ uint8_t RdmaHw::ScoreForRedirect(Ptr<RdmaRxQueuePair> q,
 		m_ackRedirectFlag,
 		static_cast<uint64_t>(m_ackRedirectValidityBaseRtts * m_sprayBaseRttNs),
 		m_sprayBaseRttNs / 2};
-	const uint8_t redirect = q->m_spineRedirect.OnArrival(CarryingSpine(ch.ipid),
+	const uint16_t redirect = q->m_spineRedirect.OnArrival(CarryingSpine(ch.ipid),
 		delay, marked, now.GetNanoSeconds(), parameters);
 	NS_ASSERT_MSG(redirect == kNoRedirect || redirect < m_spineCount,
 		"a redirect names a spine by its index");
@@ -1970,7 +1974,8 @@ bool RdmaHw::ValidAckRoute() const{
 	const bool spray = m_ackRoute == static_cast<uint32_t>(AckRoute::Spray);
 	// Every route but the data's names its spine in the answer.
 	const bool named = m_ackRoute != static_cast<uint32_t>(AckRoute::DataSpine);
-	if (CustomHeader::ackRouteSpineBytes != (named ? 1 : 0))
+	if (CustomHeader::ackRouteSpineBytes !=
+			(named ? SpineFieldBytes(m_spineCount) : 0))
 		return false;
 	if (m_ackRouteOracle && (!spray || !m_switchQueues ||
 			m_leaf == SwitchQueueState::kNoLeaf))
@@ -1991,7 +1996,7 @@ FaultedSpines &RdmaHw::AnswerFaultedSpinesTo(uint32_t leaf){
 		.first->second;
 }
 
-uint8_t RdmaHw::AnswerRouteSpine(uint32_t senderIp, uint16_t pg){
+uint16_t RdmaHw::AnswerRouteSpine(uint32_t senderIp, uint16_t pg){
 	if (m_ackRoute == static_cast<uint32_t>(AckRoute::DataSpine) ||
 			!AnswersCrossSpine(senderIp))
 		return kNoRouteSpine;
@@ -2006,7 +2011,7 @@ uint8_t RdmaHw::AnswerRouteSpine(uint32_t senderIp, uint16_t pg){
 	const uint64_t now = Simulator::Now().GetNanoSeconds();
 	const uint32_t leaf = m_switchQueues->LeafOf(senderIp);
 	// The spines this leaf's senders hold, but for a probe due on one.
-	uint8_t held = 0;
+	SpineBitmap held;
 	if (m_sprayAnswerPathSeq){
 		AnswerHoldReports &reports = AnswerHoldReportsOf();
 		uint8_t probe;
@@ -2025,7 +2030,7 @@ uint8_t RdmaHw::AnswerRouteSpine(uint32_t senderIp, uint16_t pg){
 	uint32_t count = 0;
 	for (uint32_t spine = 0; spine < m_spineCount; spine++){
 		if ((!faulted || !faulted->Excludes(spine)) &&
-				!(spine < 8 && ((held >> spine) & 1)))
+				!held.Test(spine))
 			allowed[count++] = spine;
 	}
 	// While every spine left is held, none is left out for being held.
@@ -2161,7 +2166,7 @@ void RdmaHw::GradeTrim(Ptr<RdmaRxQueuePair> q, const CustomHeader &ch,
 void RdmaHw::SendAck(Ptr<RdmaRxQueuePair> q, uint32_t sourceIp,
 		uint32_t destinationIp, uint16_t sport, uint16_t dport, uint16_t pg,
 		const IntHeader &ih, uint32_t packetSeq, uint16_t identification,
-		bool nack, bool cnp, bool spent, bool probeAnswer, uint8_t redirect,
+		bool nack, bool cnp, bool spent, bool probeAnswer, uint16_t redirect,
 		bool duplicate){
 	qbbHeader seqh;
 	if (duplicate)
@@ -2310,8 +2315,9 @@ int RdmaHw::ReceiveAck(Ptr<Packet> p, CustomHeader &ch){
 			if (IsSprayPolicy())
 				qp->m_pathSelector->OnReport(ReportOf(ch), now);
 			if (IsReceiverHold())
-				qp->m_pathSelector->OnReceiverHold(ch.sip, ch.ack.receiver_hold,
-					now);
+				qp->m_pathSelector->OnReceiverHold(ch.sip,
+					SpineBitmap::FromBytes(ch.ack.receiver_hold,
+						CustomHeader::ackReceiverHoldBytes), now);
 			uint64_t copyLost = 0;
 			if ((ch.ack.flags >> qbbHeader::FLAG_PROBE_ANSWER) & 1){
 				qp->m_pathSelector->OnProbeAnswer(path, cnp, now);
@@ -2825,7 +2831,7 @@ int RdmaHw::ReceiveTrim(Ptr<Packet> p, CustomHeader &ch){
 	// step 2 and section 3.5.15.1: send a NACK, do not advance any receive state,
 	// do not establish a PDC, and drop the packet.
 	if (ch.l3Prot == 0x11){
-		const uint32_t udpHeaderBytes = CustomHeader::GetUdpHeaderSize();
+		const uint32_t udpHeaderBytes = ch.UdpHeaderBytes();
 		// The UDP length field survives trimming unmodified, so it still reports
 		// the size of the original packet that was dropped.
 		const uint32_t originalPayload = ch.udp.payload_size > udpHeaderBytes
@@ -2838,7 +2844,7 @@ int RdmaHw::ReceiveTrim(Ptr<Packet> p, CustomHeader &ch){
 			? GetRxQp(ch.dip, ch.sip, ch.udp.dport, ch.udp.sport, ch.udp.pg, true)
 			: nullptr;
 		// The trimmed header keeps the path sequence: the trim keeps at least
-		// CustomHeader::GetUdpHeaderSize() bytes of IP payload. It only marks
+		// the header's bytes of IP payload (CustomHeader::UdpHeaderBytes). It only marks
 		// that sequence as accounted, since it can overtake earlier data of
 		// its path; it counts no gap.
 		if (m_sprayPathSeq)
@@ -3430,7 +3436,8 @@ Ptr<Packet> RdmaHw::GetNxtPacket(Ptr<RdmaQueuePair> qp){
 	// payload bytes were discarded. ns-3 otherwise derives that field from the
 	// live buffer extent, which does not survive truncation, so write it
 	// explicitly.
-	udpHeader.ForcePayloadSize (CustomHeader::GetUdpHeaderSize() + payload_size);
+	udpHeader.ForcePayloadSize (
+		CustomHeader::GetUdpHeaderSize(seqTs.GetTailFlags()) + payload_size);
 	p->AddHeader (udpHeader);
 	if (copy)
 		copy->AddHeader(udpHeader);
