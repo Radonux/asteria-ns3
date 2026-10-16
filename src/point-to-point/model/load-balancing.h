@@ -71,11 +71,15 @@ inline uint16_t PathOf(LoadBalancingMode mode, uint16_t identification){
 // on a spine not held, its answer SprayHeldLossRtts base RTTs overdue, is
 // repaired. Evidence declares it lost as a timed-out send is; Probe counts no
 // loss as it repairs, and under SprayDuplicateReport the repair's answer
-// settles the send (RdmaQueuePair::m_overdueProbe).
+// settles the send (RdmaQueuePair::m_overdueProbe); Reprobe repairs as Probe
+// does and repairs the send again each time its last repair goes
+// SprayHeldLossRtts base RTTs without an answer, up to
+// SprayOverdueRepairLimit repairs.
 enum class OverdueRepair : uint32_t {
 	Off = 0,
 	Evidence,
 	Probe,
+	Reprobe,
 };
 
 enum class DuplicateReport : uint32_t {

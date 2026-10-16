@@ -10012,7 +10012,8 @@ class DuplicateReportTest : public TestCase
 /**
  * SprayOverdueRepair: a queue pair's latest send on a spine not held is
  * repaired once its answer is overdue, as a held send is, and a flagged
- * answer to the repaired sequence counts the repair spurious.
+ * answer to the repaired sequence counts the repair spurious; under reprobe
+ * an unanswered repair is repaired again, up to SprayOverdueRepairLimit.
  */
 class OverdueRepairTest : public TestCase
 {
@@ -10022,7 +10023,8 @@ class OverdueRepairTest : public TestCase
                    "declared lost and repaired once its answer is SprayHeldLossRtts base RTTs "
                    "overdue, one repair until its next answer or timeout, its loss evidence as a "
                    "timed-out send's; a receiver flags duplicates, and the answer showing the "
-                   "send arrived first counts the repair spurious")
+                   "send arrived first counts the repair spurious; under reprobe a repair "
+                   "without an answer is repaired again, up to SprayOverdueRepairLimit repairs")
     {
     }
 
@@ -10034,7 +10036,9 @@ class OverdueRepairTest : public TestCase
         Declared();
         Spurious();
         Probe();
+        Reprobe();
         Host();
+        ReprobeHost();
         Valid();
         CustomHeader::ackCarriesPacketSeq = savedPacketSeq;
         Simulator::Destroy();
@@ -10186,6 +10190,92 @@ class OverdueRepairTest : public TestCase
         NS_TEST_EXPECT_MSG_EQ(covered, 2u, "and told");
     }
 
+    // Under reprobe a sequence repaired again keeps its send's path, each
+    // repair's path is noted, and an answer along any of them is a repair's.
+    void Reprobe()
+    {
+        ScriptedSelector* selector = nullptr;
+        Ptr<RdmaQueuePair> qp = Sends(selector);
+        qp->m_overdueProbe = true;
+        qp->m_overdueRepeat = true;
+        qp->m_coverageFirst = true;
+        qp->m_deferTimeoutEvidence = true;
+        qp->DeclareOverdueSendLost(IsolatedHost::kMtu, 2, 10);
+        qp->NoteOverdueRepairSent(IsolatedHost::kMtu, 4);
+        qp->NoteOverdueRepairSent(IsolatedHost::kMtu, 6);
+        // The repair, sent along 4 at 300 ns, declared lost in turn.
+        qp->m_outstanding.Add(IsolatedHost::kMtu, IsolatedHost::kMtu, 4, 300);
+        NS_TEST_EXPECT_MSG_EQ(qp->DeclareOverdueSendLost(IsolatedHost::kMtu, 4, 300),
+                              uint64_t(IsolatedHost::kMtu), "the repair is repaired");
+        const RdmaQueuePair::OverdueRepair& r = qp->m_overdueRepaired.at(IsolatedHost::kMtu);
+        NS_TEST_EXPECT_MSG_EQ(r.path, 2, "the send's path is kept");
+        NS_TEST_EXPECT_MSG_EQ(r.declared, 2u, "two repairs declared");
+        NS_TEST_EXPECT_MSG_EQ(r.repairPaths.size(), 1u, "a second repair before the next declared is not noted");
+        qp->NoteOverdueRepairSent(IsolatedHost::kMtu, 5);
+        NS_TEST_EXPECT_MSG_EQ((qp->m_overdueRepaired.at(IsolatedHost::kMtu).repairPaths ==
+                               std::vector<uint16_t>{4, 5}),
+                              true, "each repair's path");
+        NS_TEST_EXPECT_MSG_EQ(Told(*selector, "loss 2"), 0u, "no loss told as they go out");
+        qp->OverdueRepairSpurious(IsolatedHost::kMtu, 4, false, 400);
+        NS_TEST_EXPECT_MSG_EQ(Told(*selector, "loss 2"), 1u,
+                              "the first repair's answer: a data loss on the send's path");
+        NS_TEST_EXPECT_MSG_EQ(qp->m_overdueRepaired.size(), 0u, "and the wait is over");
+        // Under probe a repair declared lost starts the sequence afresh.
+        ScriptedSelector* probed = nullptr;
+        Ptr<RdmaQueuePair> probe = Sends(probed);
+        probe->m_overdueProbe = true;
+        probe->DeclareOverdueSendLost(IsolatedHost::kMtu, 2, 10);
+        probe->NoteOverdueRepairSent(IsolatedHost::kMtu, 4);
+        probe->m_outstanding.Add(IsolatedHost::kMtu, IsolatedHost::kMtu, 4, 300);
+        probe->DeclareOverdueSendLost(IsolatedHost::kMtu, 4, 300);
+        NS_TEST_EXPECT_MSG_EQ(probe->m_overdueRepaired.at(IsolatedHost::kMtu).path, 4, "its path the repair's");
+        NS_TEST_EXPECT_MSG_EQ(probe->m_overdueRepaired.at(IsolatedHost::kMtu).repairPaths.size(), 0u,
+                              "and no repair sent of it yet");
+    }
+
+    // The host's timer under reprobe, a base RTT of 100 ns, SprayHeldLossRtts
+    // 2 and a limit of 2 repairs.
+    void ReprobeHost()
+    {
+        Simulator::Destroy();
+        IsolatedHost sender(LoadBalancingMode::SprayUniform, kTestReceiver, 8);
+        sender.hw->m_sprayOverdueRepair = static_cast<uint32_t>(OverdueRepair::Reprobe);
+        sender.hw->m_sprayOverdueRepairLimit = 2;
+        sender.hw->m_sprayHeldLossRtts = 2;
+        std::map<std::string, uint32_t> events;
+        sender.hw->m_transportEventCallback = Callback<void, const char*, uint64_t>(
+            [&events](const char* event, uint64_t) { ++events[event]; });
+        Ptr<RdmaQueuePair> qp = sender.AddSender(kTestSender, kTestReceiver, 8 * IsolatedHost::kMtu);
+        qp->m_baseRtt = 100;
+        qp->snd_nxt = IsolatedHost::kMtu;
+        NS_TEST_EXPECT_MSG_EQ(qp->m_overdueRepeat, true, "the queue pair repeats");
+        qp->m_outstanding.Add(0, IsolatedHost::kMtu, 1, 0);
+        sender.hw->TakeOverdueSend(qp, 0, 1, 0, false);
+        Simulator::Stop(NanoSeconds(210));
+        Simulator::Run();
+        NS_TEST_EXPECT_MSG_EQ(events["overdue_repair"], 1u, "the send is repaired at 200 ns");
+        // The repair leaves along 4 at 210 ns: taken again, as a repair of the
+        // sequence repaired.
+        qp->NoteOverdueRepairSent(0, 4);
+        qp->m_outstanding.Add(0, IsolatedHost::kMtu, 4, 210);
+        sender.hw->TakeOverdueSend(qp, 0, 4, 210, false, true);
+        NS_TEST_EXPECT_MSG_EQ(qp->m_overdueTaken, true, "the repair is taken");
+        sender.hw->TakeOverdueSend(qp, IsolatedHost::kMtu, 2, 215, false);
+        NS_TEST_EXPECT_MSG_EQ(qp->m_overdueSeq, 0u, "a new send is not, while one is repaired");
+        Simulator::Stop(NanoSeconds(210));
+        Simulator::Run();
+        NS_TEST_EXPECT_MSG_EQ(events["overdue_repair"], 2u, "unanswered, it is repaired again at 410 ns");
+        NS_TEST_EXPECT_MSG_EQ(qp->m_overdueRepaired.at(0).path, 1, "the send's path kept");
+        qp->NoteOverdueRepairSent(0, 5);
+        qp->m_outstanding.Add(0, IsolatedHost::kMtu, 5, 420);
+        sender.hw->TakeOverdueSend(qp, 0, 5, 420, false, true);
+        NS_TEST_EXPECT_MSG_EQ(qp->m_overdueTaken, false, "the limit's last repair is not taken");
+        Simulator::Stop(NanoSeconds(400));
+        Simulator::Run();
+        NS_TEST_EXPECT_MSG_EQ(events["overdue_repair"], 2u, "and not repaired a third time");
+        Simulator::Destroy();
+    }
+
     // The host's timer, at a base RTT of 100 ns and SprayHeldLossRtts 2.
     void Host()
     {
@@ -10248,6 +10338,7 @@ class OverdueRepairTest : public TestCase
         NS_TEST_EXPECT_MSG_EQ(hw->ValidOverdueRepair(), true, "accepted with reps_hold");
         hw->m_sprayHeldLossRtts = 0;
         NS_TEST_EXPECT_MSG_EQ(hw->ValidOverdueRepair(), false, "but not with SprayHeldLossRtts 0");
+        NS_TEST_EXPECT_MSG_EQ(hw->m_sprayOverdueRepairLimit, 2u, "two repairs under reprobe by default");
     }
 };
 

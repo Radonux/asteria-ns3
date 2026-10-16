@@ -371,9 +371,15 @@ bool spray_held_loss_rtts_given = false;
 // overdue_repair_spurious. With either value under SPRAY_DUPLICATE_REPORT, a
 // timed-out send the cumulative acknowledgement leaves a data loss by
 // covering its sequence first is also counted as timeout_loss_data_covered.
-// Off, the default.
+// reprobe: probe's repair, and a repair that goes SPRAY_HELD_LOSS_RTTS of the
+// queue pair's base RTTs without an answer is followed by another of the
+// same send, up to SPRAY_OVERDUE_REPAIR_LIMIT repairs (at least 1, default 2)
+// until the queue pair's next answer or retransmission timeout; the limit is
+// read under reprobe alone. Off, the default.
 std::string spray_overdue_repair = "off";
 bool spray_overdue_repair_given = false;
+uint32_t spray_overdue_repair_limit = 2;
+bool spray_overdue_repair_limit_given = false;
 // Under LOAD_BALANCING spray_uniform, with any PATH_SELECTOR,
 // SPRAY_ACK_LOSS_RTTS <x>: a data send that the cumulative acknowledgement
 // covers before its own acknowledgement arrives, and whose own acknowledgement
@@ -2442,8 +2448,17 @@ bool valid_hold_rule() {
     return false;
   }
   if (spray_overdue_repair != "evidence" && spray_overdue_repair != "probe" &&
-      spray_overdue_repair != "off") {
-    std::cerr << "SPRAY_OVERDUE_REPAIR must be evidence, probe or off\n";
+      spray_overdue_repair != "reprobe" && spray_overdue_repair != "off") {
+    std::cerr << "SPRAY_OVERDUE_REPAIR must be evidence, probe, reprobe or off\n";
+    return false;
+  }
+  if (spray_overdue_repair_limit_given && spray_overdue_repair != "reprobe") {
+    std::cerr << "SPRAY_OVERDUE_REPAIR_LIMIT is read only under "
+                 "SPRAY_OVERDUE_REPAIR reprobe\n";
+    return false;
+  }
+  if (spray_overdue_repair_limit < 1) {
+    std::cerr << "SPRAY_OVERDUE_REPAIR_LIMIT must be at least 1\n";
     return false;
   }
   if (spray_overdue_repair_given &&
@@ -2742,6 +2757,9 @@ bool ReadConf(string network_configuration) {
     } else if (key.compare("SPRAY_OVERDUE_REPAIR") == 0) {
       conf >> spray_overdue_repair;
       spray_overdue_repair_given = true;
+    } else if (key.compare("SPRAY_OVERDUE_REPAIR_LIMIT") == 0) {
+      conf >> spray_overdue_repair_limit;
+      spray_overdue_repair_limit_given = true;
     } else if (key.compare("SPRAY_ACK_LOSS_RTTS") == 0) {
       conf >> spray_ack_loss_rtts;
       spray_ack_loss_rtts_given = true;
@@ -4185,8 +4203,11 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),
           "SprayOverdueRepair",
           UintegerValue(static_cast<uint32_t>(
               spray_overdue_repair == "probe"      ? OverdueRepair::Probe
+              : spray_overdue_repair == "reprobe"  ? OverdueRepair::Reprobe
               : spray_overdue_repair == "evidence" ? OverdueRepair::Evidence
                                                    : OverdueRepair::Off)));
+      rdmaHw->SetAttribute("SprayOverdueRepairLimit",
+                           UintegerValue(spray_overdue_repair_limit));
       rdmaHw->SetAttribute("SprayAckLossRtts",
                            DoubleValue(spray_ack_loss_rtts));
       rdmaHw->SetAttribute(

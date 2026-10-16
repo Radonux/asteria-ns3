@@ -676,12 +676,22 @@ TypeId RdmaHw::GetTypeId (void)
 				"acknowledgement covers the sequence first. A receiver flags "
 				"its answers to duplicates as under SprayDuplicateReport, and "
 				"the answer showing the send arrived first counts the repair "
-				"spurious. Default 0.",
+				"spurious. 3=reprobe: probe's repair, and a repair without an "
+				"answer for SprayHeldLossRtts base RTTs is followed by another "
+				"of the same send, up to SprayOverdueRepairLimit repairs until "
+				"the next answer or timeout. Default 0.",
 				UintegerValue(static_cast<uint32_t>(OverdueRepair::Off)),
 				MakeUintegerAccessor(&RdmaHw::m_sprayOverdueRepair),
 				MakeUintegerChecker<uint32_t>(
 					static_cast<uint32_t>(OverdueRepair::Off),
-					static_cast<uint32_t>(OverdueRepair::Probe)))
+					static_cast<uint32_t>(OverdueRepair::Reprobe)))
+		.AddAttribute("SprayOverdueRepairLimit",
+				"Under SprayOverdueRepair 3, the repairs of one send the "
+				"overdue repair sends until the queue pair's next answer or "
+				"retransmission timeout. Default 2.",
+				UintegerValue(2),
+				MakeUintegerAccessor(&RdmaHw::m_sprayOverdueRepairLimit),
+				MakeUintegerChecker<uint32_t>(1))
 		.AddAttribute("SprayAckLossRtts",
 				"Under LoadBalancing 2, the queue pair's base RTTs after "
 				"which a send the cumulative acknowledgement covered before "
@@ -2389,6 +2399,7 @@ int RdmaHw::ReceiveAck(Ptr<Packet> p, CustomHeader &ch){
 				// An answer lets the next overdue send be repaired.
 				if (IsOverdueRepair()){
 					qp->m_overdueSpent = false;
+					qp->m_overdueRepeats = 0;
 					if (qp->OverdueRepairSpurious(ch.ack.packet_seq, path,
 							(ch.ack.flags >> qbbHeader::FLAG_DUPLICATE) & 1, now))
 						ReportTransportEvent("overdue_repair_spurious", 0);
@@ -3108,6 +3119,7 @@ void RdmaHw::HandleRetransmissionTimeout(Ptr<RdmaQueuePair> qp){
 	qp->m_timeouts++;
 	ReportTransportEvent("rto_fired", 0);
 	qp->m_overdueSpent = false;
+	qp->m_overdueRepeats = 0;
 	{
 		// The send the timer waited for is the oldest outstanding one.
 		const uint64_t oldest = qp->m_outstanding.IsKept()
@@ -3154,8 +3166,11 @@ void RdmaHw::HeldSendDue(Ptr<RdmaQueuePair> qp, uint64_t seq, uint16_t path,
 }
 
 void RdmaHw::TakeOverdueSend(Ptr<RdmaQueuePair> qp, uint64_t seq,
-		uint16_t path, uint64_t sentNs, bool held){
-	if (qp->m_overdueSpent)
+		uint16_t path, uint64_t sentNs, bool held, bool repair){
+	// Under reprobe the repair of the sequence repaired is taken again.
+	const bool again = repair && qp->m_overdueRepeat && seq == qp->m_overdueSeq &&
+		qp->m_overdueRepeats < m_sprayOverdueRepairLimit;
+	if (qp->m_overdueSpent && !again)
 		return;
 	// A held send's own timer repairs it.
 	qp->m_overdueTaken = !held;
@@ -3188,6 +3203,7 @@ void RdmaHw::OverdueSendDue(Ptr<RdmaQueuePair> qp){
 	if (lost == 0)
 		return;
 	qp->m_overdueSpent = true;
+	qp->m_overdueRepeats++;
 	ReportTransportEvent("overdue_repair", 0);
 	if (m_cc_mode == 11 && DeliverCongestionSignal(qp)){
 		qp->Nscc().OnLoss(lost);
@@ -3561,7 +3577,7 @@ Ptr<Packet> RdmaHw::GetNxtPacket(Ptr<RdmaQueuePair> qp){
 		if (IsOverdueRepair()){
 			if (is_repair)
 				qp->NoteOverdueRepairSent(seq, path);
-			TakeOverdueSend(qp, seq, path, sentNs, held);
+			TakeOverdueSend(qp, seq, path, sentNs, held, is_repair);
 		}
 		if (copy){
 			// The copy leaves ahead of the data packet, through the NIC's
@@ -3670,7 +3686,10 @@ bool RdmaHw::StartPathSelection(Ptr<RdmaQueuePair> qp, uint64_t bdpBytes,
 				MakeCallback(&RdmaHw::ReportTimedOutCovered, this);
 	}
 	qp->m_overdueProbe =
-		m_sprayOverdueRepair == static_cast<uint32_t>(OverdueRepair::Probe);
+		m_sprayOverdueRepair == static_cast<uint32_t>(OverdueRepair::Probe) ||
+		m_sprayOverdueRepair == static_cast<uint32_t>(OverdueRepair::Reprobe);
+	qp->m_overdueRepeat =
+		m_sprayOverdueRepair == static_cast<uint32_t>(OverdueRepair::Reprobe);
 	if (!IsConnectionPathState()){
 		qp->m_pathSelector = MakePathSelector(qp, bdpBytes, baseRttNs);
 		return true;

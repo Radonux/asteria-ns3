@@ -391,11 +391,16 @@ public:
 	uint16_t m_overduePath;
 	uint64_t m_overdueSentNs;
 	bool m_overdueSpent;
+	// Under SprayOverdueRepair reprobe, the repairs sent since the queue
+	// pair's last answer or timeout.
+	uint32_t m_overdueRepeats;
 	EventId m_overdueTimer;
+	// A sequence's send path, the repairs DeclareOverdueSendLost declared of
+	// it and the paths of those sent, and whether its send was a trickle's.
 	struct OverdueRepair {
 		uint16_t path;
-		bool repairSent;
-		uint16_t repairPath;
+		uint32_t declared;
+		std::vector<uint16_t> repairPaths;
 		bool trickle;
 	};
 	std::map<uint64_t, OverdueRepair> m_overdueRepaired;
@@ -409,16 +414,20 @@ public:
 	// m_duplicate_answer_losses; the send's own nothing. A sequence the
 	// cumulative acknowledgement covers first counts nothing.
 	bool m_overdueProbe;
+	// SprayOverdueRepair reprobe: a repair declared lost again keeps its
+	// sequence's record (DeclareOverdueSendLost).
+	bool m_overdueRepeat;
 	// Declare lost the send of seq along path made at sentNs, if it is still
 	// outstanding, and queue its range for repair; its loss is evidence as a
 	// retransmission timeout's is (DeclareLostSentBy), or under m_overdueProbe
-	// none. Returns the bytes declared lost: zero when it was acknowledged or
-	// declared lost since, or seq was sent again, or under SprayCoverageFirst
-	// it is covered.
+	// none; under m_overdueRepeat a sequence repaired already keeps its
+	// send's path as its repair is declared lost. Returns the bytes declared
+	// lost: zero when it was acknowledged or declared lost since, or seq was
+	// sent again, or under SprayCoverageFirst it is covered.
 	uint64_t DeclareOverdueSendLost(uint64_t seq, uint16_t path,
 		uint64_t sentNs);
-	// A repair of seq left along path: the first, of a sequence
-	// DeclareOverdueSendLost repaired, is the repair's path.
+	// A repair of seq left along path: the first after each repair
+	// DeclareOverdueSendLost declared of the sequence is that repair's path.
 	void NoteOverdueRepairSent(uint64_t seq, uint16_t path);
 	// Whether the answer to seq along path, flagged as a duplicate or not,
 	// shows a repair of DeclareOverdueSendLost spurious, the send it repaired
@@ -427,6 +436,7 @@ public:
 	// Unflagged along the repair's path, where the send took another, it is
 	// the repair's, which arrived first; either answer ends the wait, and
 	// along one path for both an unflagged answer leaves it to a flagged one.
+	// An answer along any of a sequence's repairs' paths is a repair's.
 	// Under m_overdueProbe the answer that ends the wait settles the send.
 	bool OverdueRepairSpurious(uint64_t seq, uint16_t path, bool duplicate,
 		uint64_t nowNs);

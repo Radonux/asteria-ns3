@@ -267,7 +267,12 @@ public:
 	// (RdmaQueuePair::m_overdueProbe). Either way a receiver flags its
 	// answers to duplicates as under SprayDuplicateReport, so that the
 	// answer showing the send arrived first counts the repair spurious.
+	// Under Reprobe the repair is a probe's, and a repair without an answer
+	// for m_sprayHeldLossRtts base RTTs is followed by another of the same
+	// send, up to m_sprayOverdueRepairLimit repairs until the queue pair's
+	// next answer or timeout (RdmaQueuePair::m_overdueRepeats).
 	uint32_t m_sprayOverdueRepair;
+	uint32_t m_sprayOverdueRepairLimit;
 	bool IsOverdueRepair() const;
 	bool ValidOverdueRepair() const;
 	// SprayAckLossRtts, under LoadBalancing SprayUniform with any selector:
@@ -901,9 +906,11 @@ public:
 	// Under SprayOverdueRepair: qp's send of seq along path at sentNs, on a
 	// spine not held when held is false, taken as its latest send, unless one
 	// was repaired since its last answer or timeout, and qp's timer set for
-	// it unless it is set; for a held send, none is taken.
+	// it unless it is set; for a held send, none is taken. Under Reprobe a
+	// repair (repair) of the sequence last repaired is taken while its
+	// repairs are fewer than m_sprayOverdueRepairLimit.
 	void TakeOverdueSend(Ptr<RdmaQueuePair> qp, uint64_t seq, uint16_t path,
-		uint64_t sentNs, bool held);
+		uint64_t sentNs, bool held, bool repair = false);
 	// qp's timer: the send taken, once its answer is overdue, declared lost
 	// if still outstanding, and its repair sent; the timer set again for a
 	// send taken later.

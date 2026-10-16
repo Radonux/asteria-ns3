@@ -255,9 +255,11 @@ RdmaQueuePair::RdmaQueuePair(uint16_t pg, Ipv4Address _sip, Ipv4Address _dip, ui
 	m_overduePath = 0;
 	m_overdueSentNs = 0;
 	m_overdueSpent = false;
+	m_overdueRepeats = 0;
 	m_overdue_declared_lost = 0;
 	m_overdue_spurious = 0;
 	m_overdueProbe = false;
+	m_overdueRepeat = false;
 	m_timeout_covered_losses = 0;
 	m_ack_loss_declared = 0;
 	m_tail_nacks_ignored = 0;
@@ -623,8 +625,12 @@ uint64_t RdmaQueuePair::DeclareOverdueSendLost(uint64_t seq, uint16_t path,
 		return 0;
 	}
 	m_overdue_declared_lost++;
-	m_overdueRepaired[seq] =
-		OverdueRepair{path, false, 0, m_outstanding.Trickle(packet)};
+	const auto repaired = m_overdueRepaired.find(seq);
+	if (m_overdueRepeat && repaired != m_overdueRepaired.end())
+		repaired->second.declared++;
+	else
+		m_overdueRepaired[seq] =
+			OverdueRepair{path, 1, {}, m_outstanding.Trickle(packet)};
 	// A probe is recovery alone.
 	if (m_overdueProbe)
 		return DeclareLost(packet, false);
@@ -640,10 +646,10 @@ void RdmaQueuePair::CountTimedOutCovered(uint32_t losses){
 
 void RdmaQueuePair::NoteOverdueRepairSent(uint64_t seq, uint16_t path){
 	const auto repair = m_overdueRepaired.find(seq);
-	if (repair == m_overdueRepaired.end() || repair->second.repairSent)
+	if (repair == m_overdueRepaired.end() ||
+			repair->second.repairPaths.size() >= repair->second.declared)
 		return;
-	repair->second.repairSent = true;
-	repair->second.repairPath = path;
+	repair->second.repairPaths.push_back(path);
 }
 
 bool RdmaQueuePair::OverdueRepairSpurious(uint64_t seq, uint16_t path,
@@ -652,8 +658,10 @@ bool RdmaQueuePair::OverdueRepairSpurious(uint64_t seq, uint16_t path,
 	if (repair == m_overdueRepaired.end())
 		return false;
 	const OverdueRepair r = repair->second;
-	const bool send = path == r.path && !(r.repairSent && r.repairPath == path);
-	const bool resend = r.repairSent && path == r.repairPath && path != r.path;
+	const bool repairs = std::find(r.repairPaths.begin(), r.repairPaths.end(), path) !=
+		r.repairPaths.end();
+	const bool send = path == r.path && !repairs;
+	const bool resend = repairs && path != r.path;
 	if (!duplicate && !send && !resend)
 		return false;
 	m_overdueRepaired.erase(repair);
