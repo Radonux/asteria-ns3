@@ -714,8 +714,9 @@ TypeId RdmaHw::GetTypeId (void)
 				"answers; 1=a spine the receiver draws uniformly per answer "
 				"from AckRouteRandomVariable; 2=a member, drawn uniformly per "
 				"answer, of the connection's set of AckRouteSetSize spines, "
-				"probed once per SprayBaseRttNs while its data arrives and a "
-				"member replaced whose probe goes unanswered; 3=the "
+				"probed once per AckRouteSetProbeRtts SprayBaseRttNs while its "
+				"data arrives and a member replaced whose probe goes "
+				"unanswered; 3=the "
 				"connection's one spine, drawn again at each duplicate data "
 				"arrival. Under 1 to 3 the spine is named in the answer's "
 				"route_spine field, which needs CustomHeader::ackRouteSpineBytes "
@@ -732,6 +733,15 @@ TypeId RdmaHw::GetTypeId (void)
 				UintegerValue(2),
 				MakeUintegerAccessor(&RdmaHw::m_ackRouteSetSize),
 				MakeUintegerChecker<uint32_t>(1))
+		.AddAttribute("AckRouteSetProbeRtts",
+				"Under AckRoute 2, the SprayBaseRttNs between a connection's "
+				"rounds of probes of its set while its data arrives; a member "
+				"is replaced at a round once a probe of it has been "
+				"unanswered for kAnswerSetProbeTimeoutRtts base RTTs. "
+				"Default 1.",
+				DoubleValue(1),
+				MakeDoubleAccessor(&RdmaHw::m_ackRouteSetProbeRtts),
+				MakeDoubleChecker<double>(0))
 		.AddAttribute("AckRouteRandomVariable",
 				"Under AckRoute 1, the variable each answer's spine is drawn "
 				"from, a stream of this host's own. Null by default, so that "

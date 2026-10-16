@@ -716,6 +716,7 @@ class LoadBalancingSwitchTest : public TestCase
         RouteByEntropy(LoadBalancingMode::Ecmp);
         RouteByEntropy(LoadBalancingMode::EntropyHash);
         ProbeAsData();
+        RouteProbeReplyAsAnswer();
         Simulator::Destroy();
     }
 
@@ -797,7 +798,8 @@ class LoadBalancingSwitchTest : public TestCase
                 uint16_t identification,
                 uint8_t protocol = 0x11,
                 uint16_t pg = 0,
-                uint16_t routeSpine = kNoRouteSpine)
+                uint16_t routeSpine = kNoRouteSpine,
+                bool routeProbeReply = false)
     {
         Ptr<Packet> packet = Create<Packet>(protocol == 0x11 ? 1000 : 0);
         if (protocol == 0x11)
@@ -818,6 +820,10 @@ class LoadBalancingSwitchTest : public TestCase
             control.SetSport(forward ? sourcePort : 10001);
             control.SetDport(forward ? 10001 : sourcePort);
             control.SetRouteSpine(routeSpine);
+            if (routeProbeReply)
+            {
+                control.SetRouteProbeReply();
+            }
             packet->AddHeader(control);
         }
         Ipv4Header ip;
@@ -1059,6 +1065,35 @@ class LoadBalancingSwitchTest : public TestCase
         NS_TEST_EXPECT_MSG_EQ(Send(m_remoteHost, 10000, 5, kPathProbeProtocol, 3).queue,
                               3,
                               "a probe waits with its priority group's data");
+    }
+
+    // A reverse set's probe reply is a path probe: it waits with its priority
+    // group's data, unless RouteProbeReplyAsAnswer queues it as an answer.
+    void RouteProbeReplyAsAnswer()
+    {
+        BuildLeaf(LoadBalancingMode::SprayUniform);
+        m_leaf->SetAttribute("AckHighPrio", UintegerValue(1));
+        m_leaf->m_mmu->ConfigNPort(m_leaf->GetNDevices() - 1);
+        m_leaf->m_mmu->ConfigBufferSize(32 * 1024 * 1024);
+        const uint16_t identification = SpineIdentification(1, 1);
+        NS_TEST_EXPECT_MSG_EQ(
+            Send(m_remoteHost, 10000, identification, kPathProbeProtocol, 3, 1, true).queue,
+            3,
+            "a reply waits with its priority group's data by default");
+        m_leaf->SetAttribute("RouteProbeReplyAsAnswer", BooleanValue(true));
+        const Egress reply = Send(m_remoteHost, 10000, identification, kPathProbeProtocol, 3, 1, true);
+        NS_TEST_EXPECT_MSG_EQ(reply.queue, 0, "and as an answer under RouteProbeReplyAsAnswer");
+        NS_TEST_EXPECT_MSG_EQ(Send(m_remoteHost, 10000, identification, 0xFC, 3, 1).queue,
+                              0,
+                              "where the answers wait");
+        NS_TEST_EXPECT_MSG_EQ(Send(m_remoteHost, 10000, identification, kPathProbeProtocol, 3, 1).queue,
+                              3,
+                              "a sender's path probe still waits with its data");
+        m_leaf->SetAttribute("AckHighPrio", UintegerValue(0));
+        NS_TEST_EXPECT_MSG_EQ(
+            Send(m_remoteHost, 10000, identification, kPathProbeProtocol, 3, 1, true).queue,
+            3,
+            "without AckHighPrio a reply waits with its group as the answers do");
     }
 
     void RouteByEntropy(LoadBalancingMode mode)

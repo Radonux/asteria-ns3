@@ -405,8 +405,9 @@ bool spray_ack_loss_rtts_given = false;
 // receiver's leaf cross no spine and draw nothing. reverse_set keeps per
 // connection, a sending host and priority group, a set of ACK_ROUTE_SET_SIZE
 // spines drawn once from that stream, routes each answer over a member drawn
-// uniformly, probes every member once per SPRAY_BASE_RTT_NS while the
-// connection's data arrives, with an acknowledgement the sender returns over
+// uniformly, probes every member once per ACK_ROUTE_SET_PROBE_RTTS of
+// SPRAY_BASE_RTT_NS (above 0, default 1) while the connection's data
+// arrives, with an acknowledgement the sender returns over
 // the spine probed, and replaces a member by a spine outside the set once its
 // probe has gone unanswered for two base RTTs (host transport events
 // answer_set_probe and answer_set_replace). repath keeps per connection one
@@ -420,6 +421,14 @@ std::string ack_route = "data_spine";
 bool ack_route_given = false;
 uint32_t ack_route_set_size = 2;
 bool ack_route_set_size_given = false;
+double ack_route_set_probe_rtts = 1;
+bool ack_route_set_probe_rtts_given = false;
+// Under ACK_ROUTE reverse_set, ACK_ROUTE_SET_REPLY: how the switches queue
+// the sender's return of a probe, a path probe. data, the default, in its
+// priority group's queue, as a path probe is, where admission can refuse it;
+// answer, as the answers are, in queue 0 under ACK_HIGH_PRIO.
+std::string ack_route_set_reply = "data";
+bool ack_route_set_reply_given = false;
 // Under ACK_ROUTE spray, ACK_ROUTE_ORACLE on: the draw leaves out the spines
 // over which an answer toward the sender's leaf crosses a fault, a loss or a
 // black hole on the receiver's leaf's uplink to the spine or on the spine's
@@ -2796,6 +2805,12 @@ bool ReadConf(string network_configuration) {
     } else if (key.compare("ACK_ROUTE_SET_SIZE") == 0) {
       conf >> ack_route_set_size;
       ack_route_set_size_given = true;
+    } else if (key.compare("ACK_ROUTE_SET_PROBE_RTTS") == 0) {
+      conf >> ack_route_set_probe_rtts;
+      ack_route_set_probe_rtts_given = true;
+    } else if (key.compare("ACK_ROUTE_SET_REPLY") == 0) {
+      conf >> ack_route_set_reply;
+      ack_route_set_reply_given = true;
     } else if (key.compare("ACK_ROUTE_ORACLE") == 0) {
       conf >> ack_route_oracle;
       ack_route_oracle_given = true;
@@ -3391,6 +3406,24 @@ bool ReadConf(string network_configuration) {
     std::cerr << "ACK_ROUTE_SET_SIZE is read only under ACK_ROUTE reverse_set\n";
     return false;
   }
+  if (ack_route_set_probe_rtts_given && ack_route != "reverse_set") {
+    std::cerr << "ACK_ROUTE_SET_PROBE_RTTS is read only under ACK_ROUTE "
+                 "reverse_set\n";
+    return false;
+  }
+  if (ack_route_set_reply_given && ack_route != "reverse_set") {
+    std::cerr << "ACK_ROUTE_SET_REPLY is read only under ACK_ROUTE "
+                 "reverse_set\n";
+    return false;
+  }
+  if (ack_route_set_reply != "data" && ack_route_set_reply != "answer") {
+    std::cerr << "ACK_ROUTE_SET_REPLY must be data or answer\n";
+    return false;
+  }
+  if (!(ack_route_set_probe_rtts > 0)) {
+    std::cerr << "ACK_ROUTE_SET_PROBE_RTTS must be above zero\n";
+    return false;
+  }
   if (ack_route_set_size == 0) {
     std::cerr << "ACK_ROUTE_SET_SIZE must be above zero\n";
     return false;
@@ -3880,6 +3913,8 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),
     if (n.Get(i)->GetNodeType() == 1) {
       Ptr<SwitchNode> sw = DynamicCast<SwitchNode>(n.Get(i));
       sw->SetAttribute("AckHighPrio", UintegerValue(ack_high_prio));
+      sw->SetAttribute("RouteProbeReplyAsAnswer",
+                       BooleanValue(ack_route_set_reply == "answer"));
         sw->SetAttribute("PacketTrimMode",
                  UintegerValue(packet_trim_mode_value()));
       sw->SetAttribute("TrimmedQueueIndex", UintegerValue(packet_trim_queue));
@@ -4246,6 +4281,8 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),
                                            : AckRoute::DataSpine)));
       rdmaHw->SetAttribute("AckRouteSetSize",
                            UintegerValue(ack_route_set_size));
+      rdmaHw->SetAttribute("AckRouteSetProbeRtts",
+                           DoubleValue(ack_route_set_probe_rtts));
       rdmaHw->SetAttribute("AckRouteOracle",
                            BooleanValue(ack_route_oracle_on()));
       // Made only where answers name their spine, so that data_spine

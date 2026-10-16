@@ -299,7 +299,8 @@ public:
 	// AckRoute ReverseSet and Repath keep each connection's answer routes,
 	// per sending host and priority group, in m_answerRoutes: under
 	// ReverseSet a set of AckRouteSetSize spines (AnswerRouteSet), probed
-	// once per SprayBaseRttNs while the connection's data arrives, a member
+	// once per AckRouteSetProbeRtts SprayBaseRttNs while the connection's
+	// data arrives, a member
 	// replaced once a probe of it has been unanswered for
 	// kAnswerSetProbeTimeoutRtts base RTTs; under Repath one spine
 	// (AnswerRepath), drawn again at each data packet that adds nothing the
@@ -309,6 +310,7 @@ public:
 	// answer_repath.
 	static constexpr double kAnswerSetProbeTimeoutRtts = 2;
 	uint32_t m_ackRouteSetSize;
+	double m_ackRouteSetProbeRtts;
 	struct AnswerRoutes {
 		AnswerRouteSet set;
 		AnswerRepath repath;

@@ -35,11 +35,12 @@ void RdmaHw::ProbeAnswerSet(Ptr<RdmaRxQueuePair> q, const CustomHeader &ch){
 	if (!AnswersCrossSpine(ch.sip))
 		return;
 	NS_ABORT_MSG_IF(m_sprayBaseRttNs == 0,
-		"AckRoute 2 probes its sets once per SprayBaseRttNs");
+		"AckRoute 2 probes its sets once per AckRouteSetProbeRtts SprayBaseRttNs");
 	std::vector<uint8_t> probes;
 	std::vector<std::pair<uint8_t, uint8_t>> replaced;
 	if (!AnswerRoutesOf(ch.sip, ch.udp.pg).set.TakeRound(
-			Simulator::Now().GetNanoSeconds(), m_sprayBaseRttNs,
+			Simulator::Now().GetNanoSeconds(),
+			static_cast<uint64_t>(m_ackRouteSetProbeRtts * m_sprayBaseRttNs),
 			static_cast<uint64_t>(kAnswerSetProbeTimeoutRtts * m_sprayBaseRttNs),
 			m_spineCount, m_ackRouteSetSize,
 			[this](uint32_t n){ return DrawAnswerRoute(n); }, probes, replaced))

@@ -38,6 +38,15 @@ TypeId SwitchNode::GetTypeId (void)
 			UintegerValue(0),
 			MakeUintegerAccessor(&SwitchNode::m_ackHighPrio),
 			MakeUintegerChecker<uint32_t>())
+	.AddAttribute("RouteProbeReplyAsAnswer",
+			"Whether the reply to a receiver's probe of its answers' route "
+			"(a path probe flagged FLAG_ROUTE_PROBE_REPLY, AckRoute 2) is "
+			"queued as an answer is, in queue 0 under AckHighPrio, rather "
+			"than in its priority group's queue as a path probe is, where "
+			"admission can refuse it. Default false.",
+			BooleanValue(false),
+			MakeBooleanAccessor(&SwitchNode::m_routeProbeReplyAsAnswer),
+			MakeBooleanChecker())
 	.AddAttribute("PacketTrimMode",
 			"0=disabled, 1=trim and forward to the destination (UEC 1.0.3 section 4.1), "
 			"2=return trim metadata to the sender (not part of UEC 1.0.3).",
@@ -273,9 +282,11 @@ uint32_t SwitchNode::QueueIndexFor(const CustomHeader &ch) const{
 		return IsUetTrimmedDscp(ch.GetIpv4Dscp()) ? m_trimmedQueueIndex : ch.udp.pg;
 	if (ch.l3Prot == kUecTrimNotificationProtocol)
 		return m_trimmedQueueIndex;
+	const bool answer = ch.l3Prot == 0xFD || ch.l3Prot == 0xFC ||
+		(m_routeProbeReplyAsAnswer && ch.l3Prot == kPathProbeProtocol &&
+			((ch.ack.flags >> qbbHeader::FLAG_ROUTE_PROBE_REPLY) & 1));
 	if (ch.l3Prot == 0xFF || ch.l3Prot == 0xFE ||
-		ch.l3Prot == kUecTrimRepairProtocol ||
-		(m_ackHighPrio && (ch.l3Prot == 0xFD || ch.l3Prot == 0xFC)))
+		ch.l3Prot == kUecTrimRepairProtocol || (m_ackHighPrio && answer))
 		return 0; // QCN, PFC, and UET control packets
 	return ch.l3Prot == 0x06 ? 1 : ch.udp.pg; // if TCP, put to queue 1
 }

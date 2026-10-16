@@ -78,6 +78,7 @@ protected:
 	uint64_t m_maxRtt;
 
 	uint32_t m_ackHighPrio; // set high priority for ACK/NACK
+	bool m_routeProbeReplyAsAnswer; // RouteProbeReplyAsAnswer
 	uint32_t m_packetTrimMode;
 	uint32_t m_trimmedQueueIndex; // TC_med egress queue for DSCP_TRIMMED
 	uint32_t m_minTrimSize;       // MIN_TRIM_SIZE, in IP payload bytes
