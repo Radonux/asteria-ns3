@@ -290,6 +290,51 @@ public:
 	// kNoRouteSpine under DataSpine and toward a host of this leaf, one
 	// draw otherwise.
 	uint8_t AnswerRouteSpine(uint32_t senderIp);
+	// SprayCoverageFirst, under LoadBalancing SprayUniform: a send the
+	// queue pair's coverage shows delivered is an answer loss, not a loss on
+	// its path (RdmaQueuePair::m_coverageFirst), each reported as the
+	// transport event answer_loss_covered.
+	bool m_sprayCoverageFirst;
+	bool ValidCoverageFirst() const;
+	void ReportCoveredAnswerLoss();
+	// SprayAnswerPathSeq, under AckRoute Spray with SprayPathSeq and a loss
+	// hold selector (answer-path-seq.h). As a receiver this host numbers
+	// each queue pair's answers per route spine (AnswerSequencer), every
+	// answer carrying its number and another route's count
+	// (CustomHeader::ackAnswerSeqBytes 5), and leaves out of its draw the
+	// spines the senders of the answer's sender leaf hold
+	// (AnswerHoldReports, from their data packets' answer_hold byte,
+	// CustomHeader::udpAnswerHoldBytes 1), but for one probe answer per held
+	// spine per m_sprayAnswerProbeIntervalNs. As a sender it reads each
+	// queue pair's numbered answers (AnswerSequenceTracker), the announced
+	// ones waiting kAnswerGuardRtts of the queue pair's base RTT, and counts
+	// the answers lost and received per route spine in the hold of the
+	// receiver's leaf (AnswerRouteHold, in m_answerRouteHolds): over
+	// m_sprayLossIntervalNs with the top loss threshold, and released after
+	// m_sprayAnswerHoldClean clean answers in a row, which its data packets
+	// to that leaf carry as their answer_hold bitmap. Each answer found lost
+	// is the transport event answer_route_lost, each probe answer sent
+	// answer_probe, and each change of either hold is traced (AnswerHold).
+	static constexpr double kAnswerGuardRtts = 2;
+	bool m_sprayAnswerPathSeq;
+	uint64_t m_sprayAnswerProbeIntervalNs;
+	uint32_t m_sprayAnswerHoldClean;
+	std::unordered_map<uint32_t, AnswerRouteHold> m_answerRouteHolds;
+	std::unique_ptr<AnswerHoldReports> m_answerHoldReports;
+	bool ValidAnswerPathSeq() const;
+	AnswerRouteHold &AnswerRouteHoldTo(uint32_t leaf);
+	AnswerHoldReports &AnswerHoldReportsOf();
+	// The number of q's next answer over route into header, under
+	// SprayAnswerPathSeq for a route spine.
+	void NumberAnswer(Ptr<RdmaRxQueuePair> q, qbbHeader &header, uint8_t route);
+	// The numbered answer ch to qp read and its outcomes counted.
+	void ReadAnswerSeq(Ptr<RdmaQueuePair> qp, const CustomHeader &ch);
+	// The AnswerHold trace source: a hold changed, at this host as a sender
+	// (receiverSide false) of the route spine toward the answers of leaf,
+	// or as a receiver of the spine of its answers to leaf.
+	typedef void (*AnswerHoldTracedCallback)(bool receiverSide, uint32_t leaf,
+		uint32_t spine, bool held, uint64_t nowNs);
+	TracedCallback<bool, uint32_t, uint32_t, bool, uint64_t> m_traceAnswerHold;
 	// HoldScope of PathSelector RepsHold and MrcHold. Under Leaf the queue
 	// pairs to the hosts of one leaf, which m_switchQueues names, share that
 	// leaf's loss hold in m_leafHolds, made at the first of them; under Pair
@@ -732,7 +777,8 @@ public:
 	// A repair request carrying header, to destinationIp, with the IPv4
 	// identification identification.
 	void SendRepairRequest(const qbbHeader &header, uint32_t sourceIp,
-		uint32_t destinationIp, uint16_t identification);
+		uint32_t destinationIp, uint16_t identification,
+		Ptr<RdmaRxQueuePair> q = nullptr);
 	// packetSeq and identification describe the data packet answered, or with
 	// probeAnswer the probe; redirect is the redirect field, kNoRedirect
 	// outside AckRedirect.

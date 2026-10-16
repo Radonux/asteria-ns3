@@ -710,6 +710,45 @@ TypeId RdmaHw::GetTypeId (void)
 				BooleanValue(false),
 				MakeBooleanAccessor(&RdmaHw::m_ackRouteOracle),
 				MakeBooleanChecker())
+		.AddAttribute("SprayCoverageFirst",
+				"Under LoadBalancing 2, whether the per-path rule, the held-loss "
+				"rule, a tail repair request, a copy's expiry and "
+				"SprayAckLossRtts first apply the queue pair's coverage, the "
+				"cumulative acknowledgement, the one of the answer read and for "
+				"a copy its data send's answer: a send it covers was delivered "
+				"and its missing answer is an answer loss, counted as "
+				"answer_loss_covered, neither repaired nor told to the "
+				"selector. Default false.",
+				BooleanValue(false),
+				MakeBooleanAccessor(&RdmaHw::m_sprayCoverageFirst),
+				MakeBooleanChecker())
+		.AddAttribute("SprayAnswerPathSeq",
+				"Under AckRoute 1 with SprayPathSeq and PathSelector 6, 7 or 9, "
+				"whether answers are numbered per route spine and announce "
+				"another route's count, the sender holds the routes of a "
+				"receiver leaf its answers are lost on and says so in its data "
+				"packets, and the receiver leaves the spines its senders hold "
+				"out of its draw but for a probe answer per "
+				"SprayAnswerProbeIntervalNs. Needs "
+				"CustomHeader::ackAnswerSeqBytes 5 and "
+				"CustomHeader::udpAnswerHoldBytes 1. Default false.",
+				BooleanValue(false),
+				MakeBooleanAccessor(&RdmaHw::m_sprayAnswerPathSeq),
+				MakeBooleanChecker())
+		.AddAttribute("SprayAnswerProbeIntervalNs",
+				"Under SprayAnswerPathSeq, the interval between two probe "
+				"answers of a receiving host over one spine held toward one "
+				"sender leaf. Default 1 ms.",
+				UintegerValue(1000000),
+				MakeUintegerAccessor(&RdmaHw::m_sprayAnswerProbeIntervalNs),
+				MakeUintegerChecker<uint64_t>(1))
+		.AddAttribute("SprayAnswerHoldClean",
+				"Under SprayAnswerPathSeq, the answers in a row received over a "
+				"held route without a loss that release it at the sender. "
+				"Default 3.",
+				UintegerValue(3),
+				MakeUintegerAccessor(&RdmaHw::m_sprayAnswerHoldClean),
+				MakeUintegerChecker<uint32_t>(1))
 		.AddAttribute("SprayPathSeq",
 				"Under LoadBalancing 2, whether every data packet carries "
 				"its queue pair's count of the data packets sent before it up "
@@ -912,6 +951,13 @@ TypeId RdmaHw::GetTypeId (void)
 				"0=none, 1=leaf, 2=host.",
 				MakeTraceSourceAccessor(&RdmaHw::m_traceReceiverHoldInterval),
 				"ns3::RdmaHw::ReceiverHoldIntervalTracedCallback")
+		.AddTraceSource("AnswerHold",
+				"Under SprayAnswerPathSeq, a hold changed: of a route spine of "
+				"a receiver leaf's answers at this host as a sender, or of a "
+				"spine of this host's answers to a sender leaf as a receiver; "
+				"the side, the leaf, the spine, whether held and the time.",
+				MakeTraceSourceAccessor(&RdmaHw::m_traceAnswerHold),
+				"ns3::RdmaHw::AnswerHoldTracedCallback")
 		.AddAttribute("EwmaGain",
 				"Control gain parameter which determines the level of rate decrease",
 				DoubleValue(1.0 / 16),
@@ -1209,6 +1255,14 @@ void RdmaHw::Setup(QpCompleteCallback cb, QpFailureCallback failure_cb){
 		"set (CustomHeader::ackReceiverHoldBytes)");
 	NS_ABORT_MSG_IF(!ValidStrayPathSeq(),
 		"SprayStrayPathSeq 1 is read only under SprayPathSeq");
+	NS_ABORT_MSG_IF(!ValidCoverageFirst(),
+		"SprayCoverageFirst is read only under LoadBalancing 2, where every "
+		"send has a record");
+	NS_ABORT_MSG_IF(!ValidAnswerPathSeq(),
+		"SprayAnswerPathSeq needs AckRoute 1, SprayPathSeq, PathSelector 6, 7 "
+		"or 9, SwitchQueueState for the hosts' leaves and at most 8 spines, and "
+		"answers and data headers carry its fields exactly when it is set "
+		"(CustomHeader::ackAnswerSeqBytes, CustomHeader::udpAnswerHoldBytes)");
 	NS_ABORT_MSG_IF(!ValidReceiverTailMissing(),
 		"SprayReceiverTailMissing needs SprayReceiverHold and "
 		"SprayTailRecovery");
@@ -1486,6 +1540,9 @@ int RdmaHw::ReceiveUdp(Ptr<Packet> p, CustomHeader &ch){
 	}
 	rxQp->m_ecn_source.total++;
 	CountArrival(rxQp, ch.ipid, payload_size);
+	if (m_sprayAnswerPathSeq)
+		AnswerHoldReportsOf().Report(ch.sip, m_switchQueues->LeafOf(ch.sip),
+			ch.udp.answer_hold, Simulator::Now().GetNanoSeconds());
 	if (m_sprayPathSeq)
 		CountPathSeq(rxQp, ch);
 	if (IsGrading())
@@ -1887,16 +1944,39 @@ uint8_t RdmaHw::AnswerRouteSpine(uint32_t senderIp){
 			std::binary_search(m_ownLeafHosts.begin(), m_ownLeafHosts.end(),
 				senderIp))
 		return kNoRouteSpine;
-	if (!m_ackRouteOracle)
+	if (!m_ackRouteOracle && !m_sprayAnswerPathSeq)
 		return m_ackRouteRandom->GetInteger(0, m_spineCount - 1);
-	FaultedSpines &faulted =
-		AnswerFaultedSpinesTo(m_switchQueues->LeafOf(senderIp));
-	faulted.Read(Simulator::Now().GetNanoSeconds());
+	const uint64_t now = Simulator::Now().GetNanoSeconds();
+	const uint32_t leaf = m_switchQueues->LeafOf(senderIp);
+	// The spines this leaf's senders hold, but for a probe due on one.
+	uint8_t held = 0;
+	if (m_sprayAnswerPathSeq){
+		AnswerHoldReports &reports = AnswerHoldReportsOf();
+		uint8_t probe;
+		if (reports.TakeProbe(leaf, now, m_sprayAnswerProbeIntervalNs, probe)){
+			ReportTransportEvent("answer_probe", 0);
+			return probe;
+		}
+		held = reports.Held(leaf);
+	}
+	FaultedSpines *faulted = nullptr;
+	if (m_ackRouteOracle){
+		faulted = &AnswerFaultedSpinesTo(leaf);
+		faulted->Read(now);
+	}
 	uint8_t allowed[UINT8_MAX + 1];
 	uint32_t count = 0;
 	for (uint32_t spine = 0; spine < m_spineCount; spine++){
-		if (!faulted.Excludes(spine))
+		if ((!faulted || !faulted->Excludes(spine)) &&
+				!(spine < 8 && ((held >> spine) & 1)))
 			allowed[count++] = spine;
+	}
+	// While every spine left is held, none is left out for being held.
+	if (count == 0){
+		for (uint32_t spine = 0; spine < m_spineCount; spine++){
+			if (!faulted || !faulted->Excludes(spine))
+				allowed[count++] = spine;
+		}
 	}
 	return allowed[m_ackRouteRandom->GetInteger(0, count - 1)];
 }
@@ -2042,6 +2122,8 @@ void RdmaHw::SendAck(Ptr<RdmaRxQueuePair> q, uint32_t sourceIp,
 	seqh.SetRedirect(redirect);
 	seqh.SetReceiverHold(ReceiverHoldBitmap(destinationIp));
 	seqh.SetRouteSpine(AnswerRouteSpine(destinationIp));
+	if (m_sprayAnswerPathSeq)
+		NumberAnswer(q, seqh, seqh.GetRouteSpine());
 	// The grant is this flag without the report above. A receiver that may not
 	// forgive this flow, or a step that is critical, never sets it, so those
 	// senders obey their controller throughout.
@@ -2136,6 +2218,8 @@ int RdmaHw::ReceiveAck(Ptr<Packet> p, CustomHeader &ch){
 
 	uint32_t nic_idx = GetNicIdxOfQp(qp);
 	Ptr<QbbNetDevice> dev = m_nic[nic_idx].dev;
+	if (m_sprayAnswerPathSeq)
+		ReadAnswerSeq(qp, ch);
 	// Both flags report on the path, not on the bytes this ACK covers, so they
 	// are read before the acknowledgement that may complete the queue pair and
 	// return. A forgiven trim rides its own ACK, and that ACK is often the one
@@ -2149,7 +2233,10 @@ int RdmaHw::ReceiveAck(Ptr<Packet> p, CustomHeader &ch){
 		std::cout << "ERROR: shouldn't receive ack\n";
 	else {
 		// Before the cumulative advance, which would remove the answered send
-		// without asking what was sent ahead of it on its path.
+		// without asking what was sent ahead of it on its path. Under
+		// SprayCoverageFirst that advance is coverage the rules apply first.
+		if (m_sprayCoverageFirst)
+			qp->m_answerCoverage = seq;
 		if (qp->m_outstanding.IsKept()){
 			const uint16_t path =
 				PathOf(static_cast<LoadBalancingMode>(m_loadBalancing), ch.ipid);
@@ -2206,6 +2293,7 @@ int RdmaHw::ReceiveAck(Ptr<Packet> p, CustomHeader &ch){
 			uint32_t goback_seq = seq / m_chunk * m_chunk;
 			qp->Acknowledge(goback_seq, keepCovered);
 		}
+		qp->m_answerCoverage = 0;
 		if (qp->snd_una > acknowledged_before){
 			qp->m_recovery_retries = 0;
 			qp->m_last_progress_ns = Simulator::Now().GetNanoSeconds();
@@ -2323,13 +2411,16 @@ void RdmaHw::SendTrimNack(Ptr<RdmaRxQueuePair> q, const CustomHeader &ch,
 	repair.SetForgivenessEligible(eligible);
 	if (IsSprayPolicy())
 		repair.SetSpineReport(ReportFor(q, destinationIp));
-	SendRepairRequest(repair, sourceIp, destinationIp, ch.ipid);
+	SendRepairRequest(repair, sourceIp, destinationIp, ch.ipid, q);
 }
 
 void RdmaHw::SendRepairRequest(const qbbHeader &header, uint32_t sourceIp,
-		uint32_t destinationIp, uint16_t identification){
+		uint32_t destinationIp, uint16_t identification,
+		Ptr<RdmaRxQueuePair> q){
 	qbbHeader routed = header;
 	routed.SetRouteSpine(AnswerRouteSpine(destinationIp));
+	if (m_sprayAnswerPathSeq)
+		NumberAnswer(q, routed, routed.GetRouteSpine());
 	Ptr<Packet> packet = Create<Packet>(
 		std::max(60 - 14 - 20 - static_cast<int>(routed.GetSerializedSize()), 0));
 	packet->AddHeader(routed);
@@ -2705,6 +2796,8 @@ int RdmaHw::ReceiveTrim(Ptr<Packet> p, CustomHeader &ch){
 	if (!qp || qp->IsFailed()) {
 		return 0;
 	}
+	if (m_sprayAnswerPathSeq)
+		ReadAnswerSeq(qp, ch);
 	if (m_sprayTailRecovery &&
 			((ch.ack.flags >> qbbHeader::FLAG_TAIL_NACK) & 1)){
 		RecoverTail(qp, ch);
@@ -3237,6 +3330,10 @@ Ptr<Packet> RdmaHw::GetNxtPacket(Ptr<RdmaQueuePair> qp){
 	if (m_sprayTailRecovery)
 		SetTailFields(qp, seqTs,
 			(is_repair ? qp->snd_nxt : seq + payload_size) >= qp->m_size);
+	if (m_sprayAnswerPathSeq)
+		seqTs.SetAnswerHold(AnswerRouteHoldTo(
+			m_switchQueues->LeafOf(qp->dip.Get())).Bitmap(
+				Simulator::Now().GetNanoSeconds()));
 	p->AddHeader (seqTs);
 	if (copy){
 		if (m_sprayPathSeq)
@@ -3368,6 +3465,11 @@ bool RdmaHw::StartPathSelection(Ptr<RdmaQueuePair> qp, uint64_t bdpBytes,
 	qp->m_outstanding.SetPacketSize(m_mtu);
 	if (m_sprayCopyExpiry == static_cast<uint32_t>(CopyExpiry::Deadline))
 		qp->m_copyDeadlineRtts = m_sprayTailLossRtts;
+	if (m_sprayCoverageFirst){
+		qp->m_coverageFirst = true;
+		qp->m_coveredAnswerLoss =
+			MakeCallback(&RdmaHw::ReportCoveredAnswerLoss, this);
+	}
 	if (!IsConnectionPathState()){
 		qp->m_pathSelector = MakePathSelector(qp, bdpBytes, baseRttNs);
 		return true;

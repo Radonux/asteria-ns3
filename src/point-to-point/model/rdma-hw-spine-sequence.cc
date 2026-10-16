@@ -166,7 +166,7 @@ void RdmaHw::SendTailNack(Ptr<RdmaRxQueuePair> q, uint8_t spine,
 	request.SetDport(q->dport);
 	request.SetTailNack(spine, first, count);
 	SendRepairRequest(request, q->sip, q->dip,
-		SpineIdentification(spine, spine));
+		SpineIdentification(spine, spine), q);
 	if (m_sprayReceiverTailMissing)
 		WaitTailMissing(q, spine, first, count);
 }

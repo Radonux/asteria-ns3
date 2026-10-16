@@ -13,6 +13,7 @@
 #include "spine-grader.h"
 #include "spine-redirect.h"
 #include "spine-sequence.h"
+#include "answer-path-seq.h"
 #include <deque>
 #include <map>
 #include <memory>
@@ -384,6 +385,27 @@ public:
 	// send covered delayNs or more before nowNs, as DeclareLost tells the
 	// selector of a send, without a repair. Returns how many.
 	uint32_t DeclareAckLosses(uint64_t nowNs, uint64_t delayNs);
+	// SprayCoverageFirst (RdmaHw): before the per-path rule, the held-loss
+	// rule, a tail repair request or a copy's expiry declares a send lost, the
+	// coverage the queue pair has is applied: the cumulative acknowledgement,
+	// snd_una or, while an answer is processed, the one it carries
+	// (m_answerCoverage), and for a copy the answer of its data send too
+	// (ExplorationCopy::dataAcknowledged). A send it covers was delivered, so
+	// only its own answer is missing: it is an answer loss, counted in
+	// m_covered_answer_losses and told to m_coveredAnswerLoss, and is neither
+	// repaired nor told to the selector, so that it enters no spine's loss
+	// counts, no hold and no copy's. Under SprayAckLossRtts the covered sends
+	// due are counted so too, rather than declared on their paths.
+	bool m_coverageFirst;
+	uint64_t m_answerCoverage;
+	uint32_t m_covered_answer_losses;
+	Callback<void> m_coveredAnswerLoss;
+	// Under SprayCoverageFirst, whether the range from seq of size bytes is
+	// covered; if so it is counted as an answer loss.
+	bool CoveredAnswerLoss(uint64_t seq, uint64_t size);
+	void CountCoveredAnswerLoss();
+	// Under SprayAnswerPathSeq, the numbered answers read so far.
+	AnswerSequenceTracker m_answerTracker;
 
 	uint64_t GetBytesLeft();
 	uint64_t GetInitialSize();
@@ -467,6 +489,9 @@ public:
 	// requested, and the one timer that requests those due.
 	PendingTailRuns m_tailRuns;
 	EventId m_tailTimer;
+	// Under SprayAnswerPathSeq, the numbers of this queue pair's answers per
+	// route spine.
+	AnswerSequencer m_answerSequencer;
 	// Under SprayReceiverTailMissing, the runs requested whose guard has
 	// not yet ended, and the one timer that counts those due.
 	PendingTailRuns m_tailMissingRuns;

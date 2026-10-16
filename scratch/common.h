@@ -105,9 +105,15 @@ std::string rto_event_output_file;
 // SPINE_LOSS_OUTPUT_FILE have other columns under each SPRAY_HOLD_SCOPE.
 // Empty writes none.
 std::string receiver_hold_output_file;
+// Under SPRAY_ANSWER_PATH_SEQ on, ANSWER_HOLD_OUTPUT_FILE: one row per change
+// of a hold, time_ns,side,rank,leaf,spine,held: side sender for a route spine
+// of the answers of receiver leaf leaf held at sender rank, receiver for a
+// spine of rank's answers to sender leaf leaf, held 1 or 0.
+std::string answer_hold_output_file;
 FILE *port_counter_file = nullptr, *spine_arrival_file = nullptr;
 FILE *spine_report_file = nullptr, *spine_loss_file = nullptr;
 FILE *rto_event_file = nullptr, *receiver_hold_file = nullptr;
+FILE *answer_hold_file = nullptr;
 
 double alpha_resume_interval = 55, rp_timer, ewma_gain = 1 / 16;
 double rate_decrease_interval = 4;
@@ -472,6 +478,42 @@ bool spray_receiver_tail_missing_given = false;
 // receiver's hold.
 std::string spray_stray_path_seq = "fresh";
 bool spray_stray_path_seq_given = false;
+// Under LOAD_BALANCING spray_uniform, SPRAY_COVERAGE_FIRST on: before the
+// per-path rule, the held-loss rule, a tail repair request or a copy's expiry
+// declares a send lost, the queue pair applies its coverage, the cumulative
+// acknowledgement (the one of the answer it reads, where it reads one) and for
+// a copy its data send's answer. A send so covered was delivered, and its
+// missing answer is an answer loss: counted as the host transport event
+// answer_loss_covered, neither repaired nor told to the selector, so that it
+// counts toward no spine's losses, no hold and no copy's. The covered sends
+// SPRAY_ACK_LOSS_RTTS declares are counted so too. Off, the default.
+std::string spray_coverage_first = "off";
+bool spray_coverage_first_given = false;
+// Under ACK_ROUTE spray with SPRAY_PATH_SEQ on and a loss hold PATH_SELECTOR,
+// SPRAY_ANSWER_PATH_SEQ on: a receiving host numbers each queue pair's answers
+// per route spine, and each answer announces another route's count. The
+// sender counts per receiver leaf and route spine the answers it receives and
+// those it finds lost, from a gap in a route's numbers or from an
+// announcement not met within two base RTTs, and holds a route whose lost
+// fraction over a SPRAY_LOSS_INTERVAL_NS interval reaches the top of
+// SPRAY_LOSS_THRESHOLDS; SPRAY_ANSWER_HOLD_CLEAN answers in a row received
+// over a held route without a loss release it. Its data packets to the leaf
+// carry the routes it holds in an answer_hold byte, and a receiving host
+// leaves out of its draw of the routes of its answers to a sender leaf the
+// spines any sender of that leaf last reported held, but for one probe answer
+// per held spine and sender leaf every SPRAY_ANSWER_PROBE_INTERVAL_NS. Each
+// answer found lost is the host transport event answer_route_lost, with its
+// breakdown by route spine, each probe answer answer_probe, and each change of
+// a sender's route hold answer_route_hold or answer_route_release;
+// ANSWER_HOLD_OUTPUT_FILE traces the changes of both ends' holds. Off, the
+// default.
+std::string spray_answer_path_seq = "off";
+bool spray_answer_path_seq_given = false;
+uint64_t spray_answer_probe_interval_ns = 1000000;
+bool spray_answer_probe_interval_ns_given = false;
+uint32_t spray_answer_hold_clean = 3;
+bool spray_answer_hold_clean_given = false;
+bool answer_path_seq() { return spray_answer_path_seq == "on"; }
 bool receiver_hold() { return spray_receiver_hold == "on"; }
 uint32_t reps_buffer_size = 8;
 uint64_t reps_freezing_timeout_ns = 10000000;
@@ -1658,7 +1700,8 @@ void write_fabric_counters() {
     }
   }
   for (FILE *file : {port_counter_file, spine_arrival_file, spine_report_file,
-                     spine_loss_file, rto_event_file, receiver_hold_file})
+                     spine_loss_file, rto_event_file, receiver_hold_file,
+                     answer_hold_file})
     if (file != nullptr)
       fflush(file);
 }
@@ -1773,6 +1816,15 @@ void write_receiver_hold_interval(uint32_t rank, uint32_t leaf,
     fprintf(receiver_hold_file, "%lu,%u,%u,%u,%u,%u,%s\n",
             static_cast<unsigned long>(end_ns), rank, leaf, spine,
             arrivals[spine], lost[spine], scopes[holds[spine]]);
+}
+
+void write_answer_hold(uint32_t rank, bool receiverSide, uint32_t leaf,
+                       uint32_t spine, bool held, uint64_t now_ns) {
+  if (answer_hold_file == nullptr)
+    return;
+  fprintf(answer_hold_file, "%lu,%s,%u,%u,%u,%d\n",
+          static_cast<unsigned long>(now_ns),
+          receiverSide ? "receiver" : "sender", rank, leaf, spine, held ? 1 : 0);
 }
 
 // The link events' applier, which keeps what a restore puts back.
@@ -2475,6 +2527,20 @@ bool ReadConf(string network_configuration) {
     } else if (key.compare("SPRAY_STRAY_PATH_SEQ") == 0) {
       conf >> spray_stray_path_seq;
       spray_stray_path_seq_given = true;
+    } else if (key.compare("SPRAY_COVERAGE_FIRST") == 0) {
+      conf >> spray_coverage_first;
+      spray_coverage_first_given = true;
+    } else if (key.compare("SPRAY_ANSWER_PATH_SEQ") == 0) {
+      conf >> spray_answer_path_seq;
+      spray_answer_path_seq_given = true;
+    } else if (key.compare("SPRAY_ANSWER_PROBE_INTERVAL_NS") == 0) {
+      conf >> spray_answer_probe_interval_ns;
+      spray_answer_probe_interval_ns_given = true;
+    } else if (key.compare("SPRAY_ANSWER_HOLD_CLEAN") == 0) {
+      conf >> spray_answer_hold_clean;
+      spray_answer_hold_clean_given = true;
+    } else if (key.compare("ANSWER_HOLD_OUTPUT_FILE") == 0) {
+      conf >> answer_hold_output_file;
     } else if (key.compare("SPRAY_HELD_EXPLORATION") == 0) {
       conf >> spray_held_exploration;
     } else if (key.compare("SPRAY_HELD_SENTINEL_INTERVAL_NS") == 0) {
@@ -3025,6 +3091,40 @@ bool ReadConf(string network_configuration) {
     std::cerr << "SPRAY_STRAY_PATH_SEQ is read only with SPRAY_PATH_SEQ on\n";
     return false;
   }
+  if (spray_coverage_first != "on" && spray_coverage_first != "off") {
+    std::cerr << "SPRAY_COVERAGE_FIRST must be on or off\n";
+    return false;
+  }
+  if (spray_coverage_first_given && load_balancing != "spray_uniform") {
+    std::cerr << "SPRAY_COVERAGE_FIRST is read only under LOAD_BALANCING "
+                 "spray_uniform\n";
+    return false;
+  }
+  if (spray_answer_path_seq != "on" && spray_answer_path_seq != "off") {
+    std::cerr << "SPRAY_ANSWER_PATH_SEQ must be on or off\n";
+    return false;
+  }
+  if (spray_answer_path_seq_given &&
+      (load_balancing != "spray_uniform" || !reps_hold() ||
+       spray_path_seq != "on" || ack_route != "spray")) {
+    std::cerr << "SPRAY_ANSWER_PATH_SEQ is read only under ACK_ROUTE spray "
+                 "with SPRAY_PATH_SEQ on and PATH_SELECTOR reps_hold, "
+                 "reps_flow_hold or mrc_hold\n";
+    return false;
+  }
+  if ((spray_answer_probe_interval_ns_given || spray_answer_hold_clean_given ||
+       !answer_hold_output_file.empty()) &&
+      !answer_path_seq()) {
+    std::cerr << "SPRAY_ANSWER_PROBE_INTERVAL_NS, SPRAY_ANSWER_HOLD_CLEAN and "
+                 "ANSWER_HOLD_OUTPUT_FILE are read only with "
+                 "SPRAY_ANSWER_PATH_SEQ on\n";
+    return false;
+  }
+  if (spray_answer_probe_interval_ns == 0 || spray_answer_hold_clean == 0) {
+    std::cerr << "SPRAY_ANSWER_PROBE_INTERVAL_NS and SPRAY_ANSWER_HOLD_CLEAN "
+                 "must be above zero\n";
+    return false;
+  }
   if (!receiver_hold_output_file.empty() && !receiver_hold()) {
     std::cerr << "RECEIVER_HOLD_OUTPUT_FILE is read only with "
                  "SPRAY_RECEIVER_HOLD on\n";
@@ -3155,6 +3255,8 @@ void SetConfig() {
   CustomHeader::ackReceiverHoldBytes = receiver_hold() ? 1 : 0;
   CustomHeader::ackTailNackBytes = tail_recovery() ? 5 : 0;
   CustomHeader::ackRouteSpineBytes = ack_route_spray() ? 1 : 0;
+  CustomHeader::ackAnswerSeqBytes = answer_path_seq() ? 5 : 0;
+  CustomHeader::udpAnswerHoldBytes = answer_path_seq() ? 1 : 0;
 
   // Set Pint
   if (cc_mode == 10) {
@@ -3302,6 +3404,13 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),
   // has one.
   transport_event_totals[{"answer_drop_up", "control"}];
   transport_event_totals[{"answer_drop_down", "control"}];
+  // Written where their key is on.
+  if (spray_coverage_first == "on")
+    transport_event_totals[{"answer_loss_covered", "control"}];
+  if (answer_path_seq())
+    for (const char *event : {"answer_route_lost", "answer_route_hold",
+                              "answer_route_release", "answer_probe"})
+      transport_event_totals[{event, "control"}];
   // The totals must land even when a watchdog exits the run mid-simulation.
   std::atexit(write_transport_event_summary);
   ZSTD_CCtx_setParameter(transport_event_raw_cctx, ZSTD_c_compressionLevel, 8);
@@ -3518,11 +3627,11 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),
               << " spines\n";
     return false;
   }
-  // The switches' state, which leaf_hold and receiver_hold read only for the
-  // hosts' leaves.
+  // The switches' state, which leaf_hold, receiver_hold and
+  // SPRAY_ANSWER_PATH_SEQ read only for the hosts' leaves.
   const Ptr<SwitchQueueState> switch_queues =
       switch_queue_cost() || leaf_hold() || reps_oracle() || receiver_hold() ||
-              ack_route_oracle_on()
+              ack_route_oracle_on() || answer_path_seq()
           ? BuildSwitchQueueState(n)
           : nullptr;
   // One variable for every host, so the draw consumes a single fixed stream.
@@ -3659,6 +3768,14 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),
       rdmaHw->SetAttribute(
           "SprayReceiverTailMissing",
           BooleanValue(spray_receiver_tail_missing == "on"));
+      rdmaHw->SetAttribute("SprayCoverageFirst",
+                           BooleanValue(spray_coverage_first == "on"));
+      rdmaHw->SetAttribute("SprayAnswerPathSeq",
+                           BooleanValue(answer_path_seq()));
+      rdmaHw->SetAttribute("SprayAnswerProbeIntervalNs",
+                           UintegerValue(spray_answer_probe_interval_ns));
+      rdmaHw->SetAttribute("SprayAnswerHoldClean",
+                           UintegerValue(spray_answer_hold_clean));
       rdmaHw->SetAttribute(
           "SprayStrayPathSeq",
           UintegerValue(static_cast<uint32_t>(spray_stray_path_seq == "closed"
@@ -3994,6 +4111,18 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),
       if (n.Get(i)->GetNodeType() == 0)
         n.Get(i)->GetObject<RdmaDriver>()->m_rdma->TraceConnectWithoutContext(
             "RetransmissionTimeout", MakeBoundCallback(&write_rto_event, i));
+  }
+  if (!answer_hold_output_file.empty()) {
+    answer_hold_file = fopen(answer_hold_output_file.c_str(), "w");
+    if (answer_hold_file == nullptr) {
+      std::cerr << "Error: cannot open " << answer_hold_output_file << "\n";
+      return false;
+    }
+    fprintf(answer_hold_file, "time_ns,side,rank,leaf,spine,held\n");
+    for (uint32_t i = 0; i < node_num; i++)
+      if (n.Get(i)->GetNodeType() == 0)
+        n.Get(i)->GetObject<RdmaDriver>()->m_rdma->TraceConnectWithoutContext(
+            "AnswerHold", MakeBoundCallback(&write_answer_hold, i));
   }
   if (!receiver_hold_output_file.empty()) {
     receiver_hold_file = fopen(receiver_hold_output_file.c_str(), "w");

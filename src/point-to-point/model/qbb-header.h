@@ -45,7 +45,9 @@ public:
     FLAG_EDGE_CONGESTED = 5,
     // A repair request names missing path sequences on a spine (SetTailNack)
     // rather than a trimmed byte range.
-    FLAG_TAIL_NACK = 6
+    FLAG_TAIL_NACK = 6,
+    // The answer carries its number on its route spine (SetAnswerSeq).
+    FLAG_ANSWER_NUMBERED = 7
   };
   qbbHeader (uint16_t pg);
   qbbHeader ();
@@ -87,6 +89,10 @@ public:
   // the one its identification names as carrying the data, the default;
   // serialized only while CustomHeader::ackRouteSpineBytes is not zero.
   void SetRouteSpine(uint8_t spine);
+  // The answer's number on its route spine and the count of answers another
+  // route carried (kNoAnswerRoute, 255, for none), and FLAG_ANSWER_NUMBERED;
+  // serialized only while CustomHeader::ackAnswerSeqBytes is not zero.
+  void SetAnswerSeq(uint16_t seq, uint8_t announceRoute, uint16_t announceSeq);
   void SetIntHeader(const IntHeader &_ih);
 
 //Getters
@@ -112,6 +118,10 @@ public:
   uint16_t GetTailSeq() const;
   uint16_t GetTailCount() const;
   uint8_t GetRouteSpine() const;
+  bool IsAnswerNumbered() const;
+  uint16_t GetAnswerSeq() const;
+  uint8_t GetAnnounceRoute() const;
+  uint16_t GetAnnounceSeq() const;
 
   static TypeId GetTypeId (void);
   virtual TypeId GetInstanceTypeId (void) const;
@@ -135,6 +145,9 @@ private:
   uint16_t m_tailSeq;
   uint16_t m_tailCount;
   uint8_t m_routeSpine;
+  uint16_t m_answerSeq;
+  uint8_t m_announceRoute;
+  uint16_t m_announceSeq;
   IntHeader ih;
   
 };

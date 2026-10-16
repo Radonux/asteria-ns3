@@ -16,7 +16,8 @@ namespace ns3 {
 		: sport(0), dport(0), flags(0), m_pg(pg), m_seq(0),
 		  m_trimPayloadSize(0), m_packetSeq(0), m_redirect(0xff),
 		  m_receiverHold(0), m_tailSpine(0), m_tailSeq(0), m_tailCount(0),
-		  m_routeSpine(0xff)
+		  m_routeSpine(0xff), m_answerSeq(0), m_announceRoute(0xff),
+		  m_announceSeq(0)
 	{
 	}
 
@@ -24,7 +25,8 @@ namespace ns3 {
 		: sport(0), dport(0), flags(0), m_pg(0), m_seq(0),
 		  m_trimPayloadSize(0), m_packetSeq(0), m_redirect(0xff),
 		  m_receiverHold(0), m_tailSpine(0), m_tailSeq(0), m_tailCount(0),
-		  m_routeSpine(0xff)
+		  m_routeSpine(0xff), m_answerSeq(0), m_announceRoute(0xff),
+		  m_announceSeq(0)
 	{}
 
 	qbbHeader::~qbbHeader()
@@ -103,6 +105,13 @@ namespace ns3 {
 	void qbbHeader::SetRouteSpine(uint8_t spine){
 		m_routeSpine = spine;
 	}
+	void qbbHeader::SetAnswerSeq(uint16_t seq, uint8_t announceRoute,
+			uint16_t announceSeq){
+		flags |= 1 << FLAG_ANSWER_NUMBERED;
+		m_answerSeq = seq;
+		m_announceRoute = announceRoute;
+		m_announceSeq = announceSeq;
+	}
 	void qbbHeader::SetIntHeader(const IntHeader &_ih){
 		ih = _ih;
 	}
@@ -167,6 +176,18 @@ namespace ns3 {
 	uint8_t qbbHeader::GetRouteSpine() const{
 		return m_routeSpine;
 	}
+	bool qbbHeader::IsAnswerNumbered() const{
+		return (flags >> FLAG_ANSWER_NUMBERED) & 1;
+	}
+	uint16_t qbbHeader::GetAnswerSeq() const{
+		return m_answerSeq;
+	}
+	uint8_t qbbHeader::GetAnnounceRoute() const{
+		return m_announceRoute;
+	}
+	uint16_t qbbHeader::GetAnnounceSeq() const{
+		return m_announceSeq;
+	}
 
 	TypeId
 		qbbHeader::GetTypeId(void)
@@ -196,7 +217,7 @@ namespace ns3 {
 			(CustomHeader::ackCarriesPacketSeq ? sizeof(tmp.m_packetSeq) : 0) +
 			CustomHeader::ackReportBytes + CustomHeader::ackRedirectBytes +
 			CustomHeader::ackReceiverHoldBytes + CustomHeader::ackTailNackBytes +
-			CustomHeader::ackRouteSpineBytes;
+			CustomHeader::ackRouteSpineBytes + CustomHeader::ackAnswerSeqBytes;
 	}
 	void qbbHeader::Serialize(Buffer::Iterator start)  const
 	{
@@ -224,6 +245,11 @@ namespace ns3 {
 		}
 		if (CustomHeader::ackRouteSpineBytes > 0)
 			i.WriteU8(m_routeSpine);
+		if (CustomHeader::ackAnswerSeqBytes > 0){
+			i.WriteU16(m_answerSeq);
+			i.WriteU8(m_announceRoute);
+			i.WriteU16(m_announceSeq);
+		}
 
 		// write IntHeader
 		ih.Serialize(i);
@@ -256,6 +282,11 @@ namespace ns3 {
 		}
 		if (CustomHeader::ackRouteSpineBytes > 0)
 			m_routeSpine = i.ReadU8();
+		if (CustomHeader::ackAnswerSeqBytes > 0){
+			m_answerSeq = i.ReadU16();
+			m_announceRoute = i.ReadU8();
+			m_announceSeq = i.ReadU16();
+		}
 
 		// read IntHeader
 		ih.Deserialize(i);

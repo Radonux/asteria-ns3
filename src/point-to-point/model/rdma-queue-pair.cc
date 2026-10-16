@@ -234,6 +234,9 @@ RdmaQueuePair::RdmaQueuePair(uint16_t pg, Ipv4Address _sip, Ipv4Address _dip, ui
 	m_ack_loss_declared = 0;
 	m_tail_nacks_ignored = 0;
 	m_copyDeadlineRtts = 0;
+	m_coverageFirst = false;
+	m_answerCoverage = 0;
+	m_covered_answer_losses = 0;
 	m_exploration_copies = 0;
 	m_exploration_copies_lost = 0;
 	m_timeouts = 0;
@@ -435,8 +438,13 @@ uint64_t RdmaQueuePair::AcknowledgePacket(uint64_t seq, uint16_t path){
 	uint64_t lost = 0;
 	for (uint64_t older = m_outstanding.OlderOnPath(packet);
 			older != OutstandingPackets::kNone;
-			older = m_outstanding.OlderOnPath(packet))
-		lost += DeclareLost(older);
+			older = m_outstanding.OlderOnPath(packet)){
+		// Delivered, as its coverage shows: the answer is what was lost.
+		if (CoveredAnswerLoss(m_outstanding.Seq(older), m_outstanding.Size(older)))
+			m_outstanding.Remove(older);
+		else
+			lost += DeclareLost(older);
+	}
 	const uint64_t nowNs = Simulator::Now().GetNanoSeconds();
 	// The answer of a resend may be that of the send declared lost before
 	// it, so only a first send's answer is told as a trickle send's.
@@ -475,8 +483,13 @@ bool RdmaQueuePair::AcknowledgeCopy(uint64_t seq, uint16_t path,
 	for (uint64_t older = m_outstanding.NewestOnPath(path);
 			older != OutstandingPackets::kNone;){
 		const uint64_t next = m_outstanding.OlderOnPath(older);
-		if (m_outstanding.SentNs(older) < sentNs)
-			lost += DeclareLost(older);
+		if (m_outstanding.SentNs(older) < sentNs){
+			if (CoveredAnswerLoss(m_outstanding.Seq(older),
+					m_outstanding.Size(older)))
+				m_outstanding.Remove(older);
+			else
+				lost += DeclareLost(older);
+		}
 		older = next;
 	}
 	if (trickle)
@@ -516,6 +529,14 @@ void RdmaQueuePair::DeclareCopyLost(
 		std::map<uint64_t, ExplorationCopy>::iterator copy, uint64_t nowNs){
 	const uint16_t path = copy->second.path;
 	const bool trickle = copy->second.trickle;
+	// Its sequence delivered, by its data send's answer or cumulatively.
+	if (m_coverageFirst && (copy->second.dataAcknowledged ||
+			copy->first + copy->second.size <=
+				std::max<uint64_t>(snd_una, m_answerCoverage))){
+		CountCoveredAnswerLoss();
+		m_copies.erase(copy);
+		return;
+	}
 	m_copies.erase(copy);
 	m_exploration_copies_lost++;
 	m_pathSelector->OnLoss(path, nowNs);
@@ -555,6 +576,11 @@ uint64_t RdmaQueuePair::DeclareLostOnPathSeqs(uint16_t path, uint16_t first,
 	uint64_t lost = 0;
 	// Oldest first, as the per-path rule declares them.
 	for (auto send = named.rbegin(); send != named.rend(); ++send){
+		if (CoveredAnswerLoss(m_outstanding.Seq(*send),
+				m_outstanding.Size(*send))){
+			m_outstanding.Remove(*send);
+			continue;
+		}
 		if (deferred)
 			deferred->push_back(DeclaredSend{m_outstanding.Seq(*send),
 				m_outstanding.Path(*send), m_outstanding.Trickle(*send)});
@@ -572,6 +598,10 @@ uint64_t RdmaQueuePair::DeclareHeldSendLost(uint64_t seq, uint16_t path,
 	if (packet == OutstandingPackets::kNone ||
 			m_outstanding.SentNs(packet) != sentNs || !m_outstanding.Held(packet))
 		return 0;
+	if (CoveredAnswerLoss(seq, m_outstanding.Size(packet))){
+		m_outstanding.Remove(packet);
+		return 0;
+	}
 	m_held_declared_lost++;
 	return DeclareLost(packet);
 }
@@ -597,6 +627,11 @@ uint32_t RdmaQueuePair::DeclareAckLosses(uint64_t nowNs, uint64_t delayNs){
 			m_covered.front().coveredNs + delayNs <= nowNs){
 		const OutstandingPackets::Unanswered send = m_covered.front().send;
 		m_covered.pop_front();
+		// Covered, so delivered: an answer loss and no loss on its path.
+		if (m_coverageFirst){
+			CountCoveredAnswerLoss();
+			continue;
+		}
 		m_pathSelector->OnLoss(send.path, nowNs);
 		if (send.trickle)
 			m_pathSelector->OnTrickleAnswer(send.path, true, nowNs);
@@ -604,6 +639,20 @@ uint32_t RdmaQueuePair::DeclareAckLosses(uint64_t nowNs, uint64_t delayNs){
 	}
 	m_ack_loss_declared += declared;
 	return declared;
+}
+
+void RdmaQueuePair::CountCoveredAnswerLoss(){
+	m_covered_answer_losses++;
+	if (!m_coveredAnswerLoss.IsNull())
+		m_coveredAnswerLoss();
+}
+
+bool RdmaQueuePair::CoveredAnswerLoss(uint64_t seq, uint64_t size){
+	if (!m_coverageFirst ||
+			seq + size > std::max<uint64_t>(snd_una, m_answerCoverage))
+		return false;
+	CountCoveredAnswerLoss();
+	return true;
 }
 
 uint32_t RdmaQueuePair::DeclareLost(uint64_t packet, bool report){

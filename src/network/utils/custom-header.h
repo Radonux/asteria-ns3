@@ -161,6 +161,10 @@ public:
 		  // the queue pair has sent up k, this one included.
 		  uint8_t tail_flags;
 		  uint16_t tail_counts[kMaxTailCounts];
+		  // Under answer path sequences, after the tail fields, only while
+		  // udpAnswerHoldBytes is not zero: the route spines the sender holds
+		  // for the answers of the destination's leaf, bit k for spine k.
+		  uint8_t answer_hold;
 	  } udp;
 	  // CnHeader
 	  struct {
@@ -203,6 +207,13 @@ public:
 		  // carrying spine its identification names. On the wire, after the
 		  // tail fields, only while ackRouteSpineBytes is not zero.
 		  uint8_t route_spine;
+		  // Under answer path sequences, after route_spine, only while
+		  // ackAnswerSeqBytes is not zero: the answer's number on its route
+		  // spine, and another route spine and its count of the queue pair's
+		  // answers (255 for none).
+		  uint16_t answer_seq;
+		  uint8_t announce_route;
+		  uint16_t announce_seq;
 		  IntHeader ih;
 	  } ack;
 	  // PauseHeader
@@ -239,6 +250,13 @@ public:
   // How many bytes the route_spine field takes, zero or one. Process-wide
   // for the same reason.
   static uint32_t ackRouteSpineBytes;
+  // How many bytes the answer path sequence fields take, zero or five.
+  // Process-wide for the same reason.
+  static uint32_t ackAnswerSeqBytes;
+  // How many bytes the answer_hold field of data headers takes, zero or one;
+  // it follows the path sequence, which it needs. Process-wide for the same
+  // reason.
+  static uint32_t udpAnswerHoldBytes;
   static uint32_t GetUdpTailBytes(void);
 
   uint8_t GetIpv4EcnBits (void) const;

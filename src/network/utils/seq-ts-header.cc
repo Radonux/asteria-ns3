@@ -37,7 +37,8 @@ SeqTsHeader::SeqTsHeader()
       m_ts(Simulator::Now().GetTimeStep()),
       m_pathSeq(0),
       m_tailFlags(0),
-      m_tailCounts{}
+      m_tailCounts{},
+      m_answerHold(0)
 {
     NS_LOG_FUNCTION(this);
     if (IntHeader::mode == 1)
@@ -97,6 +98,18 @@ SeqTsHeader::SetTail (uint8_t flags, const uint16_t* counts, uint32_t n)
 		m_tailCounts[k] = k < n ? counts[k] : 0;
 }
 
+void
+SeqTsHeader::SetAnswerHold (uint8_t bitmap)
+{
+	m_answerHold = bitmap;
+}
+
+uint8_t
+SeqTsHeader::GetAnswerHold (void) const
+{
+	return m_answerHold;
+}
+
 uint8_t
 SeqTsHeader::GetTailFlags (void) const
 {
@@ -141,7 +154,8 @@ SeqTsHeader::GetSerializedSize() const
 
 uint32_t SeqTsHeader::GetHeaderSize(void){
 	return 6 + IntHeader::GetStaticSize() +
-		(CustomHeader::udpCarriesPathSeq ? sizeof(uint16_t) : 0) +
+		(CustomHeader::udpCarriesPathSeq
+			? sizeof(uint16_t) + CustomHeader::udpAnswerHoldBytes : 0) +
 		CustomHeader::GetUdpTailBytes();
 }
 
@@ -165,6 +179,8 @@ SeqTsHeader::Serialize(Buffer::Iterator start) const
             for (uint32_t k = 0; k < CustomHeader::udpTailCounts; k++)
                 i.WriteHtonU16(m_tailCounts[k]);
         }
+        if (CustomHeader::udpAnswerHoldBytes > 0)
+            i.WriteU8(m_answerHold);
     }
 }
 
@@ -188,6 +204,8 @@ SeqTsHeader::Deserialize(Buffer::Iterator start)
             for (uint32_t k = 0; k < CustomHeader::udpTailCounts; k++)
                 m_tailCounts[k] = i.ReadNtohU16();
         }
+        if (CustomHeader::udpAnswerHoldBytes > 0)
+            m_answerHold = i.ReadU8();
     }
     return GetSerializedSize ();
 }
