@@ -1086,25 +1086,40 @@ void record_host_transport_event(const char *event, uint64_t bytes) {
   accumulate_transport_event(event, plane, bytes);
 }
 
+// The totals of a device's per-packet event, by the addresses of the literals
+// naming the event and its plane: written on every hop of every packet, they
+// are found by two pointers rather than by building and comparing strings.
+map<pair<const char *, const char *>, pair<uint64_t, uint64_t> *>
+    transport_event_totals_by_literal;
+
 void write_transport_event(const char *event, Ptr<QbbNetDevice> dev,
                            Ptr<const Packet> packet, uint32_t protocol,
                            int32_t queue) {
+  // The totals need the IP header alone; the transport header is read for a
+  // row of the raw stream.
+  CustomHeader ip(CustomHeader::L2_Header | CustomHeader::L3_Header);
+  packet->PeekHeader(ip);
+  // A trimmed packet rides the UDP protocol number but carries no payload, so
+  // it is reported on the control plane alongside ACKs and NACKs.
+  const bool payload_bearing =
+      protocol == 0x11 && !IsUetTrimmedDscp(ip.GetIpv4Dscp());
+  const char *plane = payload_bearing ? "data" : "control";
+  auto &totals = transport_event_totals_by_literal[{event, plane}];
+  if (totals == nullptr)
+    totals = &transport_event_totals[{event, plane}];
+  totals->first += 1;
+  totals->second += packet->GetSize();
+  maybe_flush_transport_event_outputs();
+  if (transport_event_raw_cctx == nullptr)
+    return;
+  const uint32_t source = ip_to_node_id(Ipv4Address(ip.sip));
+  const uint32_t destination = ip_to_node_id(Ipv4Address(ip.dip));
+  if (!transport_event_traced(source, destination))
+    return;
   CustomHeader ch(CustomHeader::L2_Header | CustomHeader::L3_Header |
                   CustomHeader::L4_Header);
   ch.getInt = 1;
   packet->PeekHeader(ch);
-  // A trimmed packet rides the UDP protocol number but carries no payload, so
-  // it is reported on the control plane alongside ACKs and NACKs.
-  const bool payload_bearing =
-      protocol == 0x11 && !IsUetTrimmedDscp(ch.GetIpv4Dscp());
-  accumulate_transport_event(event, payload_bearing ? "data" : "control",
-                             packet->GetSize());
-  if (transport_event_raw_cctx == nullptr)
-    return;
-  const uint32_t source = ip_to_node_id(Ipv4Address(ch.sip));
-  const uint32_t destination = ip_to_node_id(Ipv4Address(ch.dip));
-  if (!transport_event_traced(source, destination))
-    return;
   uint16_t source_port = 0;
   uint32_t sequence = 0;
   if (protocol == 0x11) {
