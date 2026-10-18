@@ -689,13 +689,21 @@ public:
 	// pairs, or under PathSelector 7 in marks of its own.
 	bool m_sprayReceiverHold;
 	uint32_t m_sprayReceiverHoldClean;
+	// Under SprayReceiverHoldSlots, per sender leaf the spine a partial
+	// list toward it names next from.
+	uint32_t m_sprayReceiverHoldSlots;
+	std::unordered_map<uint32_t, uint32_t> m_receiverHoldNext;
 	std::unique_ptr<ReceiverHold> m_receiverHold;
 	std::shared_ptr<ReceiverHoldMarks> m_receiverHoldMarks;
 	bool IsReceiverHold() const;
 	bool ValidReceiverHold() const;
 	ReceiverHold &ReceiverHoldOf();
-	// The receiver_hold field of an answer to the host at senderIp.
+	// The spines held for the leaf of the host at senderIp.
 	SpineBitmap ReceiverHoldBitmap(uint32_t senderIp) const;
+	// The receiver_hold field of an answer to the host at senderIp: the
+	// held spines, or over SprayReceiverHoldSlots of them that many, named
+	// in turn toward its leaf, and partial.
+	SpineBitmap ReceiverHoldReport(uint32_t senderIp, bool &partial);
 	// Give qp's selector the marks it holds by.
 	void AttachReceiverHold(Ptr<RdmaQueuePair> qp);
 	// The ReceiverHoldInterval trace source: the host's ReceiverHold closed an

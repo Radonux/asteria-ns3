@@ -7838,7 +7838,7 @@ class MrcHoldExplorationTest : public TestCase
         MrcHoldSelector selector(SelectorStream(), kSpines, 1000, 2000, hold);
         selector.SetReceiverHold(std::make_shared<ReceiverHoldMarks>(kSpines, kSentinelNs),
                                  kReceiverLeaf);
-        selector.OnReceiverHold(100, SpineBitmap::FromByte(0x08), 0);
+        selector.OnReceiverHold(100, SpineBitmap::FromByte(0x08), false, 0);
         Sends sends = Draw(selector, 0, 400);
         NS_TEST_EXPECT_MSG_EQ(sends.live[3], 0u, which + "the held spine leaves MRC's choices");
         NS_TEST_EXPECT_MSG_EQ(sends.explorations, 0u, which + "no sentinel before its interval");
@@ -7848,7 +7848,7 @@ class MrcHoldExplorationTest : public TestCase
         NS_TEST_EXPECT_MSG_EQ(sends.live[3], duplicate ? 0u : 1u, which + "one sentinel on 3");
         NS_TEST_EXPECT_MSG_EQ(sends.copies[3], duplicate ? 1u : 0u, which + "a copy under duplicate");
         NS_TEST_EXPECT_MSG_EQ(sends.explorations, duplicate ? 0u : 1u, which + "the data's flag");
-        selector.OnReceiverHold(100, SpineBitmap(), 2 * kSentinelNs);
+        selector.OnReceiverHold(100, SpineBitmap(), false, 2 * kSentinelNs);
         sends = Draw(selector, 2 * kSentinelNs, 400);
         NS_TEST_EXPECT_MSG_GT(sends.live[3], 10u, which + "a clear bit returns it to MRC");
     }
@@ -10644,9 +10644,9 @@ class SpineCountTest : public TestCase
         hold.OnArrival(0, 255, 1, false, 0);
         NS_TEST_EXPECT_MSG_EQ((hold.Bitmap(0) == Of({255})), true, "a receiver holds spine 255");
         ReceiverHoldMarks marks(256, 1000);
-        marks.OnBitmap(4, 100, Of({255}));
+        marks.OnBitmap(4, 100, Of({255}), false);
         NS_TEST_EXPECT_MSG_EQ(marks.Holds(4, 255), true, "and its sender reads the hold");
-        marks.OnBitmap(4, 100, SpineBitmap());
+        marks.OnBitmap(4, 100, SpineBitmap(), false);
         NS_TEST_EXPECT_MSG_EQ(marks.Holds(4, 255), false, "and its release");
 
         AnswerHoldReports reports(256);
@@ -11598,6 +11598,7 @@ class SprayReceiverHoldTest : public TestCase
 
         Unit();
         Transport();
+        Slots();
 
         CustomHeader::ackReceiverHoldBytes = savedHoldBytes;
         CustomHeader::udpCarriesPathSeq = savedPathSeq;
@@ -11643,11 +11644,11 @@ class SprayReceiverHoldTest : public TestCase
         NS_TEST_EXPECT_MSG_EQ(hold.LossLeaves(5), 0u, "and clear its leaves");
 
         ReceiverHoldMarks marks(kSpines, kSentinelNs);
-        marks.OnBitmap(4, 100, SpineBitmap::FromByte(0x08));
-        marks.OnBitmap(4, 101, SpineBitmap::FromByte(0x08));
-        marks.OnBitmap(4, 100, SpineBitmap());
+        marks.OnBitmap(4, 100, SpineBitmap::FromByte(0x08), false);
+        marks.OnBitmap(4, 101, SpineBitmap::FromByte(0x08), false);
+        marks.OnBitmap(4, 100, SpineBitmap(), false);
         NS_TEST_EXPECT_MSG_EQ(marks.Holds(4, 3), true, "held while one receiver holds it");
-        marks.OnBitmap(4, 101, SpineBitmap());
+        marks.OnBitmap(4, 101, SpineBitmap(), false);
         NS_TEST_EXPECT_MSG_EQ(marks.Holds(4, 3), false, "and released by the last of them");
     }
 
@@ -11849,18 +11850,124 @@ class SprayReceiverHoldTest : public TestCase
             }
             Ptr<RdmaQueuePair> flow = sender.host.AddSender(a1, r, 1000000000);
             hw->AttachReceiverHold(flow);
-            flow->m_pathSelector->OnReceiverHold(r.Get(), SpineBitmap::FromByte(0x08), 0);
+            flow->m_pathSelector->OnReceiverHold(r.Get(), SpineBitmap::FromByte(0x08), false, 0);
             drawn = Draws(flow, 0, 400);
             NS_TEST_EXPECT_MSG_EQ(drawn[3], 0u, "a set bit holds the spine under every scope");
             drawn = Draws(flow, 1000000, 400);
             NS_TEST_EXPECT_MSG_EQ(drawn[3], 1u, "and sends it one sentinel per interval");
-            flow->m_pathSelector->OnReceiverHold(r.Get(), SpineBitmap(), 2000000);
+            flow->m_pathSelector->OnReceiverHold(r.Get(), SpineBitmap(), false, 2000000);
             drawn = Draws(flow, 2000000, 400);
             NS_TEST_EXPECT_MSG_GT(drawn[3], 10u, "a clear bit releases it");
         }
     }
 
     static constexpr uint32_t kFlowHold = 99;
+
+    // Under SprayReceiverHoldSlots the acknowledgement names the held spines
+    // in a list of that many slots. Holding more, the receiver names that
+    // many in turn and marks the list partial; its sender adds the spines a
+    // partial list names, releases none, and releases by a complete list.
+    void Slots()
+    {
+        auto of = [](std::initializer_list<uint32_t> spines) {
+            SpineBitmap bitmap;
+            for (const uint32_t k : spines)
+            {
+                bitmap.Set(k);
+            }
+            return bitmap;
+        };
+        uint8_t list[SpineListBytes(8)];
+        of({3, 6, 7}).ToList(list, 8, false);
+        NS_TEST_EXPECT_MSG_EQ((list[0] == 3 && list[1] == 3 && list[2] == 6 && list[3] == 7 &&
+                               list[4] == 0 && list[8] == 0),
+                              true,
+                              "a list holds its count and the spines in order");
+        bool partial = true;
+        NS_TEST_EXPECT_MSG_EQ((SpineBitmap::FromList(list, 8, partial) == of({3, 6, 7}) && !partial),
+                              true,
+                              "and reads back complete");
+        of({3, 6, 7}).ToList(list, 2, true);
+        NS_TEST_EXPECT_MSG_EQ((list[0] == 0x82 && SpineBitmap::FromList(list, 2, partial) == of({3, 6}) &&
+                               partial),
+                              true,
+                              "a partial list names its lowest spines and reads back partial");
+        NS_TEST_EXPECT_MSG_EQ(of({3, 6, 7}).Count(), 3u, "a bitmap counts its spines");
+
+        const uint32_t savedSlots = CustomHeader::ackReceiverHoldSlots;
+        const uint32_t savedBytes = CustomHeader::ackReceiverHoldBytes;
+        CustomHeader::ackReceiverHoldBytes = 0;
+        const uint32_t without = qbbHeader().GetSerializedSize();
+        CustomHeader::ackReceiverHoldSlots = 2;
+        CustomHeader::ackReceiverHoldBytes = SpineListBytes(2);
+        NS_TEST_EXPECT_MSG_EQ(qbbHeader().GetSerializedSize(),
+                              without + 3,
+                              "two slots take three bytes");
+
+        const Ipv4Address a("11.0.1.1"), r("11.0.2.1");
+        Ptr<SwitchQueueState> leaves = Create<SwitchQueueState>(2, kSpines);
+        leaves->SetLeafOf(a.Get(), 0);
+        leaves->SetLeafOf(r.Get(), 1);
+        Host receiver(r, {a}, leaves);
+        Host sender(a, {r}, leaves);
+        receiver.host.hw->m_sprayReceiverHoldSlots = 2;
+        sender.host.hw->m_sprayReceiverHoldSlots = 2;
+        NS_TEST_EXPECT_MSG_EQ(receiver.host.hw->ValidReceiverHold(), true, "two slots accepted");
+        CustomHeader::ackReceiverHoldBytes = SpineBitmapBytes(kSpines);
+        NS_TEST_EXPECT_MSG_EQ(receiver.host.hw->ValidReceiverHold(),
+                              false,
+                              "refused with the bitmap's bytes");
+        CustomHeader::ackReceiverHoldBytes = SpineListBytes(2);
+        Ptr<RdmaQueuePair> qp = sender.host.AddSender(a, r, 1000000000);
+        sender.host.hw->AttachReceiverHold(qp);
+        std::map<uint8_t, uint16_t> pathSeq;
+        uint32_t seq = 0;
+        auto deliver = [&](uint8_t spine, uint16_t skip = 0) {
+            uint16_t& next = pathSeq[spine];
+            next += skip;
+            seq += IsolatedHost::kMtu;
+            const uint8_t held = Deliver(receiver, sender, seq, spine, next++);
+            return std::make_pair(held, receiver.host.emitted.back().ack.receiver_hold_partial);
+        };
+        auto senderHolds = [&](uint32_t spine) {
+            return sender.host.hw->m_receiverHoldMarks->Holds(1, spine);
+        };
+        deliver(1);
+        deliver(1, 1);
+        deliver(3);
+        NS_TEST_EXPECT_MSG_EQ((deliver(3, 1) == std::make_pair(uint8_t{0x0a}, false)),
+                              true,
+                              "two held spines fit the list");
+        deliver(5);
+        NS_TEST_EXPECT_MSG_EQ((deliver(5, 1) == std::make_pair(uint8_t{0x0a}, true)),
+                              true,
+                              "over it the list names spines 1 and 3, partial");
+        NS_TEST_EXPECT_MSG_EQ(senderHolds(5), false, "spine 5 not yet named");
+        NS_TEST_EXPECT_MSG_EQ((deliver(1) == std::make_pair(uint8_t{0x22}, true)),
+                              true,
+                              "the next names 5 and wraps to 1");
+        NS_TEST_EXPECT_MSG_EQ((senderHolds(1) && senderHolds(3) && senderHolds(5)),
+                              true,
+                              "and the sender holds all three, spine 3 unnamed");
+        NS_TEST_EXPECT_MSG_EQ((deliver(1) == std::make_pair(uint8_t{0x28}, true)),
+                              true,
+                              "then 3 and 5");
+        // Clean arrivals on spine 3 release it at the receiver; the complete
+        // list that follows releases it at the sender.
+        std::pair<uint8_t, bool> report;
+        for (uint32_t i = 0; i < kClean; ++i)
+        {
+            report = deliver(3);
+        }
+        NS_TEST_EXPECT_MSG_EQ((report == std::make_pair(uint8_t{0x22}, false)),
+                              true,
+                              "with spine 3 released the list is complete");
+        NS_TEST_EXPECT_MSG_EQ((senderHolds(1) && !senderHolds(3) && senderHolds(5)),
+                              true,
+                              "and the sender releases spine 3");
+        CustomHeader::ackReceiverHoldSlots = savedSlots;
+        CustomHeader::ackReceiverHoldBytes = savedBytes;
+    }
 };
 
 class SprayReceiverHoldTraceTest : public TestCase
@@ -12283,9 +12390,12 @@ class ForcedChoiceSelector : public PathSelector
         m_inner->OnRedirect(spine, carrying, nowNs);
     }
 
-    void OnReceiverHold(uint32_t receiver, const SpineBitmap& bitmap, uint64_t nowNs) override
+    void OnReceiverHold(uint32_t receiver,
+                        const SpineBitmap& bitmap,
+                        bool partial,
+                        uint64_t nowNs) override
     {
-        m_inner->OnReceiverHold(receiver, bitmap, nowNs);
+        m_inner->OnReceiverHold(receiver, bitmap, partial, nowNs);
     }
 
     void SetReceiverHold(std::shared_ptr<ReceiverHoldMarks> marks, uint32_t leaf) override

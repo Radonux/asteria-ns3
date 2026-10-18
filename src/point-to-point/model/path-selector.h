@@ -277,9 +277,10 @@ public:
 	// answers, before the answer itself is told.
 	virtual void OnRedirect(uint16_t spine, uint8_t carrying, uint64_t nowNs);
 	// An acknowledgement's receiver_hold bitmap from receiver, before the
-	// answer itself is told.
+	// answer itself is told; partial for a partial spine list, which adds
+	// the spines it names and releases none.
 	virtual void OnReceiverHold(uint32_t receiver, const SpineBitmap &bitmap,
-		uint64_t nowNs);
+		bool partial, uint64_t nowNs);
 	// Under SprayReceiverHold, the marks of the receivers on the destination's
 	// leaf, which a selector with a loss hold holds spines by; others ignore
 	// them.
@@ -309,7 +310,7 @@ public:
 	void OnReport(const SpineReport &report, uint64_t nowNs) override;
 	void OnRedirect(uint16_t spine, uint8_t carrying, uint64_t nowNs) override;
 	void OnReceiverHold(uint32_t receiver, const SpineBitmap &bitmap,
-		uint64_t nowNs) override;
+		bool partial, uint64_t nowNs) override;
 	void SetReceiverHold(std::shared_ptr<ReceiverHoldMarks> marks,
 		uint32_t leaf) override;
 
@@ -945,7 +946,8 @@ public:
 	// sentinels where the loss hold does not hold them.
 	void SetReceiverHold(std::shared_ptr<ReceiverHoldMarks> marks,
 		uint32_t leaf);
-	void OnReceiverHold(uint32_t receiver, const SpineBitmap &bitmap);
+	void OnReceiverHold(uint32_t receiver, const SpineBitmap &bitmap,
+		bool partial);
 
 private:
 	bool TakeHoldSentinel(uint64_t nowNs, uint8_t &spine);
@@ -1002,7 +1004,7 @@ public:
 	void SetReceiverHold(std::shared_ptr<ReceiverHoldMarks> marks,
 		uint32_t leaf) override;
 	void OnReceiverHold(uint32_t receiver, const SpineBitmap &bitmap,
-		uint64_t nowNs) override;
+		bool partial, uint64_t nowNs) override;
 
 protected:
 	bool Excluded(uint16_t path) const override;
@@ -1206,7 +1208,7 @@ public:
 	void SetReceiverHold(std::shared_ptr<ReceiverHoldMarks> marks,
 		uint32_t leaf) override;
 	void OnReceiverHold(uint32_t receiver, const SpineBitmap &bitmap,
-		uint64_t nowNs) override;
+		bool partial, uint64_t nowNs) override;
 
 protected:
 	bool Excluded(uint16_t path) const override;

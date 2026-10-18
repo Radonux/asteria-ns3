@@ -34,6 +34,7 @@ uint32_t CustomHeader::ackReportBytes = 0;
 uint32_t CustomHeader::ackRedirectBytes = 0;
 bool CustomHeader::udpCarriesPathSeq = false;
 uint32_t CustomHeader::ackReceiverHoldBytes = 0;
+uint32_t CustomHeader::ackReceiverHoldSlots = 0;
 uint32_t CustomHeader::udpTailCounts = 0;
 uint32_t CustomHeader::ackTailNackBytes = 0;
 uint32_t CustomHeader::ackRouteSpineBytes = 0;
@@ -208,7 +209,12 @@ void CustomHeader::Serialize (Buffer::Iterator start) const{
 			  i.WriteU8(ack.redirect == 0xffff ? 0xff : static_cast<uint8_t>(ack.redirect));
 		  else if (ackRedirectBytes == 2)
 			  i.WriteU16(ack.redirect);
-		  if (ackReceiverHoldBytes > 0)
+		  if (ackReceiverHoldSlots > 0){
+			  uint8_t list[SpineListBytes(kMaxSpineListSlots)];
+			  SpineBitmap::FromBytes(ack.receiver_hold, kSpineBitmapBytes)
+				  .ToList(list, ackReceiverHoldSlots, ack.receiver_hold_partial);
+			  i.Write(list, ackReceiverHoldBytes);
+		  }else if (ackReceiverHoldBytes > 0)
 			  i.Write(ack.receiver_hold, ackReceiverHoldBytes);
 		  if (ackTailNackBytes > 0){
 			  i.WriteU8(ack.tail_spine);
@@ -389,7 +395,14 @@ CustomHeader::Deserialize (Buffer::Iterator start)
 			  ack.redirect = redirect == 0xff ? 0xffff : redirect;
 		  }else if (ackRedirectBytes == 2)
 			  ack.redirect = i.ReadU16();
-		  if (ackReceiverHoldBytes > 0)
+		  ack.receiver_hold_partial = false;
+		  if (ackReceiverHoldSlots > 0){
+			  uint8_t list[SpineListBytes(kMaxSpineListSlots)];
+			  i.Read(list, ackReceiverHoldBytes);
+			  SpineBitmap::FromList(list, ackReceiverHoldSlots,
+				  ack.receiver_hold_partial).ToBytes(ack.receiver_hold,
+					  kSpineBitmapBytes);
+		  }else if (ackReceiverHoldBytes > 0)
 			  i.Read(ack.receiver_hold, ackReceiverHoldBytes);
 		  if (ackTailNackBytes > 0){
 			  ack.tail_spine = i.ReadU8();

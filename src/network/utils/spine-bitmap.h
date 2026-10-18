@@ -2,6 +2,7 @@
 #define SPINE_BITMAP_H
 
 #include <array>
+#include <bit>
 #include <cstdint>
 
 namespace ns3 {
@@ -22,6 +23,17 @@ constexpr uint32_t SpineBitmapBytes(uint32_t spines){
 // one, with 255 for none, below 256 spines, else two, with 0xffff.
 constexpr uint32_t SpineFieldBytes(uint32_t spines){
 	return spines <= 255 ? 1 : 2;
+}
+
+// The most spines a spine list names: its count takes the low seven bits of
+// its first byte.
+constexpr uint32_t kMaxSpineListSlots = 127;
+
+// The bytes a spine list of slots slots takes on the wire: a byte of the
+// count, its top bit set for a partial list, then a byte per slot, the first
+// count of them the spines named in ascending order and the rest zero.
+constexpr uint32_t SpineListBytes(uint32_t slots){
+	return 1 + slots;
 }
 
 // A set of spines, bit k for spine k, as a header's bitmap fields carry it:
@@ -45,6 +57,34 @@ public:
 	void ToBytes(uint8_t *bytes, uint32_t count) const{
 		for (uint32_t i = 0; i < count && i < kSpineBitmapBytes; i++)
 			bytes[i] = m_bytes[i];
+	}
+	// The spine list of slots slots (SpineListBytes) naming its lowest slots
+	// spines, partial or not.
+	void ToList(uint8_t *bytes, uint32_t slots, bool partial) const{
+		uint32_t count = 0;
+		for (uint32_t k = 0; k < kMaxSpineCount && count < slots; k++)
+			if (Test(k))
+				bytes[1 + count++] = static_cast<uint8_t>(k);
+		for (uint32_t i = 1 + count; i < 1 + slots; i++)
+			bytes[i] = 0;
+		bytes[0] = static_cast<uint8_t>(count | (partial ? 0x80u : 0u));
+	}
+	// The spines a spine list of slots slots names, and whether it is
+	// partial.
+	static SpineBitmap FromList(const uint8_t *bytes, uint32_t slots,
+			bool &partial){
+		SpineBitmap bitmap;
+		partial = (bytes[0] & 0x80) != 0;
+		const uint32_t count = bytes[0] & 0x7f;
+		for (uint32_t i = 0; i < count && i < slots; i++)
+			bitmap.Set(bytes[1 + i]);
+		return bitmap;
+	}
+	uint32_t Count() const{
+		uint32_t count = 0;
+		for (const uint8_t byte : m_bytes)
+			count += std::popcount(byte);
+		return count;
 	}
 	bool Test(uint32_t spine) const{
 		return spine < kMaxSpineCount && ((m_bytes[spine / 8] >> (spine % 8)) & 1);

@@ -203,8 +203,12 @@ public:
 		  uint16_t redirect;
 		  // The spines the receiving host holds for the sender's leaf, bit k
 		  // of byte k / 8 for spine k. On the wire, after the redirect field,
-		  // ackReceiverHoldBytes of it, only while that is not zero.
+		  // ackReceiverHoldBytes of it, only while that is not zero: the
+		  // bitmap, or under ackReceiverHoldSlots the spine list naming them.
 		  uint8_t receiver_hold[kSpineBitmapBytes];
+		  // Whether that spine list is partial, naming some of the held
+		  // spines only; false for the bitmap.
+		  bool receiver_hold_partial;
 		  // A tail repair request (qbbHeader::FLAG_TAIL_NACK): the spine,
 		  // the first path sequence missing on it and how many from there.
 		  // On the wire, after receiver_hold, only while ackTailNackBytes is
@@ -249,9 +253,13 @@ public:
   // Whether data headers carry udp.path_seq. Process-wide for the same
   // reason.
   static bool udpCarriesPathSeq;
-  // How many bytes the receiver_hold field takes, zero or SpineBitmapBytes
-  // of the spines. Process-wide for the same reason.
+  // How many bytes the receiver_hold field takes, zero, SpineBitmapBytes of
+  // the spines or SpineListBytes of ackReceiverHoldSlots. Process-wide for
+  // the same reason.
   static uint32_t ackReceiverHoldBytes;
+  // The slots of the spine list the receiver_hold field takes, zero for the
+  // bitmap. Process-wide for the same reason.
+  static uint32_t ackReceiverHoldSlots;
   // How many per-spine counts the tail fields of data headers carry, zero
   // for none; the fields take 1 + 2 * udpTailCounts bytes, or over more
   // than kFixedTailCounts spines the flags byte alone where they do not

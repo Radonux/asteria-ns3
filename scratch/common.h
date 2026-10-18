@@ -560,6 +560,14 @@ std::string spray_receiver_hold = "off";
 bool spray_receiver_hold_given = false;
 uint32_t spray_receiver_hold_clean = 1024;
 bool spray_receiver_hold_clean_given = false;
+// With SPRAY_RECEIVER_HOLD on, SPRAY_RECEIVER_HOLD_SLOTS n: the
+// acknowledgement's receiver_hold field is a list of n spine bytes after a
+// count byte instead of the bitmap over every spine, so it does not grow with
+// the spines. Holding more than n spines toward a sender leaf, the receiver
+// names n of them, in turn from past the last one it named, and marks the
+// list partial; a sender adds the spines a partial list names and releases
+// none until a complete list. 0, the default, keeps the bitmap; at most 127.
+uint32_t spray_receiver_hold_slots = 0;
 // With SPRAY_RECEIVER_HOLD and SPRAY_TAIL_RECOVERY on,
 // SPRAY_RECEIVER_TAIL_MISSING on: the receiving host's hold also counts as
 // missing, for the sender's leaf on their requested spine, the path sequences
@@ -2853,6 +2861,8 @@ bool ReadConf(string network_configuration) {
     } else if (key.compare("SPRAY_RECEIVER_HOLD_CLEAN") == 0) {
       conf >> spray_receiver_hold_clean;
       spray_receiver_hold_clean_given = true;
+    } else if (key.compare("SPRAY_RECEIVER_HOLD_SLOTS") == 0) {
+      conf >> spray_receiver_hold_slots;
     } else if (key.compare("SPRAY_RECEIVER_TAIL_MISSING") == 0) {
       conf >> spray_receiver_tail_missing;
       spray_receiver_tail_missing_given = true;
@@ -3500,6 +3510,16 @@ bool ReadConf(string network_configuration) {
     std::cerr << "SPRAY_RECEIVER_HOLD_CLEAN must be above zero\n";
     return false;
   }
+  if (spray_receiver_hold_slots > 0 && !receiver_hold()) {
+    std::cerr << "SPRAY_RECEIVER_HOLD_SLOTS is read only with "
+                 "SPRAY_RECEIVER_HOLD on\n";
+    return false;
+  }
+  if (spray_receiver_hold_slots > kMaxSpineListSlots) {
+    std::cerr << "SPRAY_RECEIVER_HOLD_SLOTS must be at most "
+              << kMaxSpineListSlots << "\n";
+    return false;
+  }
   if (spray_receiver_tail_missing != "on" &&
       spray_receiver_tail_missing != "off") {
     std::cerr << "SPRAY_RECEIVER_TAIL_MISSING must be on or off\n";
@@ -3716,6 +3736,8 @@ void SetConfig() {
   CustomHeader::ackRedirectBytes = path_selector == "ack_redirect" ? 1 : 0;
   CustomHeader::udpCarriesPathSeq = spray_path_seq == "on";
   CustomHeader::ackReceiverHoldBytes = receiver_hold() ? 1 : 0;
+  CustomHeader::ackReceiverHoldSlots =
+      receiver_hold() ? spray_receiver_hold_slots : 0;
   CustomHeader::ackTailNackBytes = tail_recovery() ? 5 : 0;
   CustomHeader::ackRouteSpineBytes = ack_route_named() ? 1 : 0;
   CustomHeader::ackAnswerSeqBytes = answer_path_seq() ? 5 : 0;
@@ -4143,7 +4165,10 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),
     if (CustomHeader::ackRedirectBytes > 0)
       CustomHeader::ackRedirectBytes = SpineFieldBytes(spine_count);
     if (CustomHeader::ackReceiverHoldBytes > 0)
-      CustomHeader::ackReceiverHoldBytes = SpineBitmapBytes(spine_count);
+      CustomHeader::ackReceiverHoldBytes =
+          spray_receiver_hold_slots > 0
+              ? SpineListBytes(spray_receiver_hold_slots)
+              : SpineBitmapBytes(spine_count);
     if (CustomHeader::ackRouteSpineBytes > 0)
       CustomHeader::ackRouteSpineBytes = SpineFieldBytes(spine_count);
     if (CustomHeader::ackAnswerSeqBytes > 0)
@@ -4311,6 +4336,8 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),
       rdmaHw->SetAttribute("SprayReceiverHold", BooleanValue(receiver_hold()));
       rdmaHw->SetAttribute("SprayReceiverHoldClean",
                            UintegerValue(spray_receiver_hold_clean));
+      rdmaHw->SetAttribute("SprayReceiverHoldSlots",
+                           UintegerValue(spray_receiver_hold_slots));
       rdmaHw->SetAttribute(
           "SprayReceiverTailMissing",
           BooleanValue(spray_receiver_tail_missing == "on"));

@@ -115,15 +115,17 @@ private:
 // set the spine's bit. A spine is held toward a leaf while any receiver on it
 // holds it; an acknowledgement from a receiver with the bit clear takes that
 // receiver out, so the hold ends only by the receivers that set it and never
-// by the sender's own clean sends. Each held (leaf, spine) is sent one
+// by the sender's own clean sends. A partial spine list (SprayReceiverHoldSlots)
+// adds the receiver to the spines it names and takes it out of none. Each held (leaf, spine) is sent one
 // sentinel per sentinel interval for the host, unless the sender's own loss
 // hold holds it and sends its own.
 class ReceiverHoldMarks {
 public:
 	ReceiverHoldMarks(uint32_t spines, uint64_t sentinelIntervalNs);
 	// The receiver_hold bitmap of an acknowledgement from receiver, a host on
-	// leaf.
-	void OnBitmap(uint32_t leaf, uint32_t receiver, const SpineBitmap &bitmap);
+	// leaf, partial or not.
+	void OnBitmap(uint32_t leaf, uint32_t receiver, const SpineBitmap &bitmap,
+		bool partial);
 	bool Holds(uint32_t leaf, uint32_t spine) const;
 	// Whether a sentinel toward leaf is due on a spine held for it and not
 	// held by localHolds, and which; the lowest such spine is taken and its
@@ -150,7 +152,7 @@ public:
 	void Set(std::shared_ptr<ReceiverHoldMarks> marks, uint32_t leaf);
 	// Whether it is set.
 	bool Active() const;
-	void OnBitmap(uint32_t receiver, const SpineBitmap &bitmap);
+	void OnBitmap(uint32_t receiver, const SpineBitmap &bitmap, bool partial);
 	bool Holds(uint32_t spine) const;
 	// Whether every spine is held by the marks or by localHolds.
 	bool HoldsEvery(const std::function<bool(uint32_t)> &localHolds) const;

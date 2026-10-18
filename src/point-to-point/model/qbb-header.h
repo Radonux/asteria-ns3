@@ -97,6 +97,9 @@ public:
   // spine k, none by default; serialized only while
   // CustomHeader::ackReceiverHoldBytes is not zero, in that many bytes.
   void SetReceiverHold(const SpineBitmap &bitmap);
+  // Under CustomHeader::ackReceiverHoldSlots, whether that spine list is
+  // partial; false by default.
+  void SetReceiverHoldPartial(bool partial);
   // The count path sequences from seq on spine that the receiver misses,
   // and FLAG_TAIL_NACK; serialized only while CustomHeader::ackTailNackBytes
   // is not zero.
@@ -129,6 +132,7 @@ public:
   const SpineReport &GetSpineReport() const;
   uint16_t GetRedirect() const;
   SpineBitmap GetReceiverHold() const;
+  bool GetReceiverHoldPartial() const;
   bool IsTailNack() const;
   uint8_t GetTailSpine() const;
   uint16_t GetTailSeq() const;
@@ -157,6 +161,7 @@ private:
   SpineReport m_spineReport;
   uint16_t m_redirect;
   SpineBitmap m_receiverHold;
+  bool m_receiverHoldPartial;
   uint8_t m_tailSpine;
   uint16_t m_tailSeq;
   uint16_t m_tailCount;

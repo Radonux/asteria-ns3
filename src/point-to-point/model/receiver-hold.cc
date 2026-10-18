@@ -159,7 +159,7 @@ ReceiverHoldMarks::ReceiverHoldMarks(uint32_t spines,
 }
 
 void ReceiverHoldMarks::OnBitmap(uint32_t leaf, uint32_t receiver,
-		const SpineBitmap &bitmap){
+		const SpineBitmap &bitmap, bool partial){
 	Leaf *marks = nullptr;
 	const auto found = m_leaves.find(leaf);
 	if (found != m_leaves.end())
@@ -171,7 +171,7 @@ void ReceiverHoldMarks::OnBitmap(uint32_t leaf, uint32_t receiver,
 	for (uint32_t k = 0; k < m_spines; k++){
 		if (bitmap.Test(k))
 			marks->receivers[k].insert(receiver);
-		else
+		else if (!partial)
 			marks->receivers[k].erase(receiver);
 	}
 }
@@ -208,9 +208,10 @@ void ReceiverHoldView::Set(std::shared_ptr<ReceiverHoldMarks> marks,
 	m_leaf = leaf;
 }
 
-void ReceiverHoldView::OnBitmap(uint32_t receiver, const SpineBitmap &bitmap){
+void ReceiverHoldView::OnBitmap(uint32_t receiver, const SpineBitmap &bitmap,
+		bool partial){
 	if (m_marks)
-		m_marks->OnBitmap(m_leaf, receiver, bitmap);
+		m_marks->OnBitmap(m_leaf, receiver, bitmap, partial);
 }
 
 bool ReceiverHoldView::Holds(uint32_t spine) const{

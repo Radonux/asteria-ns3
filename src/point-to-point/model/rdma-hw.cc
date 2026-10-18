@@ -872,6 +872,18 @@ TypeId RdmaHw::GetTypeId (void)
 				UintegerValue(1024),
 				MakeUintegerAccessor(&RdmaHw::m_sprayReceiverHoldClean),
 				MakeUintegerChecker<uint32_t>(1))
+		.AddAttribute("SprayReceiverHoldSlots",
+				"Under SprayReceiverHold, the spines an acknowledgement's "
+				"receiver_hold field names as a spine list, zero for the "
+				"bitmap over every spine. Over that many held spines the "
+				"receiver names that many, in turn from past the last one it "
+				"named toward the sender's leaf, and marks the list partial: "
+				"its sender adds the spines it names and releases none. Needs "
+				"CustomHeader::ackReceiverHoldSlots of it and "
+				"ackReceiverHoldBytes SpineListBytes of it. Default 0.",
+				UintegerValue(0),
+				MakeUintegerAccessor(&RdmaHw::m_sprayReceiverHoldSlots),
+				MakeUintegerChecker<uint32_t>(0, kMaxSpineListSlots))
 		.AddAttribute("SprayReceiverTailMissing",
 				"Under SprayReceiverHold and SprayTailRecovery, whether the "
 				"receiver's hold also counts missing, on their requested "
@@ -1327,8 +1339,9 @@ void RdmaHw::Setup(QpCompleteCallback cb, QpFailureCallback failure_cb){
 	NS_ABORT_MSG_IF(!ValidReceiverHold(),
 		"SprayReceiverHold needs SprayPathSeq, PathSelector 6, 7 or 9, "
 		"SwitchQueueState for the hosts' leaves, and acknowledgements carry "
-		"the receiver_hold field over the spines exactly when it is set "
-		"(CustomHeader::ackReceiverHoldBytes)");
+		"the receiver_hold field over the spines, or SprayReceiverHoldSlots "
+		"of at most 127 as a spine list, exactly when it is set "
+		"(CustomHeader::ackReceiverHoldBytes, ackReceiverHoldSlots)");
 	NS_ABORT_MSG_IF(!ValidStrayPathSeq(),
 		"SprayStrayPathSeq 1 is read only under SprayPathSeq");
 	NS_ABORT_MSG_IF(!ValidNsccRttSample(),
@@ -2259,7 +2272,9 @@ void RdmaHw::SendAck(Ptr<RdmaRxQueuePair> q, uint32_t sourceIp,
 	if (IsSprayPolicy())
 		seqh.SetSpineReport(ReportFor(q, destinationIp));
 	seqh.SetRedirect(redirect);
-	seqh.SetReceiverHold(ReceiverHoldBitmap(destinationIp));
+	bool holdPartial = false;
+	seqh.SetReceiverHold(ReceiverHoldReport(destinationIp, holdPartial));
+	seqh.SetReceiverHoldPartial(holdPartial);
 	seqh.SetRouteSpine(AnswerRouteSpine(destinationIp, pg));
 	if (m_sprayAnswerPathSeq)
 		NumberAnswer(q, seqh, seqh.GetRouteSpine());
@@ -2391,7 +2406,9 @@ int RdmaHw::ReceiveAck(Ptr<Packet> p, CustomHeader &ch){
 			if (IsReceiverHold())
 				qp->m_pathSelector->OnReceiverHold(ch.sip,
 					SpineBitmap::FromBytes(ch.ack.receiver_hold,
-						CustomHeader::ackReceiverHoldBytes), now);
+						CustomHeader::ackReceiverHoldSlots > 0 ? kSpineBitmapBytes
+							: CustomHeader::ackReceiverHoldBytes),
+					ch.ack.receiver_hold_partial, now);
 			uint64_t copyLost = 0;
 			if ((ch.ack.flags >> qbbHeader::FLAG_PROBE_ANSWER) & 1){
 				qp->m_pathSelector->OnProbeAnswer(path, cnp, now);

@@ -81,7 +81,8 @@ void PathSelector::OnReport(const SpineReport &, uint64_t){
 void PathSelector::OnRedirect(uint16_t, uint8_t, uint64_t){
 }
 
-void PathSelector::OnReceiverHold(uint32_t, const SpineBitmap &, uint64_t){
+void PathSelector::OnReceiverHold(uint32_t, const SpineBitmap &, bool,
+		uint64_t){
 }
 
 void PathSelector::SetReceiverHold(std::shared_ptr<ReceiverHoldMarks>,
@@ -159,8 +160,8 @@ void SharedPathSelector::OnRedirect(uint16_t spine, uint8_t carrying,
 }
 
 void SharedPathSelector::OnReceiverHold(uint32_t receiver,
-		const SpineBitmap &bitmap, uint64_t nowNs){
-	m_shared->OnReceiverHold(receiver, bitmap, nowNs);
+		const SpineBitmap &bitmap, bool partial, uint64_t nowNs){
+	m_shared->OnReceiverHold(receiver, bitmap, partial, nowNs);
 }
 
 void SharedPathSelector::SetReceiverHold(
@@ -1541,8 +1542,8 @@ void LossHoldExploration::SetReceiverHold(
 }
 
 void LossHoldExploration::OnReceiverHold(uint32_t receiver,
-		const SpineBitmap &bitmap){
-	m_receiverHold.OnBitmap(receiver, bitmap);
+		const SpineBitmap &bitmap, bool partial){
+	m_receiverHold.OnBitmap(receiver, bitmap, partial);
 }
 
 bool LossHoldExploration::TakeHoldSentinel(uint64_t nowNs, uint8_t &spine){
@@ -1640,8 +1641,8 @@ void RepsHoldSelector::SetReceiverHold(
 }
 
 void RepsHoldSelector::OnReceiverHold(uint32_t receiver,
-		const SpineBitmap &bitmap, uint64_t){
-	m_exploration.OnReceiverHold(receiver, bitmap);
+		const SpineBitmap &bitmap, bool partial, uint64_t){
+	m_exploration.OnReceiverHold(receiver, bitmap, partial);
 }
 
 bool RepsHoldSelector::Excluded(uint16_t path) const{
@@ -1953,8 +1954,8 @@ void MrcHoldSelector::SetReceiverHold(
 }
 
 void MrcHoldSelector::OnReceiverHold(uint32_t receiver,
-		const SpineBitmap &bitmap, uint64_t){
-	m_exploration.OnReceiverHold(receiver, bitmap);
+		const SpineBitmap &bitmap, bool partial, uint64_t){
+	m_exploration.OnReceiverHold(receiver, bitmap, partial);
 }
 
 bool MrcHoldSelector::Excluded(uint16_t path) const{

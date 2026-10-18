@@ -242,8 +242,14 @@ bool RdmaHw::IsReceiverHold() const{
 }
 
 bool RdmaHw::ValidReceiverHold() const{
+	const uint32_t bytes = m_sprayReceiverHoldSlots > 0
+		? SpineListBytes(m_sprayReceiverHoldSlots) : SpineBitmapBytes(m_spineCount);
 	return CustomHeader::ackReceiverHoldBytes ==
-			(m_sprayReceiverHold ? SpineBitmapBytes(m_spineCount) : 0u) &&
+			(m_sprayReceiverHold ? bytes : 0u) &&
+		CustomHeader::ackReceiverHoldSlots ==
+			(m_sprayReceiverHold ? m_sprayReceiverHoldSlots : 0u) &&
+		(m_sprayReceiverHold || m_sprayReceiverHoldSlots == 0) &&
+		m_sprayReceiverHoldSlots <= kMaxSpineListSlots &&
 		(!m_sprayReceiverHold ||
 			(m_sprayPathSeq && IsRepsHold() && m_switchQueues &&
 				m_spineCount > 0 && m_spineCount <= kReceiverHoldSpines));
@@ -271,6 +277,31 @@ SpineBitmap RdmaHw::ReceiverHoldBitmap(uint32_t senderIp) const{
 	if (!IsReceiverHold() || !m_receiverHold)
 		return SpineBitmap();
 	return m_receiverHold->Bitmap(m_switchQueues->LeafOf(senderIp));
+}
+
+SpineBitmap RdmaHw::ReceiverHoldReport(uint32_t senderIp, bool &partial){
+	partial = false;
+	const SpineBitmap held = ReceiverHoldBitmap(senderIp);
+	if (m_sprayReceiverHoldSlots == 0 || held.Count() <= m_sprayReceiverHoldSlots)
+		return held;
+	// Each partial list names the next held spines from past the last one
+	// the previous list toward the leaf named, so every held spine reaches
+	// its senders while more are held than a list names.
+	partial = true;
+	uint32_t &next = m_receiverHoldNext[m_switchQueues->LeafOf(senderIp)];
+	SpineBitmap named;
+	uint32_t count = 0;
+	uint32_t last = next;
+	for (uint32_t i = 0; i < m_spineCount && count < m_sprayReceiverHoldSlots; i++){
+		const uint32_t k = (next + i) % m_spineCount;
+		if (held.Test(k)){
+			named.Set(k);
+			count++;
+			last = k;
+		}
+	}
+	next = (last + 1) % m_spineCount;
+	return named;
 }
 
 void RdmaHw::AttachReceiverHold(Ptr<RdmaQueuePair> qp){
