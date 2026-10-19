@@ -697,6 +697,8 @@ public:
 	// Under SprayReceiverHoldSlots, per sender leaf the spine a partial
 	// list toward it names next from.
 	uint32_t m_sprayReceiverHoldSlots;
+	// ReceiverHoldMarks' widenLeaves for the host's marks.
+	uint32_t m_sprayReceiverHoldWiden;
 	std::unordered_map<uint32_t, uint32_t> m_receiverHoldNext;
 	std::unique_ptr<ReceiverHold> m_receiverHold;
 	std::shared_ptr<ReceiverHoldMarks> m_receiverHoldMarks;

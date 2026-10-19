@@ -150,15 +150,17 @@ ReceiverHoldMarks::Leaf::Leaf(uint32_t spines)
 
 ReceiverHoldMarks::ReceiverHoldMarks(uint32_t spines,
 		uint64_t sentinelIntervalNs, uint32_t sentinelSpread,
-		uint64_t sentinelSalt)
+		uint64_t sentinelSalt, uint32_t widenLeaves)
 	: m_spines(spines), m_sentinelIntervalNs(sentinelIntervalNs),
-	  m_sentinelSpread(sentinelSpread), m_sentinelSalt(sentinelSalt)
+	  m_sentinelSpread(sentinelSpread), m_sentinelSalt(sentinelSalt),
+	  m_widenLeaves(widenLeaves), m_heldLeaves(spines)
 {
 	NS_ASSERT_MSG(spines > 0 && spines <= kReceiverHoldSpines,
 		"a receiver's hold names at most kReceiverHoldSpines spines");
 	NS_ASSERT_MSG(sentinelIntervalNs > 0,
 		"a held spine's sentinels are an interval apart");
 	NS_ASSERT_MSG(sentinelSpread > 0, "a sentinel spread is at least 1");
+	NS_ASSERT_MSG(widenLeaves != 1, "a hold widens from at least two leaves");
 }
 
 void ReceiverHoldMarks::OnBitmap(uint32_t leaf, uint32_t receiver,
@@ -172,14 +174,19 @@ void ReceiverHoldMarks::OnBitmap(uint32_t leaf, uint32_t receiver,
 	if (marks == nullptr)
 		return;
 	for (uint32_t k = 0; k < m_spines; k++){
+		const bool held = !marks->receivers[k].empty();
 		if (bitmap.Test(k))
 			marks->receivers[k].insert(receiver);
 		else if (!partial)
 			marks->receivers[k].erase(receiver);
+		m_heldLeaves[k] += !marks->receivers[k].empty();
+		m_heldLeaves[k] -= held;
 	}
 }
 
 bool ReceiverHoldMarks::Holds(uint32_t leaf, uint32_t spine) const{
+	if (m_widenLeaves > 0 && m_heldLeaves[spine] >= m_widenLeaves)
+		return true;
 	const auto found = m_leaves.find(leaf);
 	return found != m_leaves.end() && !found->second.receivers[spine].empty();
 }

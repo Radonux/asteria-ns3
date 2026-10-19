@@ -11600,6 +11600,7 @@ class SprayReceiverHoldTest : public TestCase
         Transport();
         Slots();
         Spread();
+        Widen();
 
         CustomHeader::ackReceiverHoldBytes = savedHoldBytes;
         CustomHeader::udpCarriesPathSeq = savedPathSeq;
@@ -12020,6 +12021,49 @@ class SprayReceiverHoldTest : public TestCase
         NS_TEST_EXPECT_MSG_EQ(spread.TakeSentinel(1, now + kSentinelNs - 1, none, spine),
                               false,
                               "and its interval restarts there");
+    }
+
+    // With widening at 2, a spine that receivers on 2 destination leaves
+    // hold is held toward every leaf, its sentinels still sent toward those
+    // leaves alone, until fewer than 2 leaves hold it; without, toward
+    // those leaves only.
+    void Widen()
+    {
+        const auto none = [](uint32_t) { return false; };
+        const SpineBitmap three = SpineBitmap::FromByte(0x08);
+        ReceiverHoldMarks narrow(kSpines, kSentinelNs);
+        ReceiverHoldMarks wide(kSpines, kSentinelNs, 1, 0, 2);
+        for (ReceiverHoldMarks* marks : {&narrow, &wide})
+        {
+            marks->OnBitmap(1, 100, three, false);
+            marks->OnBitmap(1, 101, three, false);
+        }
+        NS_TEST_EXPECT_MSG_EQ((wide.Holds(1, 3) && !wide.Holds(2, 3)),
+                              true,
+                              "receivers on one leaf hold it toward that leaf");
+        for (ReceiverHoldMarks* marks : {&narrow, &wide})
+        {
+            marks->OnBitmap(4, 400, three, true);
+        }
+        NS_TEST_EXPECT_MSG_EQ((wide.Holds(2, 3) && wide.Holds(7, 3) && !wide.Holds(2, 4)),
+                              true,
+                              "on two leaves, toward every leaf");
+        NS_TEST_EXPECT_MSG_EQ((narrow.Holds(4, 3) && !narrow.Holds(2, 3)),
+                              true,
+                              "unwidened, toward those leaves only");
+        uint8_t spine = 0;
+        NS_TEST_EXPECT_MSG_EQ(wide.TakeSentinel(2, kSentinelNs, none, spine),
+                              false,
+                              "no sentinel toward a widened leaf");
+        NS_TEST_EXPECT_MSG_EQ((wide.TakeSentinel(4, kSentinelNs, none, spine) && spine == 3),
+                              true,
+                              "one toward a holding leaf");
+        wide.OnBitmap(1, 100, SpineBitmap(), false);
+        NS_TEST_EXPECT_MSG_EQ(wide.Holds(2, 3), true, "one receiver of leaf 1 still holds it");
+        wide.OnBitmap(1, 101, SpineBitmap(), false);
+        NS_TEST_EXPECT_MSG_EQ((!wide.Holds(2, 3) && !wide.Holds(1, 3) && wide.Holds(4, 3)),
+                              true,
+                              "with leaf 1 released, toward leaf 4 alone");
     }
 };
 

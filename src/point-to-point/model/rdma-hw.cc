@@ -893,6 +893,16 @@ TypeId RdmaHw::GetTypeId (void)
 				UintegerValue(0),
 				MakeUintegerAccessor(&RdmaHw::m_sprayReceiverHoldSlots),
 				MakeUintegerChecker<uint32_t>(0, kMaxSpineListSlots))
+		.AddAttribute("SprayReceiverHoldWiden",
+				"Under SprayReceiverHold, with the host's marks shared by its "
+				"queue pairs: a spine that receivers on this many destination "
+				"leaves hold for the host's leaf is held toward every leaf, "
+				"its sentinels still sent toward those leaves alone. 0, the "
+				"default, holds it toward those leaves only; otherwise at "
+				"least 2.",
+				UintegerValue(0),
+				MakeUintegerAccessor(&RdmaHw::m_sprayReceiverHoldWiden),
+				MakeUintegerChecker<uint32_t>())
 		.AddAttribute("SprayReceiverTailMissing",
 				"Under SprayReceiverHold and SprayTailRecovery, whether the "
 				"receiver's hold also counts missing, on their requested "

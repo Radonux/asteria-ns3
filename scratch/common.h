@@ -568,6 +568,14 @@ bool spray_receiver_hold_clean_given = false;
 // list partial; a sender adds the spines a partial list names and releases
 // none until a complete list. 0, the default, keeps the bitmap; at most 127.
 uint32_t spray_receiver_hold_slots = 0;
+// With SPRAY_RECEIVER_HOLD on, SPRAY_RECEIVER_HOLD_WIDEN n: a sender holds
+// spine k toward every leaf while receivers on n or more destination leaves
+// hold k for its leaf, as its own loss hold widens after losses toward
+// SPRAY_HOLD_AUTO_LEAVES leaves, so that the receivers' reports of its own
+// uplink add up; its sentinels on k still go toward those leaves alone. 0,
+// the default, holds k toward those leaves only; otherwise at least 2.
+// Refused under reps_flow_hold, whose marks are each queue pair's own.
+uint32_t spray_receiver_hold_widen = 0;
 // With SPRAY_RECEIVER_HOLD and SPRAY_TAIL_RECOVERY on,
 // SPRAY_RECEIVER_TAIL_MISSING on: the receiving host's hold also counts as
 // missing, for the sender's leaf on their requested spine, the path sequences
@@ -2873,6 +2881,8 @@ bool ReadConf(string network_configuration) {
       spray_receiver_hold_clean_given = true;
     } else if (key.compare("SPRAY_RECEIVER_HOLD_SLOTS") == 0) {
       conf >> spray_receiver_hold_slots;
+    } else if (key.compare("SPRAY_RECEIVER_HOLD_WIDEN") == 0) {
+      conf >> spray_receiver_hold_widen;
     } else if (key.compare("SPRAY_RECEIVER_TAIL_MISSING") == 0) {
       conf >> spray_receiver_tail_missing;
       spray_receiver_tail_missing_given = true;
@@ -3534,6 +3544,16 @@ bool ReadConf(string network_configuration) {
   if (spray_receiver_hold_slots > kMaxSpineListSlots) {
     std::cerr << "SPRAY_RECEIVER_HOLD_SLOTS must be at most "
               << kMaxSpineListSlots << "\n";
+    return false;
+  }
+  if (spray_receiver_hold_widen > 0 &&
+      (!receiver_hold() || path_selector == "reps_flow_hold")) {
+    std::cerr << "SPRAY_RECEIVER_HOLD_WIDEN is read only with "
+                 "SPRAY_RECEIVER_HOLD on, under reps_hold or mrc_hold\n";
+    return false;
+  }
+  if (spray_receiver_hold_widen == 1) {
+    std::cerr << "SPRAY_RECEIVER_HOLD_WIDEN must be 0 or at least 2\n";
     return false;
   }
   if (spray_receiver_tail_missing != "on" &&
@@ -4354,6 +4374,8 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),
                            UintegerValue(spray_receiver_hold_clean));
       rdmaHw->SetAttribute("SprayReceiverHoldSlots",
                            UintegerValue(spray_receiver_hold_slots));
+      rdmaHw->SetAttribute("SprayReceiverHoldWiden",
+                           UintegerValue(spray_receiver_hold_widen));
       rdmaHw->SetAttribute(
           "SprayReceiverTailMissing",
           BooleanValue(spray_receiver_tail_missing == "on"));
