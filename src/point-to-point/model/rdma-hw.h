@@ -188,6 +188,11 @@ public:
 	// SpineScores::Parameters::heldExploration and sentinelIntervalNs.
 	SpineScores::HeldExploration m_sprayHeldExploration;
 	uint64_t m_sprayHeldSentinelIntervalNs;
+	// SpineScores::Parameters::sentinelSpread, for the loss hold's and the
+	// receivers' hold's sentinels alike, and its salt: the node's ID, zero
+	// without a node (as in a unit test).
+	uint32_t m_sprayHeldSentinelSpread;
+	uint64_t SentinelSalt() const;
 	// Whether the held exploration suits the cost source: none sends a held
 	// spine nothing, and only the switch_queue cost source releases one
 	// without its arrivals.

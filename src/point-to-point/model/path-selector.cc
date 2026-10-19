@@ -350,6 +350,8 @@ SpineScores::SpineScores(uint32_t spines, const Parameters &parameters)
 	  m_held(spines), m_sentinelNs(spines),
 	  m_sentinelIntervalNs(parameters.sentinelIntervalNs > 0
 		? parameters.sentinelIntervalNs : parameters.reportIntervalNs),
+	  m_sentinelSpread(parameters.sentinelSpread),
+	  m_sentinelSalt(parameters.sentinelSalt),
 	  m_poolDecayEndNs(parameters.poolDecayIntervalNs),
 	  m_gradeSum(spines), m_gradeCount(spines)
 {
@@ -367,6 +369,7 @@ SpineScores::SpineScores(uint32_t spines, const Parameters &parameters)
 	NS_ASSERT_MSG(parameters.heldExploration !=
 			HeldExploration::Sentinel || m_sentinelIntervalNs > 0,
 		"a held spine's sentinels are an interval apart");
+	NS_ASSERT_MSG(m_sentinelSpread > 0, "a sentinel spread is at least 1");
 	// The largest score a decay takes exactly the top grade from.
 	m_scores.assign(spines,
 		SpineReport::kTopGrade * kGradeScale * uint64_t{65536} / m_decay);
@@ -704,7 +707,8 @@ bool SpineScores::TakeHoldSentinel(uint64_t nowNs, uint8_t &spine){
 }
 
 bool SpineScores::SentinelDue(uint32_t spine, uint64_t nowNs){
-	if (nowNs < m_sentinelNs[spine] + m_sentinelIntervalNs)
+	if (nowNs < m_sentinelNs[spine] + m_sentinelIntervalNs ||
+			!SentinelSpreadTakes(nowNs, m_sentinelSalt, m_sentinelSpread))
 		return false;
 	m_sentinelNs[spine] = nowNs;
 	return true;
@@ -1079,6 +1083,8 @@ AutoLossHold::AutoLossHold(uint32_t spines,
 	  m_cleanOnAnswers(parameters.cleanOnAnswers),
 	  m_sentinelIntervalNs(parameters.sentinelIntervalNs > 0
 		? parameters.sentinelIntervalNs : parameters.reportIntervalNs),
+	  m_sentinelSpread(parameters.sentinelSpread),
+	  m_sentinelSalt(parameters.sentinelSalt),
 	  m_autoLeaves(autoLeaves), m_holdRule(parameters.holdRule),
 	  m_likelihood(parameters.likelihood),
 	  m_holdRelease(parameters.holdRelease),
@@ -1099,6 +1105,7 @@ AutoLossHold::AutoLossHold(uint32_t spines,
 		"a hold ends by clean sends or by its trickle sends");
 	NS_ASSERT_MSG(m_sentinelIntervalNs > 0,
 		"a held spine's sentinels are an interval apart");
+	NS_ASSERT_MSG(m_sentinelSpread > 0, "a sentinel spread is at least 1");
 	NS_ASSERT_MSG(autoLeaves >= 2, "host scope takes at least two leaves");
 }
 
@@ -1429,7 +1436,8 @@ bool AutoLossHold::LeafHolds(uint32_t spine) const{
 }
 
 bool AutoLossHold::SentinelDue(uint64_t &lastNs, uint64_t nowNs) const{
-	if (nowNs < lastNs + m_sentinelIntervalNs)
+	if (nowNs < lastNs + m_sentinelIntervalNs ||
+			!SentinelSpreadTakes(nowNs, m_sentinelSalt, m_sentinelSpread))
 		return false;
 	lastNs = nowNs;
 	return true;

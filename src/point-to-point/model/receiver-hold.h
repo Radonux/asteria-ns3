@@ -13,6 +13,20 @@
 
 namespace ns3 {
 
+// Whether a send at nowNs from the host salt names takes a sentinel that is
+// due, under a sentinel spread of spread: one send in spread on average, by
+// a hash of the send's time and the host, so that hosts sending in step take
+// theirs on different sends; every send at spread 1.
+inline bool SentinelSpreadTakes(uint64_t nowNs, uint64_t salt,
+		uint32_t spread){
+	if (spread <= 1)
+		return true;
+	uint64_t z = nowNs + (salt + 1) * 0x9E3779B97F4A7C15ULL;
+	z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
+	z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
+	return (z ^ (z >> 31)) % spread == 0;
+}
+
 // The spines an acknowledgement's receiver_hold bitmap can name: bit k is
 // spine k.
 constexpr uint32_t kReceiverHoldSpines = kMaxSpineCount;
@@ -121,15 +135,19 @@ private:
 // hold holds it and sends its own.
 class ReceiverHoldMarks {
 public:
-	ReceiverHoldMarks(uint32_t spines, uint64_t sentinelIntervalNs);
+	// Sentinels spread over sends by sentinelSpread for the host
+	// sentinelSalt names (SentinelSpreadTakes).
+	ReceiverHoldMarks(uint32_t spines, uint64_t sentinelIntervalNs,
+		uint32_t sentinelSpread = 1, uint64_t sentinelSalt = 0);
 	// The receiver_hold bitmap of an acknowledgement from receiver, a host on
 	// leaf, partial or not.
 	void OnBitmap(uint32_t leaf, uint32_t receiver, const SpineBitmap &bitmap,
 		bool partial);
 	bool Holds(uint32_t leaf, uint32_t spine) const;
 	// Whether a sentinel toward leaf is due on a spine held for it and not
-	// held by localHolds, and which; the lowest such spine is taken and its
-	// sentinel interval restarts now.
+	// held by localHolds, and which, on a send that takes it under the
+	// sentinel spread; the lowest such spine is taken and its sentinel
+	// interval restarts now.
 	bool TakeSentinel(uint32_t leaf, uint64_t nowNs,
 		const std::function<bool(uint32_t)> &localHolds, uint8_t &spine);
 	uint32_t Spines() const;
@@ -142,6 +160,8 @@ private:
 	};
 	uint32_t m_spines;
 	uint64_t m_sentinelIntervalNs;
+	uint32_t m_sentinelSpread;
+	uint64_t m_sentinelSalt;
 	std::unordered_map<uint32_t, Leaf> m_leaves;
 };
 

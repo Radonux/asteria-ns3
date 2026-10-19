@@ -463,6 +463,11 @@ public:
 		// Under the sentinel held exploration, the interval between two
 		// sentinels on one held spine; zero, the report interval.
 		uint64_t sentinelIntervalNs = 0;
+		// Which sends take a sentinel once it is due: one in sentinelSpread
+		// on average for the host sentinelSalt names (SentinelSpreadTakes);
+		// at 1 the first.
+		uint32_t sentinelSpread = 1;
+		uint64_t sentinelSalt = 0;
 		// As a pool: the pool decay interval; zero decays once per report
 		// taken.
 		uint64_t poolDecayIntervalNs = 0;
@@ -654,6 +659,8 @@ private:
 	std::vector<bool> m_held;
 	std::vector<uint64_t> m_sentinelNs;
 	uint64_t m_sentinelIntervalNs;
+	uint32_t m_sentinelSpread;
+	uint64_t m_sentinelSalt;
 	// As a pool with a pool decay interval: the end of the interval in
 	// progress, the scores decayed once at its start, and per spine the sum
 	// and count of the grades taken in it.
@@ -888,6 +895,8 @@ private:
 	uint32_t m_cleanSends;
 	bool m_cleanOnAnswers;
 	uint64_t m_sentinelIntervalNs;
+	uint32_t m_sentinelSpread;
+	uint64_t m_sentinelSalt;
 	uint32_t m_autoLeaves;
 	HoldRule m_holdRule;
 	LossLikelihoodRatio::Parameters m_likelihood;

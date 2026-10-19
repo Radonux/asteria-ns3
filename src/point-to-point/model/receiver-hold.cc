@@ -149,13 +149,16 @@ ReceiverHoldMarks::Leaf::Leaf(uint32_t spines)
 }
 
 ReceiverHoldMarks::ReceiverHoldMarks(uint32_t spines,
-		uint64_t sentinelIntervalNs)
-	: m_spines(spines), m_sentinelIntervalNs(sentinelIntervalNs)
+		uint64_t sentinelIntervalNs, uint32_t sentinelSpread,
+		uint64_t sentinelSalt)
+	: m_spines(spines), m_sentinelIntervalNs(sentinelIntervalNs),
+	  m_sentinelSpread(sentinelSpread), m_sentinelSalt(sentinelSalt)
 {
 	NS_ASSERT_MSG(spines > 0 && spines <= kReceiverHoldSpines,
 		"a receiver's hold names at most kReceiverHoldSpines spines");
 	NS_ASSERT_MSG(sentinelIntervalNs > 0,
 		"a held spine's sentinels are an interval apart");
+	NS_ASSERT_MSG(sentinelSpread > 0, "a sentinel spread is at least 1");
 }
 
 void ReceiverHoldMarks::OnBitmap(uint32_t leaf, uint32_t receiver,
@@ -185,6 +188,8 @@ bool ReceiverHoldMarks::TakeSentinel(uint32_t leaf, uint64_t nowNs,
 		const std::function<bool(uint32_t)> &localHolds, uint8_t &spine){
 	const auto found = m_leaves.find(leaf);
 	if (found == m_leaves.end())
+		return false;
+	if (!SentinelSpreadTakes(nowNs, m_sentinelSalt, m_sentinelSpread))
 		return false;
 	Leaf &marks = found->second;
 	for (uint32_t k = 0; k < m_spines; k++){

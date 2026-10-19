@@ -11599,6 +11599,7 @@ class SprayReceiverHoldTest : public TestCase
         Unit();
         Transport();
         Slots();
+        Spread();
 
         CustomHeader::ackReceiverHoldBytes = savedHoldBytes;
         CustomHeader::udpCarriesPathSeq = savedPathSeq;
@@ -11967,6 +11968,58 @@ class SprayReceiverHoldTest : public TestCase
                               "and the sender releases spine 3");
         CustomHeader::ackReceiverHoldSlots = savedSlots;
         CustomHeader::ackReceiverHoldBytes = savedBytes;
+    }
+
+    // Under a sentinel spread a due sentinel rides one send in that many, by
+    // the send's time and the host, so that hosts sending in step take theirs
+    // on different sends; at 1 the first send once due takes it.
+    void Spread()
+    {
+        constexpr uint64_t kPacketNs = 83;
+        uint32_t taken = 0;
+        bool everyAtOne = true;
+        for (uint64_t i = 0; i < 16000; ++i)
+        {
+            everyAtOne = everyAtOne && SentinelSpreadTakes(i * kPacketNs, 5, 1);
+            taken += SentinelSpreadTakes(i * kPacketNs, 5, 16);
+        }
+        NS_TEST_EXPECT_MSG_EQ(everyAtOne, true, "every send takes it at 1");
+        NS_TEST_EXPECT_MSG_EQ((taken > 700 && taken < 1300), true, "about one send in 16");
+        std::set<uint64_t> firsts;
+        for (uint64_t salt = 0; salt < 56; ++salt)
+        {
+            uint64_t i = 0;
+            while (!SentinelSpreadTakes(kSentinelNs + i * kPacketNs, salt, 16))
+            {
+                ++i;
+            }
+            firsts.insert(i);
+        }
+        NS_TEST_EXPECT_MSG_EQ((firsts.size() >= 8), true, "hosts in step take different sends");
+
+        const auto none = [](uint32_t) { return false; };
+        ReceiverHoldMarks first(kSpines, kSentinelNs);
+        ReceiverHoldMarks spread(kSpines, kSentinelNs, 16, 5);
+        first.OnBitmap(1, 100, SpineBitmap::FromByte(0x08), false);
+        spread.OnBitmap(1, 100, SpineBitmap::FromByte(0x08), false);
+        uint8_t spine = 0;
+        NS_TEST_EXPECT_MSG_EQ((first.TakeSentinel(1, kSentinelNs, none, spine) && spine == 3),
+                              true,
+                              "at 1 the first send once due takes it");
+        uint64_t expected = kSentinelNs;
+        while (!SentinelSpreadTakes(expected, 5, 16))
+        {
+            expected += kPacketNs;
+        }
+        uint64_t now = kSentinelNs;
+        while (!spread.TakeSentinel(1, now, none, spine))
+        {
+            now += kPacketNs;
+        }
+        NS_TEST_EXPECT_MSG_EQ((now == expected && spine == 3), true, "spread, the send the hash names");
+        NS_TEST_EXPECT_MSG_EQ(spread.TakeSentinel(1, now + kSentinelNs - 1, none, spine),
+                              false,
+                              "and its interval restarts there");
     }
 };
 

@@ -311,11 +311,13 @@ void RdmaHw::AttachReceiverHold(Ptr<RdmaQueuePair> qp){
 	std::shared_ptr<ReceiverHoldMarks> marks;
 	if (m_pathSelectorKind ==
 			static_cast<uint32_t>(PathSelectorKind::RepsFlowHold))
-		marks = std::make_shared<ReceiverHoldMarks>(m_spineCount, sentinelNs);
+		marks = std::make_shared<ReceiverHoldMarks>(m_spineCount, sentinelNs,
+			m_sprayHeldSentinelSpread, SentinelSalt());
 	else {
 		if (!m_receiverHoldMarks)
-			m_receiverHoldMarks =
-				std::make_shared<ReceiverHoldMarks>(m_spineCount, sentinelNs);
+			m_receiverHoldMarks = std::make_shared<ReceiverHoldMarks>(
+				m_spineCount, sentinelNs, m_sprayHeldSentinelSpread,
+				SentinelSalt());
 		marks = m_receiverHoldMarks;
 	}
 	const uint32_t leaf = m_switchQueues->LeafOf(qp->dip.Get());

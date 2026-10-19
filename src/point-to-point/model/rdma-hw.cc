@@ -548,6 +548,15 @@ TypeId RdmaHw::GetTypeId (void)
 				UintegerValue(0),
 				MakeUintegerAccessor(&RdmaHw::m_sprayHeldSentinelIntervalNs),
 				MakeUintegerChecker<uint64_t>())
+		.AddAttribute("SprayHeldSentinelSpread",
+				"Under SprayHeldExploration sentinel, which send takes a "
+				"sentinel once it is due, the loss hold's and the receivers' "
+				"hold's alike: one send in this many on average, by a hash of "
+				"the send's time and the node, so that hosts sending in step "
+				"take theirs on different sends. Default 1, the first send.",
+				UintegerValue(1),
+				MakeUintegerAccessor(&RdmaHw::m_sprayHeldSentinelSpread),
+				MakeUintegerChecker<uint32_t>(1))
 		.AddAttribute("SprayHoldScope",
 				"Under PathSelector 6 and 9, what one loss hold is kept for: 0=every "
 				"destination of the host, 1=the destinations on one leaf, each "
@@ -1983,6 +1992,10 @@ SpineScores &RdmaHw::DestinationHold(uint32_t destination){
 	return HostScores(LossHoldParameters());
 }
 
+uint64_t RdmaHw::SentinelSalt() const{
+	return m_node ? m_node->GetId() : 0;
+}
+
 SpineScores::Parameters RdmaHw::LossHoldParameters() const{
 	// The scores are never drawn from: only their loss counting, loss hold
 	// and sentinels are read. A sentinel interval of zero is the loss
@@ -1994,6 +2007,8 @@ SpineScores::Parameters RdmaHw::LossHoldParameters() const{
 	parameters.lossHoldCleanSentinels = m_sprayLossHoldCleanSentinels;
 	parameters.heldExploration = m_sprayHeldExploration;
 	parameters.sentinelIntervalNs = m_sprayHeldSentinelIntervalNs;
+	parameters.sentinelSpread = m_sprayHeldSentinelSpread;
+	parameters.sentinelSalt = SentinelSalt();
 	parameters.holdRule = static_cast<HoldRule>(m_sprayHoldRule);
 	parameters.holdRelease = static_cast<HoldRelease>(m_sprayHoldRelease);
 	parameters.trickleFraction = m_sprayHoldTrickle;
@@ -3799,6 +3814,8 @@ std::unique_ptr<PathSelector> RdmaHw::MakePathSelector(Ptr<RdmaQueuePair> qp,
 			SprayReportIntervalNs(), m_sprayEdgeFreeze};
 		parameters.heldExploration = m_sprayHeldExploration;
 		parameters.sentinelIntervalNs = m_sprayHeldSentinelIntervalNs;
+		parameters.sentinelSpread = m_sprayHeldSentinelSpread;
+		parameters.sentinelSalt = SentinelSalt();
 		parameters.poolHoldPropagates = m_sprayPoolHoldPropagates;
 		if (CountsSprayLoss()){
 			parameters.lossThresholds = SprayLossThresholds();
