@@ -18,7 +18,7 @@ ReceiverHold::ReceiverHold(uint32_t spines, uint32_t autoLeaves,
 {
 	NS_ASSERT_MSG(spines > 0 && spines <= kReceiverHoldSpines,
 		"a receiver's hold names at most kReceiverHoldSpines spines");
-	NS_ASSERT_MSG(autoLeaves >= 2, "host scope takes at least two leaves");
+	NS_ASSERT_MSG(autoLeaves >= 1, "host scope takes at least one leaf");
 	NS_ASSERT_MSG(cleanArrivals > 0, "a receiver's hold ends by clean arrivals");
 }
 

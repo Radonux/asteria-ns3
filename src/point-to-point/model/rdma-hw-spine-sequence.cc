@@ -259,7 +259,9 @@ ReceiverHold &RdmaHw::ReceiverHoldOf(){
 	if (m_receiverHold)
 		return *m_receiverHold;
 	m_receiverHold = std::make_unique<ReceiverHold>(m_spineCount,
-		m_sprayHoldAutoLeaves, m_sprayReceiverHoldClean, m_sprayLossIntervalNs);
+		m_sprayReceiverHoldAutoLeaves > 0
+			? m_sprayReceiverHoldAutoLeaves : m_sprayHoldAutoLeaves,
+		m_sprayReceiverHoldClean, m_sprayLossIntervalNs);
 	m_receiverHold->SetIntervalCallback(
 		[this](uint32_t leaf, uint64_t endNs,
 				const std::vector<uint32_t> &arrivals,

@@ -11601,6 +11601,7 @@ class SprayReceiverHoldTest : public TestCase
         Slots();
         Spread();
         Widen();
+        FirstLoss();
 
         CustomHeader::ackReceiverHoldBytes = savedHoldBytes;
         CustomHeader::udpCarriesPathSeq = savedPathSeq;
@@ -12064,6 +12065,22 @@ class SprayReceiverHoldTest : public TestCase
         NS_TEST_EXPECT_MSG_EQ((!wide.Holds(2, 3) && !wide.Holds(1, 3) && wide.Holds(4, 3)),
                               true,
                               "with leaf 1 released, toward leaf 4 alone");
+    }
+
+    // With autoLeaves 1 a spine's first missing packet holds it for every
+    // sender leaf, and its release is the host scope's.
+    void FirstLoss()
+    {
+        ReceiverHold hold(kSpines, 1, 3, 0);
+        hold.OnArrival(0, 3, 1, false, 0);
+        NS_TEST_EXPECT_MSG_EQ((hold.HostHolds(3) && hold.Holds(0, 3) && hold.Holds(5, 3)),
+                              true,
+                              "one missing packet holds it for every sender leaf");
+        for (uint32_t leaf : {1u, 2u, 6u})
+        {
+            hold.OnArrival(leaf, 3, 0, false, 0);
+        }
+        NS_TEST_EXPECT_MSG_EQ(hold.HostHolds(3), false, "clean arrivals from any leaf release it");
     }
 };
 

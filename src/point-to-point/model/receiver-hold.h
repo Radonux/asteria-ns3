@@ -64,7 +64,8 @@ public:
 	using IntervalCallback = std::function<void(uint32_t leaf, uint64_t endNs,
 		const std::vector<uint32_t> &arrivals, const std::vector<uint32_t> &lost,
 		const std::vector<Scope> &holds)>;
-	// Over spines, at most kReceiverHoldSpines; autoLeaves is at least 2 and
+	// Over spines, at most kReceiverHoldSpines; autoLeaves is at least 1 (at
+	// 1 a spine's first missing packet holds it for every sender leaf) and
 	// cleanArrivals above zero. intervalNs zero closes no interval.
 	ReceiverHold(uint32_t spines, uint32_t autoLeaves, uint32_t cleanArrivals,
 		uint64_t intervalNs);

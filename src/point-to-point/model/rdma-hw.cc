@@ -903,6 +903,14 @@ TypeId RdmaHw::GetTypeId (void)
 				UintegerValue(0),
 				MakeUintegerAccessor(&RdmaHw::m_sprayReceiverHoldWiden),
 				MakeUintegerChecker<uint32_t>())
+		.AddAttribute("SprayReceiverHoldAutoLeaves",
+				"Under SprayReceiverHold, the sender leaves with a missing "
+				"packet on a spine from which the receiving host holds it for "
+				"every sender leaf; 1 holds it so at its first missing packet. "
+				"Default 0, SprayHoldAutoLeaves.",
+				UintegerValue(0),
+				MakeUintegerAccessor(&RdmaHw::m_sprayReceiverHoldAutoLeaves),
+				MakeUintegerChecker<uint32_t>())
 		.AddAttribute("SprayReceiverTailMissing",
 				"Under SprayReceiverHold and SprayTailRecovery, whether the "
 				"receiver's hold also counts missing, on their requested "
