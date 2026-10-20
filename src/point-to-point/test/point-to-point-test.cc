@@ -12065,6 +12065,16 @@ class SprayReceiverHoldTest : public TestCase
         NS_TEST_EXPECT_MSG_EQ((!wide.Holds(2, 3) && !wide.Holds(1, 3) && wide.Holds(4, 3)),
                               true,
                               "with leaf 1 released, toward leaf 4 alone");
+        ReceiverHoldMarks onLeaf0(kSpines, kSentinelNs, 1, 0, 2, 0);
+        onLeaf0.OnBitmap(0, 10, three, false);
+        onLeaf0.OnBitmap(4, 400, three, false);
+        NS_TEST_EXPECT_MSG_EQ((onLeaf0.Holds(0, 3) && onLeaf0.Holds(4, 3) && !onLeaf0.Holds(2, 3)),
+                              true,
+                              "the host's own leaf counts toward no widening");
+        onLeaf0.OnBitmap(5, 500, three, false);
+        NS_TEST_EXPECT_MSG_EQ(onLeaf0.Holds(2, 3), true, "two other leaves widen it");
+        onLeaf0.OnBitmap(0, 10, SpineBitmap(), false);
+        NS_TEST_EXPECT_MSG_EQ(onLeaf0.Holds(2, 3), true, "its own leaf's release leaves it widened");
     }
 
     // With autoLeaves 1 a spine's first missing packet holds it for every

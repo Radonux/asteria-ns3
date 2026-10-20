@@ -139,10 +139,12 @@ public:
 	// Sentinels spread over sends by sentinelSpread for the host
 	// sentinelSalt names (SentinelSpreadTakes). With widenLeaves, at least
 	// 2, a spine that receivers on that many leaves hold is held toward
-	// every leaf; 0 holds it toward those leaves only.
+	// every leaf; 0 holds it toward those leaves only. ownLeaf, the host's
+	// leaf, counts toward no widening: a send to it crosses no spine, so its
+	// receivers' holds say nothing of the host's uplinks.
 	ReceiverHoldMarks(uint32_t spines, uint64_t sentinelIntervalNs,
 		uint32_t sentinelSpread = 1, uint64_t sentinelSalt = 0,
-		uint32_t widenLeaves = 0);
+		uint32_t widenLeaves = 0, uint32_t ownLeaf = UINT32_MAX);
 	// The receiver_hold bitmap of an acknowledgement from receiver, a host on
 	// leaf, partial or not.
 	void OnBitmap(uint32_t leaf, uint32_t receiver, const SpineBitmap &bitmap,
@@ -167,7 +169,9 @@ private:
 	uint32_t m_sentinelSpread;
 	uint64_t m_sentinelSalt;
 	uint32_t m_widenLeaves;
-	// Per spine, the leaves some receiver of which holds it.
+	uint32_t m_ownLeaf;
+	// Per spine, the leaves other than m_ownLeaf some receiver of which
+	// holds it.
 	std::vector<uint32_t> m_heldLeaves;
 	std::unordered_map<uint32_t, Leaf> m_leaves;
 };

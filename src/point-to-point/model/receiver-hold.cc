@@ -150,10 +150,10 @@ ReceiverHoldMarks::Leaf::Leaf(uint32_t spines)
 
 ReceiverHoldMarks::ReceiverHoldMarks(uint32_t spines,
 		uint64_t sentinelIntervalNs, uint32_t sentinelSpread,
-		uint64_t sentinelSalt, uint32_t widenLeaves)
+		uint64_t sentinelSalt, uint32_t widenLeaves, uint32_t ownLeaf)
 	: m_spines(spines), m_sentinelIntervalNs(sentinelIntervalNs),
 	  m_sentinelSpread(sentinelSpread), m_sentinelSalt(sentinelSalt),
-	  m_widenLeaves(widenLeaves), m_heldLeaves(spines)
+	  m_widenLeaves(widenLeaves), m_ownLeaf(ownLeaf), m_heldLeaves(spines)
 {
 	NS_ASSERT_MSG(spines > 0 && spines <= kReceiverHoldSpines,
 		"a receiver's hold names at most kReceiverHoldSpines spines");
@@ -173,14 +173,17 @@ void ReceiverHoldMarks::OnBitmap(uint32_t leaf, uint32_t receiver,
 		marks = &m_leaves.try_emplace(leaf, m_spines).first->second;
 	if (marks == nullptr)
 		return;
+	const bool counts = leaf != m_ownLeaf;
 	for (uint32_t k = 0; k < m_spines; k++){
 		const bool held = !marks->receivers[k].empty();
 		if (bitmap.Test(k))
 			marks->receivers[k].insert(receiver);
 		else if (!partial)
 			marks->receivers[k].erase(receiver);
-		m_heldLeaves[k] += !marks->receivers[k].empty();
-		m_heldLeaves[k] -= held;
+		if (counts){
+			m_heldLeaves[k] += !marks->receivers[k].empty();
+			m_heldLeaves[k] -= held;
+		}
 	}
 }
 

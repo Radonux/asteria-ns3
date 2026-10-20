@@ -319,7 +319,8 @@ void RdmaHw::AttachReceiverHold(Ptr<RdmaQueuePair> qp){
 		if (!m_receiverHoldMarks)
 			m_receiverHoldMarks = std::make_shared<ReceiverHoldMarks>(
 				m_spineCount, sentinelNs, m_sprayHeldSentinelSpread,
-				SentinelSalt(), m_sprayReceiverHoldWiden);
+				SentinelSalt(), m_sprayReceiverHoldWiden,
+				m_switchQueues->LeafOf(qp->sip.Get()));
 		marks = m_receiverHoldMarks;
 	}
 	const uint32_t leaf = m_switchQueues->LeafOf(qp->dip.Get());
