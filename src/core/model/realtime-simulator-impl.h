@@ -204,9 +204,9 @@ class RealtimeSimulatorImpl : public SimulatorImpl
     /**< Number of events in the event list. */
     int m_unscheduledEvents;
     /**< Unique id for the next event to be scheduled. */
-    uint32_t m_uid;
+    uint64_t m_uid;
     /**< Unique id of the current event. */
-    uint32_t m_currentUid;
+    uint64_t m_currentUid;
     /**< Timestep of the current event. */
     uint64_t m_currentTs;
     /**< Execution context. */
