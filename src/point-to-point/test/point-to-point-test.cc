@@ -3579,6 +3579,96 @@ class RackLossRuleTest : public TestCase
     }
 };
 
+class RackDeferredLossTest : public TestCase
+{
+  public:
+    RackDeferredLossTest()
+        : TestCase("Under SprayRackDeferLoss the rule's declarations wait on the host until a "
+                   "late answer drops them, and an answer to a resend sooner than a base RTT "
+                   "declares nothing")
+    {
+    }
+
+    void DoRun() override
+    {
+        constexpr uint32_t kMtu = IsolatedHost::kMtu;
+        {
+            IsolatedHost sender(LoadBalancingMode::SprayUniform, kTestReceiver, 8);
+            sender.hw->m_sprayTailLossRtts = 4;
+            Ptr<RdmaQueuePair> qp = sender.AddSender(kTestSender, kTestReceiver, 10 * kMtu);
+            qp->m_rackReorderNs = 2000;
+            qp->m_rackDeferLoss = true;
+            qp->m_baseRtt = 1000;
+            qp->snd_nxt = 4 * kMtu;
+            qp->m_highest_sent = 4 * kMtu;
+            // One send per path, at 0, 2000, 3500 and 5000 ns.
+            const uint64_t sentNs[] = {0, 2000, 3500, 5000};
+            for (uint16_t spine = 0; spine < 4; ++spine)
+            {
+                qp->m_outstanding.Add(spine * kMtu, kMtu, spine, sentNs[spine]);
+            }
+            NS_TEST_EXPECT_MSG_EQ(qp->AcknowledgePacket(3 * kMtu, 3),
+                                  2 * kMtu,
+                                  "the sends at 0 and 2000 ns are lost");
+            NS_TEST_EXPECT_MSG_EQ(qp->RepairBytesLeft(), 2 * kMtu, "both are repaired at once");
+            NS_TEST_EXPECT_MSG_EQ(qp->m_rackDeferred.size(), 2, "both wait to be told");
+            NS_TEST_EXPECT_MSG_EQ(qp->m_rackDeferred[1].seq, kMtu, "oldest first");
+            NS_TEST_EXPECT_MSG_EQ(qp->m_rackDeferred[1].path, 1, "with the path it left along");
+            sender.hw->DeferRackLosses(qp);
+            NS_TEST_EXPECT_MSG_EQ(qp->m_rackDeferred.empty(), true, "the host holds them now");
+            NS_TEST_EXPECT_MSG_EQ(sender.hw->m_tailLosses.size(), 2, "as tail repair losses");
+            NS_TEST_EXPECT_MSG_EQ(sender.hw->m_tailLosses.begin()->first,
+                                  4000,
+                                  "due four base RTTs later");
+            const uint64_t key = RdmaHw::GetQpKey(kTestReceiver.Get(),
+                                                  IsolatedHost::kSenderPort,
+                                                  IsolatedHost::kPriorityGroup);
+            NS_TEST_EXPECT_MSG_EQ(
+                sender.hw->CancelTailLoss(key, qp, 0, 0, RdmaHw::TailLossEnd::Acknowledged),
+                true,
+                "the late answer of the send at 0 ns drops its loss");
+            NS_TEST_EXPECT_MSG_EQ(sender.hw->m_tailLossesDelivered, 1, "counted as delivered");
+            NS_TEST_EXPECT_MSG_EQ(sender.hw->m_tailLosses.size(), 1, "the other still waits");
+            Simulator::Destroy();
+        }
+        // The send of packet 1 left along path 1 at 1000 ns, was declared lost
+        // and left again along path 1 at 5000 ns; the send of packet 0 left
+        // at 0 ns. An answer of packet 1 along path 1 at 5500 ns is sooner
+        // than a base RTT after the resend and names no send time; one at
+        // 16000 ns is the resend's.
+        for (const uint64_t answerNs : {uint64_t{5500}, uint64_t{16000}})
+        {
+            IsolatedHost sender(LoadBalancingMode::SprayUniform, kTestReceiver, 8);
+            Ptr<RdmaQueuePair> qp = sender.AddSender(kTestSender, kTestReceiver, 10 * kMtu);
+            qp->m_rackReorderNs = 2000;
+            qp->m_baseRtt = 10000;
+            qp->snd_nxt = 2 * kMtu;
+            qp->m_highest_sent = 2 * kMtu;
+            qp->m_outstanding.Add(0, kMtu, 0, 0);
+            qp->m_outstanding.Add(kMtu, kMtu, 1, 1000);
+            qp->m_outstanding.RemoveLost(1);
+            qp->m_outstanding.Add(kMtu, kMtu, 1, 5000);
+            NS_TEST_EXPECT_MSG_EQ(static_cast<uint32_t>(qp->m_outstanding.Sends(1)),
+                                  2,
+                                  "packet 1 was sent twice");
+            uint64_t lost = 0;
+            Simulator::Schedule(NanoSeconds(answerNs),
+                                [&]() { lost = qp->AcknowledgePacket(kMtu, 1); });
+            Simulator::Run();
+            const bool ambiguous = answerNs < 5000 + 10000;
+            const uint64_t expectedLost = ambiguous ? 0 : kMtu;
+            const uint64_t expectedBytes = ambiguous ? kMtu : 0;
+            NS_TEST_EXPECT_MSG_EQ(lost,
+                                  expectedLost,
+                                  "only the resend's own answer declares the send at 0 ns lost");
+            NS_TEST_EXPECT_MSG_EQ(qp->m_outstanding.Bytes(),
+                                  expectedBytes,
+                                  "the answered packet's record is gone either way");
+            Simulator::Destroy();
+        }
+    }
+};
+
 class OutstandingWindowTest : public TestCase
 {
   public:
@@ -17462,6 +17552,7 @@ PointToPointTestSuite::PointToPointTestSuite()
     AddTestCase(new OutstandingPacketsModelTest, TestCase::Duration::QUICK);
     AddTestCase(new SelectiveTimeoutTest, TestCase::Duration::QUICK);
     AddTestCase(new RackLossRuleTest, TestCase::Duration::QUICK);
+    AddTestCase(new RackDeferredLossTest, TestCase::Duration::QUICK);
     AddTestCase(new OutstandingWindowTest, TestCase::Duration::QUICK);
     AddTestCase(new TrimRepairedOnceTest, TestCase::Duration::QUICK);
     AddTestCase(new DuplicateRepairTest, TestCase::Duration::QUICK);

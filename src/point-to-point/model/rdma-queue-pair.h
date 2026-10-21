@@ -421,6 +421,13 @@ public:
 	// outstanding send made at or before t less this window, along any path
 	// (RACK, RFC 8985 section 6.2, without its reorder timer); 0 is off.
 	uint64_t m_rackReorderNs;
+	// SprayRackDeferLoss: the sends the rule declares lost are repaired at
+	// once, but their loss is not told to the path selector here; they wait
+	// in m_rackDeferred for RdmaHw, which tells them as a tail repair
+	// request's declarations (DeferTailLosses), so that the late answer of a
+	// send that had only waited in a queue drops its loss.
+	bool m_rackDeferLoss;
+	std::vector<DeclaredSend> m_rackDeferred;
 	// Declare lost the send of seq along path made at sentNs, if it is still
 	// outstanding, and queue its range for repair; its loss is evidence as a
 	// retransmission timeout's is (DeclareLostSentBy), or under m_overdueProbe

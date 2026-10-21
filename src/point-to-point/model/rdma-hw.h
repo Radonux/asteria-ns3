@@ -279,6 +279,14 @@ public:
 	uint32_t m_sprayOverdueRepair;
 	uint32_t m_sprayOverdueRepairLimit;
 	uint64_t m_sprayRackReorderNs;
+	// SprayRackDeferLoss, under SprayRackReorderNs and SprayTailLossRtts
+	// above zero: the rule's declarations reach the selector as a tail repair
+	// request's do, SprayTailLossRtts base RTTs later unless the declared
+	// send's answer arrives first (RdmaQueuePair::m_rackDeferLoss).
+	bool m_sprayRackDeferLoss;
+	bool ValidRackDeferLoss() const;
+	// Hands qp's waiting declarations of the rule to DeferTailLosses.
+	void DeferRackLosses(Ptr<RdmaQueuePair> qp);
 	bool IsOverdueRepair() const;
 	bool ValidOverdueRepair() const;
 	// SprayAckLossRtts, under LoadBalancing SprayUniform with any selector:

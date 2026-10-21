@@ -261,6 +261,7 @@ RdmaQueuePair::RdmaQueuePair(uint16_t pg, Ipv4Address _sip, Ipv4Address _dip, ui
 	m_overdueProbe = false;
 	m_overdueRepeat = false;
 	m_rackReorderNs = 0;
+	m_rackDeferLoss = false;
 	m_timeout_covered_losses = 0;
 	m_ack_loss_declared = 0;
 	m_tail_nacks_ignored = 0;
@@ -485,15 +486,26 @@ uint64_t RdmaQueuePair::AcknowledgePacket(uint64_t seq, uint16_t path){
 	// rarely share one, so the rule above seldom applies.
 	if (m_rackReorderNs > 0){
 		const uint64_t sentNs = m_outstanding.SentNs(packet);
+		// An answer to a resend sooner than a base RTT after it left is the
+		// first send's, made earlier than the record says: it names no send
+		// time (RFC 8985 section 6.2 skips it).
+		const uint64_t answeredNs = Simulator::Now().GetNanoSeconds();
+		const bool ambiguous = m_outstanding.Sends(packet) > 1 &&
+			answeredNs < sentNs + m_baseRtt;
 		for (uint64_t oldest = m_outstanding.Oldest();
-				oldest != packet && oldest != OutstandingPackets::kNone &&
+				!ambiguous && oldest != packet &&
+					oldest != OutstandingPackets::kNone &&
 					m_outstanding.SentNs(oldest) + m_rackReorderNs <= sentNs;
 				oldest = m_outstanding.Oldest()){
 			if (CoveredAnswerLoss(m_outstanding.Seq(oldest),
-					m_outstanding.Size(oldest)))
+					m_outstanding.Size(oldest))){
 				m_outstanding.Remove(oldest);
-			else
-				lost += DeclareLost(oldest);
+				continue;
+			}
+			if (m_rackDeferLoss)
+				m_rackDeferred.push_back(DeclaredSend{m_outstanding.Seq(oldest),
+					m_outstanding.Path(oldest), m_outstanding.Trickle(oldest)});
+			lost += DeclareLost(oldest, !m_rackDeferLoss);
 		}
 	}
 	const uint64_t nowNs = Simulator::Now().GetNanoSeconds();

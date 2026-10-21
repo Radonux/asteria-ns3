@@ -716,6 +716,16 @@ TypeId RdmaHw::GetTypeId (void)
 				UintegerValue(0),
 				MakeUintegerAccessor(&RdmaHw::m_sprayRackReorderNs),
 				MakeUintegerChecker<uint64_t>())
+		.AddAttribute("SprayRackDeferLoss",
+				"Under SprayRackReorderNs and SprayTailLossRtts above zero, "
+				"whether the sends the loss rule across paths declares lost "
+				"are told to the path selector as a tail repair request's "
+				"declarations are: SprayTailLossRtts base RTTs later, unless "
+				"the declared send's answer arrives first. They are repaired "
+				"at once either way. Default false.",
+				BooleanValue(false),
+				MakeBooleanAccessor(&RdmaHw::m_sprayRackDeferLoss),
+				MakeBooleanChecker())
 		.AddAttribute("SprayAckLossRtts",
 				"Under LoadBalancing 2, the queue pair's base RTTs after "
 				"which a send the cumulative acknowledgement covered before "
@@ -1373,6 +1383,9 @@ void RdmaHw::Setup(QpCompleteCallback cb, QpFailureCallback failure_cb){
 		"(CustomHeader::udpTailCounts, CustomHeader::ackTailNackBytes)");
 	NS_ABORT_MSG_IF(!ValidTailLoss(),
 		"SprayTailLossRtts is read only under SprayTailRecovery");
+	NS_ABORT_MSG_IF(!ValidRackDeferLoss(),
+		"SprayRackDeferLoss needs SprayRackReorderNs and SprayTailLossRtts "
+		"above zero");
 	NS_ABORT_MSG_IF(!ValidReceiverHold(),
 		"SprayReceiverHold needs SprayPathSeq, PathSelector 6, 7 or 9, "
 		"SwitchQueueState for the hosts' leaves, and acknowledgements carry "
@@ -2089,6 +2102,19 @@ bool RdmaHw::ValidTailLoss() const{
 	return m_sprayTailLossRtts == 1 || m_sprayTailRecovery;
 }
 
+bool RdmaHw::ValidRackDeferLoss() const{
+	return !m_sprayRackDeferLoss ||
+		(m_sprayRackReorderNs > 0 && m_sprayTailLossRtts > 0);
+}
+
+void RdmaHw::DeferRackLosses(Ptr<RdmaQueuePair> qp){
+	if (qp->m_rackDeferred.empty())
+		return;
+	DeferTailLosses(qp, qp->m_rackDeferred,
+		static_cast<uint64_t>(m_sprayTailLossRtts * qp->m_baseRtt));
+	qp->m_rackDeferred.clear();
+}
+
 bool RdmaHw::ValidAckLoss() const{
 	return m_sprayAckLossRtts == 0 || m_loadBalancing ==
 		static_cast<uint32_t>(LoadBalancingMode::SprayUniform);
@@ -2500,6 +2526,7 @@ int RdmaHw::ReceiveAck(Ptr<Packet> p, CustomHeader &ch){
 					HandleAckNscc(qp, ch.ack.packet_seq, path, cnp, rcvCwndPend);
 				else
 					qp->AcknowledgePacket(ch.ack.packet_seq, path);
+				DeferRackLosses(qp);
 				// The answer to a send the cumulative acknowledgement covered
 				// first finds no record; the selector has heard it above.
 				if (!qp->m_covered.empty())
@@ -3780,6 +3807,7 @@ bool RdmaHw::StartPathSelection(Ptr<RdmaQueuePair> qp, uint64_t bdpBytes,
 	qp->m_overdueRepeat =
 		m_sprayOverdueRepair == static_cast<uint32_t>(OverdueRepair::Reprobe);
 	qp->m_rackReorderNs = m_sprayRackReorderNs;
+	qp->m_rackDeferLoss = m_sprayRackDeferLoss;
 	if (!IsConnectionPathState()){
 		qp->m_pathSelector = MakePathSelector(qp, bdpBytes, baseRttNs);
 		return true;

@@ -391,6 +391,14 @@ bool spray_overdue_repair_limit_given = false;
 // off.
 uint64_t spray_rack_reorder_ns = 0;
 bool spray_rack_reorder_ns_given = false;
+// Under SPRAY_RACK_REORDER_NS above 0 and SPRAY_TAIL_LOSS_RTTS above 0,
+// SPRAY_RACK_DEFER_LOSS on: the sends that rule declares lost are repaired at
+// once, but the path selector is told of their loss as of a tail repair
+// request's declarations, SPRAY_TAIL_LOSS_RTTS base RTTs later, and the
+// declared send's answer arriving before then drops the loss (counted as
+// tail_loss_delivered or tail_loss_ambiguous). Default off.
+std::string spray_rack_defer_loss = "off";
+bool spray_rack_defer_loss_given = false;
 // Under LOAD_BALANCING spray_uniform, with any PATH_SELECTOR,
 // SPRAY_ACK_LOSS_RTTS <x>: a data send that the cumulative acknowledgement
 // covers before its own acknowledgement arrives, and whose own acknowledgement
@@ -2531,6 +2539,16 @@ bool valid_hold_rule() {
                  "spray_uniform\n";
     return false;
   }
+  if (spray_rack_defer_loss != "on" && spray_rack_defer_loss != "off") {
+    std::cerr << "SPRAY_RACK_DEFER_LOSS must be on or off\n";
+    return false;
+  }
+  if (spray_rack_defer_loss_given &&
+      (spray_rack_reorder_ns == 0 || spray_tail_loss_rtts <= 0)) {
+    std::cerr << "SPRAY_RACK_DEFER_LOSS is read only under "
+                 "SPRAY_RACK_REORDER_NS and SPRAY_TAIL_LOSS_RTTS above 0\n";
+    return false;
+  }
   // Without a loss hold, reps_spine, reps_oracle and the uniform draw read
   // reprobe alone.
   const bool overdue_without_hold =
@@ -2842,6 +2860,9 @@ bool ReadConf(string network_configuration) {
     } else if (key.compare("SPRAY_RACK_REORDER_NS") == 0) {
       conf >> spray_rack_reorder_ns;
       spray_rack_reorder_ns_given = true;
+    } else if (key.compare("SPRAY_RACK_DEFER_LOSS") == 0) {
+      conf >> spray_rack_defer_loss;
+      spray_rack_defer_loss_given = true;
     } else if (key.compare("SPRAY_ACK_LOSS_RTTS") == 0) {
       conf >> spray_ack_loss_rtts;
       spray_ack_loss_rtts_given = true;
@@ -4362,6 +4383,8 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),
                            UintegerValue(spray_overdue_repair_limit));
       rdmaHw->SetAttribute("SprayRackReorderNs",
                            UintegerValue(spray_rack_reorder_ns));
+      rdmaHw->SetAttribute("SprayRackDeferLoss",
+                           BooleanValue(spray_rack_defer_loss == "on"));
       rdmaHw->SetAttribute("SprayAckLossRtts",
                            DoubleValue(spray_ack_loss_rtts));
       rdmaHw->SetAttribute(
