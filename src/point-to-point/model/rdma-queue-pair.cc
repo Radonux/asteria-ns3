@@ -260,6 +260,7 @@ RdmaQueuePair::RdmaQueuePair(uint16_t pg, Ipv4Address _sip, Ipv4Address _dip, ui
 	m_overdue_spurious = 0;
 	m_overdueProbe = false;
 	m_overdueRepeat = false;
+	m_rackReorderNs = 0;
 	m_timeout_covered_losses = 0;
 	m_ack_loss_declared = 0;
 	m_tail_nacks_ignored = 0;
@@ -479,6 +480,21 @@ uint64_t RdmaQueuePair::AcknowledgePacket(uint64_t seq, uint16_t path){
 			m_outstanding.Remove(older);
 		else
 			lost += DeclareLost(older);
+	}
+	// Across paths by send time: with many paths two outstanding sends
+	// rarely share one, so the rule above seldom applies.
+	if (m_rackReorderNs > 0){
+		const uint64_t sentNs = m_outstanding.SentNs(packet);
+		for (uint64_t oldest = m_outstanding.Oldest();
+				oldest != packet && oldest != OutstandingPackets::kNone &&
+					m_outstanding.SentNs(oldest) + m_rackReorderNs <= sentNs;
+				oldest = m_outstanding.Oldest()){
+			if (CoveredAnswerLoss(m_outstanding.Seq(oldest),
+					m_outstanding.Size(oldest)))
+				m_outstanding.Remove(oldest);
+			else
+				lost += DeclareLost(oldest);
+		}
 	}
 	const uint64_t nowNs = Simulator::Now().GetNanoSeconds();
 	// The answer of a resend may be that of the send declared lost before

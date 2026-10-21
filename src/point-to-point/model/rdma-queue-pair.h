@@ -417,6 +417,10 @@ public:
 	// SprayOverdueRepair reprobe: a repair declared lost again keeps its
 	// sequence's record (DeclareOverdueSendLost).
 	bool m_overdueRepeat;
+	// SprayRackReorderNs: the answer to a send made at t declares lost every
+	// outstanding send made at or before t less this window, along any path
+	// (RACK, RFC 8985 section 6.2, without its reorder timer); 0 is off.
+	uint64_t m_rackReorderNs;
 	// Declare lost the send of seq along path made at sentNs, if it is still
 	// outstanding, and queue its range for repair; its loss is evidence as a
 	// retransmission timeout's is (DeclareLostSentBy), or under m_overdueProbe

@@ -278,6 +278,7 @@ public:
 	// next answer or timeout (RdmaQueuePair::m_overdueRepeats).
 	uint32_t m_sprayOverdueRepair;
 	uint32_t m_sprayOverdueRepairLimit;
+	uint64_t m_sprayRackReorderNs;
 	bool IsOverdueRepair() const;
 	bool ValidOverdueRepair() const;
 	// SprayAckLossRtts, under LoadBalancing SprayUniform with any selector:

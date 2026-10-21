@@ -706,6 +706,16 @@ TypeId RdmaHw::GetTypeId (void)
 				UintegerValue(2),
 				MakeUintegerAccessor(&RdmaHw::m_sprayOverdueRepairLimit),
 				MakeUintegerChecker<uint32_t>(1))
+		.AddAttribute("SprayRackReorderNs",
+				"Under LoadBalancing 2, the reorder window of the sender's "
+				"loss rule across paths: an answer to a send made at t "
+				"declares lost, as the answer to a later send along the same "
+				"path does, every outstanding send made at or before t less "
+				"this window (RACK, RFC 8985 section 6.2, without its reorder "
+				"timer). 0 is off. Default 0.",
+				UintegerValue(0),
+				MakeUintegerAccessor(&RdmaHw::m_sprayRackReorderNs),
+				MakeUintegerChecker<uint64_t>())
 		.AddAttribute("SprayAckLossRtts",
 				"Under LoadBalancing 2, the queue pair's base RTTs after "
 				"which a send the cumulative acknowledgement covered before "
@@ -3769,6 +3779,7 @@ bool RdmaHw::StartPathSelection(Ptr<RdmaQueuePair> qp, uint64_t bdpBytes,
 		m_sprayOverdueRepair == static_cast<uint32_t>(OverdueRepair::Reprobe);
 	qp->m_overdueRepeat =
 		m_sprayOverdueRepair == static_cast<uint32_t>(OverdueRepair::Reprobe);
+	qp->m_rackReorderNs = m_sprayRackReorderNs;
 	if (!IsConnectionPathState()){
 		qp->m_pathSelector = MakePathSelector(qp, bdpBytes, baseRttNs);
 		return true;

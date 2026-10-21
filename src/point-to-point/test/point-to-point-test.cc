@@ -3526,6 +3526,59 @@ class SelectiveTimeoutTest : public TestCase
     }
 };
 
+class RackLossRuleTest : public TestCase
+{
+  public:
+    RackLossRuleTest()
+        : TestCase("An answer declares lost the sends made a reorder window before its own, "
+                   "along any path")
+    {
+    }
+
+    void DoRun() override
+    {
+        constexpr uint32_t kMtu = IsolatedHost::kMtu;
+        for (const uint64_t window : {uint64_t{0}, uint64_t{2000}})
+        {
+            IsolatedHost sender(LoadBalancingMode::SprayUniform, kTestReceiver, 8);
+            Ptr<RdmaQueuePair> qp = sender.AddSender(kTestSender, kTestReceiver, 10 * kMtu);
+            qp->m_rackReorderNs = window;
+            qp->snd_nxt = 4 * kMtu;
+            qp->m_highest_sent = 4 * kMtu;
+            // One send per path, at 0, 2000, 3500 and 5000 ns.
+            const uint64_t sentNs[] = {0, 2000, 3500, 5000};
+            for (uint16_t spine = 0; spine < 4; ++spine)
+            {
+                qp->m_outstanding.Add(spine * kMtu, kMtu, spine, sentNs[spine]);
+            }
+            const uint64_t lost = qp->AcknowledgePacket(3 * kMtu, 3);
+            if (window == 0)
+            {
+                NS_TEST_EXPECT_MSG_EQ(lost, 0, "off, no send shares the answered send's path");
+                NS_TEST_EXPECT_MSG_EQ(qp->m_outstanding.Bytes(),
+                                      3 * kMtu,
+                                      "off, the older sends stay outstanding");
+                continue;
+            }
+            NS_TEST_EXPECT_MSG_EQ(lost, 2 * kMtu, "the sends at 0 and 2000 ns are lost");
+            NS_TEST_EXPECT_MSG_EQ(qp->m_repair_ranges.size(), 1, "the two sends join one range");
+            NS_TEST_EXPECT_MSG_EQ(qp->m_repair_ranges.count(0), 1, "the range starts at the first send");
+            NS_TEST_EXPECT_MSG_EQ(qp->m_repair_ranges[0],
+                                  2 * kMtu,
+                                  "the range ends after the second send");
+            NS_TEST_EXPECT_MSG_EQ(qp->RepairBytesLeft(),
+                                  2 * kMtu,
+                                  "the send inside the window is not repaired");
+            NS_TEST_EXPECT_MSG_EQ(qp->m_outstanding.Bytes(),
+                                  kMtu,
+                                  "the send at 3500 ns stays outstanding");
+            // An answer to an older send declares nothing new.
+            NS_TEST_EXPECT_MSG_EQ(qp->AcknowledgePacket(2 * kMtu, 2), 0, "nothing older is left");
+            Simulator::Destroy();
+        }
+    }
+};
+
 class OutstandingWindowTest : public TestCase
 {
   public:
@@ -17408,6 +17461,7 @@ PointToPointTestSuite::PointToPointTestSuite()
     AddTestCase(new ReorderGapTest, TestCase::Duration::QUICK);
     AddTestCase(new OutstandingPacketsModelTest, TestCase::Duration::QUICK);
     AddTestCase(new SelectiveTimeoutTest, TestCase::Duration::QUICK);
+    AddTestCase(new RackLossRuleTest, TestCase::Duration::QUICK);
     AddTestCase(new OutstandingWindowTest, TestCase::Duration::QUICK);
     AddTestCase(new TrimRepairedOnceTest, TestCase::Duration::QUICK);
     AddTestCase(new DuplicateRepairTest, TestCase::Duration::QUICK);

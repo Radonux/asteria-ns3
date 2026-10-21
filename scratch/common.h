@@ -383,6 +383,14 @@ std::string spray_overdue_repair = "off";
 bool spray_overdue_repair_given = false;
 uint32_t spray_overdue_repair_limit = 2;
 bool spray_overdue_repair_limit_given = false;
+// Under LOAD_BALANCING spray_uniform, SPRAY_RACK_REORDER_NS n: the answer to
+// a send made at t declares lost every outstanding send of the queue pair
+// made at or before t - n ns, along any path, as the answer to a later send
+// along the same path already does (RACK, RFC 8985 section 6.2, without its
+// reorder timer); its loss is told to the path selector. 0, the default, is
+// off.
+uint64_t spray_rack_reorder_ns = 0;
+bool spray_rack_reorder_ns_given = false;
 // Under LOAD_BALANCING spray_uniform, with any PATH_SELECTOR,
 // SPRAY_ACK_LOSS_RTTS <x>: a data send that the cumulative acknowledgement
 // covers before its own acknowledgement arrives, and whose own acknowledgement
@@ -2518,6 +2526,11 @@ bool valid_hold_rule() {
     std::cerr << "SPRAY_OVERDUE_REPAIR_LIMIT must be at least 1\n";
     return false;
   }
+  if (spray_rack_reorder_ns_given && load_balancing != "spray_uniform") {
+    std::cerr << "SPRAY_RACK_REORDER_NS is read only under LOAD_BALANCING "
+                 "spray_uniform\n";
+    return false;
+  }
   // Without a loss hold, reps_spine, reps_oracle and the uniform draw read
   // reprobe alone.
   const bool overdue_without_hold =
@@ -2826,6 +2839,9 @@ bool ReadConf(string network_configuration) {
     } else if (key.compare("SPRAY_OVERDUE_REPAIR_LIMIT") == 0) {
       conf >> spray_overdue_repair_limit;
       spray_overdue_repair_limit_given = true;
+    } else if (key.compare("SPRAY_RACK_REORDER_NS") == 0) {
+      conf >> spray_rack_reorder_ns;
+      spray_rack_reorder_ns_given = true;
     } else if (key.compare("SPRAY_ACK_LOSS_RTTS") == 0) {
       conf >> spray_ack_loss_rtts;
       spray_ack_loss_rtts_given = true;
@@ -4344,6 +4360,8 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),
                                                    : OverdueRepair::Off)));
       rdmaHw->SetAttribute("SprayOverdueRepairLimit",
                            UintegerValue(spray_overdue_repair_limit));
+      rdmaHw->SetAttribute("SprayRackReorderNs",
+                           UintegerValue(spray_rack_reorder_ns));
       rdmaHw->SetAttribute("SprayAckLossRtts",
                            DoubleValue(spray_ack_loss_rtts));
       rdmaHw->SetAttribute(
