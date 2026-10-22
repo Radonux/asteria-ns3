@@ -86,14 +86,12 @@ bool RdmaHw::ThemisArrival(Ptr<RdmaRxQueuePair> q, const CustomHeader &ch){
 
 void RdmaHw::ThemisPathAvoid(Ptr<RdmaQueuePair> qp, uint64_t seq){
 	const uint64_t nowNs = Simulator::Now().GetNanoSeconds();
-	const uint64_t psn = qp->m_psnBase + seq / m_mtu;
-	qp->m_pathSelector->OnPathAvoid(psn, nowNs);
+	const int avoided = qp->m_pathSelector->OnPathAvoid(qp->m_psnBase + seq / m_mtu, nowNs);
 	m_themisSignalsReceived++;
 	ReportTransportEvent("themis_signal_received", 0);
-	// The path the source avoids.
-	if (const auto *themis = dynamic_cast<const ThemisSelector *>(qp->m_pathSelector.get()))
-		ReportTransportEvent(("themis_signal_spine" +
-			std::to_string(themis->Assigned(psn))).c_str(), 0);
+	// The path the source avoids, through a connection's shared selector too.
+	if (avoided >= 0)
+		ReportTransportEvent(("themis_signal_spine" + std::to_string(avoided)).c_str(), 0);
 	const uint64_t lost = qp->DeclareLostSeq(seq);
 	if (lost == 0)
 		return;

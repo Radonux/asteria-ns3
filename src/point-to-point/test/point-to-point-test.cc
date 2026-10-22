@@ -3843,11 +3843,15 @@ class ThemisDestinationTest : public TestCase
             Simulator::Destroy();
         }
         // A floor: N 8, threshold 3, stash at least 1000 ns old; packets 1 to 4
-        // at 0 ns, 5 at 999 ns and 6 at 1000 ns.
+        // at 500 ns, 5 at 1499 ns and 6 at 1500 ns.
         {
             IsolatedHost receiver(LoadBalancingMode::SprayUniform, kTestSender, 8);
             Configure(receiver, 8, 3);
             receiver.hw->m_sprayThemisStashMinNs = 1000;
+            // The stash is made at 500 ns, so a stash time left at 0 would
+            // signal at packet 5.
+            Simulator::Stop(NanoSeconds(500));
+            Simulator::Run();
             for (uint32_t psn = 1; psn <= 4; ++psn)
             {
                 Arrive(receiver, psn);
@@ -3992,6 +3996,44 @@ class ThemisSenderTest : public TestCase
         NS_TEST_EXPECT_MSG_EQ(qp->m_repair_ranges.size(), 1, "a second signal repairs nothing more");
         NS_TEST_EXPECT_MSG_EQ(selector->Counter(selector->Assigned(0)), 2, "but sets the window again");
         Simulator::Destroy();
+        {
+            // Under connection path state the queue pair's selector is the
+            // connection's shared one; the event still names the avoided path.
+            IsolatedHost host(LoadBalancingMode::SprayUniform, kTestReceiver, 8);
+            host.hw->m_pathSelectorKind = static_cast<uint32_t>(PathSelectorKind::Themis);
+            host.hw->m_sprayPathState = static_cast<uint32_t>(PathState::Connection);
+            Ptr<RdmaQueuePair> connection = host.AddSender(kTestSender, kTestReceiver, 10 * kMtu);
+            NS_TEST_ASSERT_MSG_EQ(host.hw->m_connectionSelectors.size(), 1, "one connection selector");
+            auto* themis = dynamic_cast<ThemisSelector*>(host.hw->m_connectionSelectors.begin()->second.get());
+            NS_TEST_ASSERT_MSG_NE(themis, nullptr, "the connection's selector is Themis's");
+            NS_TEST_EXPECT_MSG_EQ(dynamic_cast<ThemisSelector*>(connection->m_pathSelector.get()), nullptr,
+                                  "the queue pair holds the shared wrapper");
+            connection->snd_nxt = 8 * kMtu;
+            connection->m_highest_sent = 8 * kMtu;
+            for (uint64_t psn = 0; psn < 8; ++psn)
+            {
+                connection->m_outstanding.Add(psn * kMtu, kMtu, themis->Assigned(psn), psn * 100);
+            }
+            std::map<std::string, uint32_t> connectionEvents;
+            host.hw->m_transportEventCallback = Callback<void, const char*, uint64_t>(
+                [&connectionEvents](const char* event, uint64_t) { ++connectionEvents[event]; });
+            CustomHeader ack;
+            ack.l3Prot = 0xFC;
+            ack.sip = kTestReceiver.Get();
+            const uint8_t spine = themis->Assigned(5);
+            ack.ipid = SpineIdentification(spine, spine);
+            ack.ack.flags = 1 << qbbHeader::FLAG_PATH_AVOID;
+            ack.ack.sport = IsolatedHost::kReceiverPort;
+            ack.ack.dport = IsolatedHost::kSenderPort;
+            ack.ack.pg = IsolatedHost::kPriorityGroup;
+            ack.ack.seq = 0;
+            ack.ack.packet_seq = 5 * kMtu;
+            host.hw->ReceiveAck(Create<Packet>(), ack);
+            NS_TEST_EXPECT_MSG_EQ(connectionEvents[spineEvent(themis->Assigned(0))], 1,
+                                  "the event names the avoided path through the shared selector");
+            NS_TEST_EXPECT_MSG_GT(themis->Counter(themis->Assigned(0)), 0, "and the path is avoided");
+            Simulator::Destroy();
+        }
     }
 };
 

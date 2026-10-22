@@ -92,7 +92,8 @@ void PathSelector::SetReceiverHold(std::shared_ptr<ReceiverHoldMarks>,
 void PathSelector::NextSend(uint64_t, bool){
 }
 
-void PathSelector::OnPathAvoid(uint64_t, uint64_t){
+int PathSelector::OnPathAvoid(uint64_t, uint64_t){
+	return -1;
 }
 
 SharedPathSelector::SharedPathSelector(std::shared_ptr<PathSelector> shared)
@@ -179,8 +180,8 @@ void SharedPathSelector::NextSend(uint64_t psn, bool repair){
 	m_shared->NextSend(psn, repair);
 }
 
-void SharedPathSelector::OnPathAvoid(uint64_t psn, uint64_t nowNs){
-	m_shared->OnPathAvoid(psn, nowNs);
+int SharedPathSelector::OnPathAvoid(uint64_t psn, uint64_t nowNs){
+	return m_shared->OnPathAvoid(psn, nowNs);
 }
 
 UniformSpineSelector::UniformSpineSelector(Ptr<UniformRandomVariable> random,
@@ -231,9 +232,12 @@ void ThemisSelector::NextSend(uint64_t psn, bool repair){
 	m_decremented = false;
 }
 
-void ThemisSelector::OnPathAvoid(uint64_t psn, uint64_t){
-	if (m_window > 0)
-		m_counter[Assigned(psn)] = m_window;
+int ThemisSelector::OnPathAvoid(uint64_t psn, uint64_t){
+	const uint8_t spine = Assigned(psn);
+	if (m_window == 0)
+		return -1;
+	m_counter[spine] = m_window;
+	return spine;
 }
 
 uint16_t ThemisSelector::Choose(uint64_t){

@@ -294,8 +294,9 @@ public:
 	// whether it is a repair.
 	virtual void NextSend(uint64_t psn, bool repair);
 	// An acknowledgement flagged as Themis's Path Avoidance Signal for the
-	// packet of sequence number psn.
-	virtual void OnPathAvoid(uint64_t psn, uint64_t nowNs);
+	// packet of sequence number psn; returns the spine avoided, or -1 for
+	// none.
+	virtual int OnPathAvoid(uint64_t psn, uint64_t nowNs);
 };
 
 // A queue pair's handle on the path selector of its connection under
@@ -324,7 +325,7 @@ public:
 	void SetReceiverHold(std::shared_ptr<ReceiverHoldMarks> marks,
 		uint32_t leaf) override;
 	void NextSend(uint64_t psn, bool repair) override;
-	void OnPathAvoid(uint64_t psn, uint64_t nowNs) override;
+	int OnPathAvoid(uint64_t psn, uint64_t nowNs) override;
 
 private:
 	std::shared_ptr<PathSelector> m_shared;
@@ -359,7 +360,7 @@ public:
 		uint32_t paths, uint64_t window, bool reroute, uint32_t base);
 	uint16_t Choose(uint64_t nowNs) override;
 	void NextSend(uint64_t psn, bool repair) override;
-	void OnPathAvoid(uint64_t psn, uint64_t nowNs) override;
+	int OnPathAvoid(uint64_t psn, uint64_t nowNs) override;
 	// The spine path psn mod N names.
 	uint8_t Assigned(uint64_t psn) const;
 	uint64_t Counter(uint8_t spine) const;
