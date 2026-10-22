@@ -716,6 +716,34 @@ TypeId RdmaHw::GetTypeId (void)
 				UintegerValue(0),
 				MakeUintegerAccessor(&RdmaHw::m_sprayRackReorderNs),
 				MakeUintegerChecker<uint64_t>())
+		.AddAttribute("SprayThemisPaths",
+				"Under PathSelector 11, the paths a queue pair's packets are "
+				"sprayed over by sequence number, spaced evenly over the "
+				"spines; 0 for every spine. Default 0.",
+				UintegerValue(0),
+				MakeUintegerAccessor(&RdmaHw::m_sprayThemisPaths),
+				MakeUintegerChecker<uint32_t>())
+		.AddAttribute("SprayThemisOooThreshold",
+				"Under PathSelector 11, the out-of-order degree, in packets "
+				"past a stashed undetermined repair request, beyond which the "
+				"destination sends a Path Avoidance Signal for its path; 0 for "
+				"none. Default 448 (Themis's).",
+				UintegerValue(448),
+				MakeUintegerAccessor(&RdmaHw::m_sprayThemisOooThreshold),
+				MakeUintegerChecker<uint32_t>())
+		.AddAttribute("SprayThemisAvoidanceWindow",
+				"Under PathSelector 11, the redirected packets a Path Avoidance "
+				"Signal avoids its path for; 0 repairs without avoiding. "
+				"Default 2000000 (Themis's).",
+				UintegerValue(2000000),
+				MakeUintegerAccessor(&RdmaHw::m_sprayThemisAvoidanceWindow),
+				MakeUintegerChecker<uint64_t>())
+		.AddAttribute("SprayThemisRetxReroute",
+				"Under PathSelector 11, whether a repair goes up another path "
+				"than its own. Default true.",
+				BooleanValue(true),
+				MakeBooleanAccessor(&RdmaHw::m_sprayThemisRetxReroute),
+				MakeBooleanChecker())
 		.AddAttribute("SprayRackDeferLoss",
 				"Under SprayRackReorderNs and SprayTailLossRtts above zero, "
 				"whether the sends the loss rule across paths declares lost "
@@ -1402,7 +1430,7 @@ void RdmaHw::Setup(QpCompleteCallback cb, QpFailureCallback failure_cb){
 		"SprayHoldRule 0");
 	NS_ABORT_MSG_IF(!ValidOverdueRepair(),
 		"SprayOverdueRepair needs SprayHeldLossRtts above zero and PathSelector "
-		"6, 7 or 9, or, at 3, PathSelector 8 or 10 or the uniform draw");
+		"6, 7 or 9, or, at 3, PathSelector 8, 10 or 11 or the uniform draw");
 	NS_ABORT_MSG_IF(!ValidCoverageFirst(),
 		"SprayCoverageFirst is read only under LoadBalancing 2, where every "
 		"send has a record");
@@ -1465,13 +1493,17 @@ void RdmaHw::Setup(QpCompleteCallback cb, QpFailureCallback failure_cb){
 				static_cast<uint32_t>(PathSelectorKind::Ops) &&
 			m_pathSelectorKind !=
 				static_cast<uint32_t>(PathSelectorKind::AckRedirect) &&
-			!IsRepsHold() && !IsRepsOracle() && !IsRepsSpine() &&
+			!IsRepsHold() && !IsRepsOracle() && !IsRepsSpine() && !IsThemis() &&
 			m_loadBalancing !=
 				static_cast<uint32_t>(LoadBalancingMode::EntropyHash),
 		"PathSelector 1 to 4 choose entropy values and need LoadBalancing 1");
 	NS_ABORT_MSG_IF(IsRepsSpine() && m_loadBalancing !=
 				static_cast<uint32_t>(LoadBalancingMode::SprayUniform),
 		"PathSelector 10 names spines and needs LoadBalancing 2");
+	NS_ABORT_MSG_IF(!ValidThemis(),
+		"PathSelector 11 needs LoadBalancing 2, selective retransmission and "
+		"paths that divide the spines, and its attributes are read only "
+		"under it");
 	NS_ABORT_MSG_IF(m_pathSelectorKind ==
 				static_cast<uint32_t>(PathSelectorKind::AckRedirect) &&
 			m_loadBalancing !=
@@ -1731,6 +1763,7 @@ int RdmaHw::ReceiveUdp(Ptr<Packet> p, CustomHeader &ch){
 		RepathAnswers(ch.sip, ch.udp.pg);
 	rxQp->NoteSeen(range_end);
 	int x = ReceiverCheckSeq(ch.udp.seq, rxQp, payload_size);
+	const bool pathAvoid = IsThemis() && ThemisArrival(rxQp, ch);
 
 	// Scored whether or not it is answered, as the grader counts it.
 	const uint16_t redirect = IsAckRedirect()
@@ -1742,7 +1775,8 @@ int RdmaHw::ReceiveUdp(Ptr<Packet> p, CustomHeader &ch){
 			(m_sprayDuplicateReport !=
 					static_cast<uint32_t>(DuplicateReport::Off) ||
 				IsOverdueRepair()) &&
-				accepted == 0 && late_forgiven == 0 && payload_size > 0);
+				accepted == 0 && late_forgiven == 0 && payload_size > 0,
+			pathAvoid);
 	}
 	// After the acknowledgement, so this packet's answer carries the state
 	// this packet produced and anything the report below absorbs is
@@ -1883,12 +1917,12 @@ bool RdmaHw::ValidOverdueRepair() const{
 	if (IsRepsHold())
 		return true;
 	// Without a loss hold, the repair that counts nothing alone: REPS, the
-	// oracle and the uniform draw.
+	// oracle, Themis and the uniform draw.
 	const bool uniformDraw = m_loadBalancing ==
 			static_cast<uint32_t>(LoadBalancingMode::SprayUniform) &&
 		m_pathSelectorKind == static_cast<uint32_t>(PathSelectorKind::Ops);
 	return m_sprayOverdueRepair == static_cast<uint32_t>(OverdueRepair::Reprobe) &&
-		(IsRepsSpine() || IsRepsOracle() || uniformDraw);
+		(IsRepsSpine() || IsRepsOracle() || IsThemis() || uniformDraw);
 }
 
 bool RdmaHw::IsOverdueRepair() const{
@@ -2323,10 +2357,12 @@ void RdmaHw::SendAck(Ptr<RdmaRxQueuePair> q, uint32_t sourceIp,
 		uint32_t destinationIp, uint16_t sport, uint16_t dport, uint16_t pg,
 		const IntHeader &ih, uint32_t packetSeq, uint16_t identification,
 		bool nack, bool cnp, bool spent, bool probeAnswer, uint16_t redirect,
-		bool duplicate){
+		bool duplicate, bool pathAvoid){
 	qbbHeader seqh;
 	if (duplicate)
 		seqh.SetDuplicate();
+	if (pathAvoid)
+		seqh.SetPathAvoid();
 	seqh.SetSeq(q->ReceiverNextExpectedSeq);
 	seqh.SetPacketSeq(packetSeq);
 	seqh.SetPG(pg);
@@ -2542,6 +2578,8 @@ int RdmaHw::ReceiveAck(Ptr<Packet> p, CustomHeader &ch){
 			qp->Acknowledge(goback_seq, keepCovered);
 		}
 		qp->m_answerCoverage = 0;
+		if (IsThemis() && ((ch.ack.flags >> qbbHeader::FLAG_PATH_AVOID) & 1))
+			ThemisPathAvoid(qp, seq);
 		if (qp->snd_una > acknowledged_before){
 			qp->m_recovery_retries = 0;
 			qp->m_last_progress_ns = Simulator::Now().GetNanoSeconds();
@@ -3610,6 +3648,7 @@ Ptr<Packet> RdmaHw::GetNxtPacket(Ptr<RdmaQueuePair> qp){
 		uint16_t probed;
 		if (qp->m_pathSelector->TakeProbe(now, probed))
 			SendPathProbe(qp, probed);
+		qp->m_pathSelector->NextSend(qp->m_psnBase + seq / m_mtu, is_repair);
 		identification = qp->m_pathSelector->Choose(now);
 		if (is_repair && !m_tailLosses.empty())
 			identification = RerouteTailRepair(qp, seq, identification, now);
@@ -3808,6 +3847,11 @@ bool RdmaHw::StartPathSelection(Ptr<RdmaQueuePair> qp, uint64_t bdpBytes,
 		m_sprayOverdueRepair == static_cast<uint32_t>(OverdueRepair::Reprobe);
 	qp->m_rackReorderNs = m_sprayRackReorderNs;
 	qp->m_rackDeferLoss = m_sprayRackDeferLoss;
+	if (IsThemis()){
+		uint64_t &next = m_themisPsnNext[GetQpKey(qp->dip.Get(), 0, qp->m_pg)];
+		qp->m_psnBase = next;
+		next += (qp->m_size + m_mtu - 1) / m_mtu;
+	}
 	if (!IsConnectionPathState()){
 		qp->m_pathSelector = MakePathSelector(qp, bdpBytes, baseRttNs);
 		return true;
@@ -3826,6 +3870,9 @@ std::unique_ptr<PathSelector> RdmaHw::MakePathSelector(Ptr<RdmaQueuePair> qp,
 		uint64_t bdpBytes, uint64_t baseRttNs){
 	if (IsAckRedirect())
 		return std::make_unique<AckRedirectSelector>(m_pathRandom, m_spineCount);
+	if (IsThemis())
+		return std::make_unique<ThemisSelector>(m_pathRandom, m_spineCount,
+			ThemisPaths(), m_sprayThemisAvoidanceWindow, m_sprayThemisRetxReroute);
 	if (m_pathSelectorKind ==
 			static_cast<uint32_t>(PathSelectorKind::RepsFlowHold))
 		return std::make_unique<RepsHoldSelector>(m_pathRandom,

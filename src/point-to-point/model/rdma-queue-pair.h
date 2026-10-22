@@ -52,6 +52,9 @@ public:
 		bool held = false);
 	// The packet number of the outstanding send of seq along path, or kNone.
 	uint64_t Find(uint64_t seq, uint16_t path) const;
+	// The packet number of the outstanding send of seq along any path, or
+	// kNone.
+	uint64_t FindPacket(uint64_t seq) const;
 	uint64_t Oldest() const;
 	uint64_t OlderOnPath(uint64_t packet) const;
 	uint64_t Seq(uint64_t packet) const;
@@ -373,6 +376,15 @@ public:
 	// queue its range for repair. Returns the bytes declared lost: zero when
 	// it was acknowledged or declared lost since, or seq was sent again.
 	uint64_t DeclareHeldSendLost(uint64_t seq, uint16_t path, uint64_t sentNs);
+	// Under PathSelector Themis: declare lost the outstanding send of seq,
+	// along whichever path it took, and queue its range for repair, as
+	// Themis's Path Avoidance Signal does for the packet it names. Returns
+	// the bytes declared lost: zero when nothing of seq is outstanding.
+	uint64_t DeclareLostSeq(uint64_t seq);
+	// Under PathSelector Themis: the packet sequence number of this queue
+	// pair's first packet in its connection, so that the connection's
+	// messages number their packets as one queue pair would.
+	uint64_t m_psnBase;
 	// Sends on a held spine declared lost by DeclareHeldSendLost.
 	uint32_t m_held_declared_lost;
 	// SprayOverdueRepair (RdmaHw): the queue pair's latest send on a spine
@@ -624,6 +636,18 @@ public:
 	uint64_t m_folded_arrivals;
 	// Under SprayPathSeq, the path sequence expected next per path.
 	SpineSequenceReceiver m_pathSeqReceiver;
+	// Under PathSelector Themis, Themis's destination state for this queue
+	// pair (Liu et al., EuroSys 2026, algorithm 1 and section 4.4), packets
+	// numbered from the queue pair's first: the highest packet seen per path
+	// index (packet mod N), the stashed undetermined repair request, its
+	// head, and the head last requested.
+	struct ThemisDestination {
+		std::vector<int64_t> pathMax;
+		bool valid = false;
+		uint64_t sePsn = 0;
+		uint64_t requestedHead = UINT64_MAX;
+	};
+	ThemisDestination m_themis;
 	// Under SprayTailRecovery with a delay, the missing runs not yet
 	// requested, and the one timer that requests those due.
 	PendingTailRuns m_tailRuns;

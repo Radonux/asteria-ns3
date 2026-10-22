@@ -109,6 +109,9 @@ namespace ns3 {
 	void qbbHeader::SetDuplicate(){
 		flags |= 1 << FLAG_DUPLICATE;
 	}
+	void qbbHeader::SetPathAvoid(){
+		flags |= 1 << FLAG_PATH_AVOID;
+	}
 	void qbbHeader::SetPacketSeq(uint32_t seq){
 		m_packetSeq = seq;
 	}

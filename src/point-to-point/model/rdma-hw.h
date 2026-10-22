@@ -462,6 +462,29 @@ public:
 	bool ValidRepsOracle() const;
 	// PathSelector RepsSpine: REPS over spines under LoadBalancing 2.
 	bool IsRepsSpine() const;
+	// PathSelector Themis (ThemisSelector at the source, ThemisArrival at
+	// the destination): its paths, 0 for the spines; the out-of-order degree
+	// in packets past which a stashed repair request becomes a Path
+	// Avoidance Signal, 0 for none; the redirected packets a signal avoids
+	// its path for; and whether a repair goes up another path.
+	bool IsThemis() const;
+	bool ValidThemis() const;
+	uint32_t ThemisPaths() const;
+	uint32_t m_sprayThemisPaths;
+	uint32_t m_sprayThemisOooThreshold;
+	uint64_t m_sprayThemisAvoidanceWindow;
+	bool m_sprayThemisRetxReroute;
+	// The packet sequence number the connection's next queue pair starts at,
+	// by the connection's key (GetQpKey with the priority group as port).
+	std::unordered_map<uint64_t, uint64_t> m_themisPsnNext;
+	// Whether the arrival ch makes Themis's destination send a Path
+	// Avoidance Signal for q, on the acknowledgement this arrival gets.
+	bool ThemisArrival(Ptr<RdmaRxQueuePair> q, const CustomHeader &ch);
+	// A Path Avoidance Signal for qp's packet at seq: its path is avoided
+	// and its outstanding send declared lost and repaired.
+	void ThemisPathAvoid(Ptr<RdmaQueuePair> qp, uint64_t seq);
+	uint64_t m_themisSignalsSent = 0;
+	uint64_t m_themisSignalsReceived = 0;
 	std::unordered_map<uint32_t, FaultedSpines> m_faultedSpines;
 	FaultedSpines &FaultedSpinesTo(uint32_t leaf);
 	// The hold in m_leafHolds of key: a destination leaf, or under Pair a
@@ -896,7 +919,7 @@ public:
 		uint32_t destinationIp, uint16_t sport, uint16_t dport, uint16_t pg,
 		const IntHeader &ih, uint32_t packetSeq, uint16_t identification,
 		bool nack, bool cnp, bool spent, bool probeAnswer, uint16_t redirect,
-		bool duplicate = false);
+		bool duplicate = false, bool pathAvoid = false);
 	// Read the receiver's two bits off an arriving repair request or
 	// acknowledgement and follow them: eligible with room grants the
 	// exemption and eligible with none returns the sender to its controller,

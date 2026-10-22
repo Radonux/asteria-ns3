@@ -57,7 +57,11 @@ public:
     FLAG_ROUTE_PROBE_REPLY = 9,
     // Under SprayDuplicateReport: the acknowledgement answers a data packet
     // whose sequence the receiver held already (SetDuplicate).
-    FLAG_DUPLICATE = 10
+    FLAG_DUPLICATE = 10,
+    // Under PathSelector Themis: the acknowledgement is Themis's Path
+    // Avoidance Signal for the packet its cumulative sequence names
+    // (SetPathAvoid).
+    FLAG_PATH_AVOID = 11
   };
   qbbHeader (uint16_t pg);
   qbbHeader ();
@@ -83,6 +87,8 @@ public:
   void SetRouteProbeReply();
   // FLAG_DUPLICATE.
   void SetDuplicate();
+  // FLAG_PATH_AVOID.
+  void SetPathAvoid();
   // The sequence of the data packet this acknowledgement answers, serialized
   // only while CustomHeader::ackCarriesPacketSeq is set.
   void SetPacketSeq(uint32_t seq);

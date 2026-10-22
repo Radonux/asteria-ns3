@@ -43,6 +43,7 @@ build_lib(
     model/rdma-hw-answer-path.cc
     model/rdma-hw-answer-route.cc
     model/rdma-hw-spine-sequence.cc
+    model/rdma-hw-themis.cc
     model/rdma-queue-pair.cc
     model/spine-grader.cc
     model/spine-redirect.cc

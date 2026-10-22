@@ -230,7 +230,8 @@ std::string load_balancing = "ecmp";
 // spines leaving out none: no loss hold, no sentinels, and none of the loss
 // hold keys; it reads REPS_BUFFER_SIZE and REPS_FREEZING_TIMEOUT_NS as reps
 // does, and SPRAY_PATH_SEQ and SPRAY_TAIL_RECOVERY as every spray_uniform
-// selector does.
+// selector does. themis is Themis's spraying by packet sequence number with
+// its path avoidance (SPRAY_THEMIS_PATHS and the keys after it).
 std::string path_selector = "ops";
 bool reps_hold() {
   return path_selector == "reps_hold" || path_selector == "reps_flow_hold" ||
@@ -399,6 +400,25 @@ bool spray_rack_reorder_ns_given = false;
 // tail_loss_delivered or tail_loss_ambiguous). Default off.
 std::string spray_rack_defer_loss = "off";
 bool spray_rack_defer_loss_given = false;
+// PATH_SELECTOR themis, under LOAD_BALANCING spray_uniform: Themis (Liu et
+// al., EuroSys 2026) over spines. A queue pair's packet of sequence number p,
+// numbered on from the connection's earlier queue pairs, goes up the spine of
+// path p mod SPRAY_THEMIS_PATHS, the paths spaced evenly over the spines (0,
+// the default, for every spine). The receiving host keeps Themis's
+// destination state per queue pair: the repair request it would send for the
+// head of a gap is confirmed when a later packet of the head's path has
+// arrived and otherwise stashed, and a packet more than
+// SPRAY_THEMIS_OOO_THRESHOLD past a stashed head (default 448, Themis's; 0
+// for none) makes that arrival's acknowledgement a Path Avoidance Signal
+// for the head. The sender declares the head's send lost and repairs it, and
+// sends the next SPRAY_THEMIS_AVOIDANCE_WINDOW packets assigned the head's
+// path (default 2000000, Themis's; 0 for none) up other paths drawn at random
+// among those not avoided. Under SPRAY_THEMIS_RETX_REROUTE on, the default, a
+// repair goes up another path than its own.
+uint32_t spray_themis_paths = 0;
+uint32_t spray_themis_ooo_threshold = 448;
+uint64_t spray_themis_avoidance_window = 2000000;
+std::string spray_themis_retx_reroute = "on";
 // Under LOAD_BALANCING spray_uniform, with any PATH_SELECTOR,
 // SPRAY_ACK_LOSS_RTTS <x>: a data send that the cumulative acknowledgement
 // covers before its own acknowledgement arrives, and whose own acknowledgement
@@ -723,6 +743,10 @@ const std::map<std::string, std::set<std::string>> path_selector_parameter_owner
     {"ACK_REDIRECT_TRIM_SCORING", {"ack_redirect"}},
     {"ACK_REDIRECT_SCOPE", {"ack_redirect"}},
     {"REPS_ORACLE_HOPS", {"reps_oracle"}},
+    {"SPRAY_THEMIS_PATHS", {"themis"}},
+    {"SPRAY_THEMIS_OOO_THRESHOLD", {"themis"}},
+    {"SPRAY_THEMIS_AVOIDANCE_WINDOW", {"themis"}},
+    {"SPRAY_THEMIS_RETX_REROUTE", {"themis"}},
 };
 // The keys of ack_redirect that only its per_connection scope reads.
 const std::set<std::string> ack_redirect_connection_keys = {
@@ -1395,6 +1419,8 @@ uint32_t path_selector_value() {
     return static_cast<uint32_t>(PathSelectorKind::MrcHold);
   if (path_selector == "reps_spine")
     return static_cast<uint32_t>(PathSelectorKind::RepsSpine);
+  if (path_selector == "themis")
+    return static_cast<uint32_t>(PathSelectorKind::Themis);
   return std::numeric_limits<uint32_t>::max();
 }
 
@@ -2554,14 +2580,14 @@ bool valid_hold_rule() {
   const bool overdue_without_hold =
       load_balancing == "spray_uniform" &&
       (path_selector == "reps_spine" || path_selector == "reps_oracle" ||
-       path_selector == "ops") &&
+       path_selector == "themis" || path_selector == "ops") &&
       (spray_overdue_repair == "reprobe" || spray_overdue_repair == "off");
   if (spray_overdue_repair_given &&
       ((!reps_hold() && !overdue_without_hold) ||
        !(spray_held_loss_rtts > 0))) {
     std::cerr << "SPRAY_OVERDUE_REPAIR is read only under PATH_SELECTOR "
                  "reps_hold, reps_flow_hold or mrc_hold, or as reprobe or "
-                 "off under reps_spine, reps_oracle or the uniform draw, "
+                 "off under reps_spine, reps_oracle, themis or the uniform draw, "
                  "with SPRAY_HELD_LOSS_RTTS above 0\n";
     return false;
   }
@@ -2863,6 +2889,14 @@ bool ReadConf(string network_configuration) {
     } else if (key.compare("SPRAY_RACK_DEFER_LOSS") == 0) {
       conf >> spray_rack_defer_loss;
       spray_rack_defer_loss_given = true;
+    } else if (key.compare("SPRAY_THEMIS_PATHS") == 0) {
+      conf >> spray_themis_paths;
+    } else if (key.compare("SPRAY_THEMIS_OOO_THRESHOLD") == 0) {
+      conf >> spray_themis_ooo_threshold;
+    } else if (key.compare("SPRAY_THEMIS_AVOIDANCE_WINDOW") == 0) {
+      conf >> spray_themis_avoidance_window;
+    } else if (key.compare("SPRAY_THEMIS_RETX_REROUTE") == 0) {
+      conf >> spray_themis_retx_reroute;
     } else if (key.compare("SPRAY_ACK_LOSS_RTTS") == 0) {
       conf >> spray_ack_loss_rtts;
       spray_ack_loss_rtts_given = true;
@@ -3394,7 +3428,7 @@ bool ReadConf(string network_configuration) {
   if (path_selector_value() == std::numeric_limits<uint32_t>::max()) {
     std::cerr << "PATH_SELECTOR must be ops, reps, ue_oblivious, ue_aware, mrc, "
                  "ack_redirect, reps_hold, reps_flow_hold, reps_oracle, "
-                 "mrc_hold or reps_spine\n";
+                 "mrc_hold, reps_spine or themis\n";
     return false;
   }
   if (reps_hold()) {
@@ -3422,9 +3456,14 @@ bool ReadConf(string network_configuration) {
     std::cerr << "REPS_ORACLE_HOPS must be round_trip or forward\n";
     return false;
   }
-  if (path_selector == "reps_spine" && load_balancing != "spray_uniform") {
+  if ((path_selector == "reps_spine" || path_selector == "themis") &&
+      load_balancing != "spray_uniform") {
     std::cerr << "PATH_SELECTOR " << path_selector
               << " names spines and requires LOAD_BALANCING spray_uniform\n";
+    return false;
+  }
+  if (spray_themis_retx_reroute != "on" && spray_themis_retx_reroute != "off") {
+    std::cerr << "SPRAY_THEMIS_RETX_REROUTE must be on or off\n";
     return false;
   }
   if (spray_hold_scope_given && !hold_scope_read()) {
@@ -3692,6 +3731,7 @@ bool ReadConf(string network_configuration) {
       return false;
   } else if (path_selector != "ops" && !reps_hold() &&
              path_selector != "reps_oracle" && path_selector != "reps_spine" &&
+             path_selector != "themis" &&
              load_balancing_value() !=
                  static_cast<uint32_t>(LoadBalancingMode::EntropyHash)) {
     std::cerr << "PATH_SELECTOR " << path_selector
@@ -4385,6 +4425,13 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),
                            UintegerValue(spray_rack_reorder_ns));
       rdmaHw->SetAttribute("SprayRackDeferLoss",
                            BooleanValue(spray_rack_defer_loss == "on"));
+      rdmaHw->SetAttribute("SprayThemisPaths", UintegerValue(spray_themis_paths));
+      rdmaHw->SetAttribute("SprayThemisOooThreshold",
+                           UintegerValue(spray_themis_ooo_threshold));
+      rdmaHw->SetAttribute("SprayThemisAvoidanceWindow",
+                           UintegerValue(spray_themis_avoidance_window));
+      rdmaHw->SetAttribute("SprayThemisRetxReroute",
+                           BooleanValue(spray_themis_retx_reroute == "on"));
       rdmaHw->SetAttribute("SprayAckLossRtts",
                            DoubleValue(spray_ack_loss_rtts));
       rdmaHw->SetAttribute(

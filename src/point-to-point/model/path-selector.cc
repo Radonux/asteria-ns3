@@ -89,6 +89,12 @@ void PathSelector::SetReceiverHold(std::shared_ptr<ReceiverHoldMarks>,
 		uint32_t){
 }
 
+void PathSelector::NextSend(uint64_t, bool){
+}
+
+void PathSelector::OnPathAvoid(uint64_t, uint64_t){
+}
+
 SharedPathSelector::SharedPathSelector(std::shared_ptr<PathSelector> shared)
 	: m_shared(std::move(shared))
 {
@@ -169,6 +175,14 @@ void SharedPathSelector::SetReceiverHold(
 	m_shared->SetReceiverHold(std::move(marks), leaf);
 }
 
+void SharedPathSelector::NextSend(uint64_t psn, bool repair){
+	m_shared->NextSend(psn, repair);
+}
+
+void SharedPathSelector::OnPathAvoid(uint64_t psn, uint64_t nowNs){
+	m_shared->OnPathAvoid(psn, nowNs);
+}
+
 UniformSpineSelector::UniformSpineSelector(Ptr<UniformRandomVariable> random,
 		uint32_t spines)
 	: m_random(random), m_spines(spines)
@@ -178,6 +192,76 @@ UniformSpineSelector::UniformSpineSelector(Ptr<UniformRandomVariable> random,
 uint16_t UniformSpineSelector::Choose(uint64_t){
 	const uint8_t spine = m_random->GetInteger(0, m_spines - 1);
 	return SpineIdentification(spine, spine);
+}
+
+ThemisSelector::ThemisSelector(Ptr<UniformRandomVariable> random,
+		uint32_t spines, uint32_t paths, uint64_t window, bool reroute)
+	: ThemisSelector(random, spines, paths, window, reroute,
+		random->GetInteger(0, spines - 1))
+{
+}
+
+ThemisSelector::ThemisSelector(Ptr<UniformRandomVariable> random,
+		uint32_t spines, uint32_t paths, uint64_t window, bool reroute,
+		uint32_t base)
+	: m_random(random), m_spines(spines), m_paths(paths),
+	  m_stride(paths > 0 ? spines / paths : 0), m_base(base),
+	  m_window(window), m_reroute(reroute), m_counter(spines, 0)
+{
+	NS_ASSERT_MSG(paths > 0 && paths <= spines && spines % paths == 0,
+		"Themis's paths divide the spines");
+	NS_ASSERT_MSG(base < spines, "the base is a spine");
+}
+
+uint8_t ThemisSelector::Assigned(uint64_t psn) const{
+	return static_cast<uint8_t>((m_base + (psn % m_paths) * m_stride) % m_spines);
+}
+
+uint64_t ThemisSelector::Counter(uint8_t spine) const{
+	return m_counter[spine];
+}
+
+uint64_t ThemisSelector::Redirects() const{
+	return m_redirects;
+}
+
+void ThemisSelector::NextSend(uint64_t psn, bool repair){
+	m_psn = psn;
+	m_repair = repair;
+	m_decremented = false;
+}
+
+void ThemisSelector::OnPathAvoid(uint64_t psn, uint64_t){
+	if (m_window > 0)
+		m_counter[Assigned(psn)] = m_window;
+}
+
+uint16_t ThemisSelector::Choose(uint64_t){
+	const uint8_t assigned = Assigned(m_psn);
+	const bool avoided = m_counter[assigned] > 0;
+	if (avoided && !m_decremented){
+		m_counter[assigned]--;
+		m_decremented = true;
+		m_redirects++;
+	}
+	const uint8_t spine = avoided || (m_repair && m_reroute)
+		? DrawOther(assigned) : assigned;
+	return SpineIdentification(spine, spine);
+}
+
+uint8_t ThemisSelector::DrawOther(uint8_t assigned){
+	uint32_t open = 0;
+	for (uint32_t index = 0; index < m_paths; ++index){
+		const uint8_t spine = Assigned(index);
+		open += spine != assigned && m_counter[spine] == 0;
+	}
+	if (open == 0)
+		return assigned;
+	uint8_t spine;
+	do
+		spine = Assigned(m_random->GetInteger(0, m_paths - 1));
+	while (spine == assigned || m_counter[spine] > 0);
+	return spine;
 }
 
 AckRedirectSelector::AckRedirectSelector(Ptr<UniformRandomVariable> random,

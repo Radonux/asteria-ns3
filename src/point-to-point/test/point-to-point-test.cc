@@ -3669,6 +3669,271 @@ class RackDeferredLossTest : public TestCase
     }
 };
 
+class ThemisSelectorTest : public TestCase
+{
+  public:
+    ThemisSelectorTest()
+        : TestCase("Themis's source sprays by packet sequence number and sends a packet whose path "
+                   "is avoided up another path, one count per send")
+    {
+    }
+
+    void DoRun() override
+    {
+        Ptr<UniformRandomVariable> random =
+            CreateObjectWithAttributes<UniformRandomVariable>("Stream", IntegerValue(0));
+        const auto chosen = [](ThemisSelector& selector, uint64_t psn, bool repair = false) {
+            selector.NextSend(psn, repair);
+            return RequestedSpine(selector.Choose(0));
+        };
+        {
+            ThemisSelector selector(random, 8, 8, 3, true, 3);
+            const uint32_t expected[] = {3, 4, 5, 6, 7, 0, 1, 2, 3, 4};
+            for (uint64_t psn = 0; psn < 10; ++psn)
+            {
+                NS_TEST_EXPECT_MSG_EQ(uint32_t(chosen(selector, psn)), expected[psn], "psn mod N");
+            }
+        }
+        {
+            ThemisSelector selector(random, 8, 4, 3, true, 1);
+            const uint32_t expected[] = {1, 3, 5, 7, 1, 3};
+            for (uint64_t psn = 0; psn < 6; ++psn)
+            {
+                NS_TEST_EXPECT_MSG_EQ(uint32_t(chosen(selector, psn)),
+                                      expected[psn],
+                                      "four paths a stride of two apart");
+            }
+        }
+        {
+            ThemisSelector selector(random, 8, 8, 3, true, 0);
+            selector.OnPathAvoid(2, 0);
+            NS_TEST_EXPECT_MSG_EQ(selector.Counter(2), 3, "the signal sets the window");
+            for (uint64_t psn = 0; psn < 32; ++psn)
+            {
+                const uint8_t spine = chosen(selector, psn);
+                const bool redirected = psn == 2 || psn == 10 || psn == 18;
+                if (redirected)
+                {
+                    NS_TEST_EXPECT_MSG_NE(uint32_t(spine), 2, "an avoided path is left");
+                }
+                else
+                {
+                    NS_TEST_EXPECT_MSG_EQ(uint32_t(spine), psn % 8, "the others keep their own");
+                }
+            }
+            NS_TEST_EXPECT_MSG_EQ(selector.Counter(2), 0, "three redirects spend the window");
+            NS_TEST_EXPECT_MSG_EQ(selector.Redirects(), 3, "and are counted");
+            selector.OnPathAvoid(10, 0);
+            NS_TEST_EXPECT_MSG_EQ(selector.Counter(2), 3, "a later signal sets it again");
+            selector.NextSend(2, false);
+            for (int draw = 0; draw < 5; ++draw)
+            {
+                selector.Choose(0);
+            }
+            NS_TEST_EXPECT_MSG_EQ(selector.Counter(2), 2, "one send takes one count");
+        }
+        {
+            ThemisSelector selector(random, 4, 4, 2, true, 0);
+            for (uint64_t psn = 0; psn < 4; ++psn)
+            {
+                selector.OnPathAvoid(psn, 0);
+            }
+            for (uint64_t psn = 0; psn < 4; ++psn)
+            {
+                NS_TEST_EXPECT_MSG_EQ(uint32_t(chosen(selector, psn)),
+                                      psn,
+                                      "with every other path avoided a packet keeps its own");
+                NS_TEST_EXPECT_MSG_EQ(selector.Counter(psn), 1, "and the count still falls");
+            }
+        }
+        for (const bool reroute : {true, false})
+        {
+            ThemisSelector selector(random, 8, 8, 3, reroute, 0);
+            selector.OnPathAvoid(6, 0);
+            std::set<uint32_t> spines;
+            for (int round = 0; round < 1000; ++round)
+            {
+                spines.insert(chosen(selector, 5, true));
+            }
+            if (reroute)
+            {
+                NS_TEST_EXPECT_MSG_EQ(spines.count(5), 0, "a repair goes up another path");
+                NS_TEST_EXPECT_MSG_EQ(spines.count(6), 0, "not up an avoided one");
+                NS_TEST_EXPECT_MSG_EQ(spines.size(), 6, "and up each of the others");
+            }
+            else
+            {
+                NS_TEST_EXPECT_MSG_EQ(spines.size(), 1, "without reroute a repair keeps its path");
+                NS_TEST_EXPECT_MSG_EQ(spines.count(5), 1, "its own");
+            }
+        }
+    }
+};
+
+class ThemisDestinationTest : public TestCase
+{
+  public:
+    ThemisDestinationTest()
+        : TestCase("Themis's destination stashes an unconfirmed head and signals its path once a "
+                   "packet is more than the threshold past it")
+    {
+    }
+
+    void DoRun() override
+    {
+        constexpr uint32_t kMtu = IsolatedHost::kMtu;
+        // The signal: N 8, threshold 3; packets 1 to 4, then 5, 6 and 0.
+        {
+            IsolatedHost receiver(LoadBalancingMode::SprayUniform, kTestSender, 8);
+            Configure(receiver, 8, 3);
+            const bool flagged[] = {false, false, false, true};
+            for (uint32_t psn = 1; psn <= 4; ++psn)
+            {
+                Arrive(receiver, psn);
+                NS_TEST_EXPECT_MSG_EQ(Flagged(receiver), flagged[psn - 1], "only packet 4 signals");
+            }
+            NS_TEST_EXPECT_MSG_EQ(receiver.emitted.back().ack.seq, 0, "for the head, packet 0");
+            for (const uint32_t psn : {5u, 6u, 0u})
+            {
+                Arrive(receiver, psn);
+                NS_TEST_EXPECT_MSG_EQ(Flagged(receiver), false, "one signal per head");
+            }
+            NS_TEST_EXPECT_MSG_EQ(receiver.emitted.back().ack.seq, 7 * kMtu, "all arrived");
+            NS_TEST_EXPECT_MSG_EQ(receiver.hw->m_themisSignalsSent, 1, "one signal sent");
+            Simulator::Destroy();
+        }
+        // Confirmed: N 4, threshold 10; packet 4 shares packet 0's path.
+        {
+            IsolatedHost receiver(LoadBalancingMode::SprayUniform, kTestSender, 8);
+            Configure(receiver, 4, 10);
+            for (uint32_t psn = 1; psn <= 20; ++psn)
+            {
+                if (psn == 2 || psn == 3)
+                {
+                    continue;
+                }
+                Arrive(receiver, psn);
+                NS_TEST_EXPECT_MSG_EQ(Flagged(receiver), false, "a confirmed head is no signal");
+            }
+            Simulator::Destroy();
+        }
+        // The head arrives: N 8, threshold 3; packets 1, 2 then 0, then 4 to 7.
+        {
+            IsolatedHost receiver(LoadBalancingMode::SprayUniform, kTestSender, 8);
+            Configure(receiver, 8, 3);
+            for (const uint32_t psn : {1u, 2u, 0u, 4u, 5u, 6u})
+            {
+                Arrive(receiver, psn);
+                NS_TEST_EXPECT_MSG_EQ(Flagged(receiver), false, "no signal before packet 7");
+            }
+            Arrive(receiver, 7);
+            NS_TEST_EXPECT_MSG_EQ(Flagged(receiver), true, "packet 7 is 4 past the new head");
+            NS_TEST_EXPECT_MSG_EQ(receiver.emitted.back().ack.seq, 3 * kMtu, "packet 3");
+            Simulator::Destroy();
+        }
+        // Confirmed as the request is made: N 4, threshold 2; packet 4 first.
+        {
+            IsolatedHost receiver(LoadBalancingMode::SprayUniform, kTestSender, 8);
+            Configure(receiver, 4, 2);
+            for (uint32_t psn = 4; psn <= 9; ++psn)
+            {
+                Arrive(receiver, psn);
+                NS_TEST_EXPECT_MSG_EQ(Flagged(receiver), false, "a head confirmed at once is no signal");
+            }
+            Simulator::Destroy();
+        }
+        // Threshold 0: no destination state at all.
+        {
+            IsolatedHost receiver(LoadBalancingMode::SprayUniform, kTestSender, 8);
+            Configure(receiver, 8, 0);
+            for (uint32_t psn = 1; psn <= 12; ++psn)
+            {
+                Arrive(receiver, psn);
+                NS_TEST_EXPECT_MSG_EQ(Flagged(receiver), false, "off");
+            }
+            Simulator::Destroy();
+        }
+    }
+
+  private:
+    static void Configure(IsolatedHost& receiver, uint32_t paths, uint32_t threshold)
+    {
+        receiver.hw->m_pathSelectorKind = static_cast<uint32_t>(PathSelectorKind::Themis);
+        receiver.hw->m_sprayThemisPaths = paths;
+        receiver.hw->m_sprayThemisOooThreshold = threshold;
+    }
+
+    static void Arrive(IsolatedHost& receiver, uint32_t psn)
+    {
+        const uint8_t spine = psn % 8;
+        receiver.ReceiveData(kTestSender,
+                             kTestReceiver,
+                             psn * IsolatedHost::kMtu,
+                             SpineIdentification(spine, spine));
+    }
+
+    static bool Flagged(const IsolatedHost& receiver)
+    {
+        return (receiver.emitted.back().ack.flags >> qbbHeader::FLAG_PATH_AVOID) & 1;
+    }
+};
+
+class ThemisSenderTest : public TestCase
+{
+  public:
+    ThemisSenderTest()
+        : TestCase("A Path Avoidance Signal declares its packet's send lost, repairs it once and "
+                   "avoids its path")
+    {
+    }
+
+    void DoRun() override
+    {
+        constexpr uint32_t kMtu = IsolatedHost::kMtu;
+        IsolatedHost sender(LoadBalancingMode::SprayUniform, kTestReceiver, 8);
+        sender.hw->m_pathSelectorKind = static_cast<uint32_t>(PathSelectorKind::Themis);
+        sender.hw->m_sprayThemisAvoidanceWindow = 2;
+        Ptr<RdmaQueuePair> qp = sender.AddSender(kTestSender, kTestReceiver, 10 * kMtu);
+        auto* selector = dynamic_cast<ThemisSelector*>(qp->m_pathSelector.get());
+        NS_TEST_ASSERT_MSG_NE(selector, nullptr, "PathSelector 11 makes Themis's selector");
+        qp->snd_nxt = 8 * kMtu;
+        qp->m_highest_sent = 8 * kMtu;
+        for (uint64_t psn = 0; psn < 8; ++psn)
+        {
+            qp->m_outstanding.Add(psn * kMtu, kMtu, selector->Assigned(psn), psn * 100);
+        }
+        const auto signal = [&](uint32_t cumulative) {
+            CustomHeader ack;
+            ack.l3Prot = 0xFC;
+            ack.sip = kTestReceiver.Get();
+            const uint8_t spine = selector->Assigned(5);
+            ack.ipid = SpineIdentification(spine, spine);
+            ack.ack.flags = 1 << qbbHeader::FLAG_PATH_AVOID;
+            ack.ack.sport = IsolatedHost::kReceiverPort;
+            ack.ack.dport = IsolatedHost::kSenderPort;
+            ack.ack.pg = IsolatedHost::kPriorityGroup;
+            ack.ack.seq = cumulative;
+            ack.ack.packet_seq = 5 * kMtu;
+            sender.hw->ReceiveAck(Create<Packet>(), ack);
+        };
+        signal(0);
+        NS_TEST_EXPECT_MSG_EQ(qp->m_repair_ranges.size(), 1, "one repair");
+        NS_TEST_EXPECT_MSG_EQ(qp->m_repair_ranges.count(0), 1, "of packet 0");
+        NS_TEST_EXPECT_MSG_EQ(qp->m_repair_ranges[0], kMtu, "alone");
+        NS_TEST_EXPECT_MSG_EQ(qp->m_outstanding.FindPacket(0), OutstandingPackets::kNone,
+                              "its send is no longer outstanding");
+        NS_TEST_EXPECT_MSG_EQ(selector->Counter(selector->Assigned(0)), 2, "its path is avoided");
+        NS_TEST_EXPECT_MSG_EQ(sender.hw->m_themisSignalsReceived, 1, "one signal received");
+        selector->NextSend(8, false);
+        selector->Choose(0);
+        NS_TEST_EXPECT_MSG_EQ(selector->Counter(selector->Assigned(0)), 1, "packet 8 is redirected");
+        signal(0);
+        NS_TEST_EXPECT_MSG_EQ(qp->m_repair_ranges.size(), 1, "a second signal repairs nothing more");
+        NS_TEST_EXPECT_MSG_EQ(selector->Counter(selector->Assigned(0)), 2, "but sets the window again");
+        Simulator::Destroy();
+    }
+};
+
 class OutstandingWindowTest : public TestCase
 {
   public:
@@ -17553,6 +17818,9 @@ PointToPointTestSuite::PointToPointTestSuite()
     AddTestCase(new SelectiveTimeoutTest, TestCase::Duration::QUICK);
     AddTestCase(new RackLossRuleTest, TestCase::Duration::QUICK);
     AddTestCase(new RackDeferredLossTest, TestCase::Duration::QUICK);
+    AddTestCase(new ThemisSelectorTest, TestCase::Duration::QUICK);
+    AddTestCase(new ThemisDestinationTest, TestCase::Duration::QUICK);
+    AddTestCase(new ThemisSenderTest, TestCase::Duration::QUICK);
     AddTestCase(new OutstandingWindowTest, TestCase::Duration::QUICK);
     AddTestCase(new TrimRepairedOnceTest, TestCase::Duration::QUICK);
     AddTestCase(new DuplicateRepairTest, TestCase::Duration::QUICK);

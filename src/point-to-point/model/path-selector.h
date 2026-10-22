@@ -215,6 +215,9 @@ enum class PathSelectorKind : uint32_t {
 	MrcHold,
 	// Under SprayUniform: REPS over spines, leaving out none.
 	RepsSpine,
+	// Under SprayUniform: Themis's spraying by packet sequence number, with
+	// its source's per-path avoidance (ThemisSelector).
+	Themis,
 };
 
 // The queue pair's sends per trickle send onto one held spine that receives
@@ -286,6 +289,13 @@ public:
 	// them.
 	virtual void SetReceiverHold(std::shared_ptr<ReceiverHoldMarks> marks,
 		uint32_t leaf);
+	// Before Choose for a data packet: its packet sequence number in the
+	// connection (the queue pair's base plus its sequence in packets), and
+	// whether it is a repair.
+	virtual void NextSend(uint64_t psn, bool repair);
+	// An acknowledgement flagged as Themis's Path Avoidance Signal for the
+	// packet of sequence number psn.
+	virtual void OnPathAvoid(uint64_t psn, uint64_t nowNs);
 };
 
 // A queue pair's handle on the path selector of its connection under
@@ -313,6 +323,8 @@ public:
 		bool partial, uint64_t nowNs) override;
 	void SetReceiverHold(std::shared_ptr<ReceiverHoldMarks> marks,
 		uint32_t leaf) override;
+	void NextSend(uint64_t psn, bool repair) override;
+	void OnPathAvoid(uint64_t psn, uint64_t nowNs) override;
 
 private:
 	std::shared_ptr<PathSelector> m_shared;
@@ -328,6 +340,48 @@ public:
 private:
 	Ptr<UniformRandomVariable> m_random;
 	uint32_t m_spines;
+};
+
+// The source side of Themis (Liu et al., EuroSys 2026), over spines. The
+// packet of sequence number psn goes up the spine of path psn mod N, the N
+// paths spaced spines / N apart from a base drawn once (equation 1). A Path
+// Avoidance Signal for psn sets its path's counter to the avoidance window;
+// while the path a packet is assigned has a nonzero counter, the packet goes
+// up another path drawn at random among those with none, and the counter
+// falls by one (section 4.4). Under reroute a repair, too, goes up another
+// path. When every other path is avoided, the packet keeps its own.
+class ThemisSelector : public PathSelector {
+public:
+	ThemisSelector(Ptr<UniformRandomVariable> random, uint32_t spines,
+		uint32_t paths, uint64_t window, bool reroute);
+	// With the base given, for tests.
+	ThemisSelector(Ptr<UniformRandomVariable> random, uint32_t spines,
+		uint32_t paths, uint64_t window, bool reroute, uint32_t base);
+	uint16_t Choose(uint64_t nowNs) override;
+	void NextSend(uint64_t psn, bool repair) override;
+	void OnPathAvoid(uint64_t psn, uint64_t nowNs) override;
+	// The spine path psn mod N names.
+	uint8_t Assigned(uint64_t psn) const;
+	uint64_t Counter(uint8_t spine) const;
+	// The packets sent up another path than their own while it was avoided.
+	uint64_t Redirects() const;
+
+private:
+	uint8_t DrawOther(uint8_t assigned);
+	Ptr<UniformRandomVariable> m_random;
+	uint32_t m_spines;
+	uint32_t m_paths;
+	uint32_t m_stride;
+	uint32_t m_base;
+	uint64_t m_window;
+	bool m_reroute;
+	std::vector<uint64_t> m_counter;
+	// The packet NextSend named, and whether its Choose has taken a count
+	// already (a repair moved off a waiting tail loss chooses again).
+	uint64_t m_psn = 0;
+	bool m_repair = false;
+	bool m_decremented = false;
+	uint64_t m_redirects = 0;
 };
 
 // The sending side of ACK redirection, modelled on MPTR (Wang et al., IEEE

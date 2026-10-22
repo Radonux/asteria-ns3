@@ -88,13 +88,17 @@ void OutstandingPackets::Add(uint64_t seq, uint32_t size, uint16_t path,
 }
 
 uint64_t OutstandingPackets::Find(uint64_t seq, uint16_t path) const{
+	const uint64_t packet = FindPacket(seq);
+	return packet != kNone && At(packet).path == path ? packet : kNone;
+}
+
+uint64_t OutstandingPackets::FindPacket(uint64_t seq) const{
 	if (m_ring.empty())
 		return kNone;
 	const uint64_t packet = seq / m_packet_size;
 	if (packet < m_first || packet - m_first >= m_ring.size())
 		return kNone;
-	const Record &record = At(packet);
-	return record.outstanding && record.path == path ? packet : kNone;
+	return At(packet).outstanding ? packet : kNone;
 }
 
 uint64_t OutstandingPackets::Oldest() const{
@@ -262,6 +266,7 @@ RdmaQueuePair::RdmaQueuePair(uint16_t pg, Ipv4Address _sip, Ipv4Address _dip, ui
 	m_overdueRepeat = false;
 	m_rackReorderNs = 0;
 	m_rackDeferLoss = false;
+	m_psnBase = 0;
 	m_timeout_covered_losses = 0;
 	m_ack_loss_declared = 0;
 	m_tail_nacks_ignored = 0;
@@ -790,6 +795,17 @@ uint64_t RdmaQueuePair::DeclareHeldSendLost(uint64_t seq, uint16_t path,
 		return 0;
 	}
 	m_held_declared_lost++;
+	return DeclareLost(packet);
+}
+
+uint64_t RdmaQueuePair::DeclareLostSeq(uint64_t seq){
+	const uint64_t packet = m_outstanding.FindPacket(seq);
+	if (packet == OutstandingPackets::kNone)
+		return 0;
+	if (CoveredAnswerLoss(m_outstanding.Seq(packet), m_outstanding.Size(packet))){
+		m_outstanding.Remove(packet);
+		return 0;
+	}
 	return DeclareLost(packet);
 }
 
