@@ -472,6 +472,7 @@ public:
 	uint32_t ThemisPaths() const;
 	uint32_t m_sprayThemisPaths;
 	uint32_t m_sprayThemisOooThreshold;
+	uint64_t m_sprayThemisStashMinNs;
 	uint64_t m_sprayThemisAvoidanceWindow;
 	bool m_sprayThemisRetxReroute;
 	// The packet sequence number the connection's next queue pair starts at,

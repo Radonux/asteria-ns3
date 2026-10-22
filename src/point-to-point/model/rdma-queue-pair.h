@@ -645,6 +645,8 @@ public:
 		std::vector<int64_t> pathMax;
 		bool valid = false;
 		uint64_t sePsn = 0;
+		// When the stash was made, in ns.
+		uint64_t stashNs = 0;
 		uint64_t requestedHead = UINT64_MAX;
 	};
 	ThemisDestination m_themis;

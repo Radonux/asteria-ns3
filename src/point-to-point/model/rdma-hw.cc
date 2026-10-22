@@ -732,6 +732,13 @@ TypeId RdmaHw::GetTypeId (void)
 				UintegerValue(448),
 				MakeUintegerAccessor(&RdmaHw::m_sprayThemisOooThreshold),
 				MakeUintegerChecker<uint32_t>())
+		.AddAttribute("SprayThemisStashMinNs",
+				"Under PathSelector 11, how long in ns a stashed head must have "
+				"waited before a packet past the threshold makes it a Path "
+				"Avoidance Signal; 0 for no wait, Themis's rule. Default 0.",
+				UintegerValue(0),
+				MakeUintegerAccessor(&RdmaHw::m_sprayThemisStashMinNs),
+				MakeUintegerChecker<uint64_t>())
 		.AddAttribute("SprayThemisAvoidanceWindow",
 				"Under PathSelector 11, the redirected packets a Path Avoidance "
 				"Signal avoids its path for; 0 repairs without avoiding. "

@@ -25,6 +25,7 @@ uint32_t RdmaHw::ThemisPaths() const{
 bool RdmaHw::ValidThemis() const{
 	if (!IsThemis())
 		return m_sprayThemisPaths == 0 && m_sprayThemisOooThreshold == 448 &&
+			m_sprayThemisStashMinNs == 0 &&
 			m_sprayThemisAvoidanceWindow == 2000000 && m_sprayThemisRetxReroute;
 	const uint32_t paths = ThemisPaths();
 	return m_loadBalancing ==
@@ -38,9 +39,9 @@ bool RdmaHw::ValidThemis() const{
 // paths do. A repair request the receiving NIC would send for the head of a
 // gap is confirmed when a later packet of the head's path has arrived, and is
 // otherwise stashed; the stash ends when the head arrives or a later packet of
-// its path does, and a packet more than the threshold past it turns it into a
-// Path Avoidance Signal on this arrival's acknowledgement, whose cumulative
-// sequence is the head's.
+// its path does, and a packet more than the threshold past it, once the stash
+// is SprayThemisStashMinNs old, turns it into a Path Avoidance Signal on this
+// arrival's acknowledgement, whose cumulative sequence is the head's.
 bool RdmaHw::ThemisArrival(Ptr<RdmaRxQueuePair> q, const CustomHeader &ch){
 	if (q->m_stray || m_sprayThemisOooThreshold == 0)
 		return false;
@@ -48,6 +49,7 @@ bool RdmaHw::ThemisArrival(Ptr<RdmaRxQueuePair> q, const CustomHeader &ch){
 	const uint32_t paths = ThemisPaths();
 	if (state.pathMax.empty())
 		state.pathMax.assign(paths, -1);
+	const uint64_t nowNs = Simulator::Now().GetNanoSeconds();
 	const uint64_t packet = ch.udp.seq / m_mtu;
 	const uint64_t head = q->ReceiverNextExpectedSeq / m_mtu;
 	int64_t &seen = state.pathMax[packet % paths];
@@ -60,7 +62,8 @@ bool RdmaHw::ThemisArrival(Ptr<RdmaRxQueuePair> q, const CustomHeader &ch){
 		}else if (packet % paths == state.sePsn % paths && packet > state.sePsn){
 			state.valid = false;
 			ReportTransportEvent("themis_stash_confirmed", 0);
-		}else if (packet > state.sePsn + m_sprayThemisOooThreshold){
+		}else if (packet > state.sePsn + m_sprayThemisOooThreshold &&
+				nowNs - state.stashNs >= m_sprayThemisStashMinNs){
 			state.valid = false;
 			signal = true;
 			m_themisSignalsSent++;
@@ -74,6 +77,7 @@ bool RdmaHw::ThemisArrival(Ptr<RdmaRxQueuePair> q, const CustomHeader &ch){
 		else{
 			state.valid = true;
 			state.sePsn = head;
+			state.stashNs = nowNs;
 			ReportTransportEvent("themis_stash", 0);
 		}
 	}
@@ -82,13 +86,14 @@ bool RdmaHw::ThemisArrival(Ptr<RdmaRxQueuePair> q, const CustomHeader &ch){
 
 void RdmaHw::ThemisPathAvoid(Ptr<RdmaQueuePair> qp, uint64_t seq){
 	const uint64_t nowNs = Simulator::Now().GetNanoSeconds();
-	qp->m_pathSelector->OnPathAvoid(qp->m_psnBase + seq / m_mtu, nowNs);
+	const uint64_t psn = qp->m_psnBase + seq / m_mtu;
+	qp->m_pathSelector->OnPathAvoid(psn, nowNs);
 	m_themisSignalsReceived++;
 	ReportTransportEvent("themis_signal_received", 0);
-	const uint64_t packet = qp->m_outstanding.FindPacket(seq);
-	if (packet != OutstandingPackets::kNone)
+	// The path the source avoids.
+	if (const auto *themis = dynamic_cast<const ThemisSelector *>(qp->m_pathSelector.get()))
 		ReportTransportEvent(("themis_signal_spine" +
-			std::to_string(qp->m_outstanding.Path(packet))).c_str(), 0);
+			std::to_string(themis->Assigned(psn))).c_str(), 0);
 	const uint64_t lost = qp->DeclareLostSeq(seq);
 	if (lost == 0)
 		return;

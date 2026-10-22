@@ -410,13 +410,15 @@ bool spray_rack_defer_loss_given = false;
 // arrived and otherwise stashed, and a packet more than
 // SPRAY_THEMIS_OOO_THRESHOLD past a stashed head (default 448, Themis's; 0
 // for none) makes that arrival's acknowledgement a Path Avoidance Signal
-// for the head. The sender declares the head's send lost and repairs it, and
+// for the head, once the stash is SPRAY_THEMIS_STASH_MIN_NS old (default 0,
+// Themis's rule). The sender declares the head's send lost and repairs it, and
 // sends the next SPRAY_THEMIS_AVOIDANCE_WINDOW packets assigned the head's
 // path (default 2000000, Themis's; 0 for none) up other paths drawn at random
 // among those not avoided. Under SPRAY_THEMIS_RETX_REROUTE on, the default, a
 // repair goes up another path than its own.
 uint32_t spray_themis_paths = 0;
 uint32_t spray_themis_ooo_threshold = 448;
+uint64_t spray_themis_stash_min_ns = 0;
 uint64_t spray_themis_avoidance_window = 2000000;
 std::string spray_themis_retx_reroute = "on";
 // Under LOAD_BALANCING spray_uniform, with any PATH_SELECTOR,
@@ -745,6 +747,7 @@ const std::map<std::string, std::set<std::string>> path_selector_parameter_owner
     {"REPS_ORACLE_HOPS", {"reps_oracle"}},
     {"SPRAY_THEMIS_PATHS", {"themis"}},
     {"SPRAY_THEMIS_OOO_THRESHOLD", {"themis"}},
+    {"SPRAY_THEMIS_STASH_MIN_NS", {"themis"}},
     {"SPRAY_THEMIS_AVOIDANCE_WINDOW", {"themis"}},
     {"SPRAY_THEMIS_RETX_REROUTE", {"themis"}},
 };
@@ -2893,6 +2896,8 @@ bool ReadConf(string network_configuration) {
       conf >> spray_themis_paths;
     } else if (key.compare("SPRAY_THEMIS_OOO_THRESHOLD") == 0) {
       conf >> spray_themis_ooo_threshold;
+    } else if (key.compare("SPRAY_THEMIS_STASH_MIN_NS") == 0) {
+      conf >> spray_themis_stash_min_ns;
     } else if (key.compare("SPRAY_THEMIS_AVOIDANCE_WINDOW") == 0) {
       conf >> spray_themis_avoidance_window;
     } else if (key.compare("SPRAY_THEMIS_RETX_REROUTE") == 0) {
@@ -4428,6 +4433,8 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),
       rdmaHw->SetAttribute("SprayThemisPaths", UintegerValue(spray_themis_paths));
       rdmaHw->SetAttribute("SprayThemisOooThreshold",
                            UintegerValue(spray_themis_ooo_threshold));
+      rdmaHw->SetAttribute("SprayThemisStashMinNs",
+                           UintegerValue(spray_themis_stash_min_ns));
       rdmaHw->SetAttribute("SprayThemisAvoidanceWindow",
                            UintegerValue(spray_themis_avoidance_window));
       rdmaHw->SetAttribute("SprayThemisRetxReroute",

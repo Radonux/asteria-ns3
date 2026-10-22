@@ -3842,6 +3842,29 @@ class ThemisDestinationTest : public TestCase
             }
             Simulator::Destroy();
         }
+        // A floor: N 8, threshold 3, stash at least 1000 ns old; packets 1 to 4
+        // at 0 ns, 5 at 999 ns and 6 at 1000 ns.
+        {
+            IsolatedHost receiver(LoadBalancingMode::SprayUniform, kTestSender, 8);
+            Configure(receiver, 8, 3);
+            receiver.hw->m_sprayThemisStashMinNs = 1000;
+            for (uint32_t psn = 1; psn <= 4; ++psn)
+            {
+                Arrive(receiver, psn);
+                NS_TEST_EXPECT_MSG_EQ(Flagged(receiver), false, "a stash 0 ns old is no signal");
+            }
+            Simulator::Stop(NanoSeconds(999));
+            Simulator::Run();
+            Arrive(receiver, 5);
+            NS_TEST_EXPECT_MSG_EQ(Flagged(receiver), false, "nor one 999 ns old");
+            Simulator::Stop(NanoSeconds(1));
+            Simulator::Run();
+            Arrive(receiver, 6);
+            NS_TEST_EXPECT_MSG_EQ(Flagged(receiver), true, "a stash 1000 ns old signals");
+            NS_TEST_EXPECT_MSG_EQ(receiver.emitted.back().ack.seq, 0, "for the head, packet 0");
+            NS_TEST_EXPECT_MSG_EQ(receiver.hw->m_themisSignalsSent, 1, "one signal sent");
+            Simulator::Destroy();
+        }
         // Threshold 0: no destination state at all.
         {
             IsolatedHost receiver(LoadBalancingMode::SprayUniform, kTestSender, 8);
@@ -3911,7 +3934,7 @@ class ThemisSenderTest : public TestCase
   public:
     ThemisSenderTest()
         : TestCase("A Path Avoidance Signal declares its packet's send lost, repairs it once and "
-                   "avoids its path")
+                   "avoids its path, and its event names the avoided path")
     {
     }
 
@@ -3926,10 +3949,18 @@ class ThemisSenderTest : public TestCase
         NS_TEST_ASSERT_MSG_NE(selector, nullptr, "PathSelector 11 makes Themis's selector");
         qp->snd_nxt = 8 * kMtu;
         qp->m_highest_sent = 8 * kMtu;
+        // Packet 0 went up another path than its own, as a redirected send does.
+        const uint8_t sentOn = (selector->Assigned(0) + 1) % 8;
         for (uint64_t psn = 0; psn < 8; ++psn)
         {
-            qp->m_outstanding.Add(psn * kMtu, kMtu, selector->Assigned(psn), psn * 100);
+            qp->m_outstanding.Add(psn * kMtu, kMtu, psn == 0 ? sentOn : selector->Assigned(psn), psn * 100);
         }
+        std::map<std::string, uint32_t> events;
+        sender.hw->m_transportEventCallback = Callback<void, const char*, uint64_t>(
+            [&events](const char* event, uint64_t) { ++events[event]; });
+        const auto spineEvent = [](uint8_t spine) {
+            return "themis_signal_spine" + std::to_string(spine);
+        };
         const auto signal = [&](uint32_t cumulative) {
             CustomHeader ack;
             ack.l3Prot = 0xFC;
@@ -3952,6 +3983,8 @@ class ThemisSenderTest : public TestCase
                               "its send is no longer outstanding");
         NS_TEST_EXPECT_MSG_EQ(selector->Counter(selector->Assigned(0)), 2, "its path is avoided");
         NS_TEST_EXPECT_MSG_EQ(sender.hw->m_themisSignalsReceived, 1, "one signal received");
+        NS_TEST_EXPECT_MSG_EQ(events[spineEvent(selector->Assigned(0))], 1, "the event names the avoided path");
+        NS_TEST_EXPECT_MSG_EQ(events[spineEvent(sentOn)], 0, "not the path the send took");
         selector->NextSend(8, false);
         selector->Choose(0);
         NS_TEST_EXPECT_MSG_EQ(selector->Counter(selector->Assigned(0)), 1, "packet 8 is redirected");
