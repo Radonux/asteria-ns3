@@ -174,13 +174,14 @@ TypeId RdmaHw::GetTypeId (void)
 				"SwitchQueueState shows a fault on toward the destination's "
 				"leaf over RepsOracleHops' hops, which needs "
 				"SprayGradeCostSource 1, and 9 is MRC over "
-				"spines leaving out the spines 6's loss hold holds, and 10 is "
-				"REPS over spines leaving out none.",
+				"spines leaving out the spines 6's loss hold holds, 10 is "
+				"REPS over spines leaving out none, and 11 is Themis's spraying "
+				"by packet sequence number with its path avoidance.",
 				UintegerValue(static_cast<uint32_t>(PathSelectorKind::Ops)),
 				MakeUintegerAccessor(&RdmaHw::m_pathSelectorKind),
 				MakeUintegerChecker<uint32_t>(
 					static_cast<uint32_t>(PathSelectorKind::Ops),
-					static_cast<uint32_t>(PathSelectorKind::RepsSpine)))
+					static_cast<uint32_t>(PathSelectorKind::Themis)))
 		.AddAttribute("RepsBufferSize",
 				"REPS: the entries of the circular buffer of entropy values to "
 				"reuse. Default 8, REPS section 3.1.",

@@ -3878,6 +3878,34 @@ class ThemisDestinationTest : public TestCase
     }
 };
 
+class PathSelectorAttributeTest : public TestCase
+{
+  public:
+    PathSelectorAttributeTest()
+        : TestCase("The PathSelector attribute takes every selector, Themis the last")
+    {
+    }
+
+    void DoRun() override
+    {
+        Ptr<RdmaHw> hw = CreateObject<RdmaHw>();
+        for (uint32_t kind = static_cast<uint32_t>(PathSelectorKind::Ops);
+             kind <= static_cast<uint32_t>(PathSelectorKind::Themis);
+             ++kind)
+        {
+            NS_TEST_EXPECT_MSG_EQ(hw->SetAttributeFailSafe("PathSelector", UintegerValue(kind)),
+                                  true,
+                                  "selector " << kind << " is accepted");
+        }
+        NS_TEST_EXPECT_MSG_EQ(
+            hw->SetAttributeFailSafe(
+                "PathSelector",
+                UintegerValue(static_cast<uint32_t>(PathSelectorKind::Themis) + 1)),
+            false,
+            "no selector past Themis");
+    }
+};
+
 class ThemisSenderTest : public TestCase
 {
   public:
@@ -17821,6 +17849,7 @@ PointToPointTestSuite::PointToPointTestSuite()
     AddTestCase(new ThemisSelectorTest, TestCase::Duration::QUICK);
     AddTestCase(new ThemisDestinationTest, TestCase::Duration::QUICK);
     AddTestCase(new ThemisSenderTest, TestCase::Duration::QUICK);
+    AddTestCase(new PathSelectorAttributeTest, TestCase::Duration::QUICK);
     AddTestCase(new OutstandingWindowTest, TestCase::Duration::QUICK);
     AddTestCase(new TrimRepairedOnceTest, TestCase::Duration::QUICK);
     AddTestCase(new DuplicateRepairTest, TestCase::Duration::QUICK);
