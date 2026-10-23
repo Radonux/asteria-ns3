@@ -683,9 +683,9 @@ bool spray_coverage_first_given = false;
 // from the host's auto loss hold, regrading without it the hold it began,
 // counted as answer_loss_duplicate, by the route spine the answer came back
 // over, and timeout_retract_release where the hold was released; a loss
-// left standing is timeout_loss_data. retract needs PATH_SELECTOR reps_hold or
-// mrc_hold under SPRAY_HOLD_SCOPE auto and SPRAY_HOLD_RULE count. Off, the
-// default.
+// left standing is timeout_loss_data. retract needs PATH_SELECTOR reps_hold,
+// mrc_hold or themis_hold under SPRAY_HOLD_SCOPE auto and SPRAY_HOLD_RULE
+// count. Off, the default.
 std::string spray_duplicate_report = "off";
 bool spray_duplicate_report_given = false;
 // Under ACK_ROUTE spray with SPRAY_PATH_SEQ on and a loss hold PATH_SELECTOR,
@@ -3704,8 +3704,8 @@ bool ReadConf(string network_configuration) {
       (!hold_scope_read() || spray_hold_scope != "auto" ||
        spray_hold_rule != "count")) {
     std::cerr << "SPRAY_DUPLICATE_REPORT retract takes losses back from "
-                 "PATH_SELECTOR reps_hold's or mrc_hold's loss hold under "
-                 "SPRAY_HOLD_SCOPE auto and SPRAY_HOLD_RULE count\n";
+                 "PATH_SELECTOR reps_hold's, mrc_hold's or themis_hold's loss "
+                 "hold under SPRAY_HOLD_SCOPE auto and SPRAY_HOLD_RULE count\n";
     return false;
   }
   if (spray_duplicate_report_given && spray_coverage_first != "on") {
