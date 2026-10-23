@@ -415,12 +415,16 @@ bool spray_rack_defer_loss_given = false;
 // sends the next SPRAY_THEMIS_AVOIDANCE_WINDOW packets assigned the head's
 // path (default 2000000, Themis's; 0 for none) up other paths drawn at random
 // among those not avoided. Under SPRAY_THEMIS_RETX_REROUTE on, the default, a
-// repair goes up another path than its own.
+// repair goes up another path than its own. Under SPRAY_THEMIS_LEAF_AVOIDANCE
+// on (default off, Themis's per queue pair avoidance), a signal avoids its
+// path for the host's every connection to the destination's leaf, each
+// keeping its own paths.
 uint32_t spray_themis_paths = 0;
 uint32_t spray_themis_ooo_threshold = 448;
 uint64_t spray_themis_stash_min_ns = 0;
 uint64_t spray_themis_avoidance_window = 2000000;
 std::string spray_themis_retx_reroute = "on";
+std::string spray_themis_leaf_avoidance = "off";
 // Under LOAD_BALANCING spray_uniform, with any PATH_SELECTOR,
 // SPRAY_ACK_LOSS_RTTS <x>: a data send that the cumulative acknowledgement
 // covers before its own acknowledgement arrives, and whose own acknowledgement
@@ -750,6 +754,7 @@ const std::map<std::string, std::set<std::string>> path_selector_parameter_owner
     {"SPRAY_THEMIS_STASH_MIN_NS", {"themis"}},
     {"SPRAY_THEMIS_AVOIDANCE_WINDOW", {"themis"}},
     {"SPRAY_THEMIS_RETX_REROUTE", {"themis"}},
+    {"SPRAY_THEMIS_LEAF_AVOIDANCE", {"themis"}},
 };
 // The keys of ack_redirect that only its per_connection scope reads.
 const std::set<std::string> ack_redirect_connection_keys = {
@@ -2902,6 +2907,8 @@ bool ReadConf(string network_configuration) {
       conf >> spray_themis_avoidance_window;
     } else if (key.compare("SPRAY_THEMIS_RETX_REROUTE") == 0) {
       conf >> spray_themis_retx_reroute;
+    } else if (key.compare("SPRAY_THEMIS_LEAF_AVOIDANCE") == 0) {
+      conf >> spray_themis_leaf_avoidance;
     } else if (key.compare("SPRAY_ACK_LOSS_RTTS") == 0) {
       conf >> spray_ack_loss_rtts;
       spray_ack_loss_rtts_given = true;
@@ -3469,6 +3476,10 @@ bool ReadConf(string network_configuration) {
   }
   if (spray_themis_retx_reroute != "on" && spray_themis_retx_reroute != "off") {
     std::cerr << "SPRAY_THEMIS_RETX_REROUTE must be on or off\n";
+    return false;
+  }
+  if (spray_themis_leaf_avoidance != "on" && spray_themis_leaf_avoidance != "off") {
+    std::cerr << "SPRAY_THEMIS_LEAF_AVOIDANCE must be on or off\n";
     return false;
   }
   if (spray_hold_scope_given && !hold_scope_read()) {
@@ -4311,7 +4322,8 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),
   // SPRAY_ANSWER_PATH_SEQ read only for the hosts' leaves.
   const Ptr<SwitchQueueState> switch_queues =
       switch_queue_cost() || leaf_hold() || reps_oracle() || receiver_hold() ||
-              ack_route_oracle_on() || answer_path_seq()
+              ack_route_oracle_on() || answer_path_seq() ||
+              spray_themis_leaf_avoidance == "on"
           ? BuildSwitchQueueState(n)
           : nullptr;
   // One variable for every host, so the draw consumes a single fixed stream.
@@ -4439,6 +4451,8 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),
                            UintegerValue(spray_themis_avoidance_window));
       rdmaHw->SetAttribute("SprayThemisRetxReroute",
                            BooleanValue(spray_themis_retx_reroute == "on"));
+      rdmaHw->SetAttribute("SprayThemisLeafAvoidance",
+                           BooleanValue(spray_themis_leaf_avoidance == "on"));
       rdmaHw->SetAttribute("SprayAckLossRtts",
                            DoubleValue(spray_ack_loss_rtts));
       rdmaHw->SetAttribute(

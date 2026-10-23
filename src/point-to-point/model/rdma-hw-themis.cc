@@ -26,9 +26,10 @@ bool RdmaHw::ValidThemis() const{
 	if (!IsThemis())
 		return m_sprayThemisPaths == 0 && m_sprayThemisOooThreshold == 448 &&
 			m_sprayThemisStashMinNs == 0 &&
-			m_sprayThemisAvoidanceWindow == 2000000 && m_sprayThemisRetxReroute;
+			m_sprayThemisAvoidanceWindow == 2000000 && m_sprayThemisRetxReroute &&
+			!m_sprayThemisLeafAvoidance;
 	const uint32_t paths = ThemisPaths();
-	return m_loadBalancing ==
+	return (!m_sprayThemisLeafAvoidance || m_switchQueues) && m_loadBalancing ==
 			static_cast<uint32_t>(LoadBalancingMode::SprayUniform) &&
 		m_selective_retransmission && m_spineCount > 0 && paths <= m_spineCount &&
 		m_spineCount % paths == 0;

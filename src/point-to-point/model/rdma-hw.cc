@@ -752,6 +752,14 @@ TypeId RdmaHw::GetTypeId (void)
 				BooleanValue(true),
 				MakeBooleanAccessor(&RdmaHw::m_sprayThemisRetxReroute),
 				MakeBooleanChecker())
+		.AddAttribute("SprayThemisLeafAvoidance",
+				"Under PathSelector 11, whether a Path Avoidance Signal avoids "
+				"its path for the host's every connection to the destination's "
+				"leaf, not the signalled connection alone; each keeps its own "
+				"paths. Default false (Themis's).",
+				BooleanValue(false),
+				MakeBooleanAccessor(&RdmaHw::m_sprayThemisLeafAvoidance),
+				MakeBooleanChecker())
 		.AddAttribute("SprayRackDeferLoss",
 				"Under SprayRackReorderNs and SprayTailLossRtts above zero, "
 				"whether the sends the loss rule across paths declares lost "
@@ -3878,9 +3886,19 @@ std::unique_ptr<PathSelector> RdmaHw::MakePathSelector(Ptr<RdmaQueuePair> qp,
 		uint64_t bdpBytes, uint64_t baseRttNs){
 	if (IsAckRedirect())
 		return std::make_unique<AckRedirectSelector>(m_pathRandom, m_spineCount);
-	if (IsThemis())
+	if (IsThemis()){
+		ThemisSelector::Counters counters;
+		if (m_sprayThemisLeafAvoidance){
+			ThemisSelector::Counters &shared =
+				m_themisLeafCounters[{m_switchQueues->LeafOf(qp->dip.Get()), qp->m_pg}];
+			if (!shared)
+				shared = std::make_shared<std::vector<uint64_t>>(m_spineCount, 0);
+			counters = shared;
+		}
 		return std::make_unique<ThemisSelector>(m_pathRandom, m_spineCount,
-			ThemisPaths(), m_sprayThemisAvoidanceWindow, m_sprayThemisRetxReroute);
+			ThemisPaths(), m_sprayThemisAvoidanceWindow, m_sprayThemisRetxReroute,
+			counters);
+	}
 	if (m_pathSelectorKind ==
 			static_cast<uint32_t>(PathSelectorKind::RepsFlowHold))
 		return std::make_unique<RepsHoldSelector>(m_pathRandom,

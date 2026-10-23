@@ -350,14 +350,18 @@ private:
 // while the path a packet is assigned has a nonzero counter, the packet goes
 // up another path drawn at random among those with none, and the counter
 // falls by one (section 4.4). Under reroute a repair, too, goes up another
-// path. When every other path is avoided, the packet keeps its own.
+// path. When every other path is avoided, the packet keeps its own. The
+// counters, one per spine, are the selector's own, or under counters given
+// shared with other selectors (a host's connections to one leaf).
 class ThemisSelector : public PathSelector {
 public:
+	using Counters = std::shared_ptr<std::vector<uint64_t>>;
 	ThemisSelector(Ptr<UniformRandomVariable> random, uint32_t spines,
-		uint32_t paths, uint64_t window, bool reroute);
+		uint32_t paths, uint64_t window, bool reroute, Counters counters = nullptr);
 	// With the base given, for tests.
 	ThemisSelector(Ptr<UniformRandomVariable> random, uint32_t spines,
-		uint32_t paths, uint64_t window, bool reroute, uint32_t base);
+		uint32_t paths, uint64_t window, bool reroute, uint32_t base,
+		Counters counters = nullptr);
 	uint16_t Choose(uint64_t nowNs) override;
 	void NextSend(uint64_t psn, bool repair) override;
 	int OnPathAvoid(uint64_t psn, uint64_t nowNs) override;
@@ -376,7 +380,7 @@ private:
 	uint32_t m_base;
 	uint64_t m_window;
 	bool m_reroute;
-	std::vector<uint64_t> m_counter;
+	Counters m_counter;
 	// The packet NextSend named, and whether its Choose has taken a count
 	// already (a repair moved off a waiting tail loss chooses again).
 	uint64_t m_psn = 0;

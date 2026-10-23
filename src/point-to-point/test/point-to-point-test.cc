@@ -4083,6 +4083,91 @@ class ThemisSenderTest : public TestCase
     }
 };
 
+class ThemisLeafAvoidanceTest : public TestCase
+{
+  public:
+    ThemisLeafAvoidanceTest()
+        : TestCase("Under SprayThemisLeafAvoidance a Path Avoidance Signal avoids its path for "
+                   "the host's every connection to the destination's leaf, and no other")
+    {
+    }
+
+    void DoRun() override
+    {
+        constexpr uint32_t kMtu = IsolatedHost::kMtu;
+        const std::vector<Ipv4Address> destinations = {
+            Ipv4Address("11.0.2.1"), Ipv4Address("11.0.3.1"), Ipv4Address("11.0.4.1")};
+        // The first two destinations on leaf 0, the third on leaf 1.
+        const auto leaves = [&destinations]() {
+            Ptr<SwitchQueueState> queues = Create<SwitchQueueState>(2, 8);
+            for (uint32_t index = 0; index < destinations.size(); ++index)
+            {
+                queues->SetLeafOf(destinations[index].Get(), index < 2 ? 0 : 1);
+            }
+            return queues;
+        };
+        for (const bool connection : {false, true})
+        {
+            IsolatedHost host(LoadBalancingMode::SprayUniform, kTestReceiver, 8);
+            host.hw->m_pathSelectorKind = static_cast<uint32_t>(PathSelectorKind::Themis);
+            host.hw->m_sprayThemisLeafAvoidance = true;
+            if (connection)
+            {
+                host.hw->m_sprayPathState = static_cast<uint32_t>(PathState::Connection);
+            }
+            NS_TEST_EXPECT_MSG_EQ(host.hw->ValidThemis(), false, "refused without the hosts' leaves");
+            host.hw->m_switchQueues = leaves();
+            NS_TEST_EXPECT_MSG_EQ(host.hw->ValidThemis(), true, "accepted with them");
+            std::vector<Ptr<RdmaQueuePair>> qps;
+            std::vector<ThemisSelector*> selectors;
+            for (const Ipv4Address& destination : destinations)
+            {
+                qps.push_back(host.AddSender(kTestSender, destination, 10 * kMtu));
+            }
+            if (connection)
+            {
+                NS_TEST_ASSERT_MSG_EQ(host.hw->m_connectionSelectors.size(), 3, "a selector per connection");
+            }
+            for (uint32_t index = 0; index < destinations.size(); ++index)
+            {
+                PathSelector* own =
+                    connection ? host.hw->m_connectionSelectors[RdmaHw::GetQpKey(destinations[index].Get(), 0,
+                                                                                 IsolatedHost::kPriorityGroup)]
+                                     .get()
+                               : qps[index]->m_pathSelector.get();
+                selectors.push_back(dynamic_cast<ThemisSelector*>(own));
+                NS_TEST_ASSERT_MSG_NE(selectors.back(), nullptr, "Themis's selector");
+            }
+            const int spine = qps[0]->m_pathSelector->OnPathAvoid(0, 0);
+            NS_TEST_ASSERT_MSG_EQ(spine, selectors[0]->Assigned(0), "the signal avoids packet 0's path");
+            NS_TEST_EXPECT_MSG_EQ(selectors[0]->Counter(spine), 2000000, "for its connection");
+            NS_TEST_EXPECT_MSG_EQ(selectors[1]->Counter(spine), 2000000, "and the other on its leaf");
+            NS_TEST_EXPECT_MSG_EQ(selectors[2]->Counter(spine), 0, "not the one on another leaf");
+            // The other connection on the leaf keeps its own paths: its packet
+            // assigned the avoided spine goes up another, and the shared
+            // counter falls by one.
+            uint64_t psn = 0;
+            while (selectors[1]->Assigned(psn) != spine)
+            {
+                ++psn;
+            }
+            qps[1]->m_pathSelector->NextSend(psn, false);
+            NS_TEST_EXPECT_MSG_NE(RequestedSpine(qps[1]->m_pathSelector->Choose(0)), spine, "is redirected");
+            NS_TEST_EXPECT_MSG_EQ(selectors[0]->Counter(spine), 1999999, "a count off the shared window");
+            Simulator::Destroy();
+        }
+        IsolatedHost host(LoadBalancingMode::SprayUniform, kTestReceiver, 8);
+        host.hw->m_pathSelectorKind = static_cast<uint32_t>(PathSelectorKind::Themis);
+        host.hw->m_switchQueues = leaves();
+        Ptr<RdmaQueuePair> first = host.AddSender(kTestSender, destinations[0], 10 * kMtu);
+        Ptr<RdmaQueuePair> second = host.AddSender(kTestSender, destinations[1], 10 * kMtu);
+        const int spine = first->m_pathSelector->OnPathAvoid(0, 0);
+        NS_TEST_EXPECT_MSG_EQ(dynamic_cast<ThemisSelector*>(second->m_pathSelector.get())->Counter(spine), 0,
+                              "off, the default, a signal avoids its path for its connection alone");
+        Simulator::Destroy();
+    }
+};
+
 class OutstandingWindowTest : public TestCase
 {
   public:
@@ -17970,6 +18055,7 @@ PointToPointTestSuite::PointToPointTestSuite()
     AddTestCase(new ThemisSelectorTest, TestCase::Duration::QUICK);
     AddTestCase(new ThemisDestinationTest, TestCase::Duration::QUICK);
     AddTestCase(new ThemisSenderTest, TestCase::Duration::QUICK);
+    AddTestCase(new ThemisLeafAvoidanceTest, TestCase::Duration::QUICK);
     AddTestCase(new PathSelectorAttributeTest, TestCase::Duration::QUICK);
     AddTestCase(new OutstandingWindowTest, TestCase::Duration::QUICK);
     AddTestCase(new TrimRepairedOnceTest, TestCase::Duration::QUICK);

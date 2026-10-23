@@ -466,7 +466,8 @@ public:
 	// the destination): its paths, 0 for the spines; the out-of-order degree
 	// in packets past which a stashed repair request becomes a Path
 	// Avoidance Signal, 0 for none; the redirected packets a signal avoids
-	// its path for; and whether a repair goes up another path.
+	// its path for; whether a repair goes up another path; and whether the
+	// host's connections to one leaf share their paths' avoidance.
 	bool IsThemis() const;
 	bool ValidThemis() const;
 	uint32_t ThemisPaths() const;
@@ -475,6 +476,11 @@ public:
 	uint64_t m_sprayThemisStashMinNs;
 	uint64_t m_sprayThemisAvoidanceWindow;
 	bool m_sprayThemisRetxReroute;
+	bool m_sprayThemisLeafAvoidance;
+	// Under m_sprayThemisLeafAvoidance, the avoidance counters by
+	// destination leaf and priority group.
+	std::map<std::pair<uint32_t, uint32_t>, std::shared_ptr<std::vector<uint64_t>>>
+		m_themisLeafCounters;
 	// The packet sequence number the connection's next queue pair starts at,
 	// by the connection's key (GetQpKey with the priority group as port).
 	std::unordered_map<uint64_t, uint64_t> m_themisPsnNext;

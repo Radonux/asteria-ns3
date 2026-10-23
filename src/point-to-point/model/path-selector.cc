@@ -196,22 +196,26 @@ uint16_t UniformSpineSelector::Choose(uint64_t){
 }
 
 ThemisSelector::ThemisSelector(Ptr<UniformRandomVariable> random,
-		uint32_t spines, uint32_t paths, uint64_t window, bool reroute)
+		uint32_t spines, uint32_t paths, uint64_t window, bool reroute,
+		Counters counters)
 	: ThemisSelector(random, spines, paths, window, reroute,
-		random->GetInteger(0, spines - 1))
+		random->GetInteger(0, spines - 1), std::move(counters))
 {
 }
 
 ThemisSelector::ThemisSelector(Ptr<UniformRandomVariable> random,
 		uint32_t spines, uint32_t paths, uint64_t window, bool reroute,
-		uint32_t base)
+		uint32_t base, Counters counters)
 	: m_random(random), m_spines(spines), m_paths(paths),
 	  m_stride(paths > 0 ? spines / paths : 0), m_base(base),
-	  m_window(window), m_reroute(reroute), m_counter(spines, 0)
+	  m_window(window), m_reroute(reroute),
+	  m_counter(counters ? std::move(counters)
+		: std::make_shared<std::vector<uint64_t>>(spines, 0))
 {
 	NS_ASSERT_MSG(paths > 0 && paths <= spines && spines % paths == 0,
 		"Themis's paths divide the spines");
 	NS_ASSERT_MSG(base < spines, "the base is a spine");
+	NS_ASSERT_MSG(m_counter->size() == spines, "a counter per spine");
 }
 
 uint8_t ThemisSelector::Assigned(uint64_t psn) const{
@@ -219,7 +223,7 @@ uint8_t ThemisSelector::Assigned(uint64_t psn) const{
 }
 
 uint64_t ThemisSelector::Counter(uint8_t spine) const{
-	return m_counter[spine];
+	return (*m_counter)[spine];
 }
 
 uint64_t ThemisSelector::Redirects() const{
@@ -236,15 +240,15 @@ int ThemisSelector::OnPathAvoid(uint64_t psn, uint64_t){
 	const uint8_t spine = Assigned(psn);
 	if (m_window == 0)
 		return -1;
-	m_counter[spine] = m_window;
+	(*m_counter)[spine] = m_window;
 	return spine;
 }
 
 uint16_t ThemisSelector::Choose(uint64_t){
 	const uint8_t assigned = Assigned(m_psn);
-	const bool avoided = m_counter[assigned] > 0;
+	const bool avoided = (*m_counter)[assigned] > 0;
 	if (avoided && !m_decremented){
-		m_counter[assigned]--;
+		(*m_counter)[assigned]--;
 		m_decremented = true;
 		m_redirects++;
 	}
@@ -257,14 +261,14 @@ uint8_t ThemisSelector::DrawOther(uint8_t assigned){
 	uint32_t open = 0;
 	for (uint32_t index = 0; index < m_paths; ++index){
 		const uint8_t spine = Assigned(index);
-		open += spine != assigned && m_counter[spine] == 0;
+		open += spine != assigned && (*m_counter)[spine] == 0;
 	}
 	if (open == 0)
 		return assigned;
 	uint8_t spine;
 	do
 		spine = Assigned(m_random->GetInteger(0, m_paths - 1));
-	while (spine == assigned || m_counter[spine] > 0);
+	while (spine == assigned || (*m_counter)[spine] > 0);
 	return spine;
 }
 
