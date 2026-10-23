@@ -233,7 +233,9 @@ std::string load_balancing = "ecmp";
 // selector does. themis is Themis's spraying by packet sequence number with
 // its path avoidance (SPRAY_THEMIS_PATHS and the keys after it). themis_hold
 // is themis leaving out the spines reps_hold's loss hold holds, at the same
-// SPRAY_HOLD_SCOPE; reps_hold() holds for it too.
+// SPRAY_HOLD_SCOPE; reps_hold() holds for it too. mrc_spine is MRC over
+// spines and ue_aware_spine UEC path-aware spraying over spines, each with
+// no loss hold and its selector's keys but the entropy space's size.
 std::string path_selector = "ops";
 bool reps_hold() {
   return path_selector == "reps_hold" || path_selector == "reps_flow_hold" ||
@@ -718,6 +720,9 @@ uint32_t reps_buffer_size = 8;
 uint64_t reps_freezing_timeout_ns = 10000000;
 uint32_t ue_ev_set_size = 256;
 double ue_saturation_fraction = 0.5;
+// UEC path-aware spraying: how long a value with a declared loss is passed
+// over, in ns; 0, the default, none.
+uint64_t ue_loss_avoid_ns = 0;
 uint32_t mrc_ev_set_size = 128;
 double mrc_skip_base_rtts = 1.0;
 double mrc_probe_timeouts = 1.0;
@@ -742,10 +747,11 @@ const std::map<std::string, std::set<std::string>> path_selector_parameter_owner
     {"REPS_FREEZING_TIMEOUT_NS",
      {"reps", "reps_hold", "reps_flow_hold", "reps_oracle", "reps_spine"}},
     {"UE_EV_SET_SIZE", {"ue_oblivious", "ue_aware"}},
-    {"UE_SATURATION_FRACTION", {"ue_aware"}},
+    {"UE_SATURATION_FRACTION", {"ue_aware", "ue_aware_spine"}},
+    {"UE_LOSS_AVOID_NS", {"ue_aware", "ue_aware_spine"}},
     {"MRC_EV_SET_SIZE", {"mrc"}},
-    {"MRC_SKIP_BASE_RTTS", {"mrc", "mrc_hold"}},
-    {"MRC_PROBE_TIMEOUTS", {"mrc", "mrc_hold"}},
+    {"MRC_SKIP_BASE_RTTS", {"mrc", "mrc_hold", "mrc_spine"}},
+    {"MRC_PROBE_TIMEOUTS", {"mrc", "mrc_hold", "mrc_spine"}},
     {"ACK_REDIRECT_OMEGA", {"ack_redirect"}},
     {"ACK_REDIRECT_FLAG", {"ack_redirect"}},
     {"ACK_REDIRECT_VALIDITY_BASE_RTTS", {"ack_redirect"}},
@@ -1434,6 +1440,10 @@ uint32_t path_selector_value() {
     return static_cast<uint32_t>(PathSelectorKind::Themis);
   if (path_selector == "themis_hold")
     return static_cast<uint32_t>(PathSelectorKind::ThemisHold);
+  if (path_selector == "mrc_spine")
+    return static_cast<uint32_t>(PathSelectorKind::MrcSpine);
+  if (path_selector == "ue_aware_spine")
+    return static_cast<uint32_t>(PathSelectorKind::UeAwareSpine);
   return std::numeric_limits<uint32_t>::max();
 }
 
@@ -2593,15 +2603,17 @@ bool valid_hold_rule() {
   const bool overdue_without_hold =
       load_balancing == "spray_uniform" &&
       (path_selector == "reps_spine" || path_selector == "reps_oracle" ||
-       path_selector == "themis" || path_selector == "ops") &&
+       path_selector == "themis" || path_selector == "mrc_spine" ||
+       path_selector == "ue_aware_spine" || path_selector == "ops") &&
       (spray_overdue_repair == "reprobe" || spray_overdue_repair == "off");
   if (spray_overdue_repair_given &&
       ((!reps_hold() && !overdue_without_hold) ||
        !(spray_held_loss_rtts > 0))) {
     std::cerr << "SPRAY_OVERDUE_REPAIR is read only under PATH_SELECTOR "
                  "reps_hold, reps_flow_hold or mrc_hold, or as reprobe or "
-                 "off under reps_spine, reps_oracle, themis or the uniform draw, "
-                 "with SPRAY_HELD_LOSS_RTTS above 0\n";
+                 "off under reps_spine, reps_oracle, themis, mrc_spine, "
+                 "ue_aware_spine or the uniform draw, with SPRAY_HELD_LOSS_RTTS "
+                 "above 0\n";
     return false;
   }
   if (spray_hold_release_value() == std::numeric_limits<uint32_t>::max()) {
@@ -2791,6 +2803,8 @@ bool ReadConf(string network_configuration) {
       conf >> ue_ev_set_size;
     } else if (key.compare("UE_SATURATION_FRACTION") == 0) {
       conf >> ue_saturation_fraction;
+    } else if (key.compare("UE_LOSS_AVOID_NS") == 0) {
+      conf >> ue_loss_avoid_ns;
     } else if (key.compare("MRC_EV_SET_SIZE") == 0) {
       conf >> mrc_ev_set_size;
     } else if (key.compare("MRC_SKIP_BASE_RTTS") == 0) {
@@ -3445,7 +3459,8 @@ bool ReadConf(string network_configuration) {
   if (path_selector_value() == std::numeric_limits<uint32_t>::max()) {
     std::cerr << "PATH_SELECTOR must be ops, reps, ue_oblivious, ue_aware, mrc, "
                  "ack_redirect, reps_hold, reps_flow_hold, reps_oracle, "
-                 "mrc_hold, reps_spine, themis or themis_hold\n";
+                 "mrc_hold, reps_spine, themis, themis_hold, mrc_spine or "
+                 "ue_aware_spine\n";
     return false;
   }
   if (reps_hold()) {
@@ -3474,7 +3489,8 @@ bool ReadConf(string network_configuration) {
     return false;
   }
   if ((path_selector == "reps_spine" || path_selector == "themis" ||
-       path_selector == "themis_hold") &&
+       path_selector == "themis_hold" || path_selector == "mrc_spine" ||
+       path_selector == "ue_aware_spine") &&
       load_balancing != "spray_uniform") {
     std::cerr << "PATH_SELECTOR " << path_selector
               << " names spines and requires LOAD_BALANCING spray_uniform\n";
@@ -3753,7 +3769,8 @@ bool ReadConf(string network_configuration) {
       return false;
   } else if (path_selector != "ops" && !reps_hold() &&
              path_selector != "reps_oracle" && path_selector != "reps_spine" &&
-             path_selector != "themis" &&
+             path_selector != "themis" && path_selector != "mrc_spine" &&
+             path_selector != "ue_aware_spine" &&
              load_balancing_value() !=
                  static_cast<uint32_t>(LoadBalancingMode::EntropyHash)) {
     std::cerr << "PATH_SELECTOR " << path_selector
@@ -4531,6 +4548,7 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),
       rdmaHw->SetAttribute("UeEvSetSize", UintegerValue(ue_ev_set_size));
       rdmaHw->SetAttribute("UeSaturationFraction",
                            DoubleValue(ue_saturation_fraction));
+      rdmaHw->SetAttribute("UeLossAvoidNs", UintegerValue(ue_loss_avoid_ns));
       rdmaHw->SetAttribute("MrcEvSetSize", UintegerValue(mrc_ev_set_size));
       rdmaHw->SetAttribute("MrcSkipBaseRtts", DoubleValue(mrc_skip_base_rtts));
       rdmaHw->SetAttribute("MrcProbeTimeouts", DoubleValue(mrc_probe_timeouts));

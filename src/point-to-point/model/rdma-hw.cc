@@ -177,12 +177,13 @@ TypeId RdmaHw::GetTypeId (void)
 				"spines leaving out the spines 6's loss hold holds, 10 is "
 				"REPS over spines leaving out none, 11 is Themis's spraying "
 				"by packet sequence number with its path avoidance, and 12 is "
-				"11 leaving out the spines 6's loss hold holds.",
+				"11 leaving out the spines 6's loss hold holds, 13 is MRC over "
+				"spines, and 14 is UEC path-aware spraying over spines.",
 				UintegerValue(static_cast<uint32_t>(PathSelectorKind::Ops)),
 				MakeUintegerAccessor(&RdmaHw::m_pathSelectorKind),
 				MakeUintegerChecker<uint32_t>(
 					static_cast<uint32_t>(PathSelectorKind::Ops),
-					static_cast<uint32_t>(PathSelectorKind::ThemisHold)))
+					static_cast<uint32_t>(PathSelectorKind::UeAwareSpine)))
 		.AddAttribute("RepsBufferSize",
 				"REPS: the entries of the circular buffer of entropy values to "
 				"reuse. Default 8, REPS section 3.1.",
@@ -221,6 +222,13 @@ TypeId RdmaHw::GetTypeId (void)
 				DoubleValue(0.5),
 				MakeDoubleAccessor(&RdmaHw::m_ueSaturationFraction),
 				MakeDoubleChecker<double>(0, 1))
+		.AddAttribute("UeLossAvoidNs",
+				"UEC path-aware spraying: how long a value with a declared loss "
+				"is passed over, in ns. UEC 1.0.3 section 3.6.16.5 leaves the "
+				"time to the implementation; default 0, no avoidance.",
+				UintegerValue(0),
+				MakeUintegerAccessor(&RdmaHw::m_ueLossAvoidNs),
+				MakeUintegerChecker<uint64_t>())
 		.AddAttribute("MrcEvSetSize",
 				"MRC: the entropy values a queue pair rotates through. Default "
 				"128, within the one to two windows of OCP MRC 1.0 section "
@@ -1511,9 +1519,13 @@ void RdmaHw::Setup(QpCompleteCallback cb, QpFailureCallback failure_cb){
 			m_pathSelectorKind !=
 				static_cast<uint32_t>(PathSelectorKind::AckRedirect) &&
 			!IsRepsHold() && !IsRepsOracle() && !IsRepsSpine() && !IsThemis() &&
+			!IsSpineBaseline() &&
 			m_loadBalancing !=
 				static_cast<uint32_t>(LoadBalancingMode::EntropyHash),
 		"PathSelector 1 to 4 choose entropy values and need LoadBalancing 1");
+	NS_ABORT_MSG_IF(IsSpineBaseline() && m_loadBalancing !=
+				static_cast<uint32_t>(LoadBalancingMode::SprayUniform),
+		"PathSelector 13 and 14 name spines and need LoadBalancing 2");
 	NS_ABORT_MSG_IF(IsRepsSpine() && m_loadBalancing !=
 				static_cast<uint32_t>(LoadBalancingMode::SprayUniform),
 		"PathSelector 10 names spines and needs LoadBalancing 2");
@@ -1536,7 +1548,8 @@ void RdmaHw::Setup(QpCompleteCallback cb, QpFailureCallback failure_cb){
 		"PathSelector 5 and only it carries the redirect field in every "
 		"acknowledgement");
 	NS_ABORT_MSG_IF((m_pathSelectorKind ==
-				static_cast<uint32_t>(PathSelectorKind::Mrc) || IsMrcHold()) &&
+				static_cast<uint32_t>(PathSelectorKind::Mrc) || IsMrcHold() ||
+			m_pathSelectorKind == static_cast<uint32_t>(PathSelectorKind::MrcSpine)) &&
 			m_retransmission_timeout_ns == 0,
 		"MRC probes at multiples of RetransmissionTimeoutNs");
 	NS_ABORT_MSG_IF(IsPathPerPacket() && !CustomHeader::ackCarriesPacketSeq,
@@ -1934,12 +1947,14 @@ bool RdmaHw::ValidOverdueRepair() const{
 	if (IsRepsHold())
 		return true;
 	// Without a loss hold, the repair that counts nothing alone: REPS, the
-	// oracle, Themis and the uniform draw.
+	// oracle, Themis, MRC and UEC path-aware spraying over spines, and the
+	// uniform draw.
 	const bool uniformDraw = m_loadBalancing ==
 			static_cast<uint32_t>(LoadBalancingMode::SprayUniform) &&
 		m_pathSelectorKind == static_cast<uint32_t>(PathSelectorKind::Ops);
 	return m_sprayOverdueRepair == static_cast<uint32_t>(OverdueRepair::Reprobe) &&
-		(IsRepsSpine() || IsRepsOracle() || IsThemis() || uniformDraw);
+		(IsRepsSpine() || IsRepsOracle() || IsThemis() || IsSpineBaseline() ||
+			uniformDraw);
 }
 
 bool RdmaHw::IsOverdueRepair() const{
@@ -1994,6 +2009,13 @@ LossLikelihoodRatio::Parameters RdmaHw::Likelihood() const{
 bool RdmaHw::IsRepsOracle() const{
 	return m_pathSelectorKind ==
 		static_cast<uint32_t>(PathSelectorKind::RepsOracle);
+}
+
+bool RdmaHw::IsSpineBaseline() const{
+	return m_pathSelectorKind ==
+			static_cast<uint32_t>(PathSelectorKind::MrcSpine) ||
+		m_pathSelectorKind ==
+			static_cast<uint32_t>(PathSelectorKind::UeAwareSpine);
 }
 
 bool RdmaHw::IsRepsSpine() const{
@@ -3948,6 +3970,14 @@ std::unique_ptr<PathSelector> RdmaHw::MakePathSelector(Ptr<RdmaQueuePair> qp,
 		return std::make_unique<RepsHoldSelector>(m_pathRandom,
 			m_repsBufferSize, m_repsFreezingTimeoutNs, bdpBytes / m_mtu,
 			m_spineCount, DestinationHold(qp->dip.Get()));
+	if (m_pathSelectorKind == static_cast<uint32_t>(PathSelectorKind::MrcSpine))
+		return std::make_unique<MrcSpineSelector>(m_pathRandom, m_spineCount,
+			static_cast<uint64_t>(m_mrcSkipBaseRtts * baseRttNs),
+			static_cast<uint64_t>(
+				m_mrcProbeTimeouts * m_retransmission_timeout_ns));
+	if (m_pathSelectorKind == static_cast<uint32_t>(PathSelectorKind::UeAwareSpine))
+		return std::make_unique<UeAwareSpineSelector>(m_pathRandom,
+			m_spineCount, m_ueSaturationFraction, m_ueLossAvoidNs);
 	if (m_loadBalancing == static_cast<uint32_t>(LoadBalancingMode::SprayUniform))
 		return std::make_unique<UniformSpineSelector>(m_pathRandom, m_spineCount);
 	if (IsSprayPolicy()){
@@ -3996,7 +4026,7 @@ std::unique_ptr<PathSelector> RdmaHw::MakePathSelector(Ptr<RdmaQueuePair> qp,
 			m_ueEvSetSize);
 	case PathSelectorKind::UeAware:
 		return std::make_unique<UeAwareSelector>(m_pathRandom,
-			m_ueEvSetSize, m_ueSaturationFraction);
+			m_ueEvSetSize, m_ueSaturationFraction, m_ueLossAvoidNs);
 	case PathSelectorKind::Mrc:
 		return std::make_unique<MrcSelector>(m_pathRandom,
 			m_mrcEvSetSize, static_cast<uint64_t>(m_mrcSkipBaseRtts * baseRttNs),

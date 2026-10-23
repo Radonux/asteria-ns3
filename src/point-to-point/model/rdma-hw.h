@@ -94,6 +94,7 @@ public:
 	uint64_t m_repsFreezingTimeoutNs;
 	uint32_t m_ueEvSetSize;
 	double m_ueSaturationFraction;
+	uint64_t m_ueLossAvoidNs;
 	uint32_t m_mrcEvSetSize;
 	double m_mrcSkipBaseRtts;
 	double m_mrcProbeTimeouts;
@@ -462,8 +463,12 @@ public:
 	bool ValidRepsOracle() const;
 	// PathSelector RepsSpine: REPS over spines under LoadBalancing 2.
 	bool IsRepsSpine() const;
+	// PathSelector MrcSpine or UeAwareSpine: MRC or UEC path-aware spraying
+	// over spines under LoadBalancing 2, with no loss hold.
+	bool IsSpineBaseline() const;
 	// PathSelector Themis or ThemisHold (ThemisSelector at the source,
-	// ThemisArrival at the destination), and ThemisHold alone: its paths, 0 for the spines; the out-of-order degree
+	// ThemisArrival at the destination), and ThemisHold alone; Themis's
+	// paths, 0 for the spines; the out-of-order degree
 	// in packets past which a stashed repair request becomes a Path
 	// Avoidance Signal, 0 for none; the redirected packets a signal avoids
 	// its path for; whether a repair goes up another path; and whether the

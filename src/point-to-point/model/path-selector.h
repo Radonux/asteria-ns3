@@ -221,6 +221,11 @@ enum class PathSelectorKind : uint32_t {
 	// Under SprayUniform: Themis, leaving out the spines RepsHold's loss hold
 	// holds (ThemisHoldSelector).
 	ThemisHold,
+	// Under SprayUniform: MRC over spines (MrcSpineSelector).
+	MrcSpine,
+	// Under SprayUniform: UEC path-aware spraying over spines
+	// (UeAwareSpineSelector).
+	UeAwareSpine,
 };
 
 // The queue pair's sends per trickle send onto one held spine that receives
@@ -1185,17 +1190,21 @@ private:
 // section's congestion bitmap: a value reported congested is marked, and the
 // rotation skips a marked value once, clearing its mark, unless more than a
 // fraction of the space is marked, when the signal no longer tells paths apart
-// and nothing is skipped.
+// and nothing is skipped. Under lossAvoidNs a value with a declared loss is
+// passed over for that long, unless every value is: section 3.6.16.5 lets the
+// source avoid an entropy value that produced a timeout or an inferred loss,
+// for a time it leaves to the implementation.
 class UeAwareSelector : public PathSelector {
 public:
 	UeAwareSelector(Ptr<UniformRandomVariable> random, uint32_t size,
-		double saturationFraction);
+		double saturationFraction, uint64_t lossAvoidNs = 0);
 	uint16_t Choose(uint64_t nowNs) override;
 	void OnAck(uint16_t path, bool marked, uint64_t nowNs) override;
 	// A trim before the last hop reports the path congested; a last-hop trim
 	// only through its echoed mark, the destination's own link being on every
 	// path (UEC 1.0.3 section 3.6.12.3).
 	void OnTrim(uint16_t path, bool lastHop, bool marked, uint64_t nowNs) override;
+	void OnLoss(uint16_t path, uint64_t nowNs) override;
 
 private:
 	void Mark(uint16_t ev);
@@ -1204,6 +1213,18 @@ private:
 	std::vector<bool> m_marked;
 	uint32_t m_markedCount;
 	double m_saturationFraction;
+	uint64_t m_lossAvoidNs;
+	// When each value's avoidance ends; empty without lossAvoidNs.
+	std::vector<uint64_t> m_avoidUntilNs;
+};
+
+// UEC path-aware spraying (UeAwareSelector) over spines under SprayUniform:
+// its values are the spine indices, each sent as SpineIdentification(k, k).
+class UeAwareSpineSelector : public UeAwareSelector {
+public:
+	UeAwareSpineSelector(Ptr<UniformRandomVariable> random, uint32_t spines,
+		double saturationFraction, uint64_t lossAvoidNs);
+	uint16_t Choose(uint64_t nowNs) override;
 };
 
 // MRC (OCP MRC 1.0 section 9.3.1, with the EV choice of the informative
@@ -1255,6 +1276,17 @@ private:
 };
 
 // MRC (MrcSelector) over spines under SprayUniform, its set the spine
+// indices, each sent as SpineIdentification(k, k), and its probes naming
+// spines; nothing else is left out.
+class MrcSpineSelector : public MrcSelector {
+public:
+	MrcSpineSelector(Ptr<UniformRandomVariable> random, uint32_t spines,
+		uint64_t skipNs, uint64_t probeIntervalNs);
+	uint16_t Choose(uint64_t nowNs) override;
+	bool TakeProbe(uint64_t nowNs, uint16_t &path) override;
+};
+
+// MRC (MrcSelector) over spines under SprayUniform, its set the spine
 // indices, with RepsHold's loss hold through LossHoldExploration, as
 // RepsHoldSelector has it: the spines the hold, or the receivers under
 // SprayReceiverHold, hold toward the queue pair's destination are left out
@@ -1264,7 +1296,7 @@ private:
 // SpineScores, the host's or the destination leaf's, or the host's
 // AutoLossHold toward the destination leaf. A declared loss moves MRC's
 // state too, and MRC's probes name spines.
-class MrcHoldSelector : public MrcSelector {
+class MrcHoldSelector : public MrcSpineSelector {
 public:
 	MrcHoldSelector(Ptr<UniformRandomVariable> random, uint32_t spines,
 		uint64_t skipNs, uint64_t probeIntervalNs, SpineScores &hold);
@@ -1277,7 +1309,6 @@ public:
 	void OnLoss(uint16_t path, uint64_t nowNs) override;
 	// The hold's count taken back; MRC's own state keeps the loss.
 	bool RetractLoss(uint16_t path, uint64_t countedNs, uint64_t nowNs) override;
-	bool TakeProbe(uint64_t nowNs, uint16_t &path) override;
 	bool ChoseTrickle() const override;
 	bool ChoseExploration() const override;
 	bool ChoseHeld() const override;

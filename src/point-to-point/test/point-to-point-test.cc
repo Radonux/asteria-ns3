@@ -3909,7 +3909,7 @@ class PathSelectorAttributeTest : public TestCase
 {
   public:
     PathSelectorAttributeTest()
-        : TestCase("The PathSelector attribute takes every selector, ThemisHold the last")
+        : TestCase("The PathSelector attribute takes every selector, UeAwareSpine the last")
     {
     }
 
@@ -3917,7 +3917,7 @@ class PathSelectorAttributeTest : public TestCase
     {
         Ptr<RdmaHw> hw = CreateObject<RdmaHw>();
         for (uint32_t kind = static_cast<uint32_t>(PathSelectorKind::Ops);
-             kind <= static_cast<uint32_t>(PathSelectorKind::ThemisHold);
+             kind <= static_cast<uint32_t>(PathSelectorKind::UeAwareSpine);
              ++kind)
         {
             NS_TEST_EXPECT_MSG_EQ(hw->SetAttributeFailSafe("PathSelector", UintegerValue(kind)),
@@ -3927,9 +3927,9 @@ class PathSelectorAttributeTest : public TestCase
         NS_TEST_EXPECT_MSG_EQ(
             hw->SetAttributeFailSafe(
                 "PathSelector",
-                UintegerValue(static_cast<uint32_t>(PathSelectorKind::ThemisHold) + 1)),
+                UintegerValue(static_cast<uint32_t>(PathSelectorKind::UeAwareSpine) + 1)),
             false,
-            "no selector past ThemisHold");
+            "no selector past UeAwareSpine");
     }
 };
 
@@ -8556,6 +8556,157 @@ class ThemisHoldSelectorTest : public TestCase
                               "Themis's spraying with the hold");
         hw->m_pathSelectorKind = static_cast<uint32_t>(PathSelectorKind::Themis);
         NS_TEST_EXPECT_MSG_EQ(hw->IsRepsHold(), false, "themis keeps no hold");
+    }
+};
+
+class SpineBaselineSelectorTest : public TestCase
+{
+  public:
+    SpineBaselineSelectorTest()
+        : TestCase("mrc_spine and ue_aware_spine choose as MRC and UEC path-aware spraying do, "
+                   "naming the spine they choose; under UeLossAvoidNs a value with a declared "
+                   "loss is passed over for that long, and without it nothing changes")
+    {
+    }
+
+    void DoRun() override
+    {
+        Mrc();
+        UeLossAvoidance();
+        UeSpine();
+        Made();
+        Simulator::Destroy();
+    }
+
+  private:
+    static constexpr uint32_t kSpines = 8;
+
+    static bool Named(uint16_t identification)
+    {
+        return RequestedSpine(identification) == CarryingSpine(identification);
+    }
+
+    // MRC over spines makes MRC's choices on the same stream, retires a
+    // spine with a declared loss and brings it back on its probe's answer.
+    void Mrc()
+    {
+        MrcSpineSelector spine(SelectorStream(), kSpines, 1000, 2000);
+        MrcSelector mrc(SelectorStream(), kSpines, 1000, 2000);
+        bool same = true;
+        for (int i = 0; i < 40; ++i)
+        {
+            const uint16_t chosen = spine.Choose(0);
+            same = same && Named(chosen) && RequestedSpine(chosen) == mrc.Choose(0);
+        }
+        NS_TEST_EXPECT_MSG_EQ(same, true, "MRC's choices, each naming its spine");
+        spine.OnLoss(3, 0);
+        bool avoided = true;
+        for (int i = 0; i < 40; ++i)
+        {
+            avoided = avoided && RequestedSpine(spine.Choose(10)) != 3;
+        }
+        NS_TEST_EXPECT_MSG_EQ(avoided, true, "a spine with a declared loss is retired");
+        uint16_t probe = 0;
+        NS_TEST_EXPECT_MSG_EQ(spine.TakeProbe(2000, probe), true, "its probe is due");
+        NS_TEST_EXPECT_MSG_EQ(uint32_t(RequestedSpine(probe)), 3u, "and names the spine");
+        NS_TEST_EXPECT_MSG_EQ(Named(probe), true, "as both requested and carrying");
+        spine.OnProbeAnswer(3, false, 2000);
+        bool back = false;
+        for (uint32_t i = 0; i < 2 * kSpines; ++i)
+        {
+            back = back || RequestedSpine(spine.Choose(2000)) == 3;
+        }
+        NS_TEST_EXPECT_MSG_EQ(back, true, "an answered probe returns it");
+    }
+
+    void UeLossAvoidance()
+    {
+        constexpr uint32_t kValues = 16;
+        {
+            UeAwareSelector told(SelectorStream(), kValues, 0.5);
+            UeAwareSelector untold(SelectorStream(), kValues, 0.5);
+            told.OnLoss(5, 0);
+            bool same = true;
+            for (uint32_t i = 0; i < 4 * kValues; ++i)
+            {
+                same = same && told.Choose(0) == untold.Choose(0);
+            }
+            NS_TEST_EXPECT_MSG_EQ(same, true, "without loss avoidance a loss changes nothing");
+        }
+        {
+            UeAwareSelector aware(SelectorStream(), kValues, 0.5, 1000);
+            aware.OnLoss(5, 0);
+            bool avoided = true;
+            for (uint32_t i = 0; i < 4 * kValues; ++i)
+            {
+                avoided = avoided && aware.Choose(999) != 5;
+            }
+            NS_TEST_EXPECT_MSG_EQ(avoided, true, "a value with a loss is passed over");
+            bool back = false;
+            for (uint32_t i = 0; i < 2 * kValues; ++i)
+            {
+                back = back || aware.Choose(1000) == 5;
+            }
+            NS_TEST_EXPECT_MSG_EQ(back, true, "and returns when the time is up");
+        }
+        {
+            UeAwareSelector aware(SelectorStream(), kValues, 0.5, 1000);
+            for (uint16_t ev = 0; ev < kValues; ++ev)
+            {
+                aware.OnLoss(ev, 0);
+            }
+            std::set<uint16_t> sent;
+            for (uint32_t i = 0; i < 4 * kValues; ++i)
+            {
+                sent.insert(aware.Choose(10));
+            }
+            NS_TEST_EXPECT_MSG_EQ(sent.size(), kValues, "with every value avoided, all are sent");
+        }
+    }
+
+    // Path-aware spraying over spines makes the selector's choices on the
+    // same stream, each naming its spine.
+    void UeSpine()
+    {
+        UeAwareSpineSelector spine(SelectorStream(), kSpines, 0.5, 1000);
+        UeAwareSelector aware(SelectorStream(), kSpines, 0.5, 1000);
+        spine.OnLoss(2, 0);
+        aware.OnLoss(2, 0);
+        spine.OnAck(6, true, 0);
+        aware.OnAck(6, true, 0);
+        bool same = true;
+        for (uint32_t i = 0; i < 6 * kSpines; ++i)
+        {
+            const uint16_t chosen = spine.Choose(100);
+            same = same && Named(chosen) && RequestedSpine(chosen) == aware.Choose(100);
+        }
+        NS_TEST_EXPECT_MSG_EQ(same, true, "the selector's choices, each naming its spine");
+    }
+
+    // PathSelector MrcSpine and UeAwareSpine make their selectors, take the
+    // overdue repair without a hold, and keep no loss hold.
+    void Made()
+    {
+        for (const auto kind : {PathSelectorKind::MrcSpine, PathSelectorKind::UeAwareSpine})
+        {
+            Ptr<RdmaHw> hw = LossHoldFixture::Hw();
+            hw->m_pathSelectorKind = static_cast<uint32_t>(kind);
+            hw->m_retransmission_timeout_ns = 2000;
+            hw->m_sprayOverdueRepair = static_cast<uint32_t>(OverdueRepair::Reprobe);
+            hw->m_sprayHeldLossRtts = 4;
+            hw->SetAttribute("Mtu", UintegerValue(1000));
+            hw->SetAttribute("PathRandomVariable", PointerValue(SelectorStream()));
+            NS_TEST_EXPECT_MSG_EQ(hw->IsSpineBaseline(), true, "a spine baseline");
+            NS_TEST_EXPECT_MSG_EQ(hw->IsRepsHold(), false, "with no loss hold");
+            NS_TEST_EXPECT_MSG_EQ(hw->ValidOverdueRepair(), true, "that takes reprobe alone");
+            Ptr<RdmaQueuePair> qp = CreateObject<RdmaQueuePair>(
+                3, Ipv4Address("11.0.1.1"), Ipv4Address("11.0.2.1"), 10000, 100);
+            hw->StartPathSelection(qp, 0, 1000);
+            const bool made = kind == PathSelectorKind::MrcSpine
+                                  ? dynamic_cast<MrcSpineSelector*>(qp->m_pathSelector.get()) != nullptr
+                                  : dynamic_cast<UeAwareSpineSelector*>(qp->m_pathSelector.get()) != nullptr;
+            NS_TEST_EXPECT_MSG_EQ(made, true, "the selector is made");
+        }
     }
 };
 
@@ -18207,6 +18358,7 @@ PointToPointTestSuite::PointToPointTestSuite()
     AddTestCase(new ThemisSenderTest, TestCase::Duration::QUICK);
     AddTestCase(new ThemisLeafAvoidanceTest, TestCase::Duration::QUICK);
     AddTestCase(new ThemisHoldSelectorTest, TestCase::Duration::QUICK);
+    AddTestCase(new SpineBaselineSelectorTest, TestCase::Duration::QUICK);
     AddTestCase(new PathSelectorAttributeTest, TestCase::Duration::QUICK);
     AddTestCase(new OutstandingWindowTest, TestCase::Duration::QUICK);
     AddTestCase(new TrimRepairedOnceTest, TestCase::Duration::QUICK);

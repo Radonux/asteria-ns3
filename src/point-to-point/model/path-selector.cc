@@ -1935,15 +1935,21 @@ uint16_t UeObliviousSelector::Choose(uint64_t){
 }
 
 UeAwareSelector::UeAwareSelector(Ptr<UniformRandomVariable> random,
-		uint32_t size, double saturationFraction)
+		uint32_t size, double saturationFraction, uint64_t lossAvoidNs)
 	: m_rotation(random, size), m_marked(size, false), m_markedCount(0),
-	  m_saturationFraction(saturationFraction)
+	  m_saturationFraction(saturationFraction), m_lossAvoidNs(lossAvoidNs),
+	  m_avoidUntilNs(lossAvoidNs > 0 ? size : 0, 0)
 {
 }
 
-uint16_t UeAwareSelector::Choose(uint64_t){
-	for (;;){
+uint16_t UeAwareSelector::Choose(uint64_t nowNs){
+	// Two passes reach every value, whatever order the second is shuffled
+	// into; past them every value is avoided, and avoidance is set aside.
+	const uint32_t avoiding = m_lossAvoidNs > 0 ? 2 * m_rotation.Size() : 0;
+	for (uint32_t visited = 0;; ++visited){
 		const uint16_t ev = m_rotation.Next();
+		if (visited < avoiding && m_avoidUntilNs[ev] > nowNs)
+			continue;
 		if (!m_marked[ev])
 			return ev;
 		const bool saturated =
@@ -1964,6 +1970,24 @@ void UeAwareSelector::OnTrim(uint16_t path, bool lastHop, bool marked,
 		uint64_t){
 	if (!lastHop || marked)
 		Mark(path);
+}
+
+void UeAwareSelector::OnLoss(uint16_t path, uint64_t nowNs){
+	if (m_lossAvoidNs == 0)
+		return;
+	NS_ASSERT_MSG(path < m_avoidUntilNs.size(), "every send takes a value of the space");
+	m_avoidUntilNs[path] = std::max(m_avoidUntilNs[path], nowNs + m_lossAvoidNs);
+}
+
+UeAwareSpineSelector::UeAwareSpineSelector(Ptr<UniformRandomVariable> random,
+		uint32_t spines, double saturationFraction, uint64_t lossAvoidNs)
+	: UeAwareSelector(random, spines, saturationFraction, lossAvoidNs)
+{
+}
+
+uint16_t UeAwareSpineSelector::Choose(uint64_t nowNs){
+	const uint8_t spine = static_cast<uint8_t>(UeAwareSelector::Choose(nowNs));
+	return SpineIdentification(spine, spine);
 }
 
 void UeAwareSelector::Mark(uint16_t ev){
@@ -2070,10 +2094,30 @@ void MrcSelector::Skip(uint16_t ev, uint64_t nowNs){
 	entropy.skipUntilNs = nowNs + m_skipNs;
 }
 
+MrcSpineSelector::MrcSpineSelector(Ptr<UniformRandomVariable> random,
+		uint32_t spines, uint64_t skipNs, uint64_t probeIntervalNs)
+	: MrcSelector(random, spines, skipNs, probeIntervalNs)
+{
+}
+
+uint16_t MrcSpineSelector::Choose(uint64_t nowNs){
+	const uint8_t spine = static_cast<uint8_t>(MrcSelector::Choose(nowNs));
+	return SpineIdentification(spine, spine);
+}
+
+// A probe is sent up the spine it probes, which its answer names back.
+bool MrcSpineSelector::TakeProbe(uint64_t nowNs, uint16_t &path){
+	uint16_t spine;
+	if (!MrcSelector::TakeProbe(nowNs, spine))
+		return false;
+	path = SpineIdentification(spine, spine);
+	return true;
+}
+
 MrcHoldSelector::MrcHoldSelector(Ptr<UniformRandomVariable> random,
 		uint32_t spines, uint64_t skipNs, uint64_t probeIntervalNs,
 		SpineScores &hold)
-	: MrcSelector(random, spines, skipNs, probeIntervalNs),
+	: MrcSpineSelector(random, spines, skipNs, probeIntervalNs),
 	  m_exploration(spines, hold)
 {
 }
@@ -2081,7 +2125,7 @@ MrcHoldSelector::MrcHoldSelector(Ptr<UniformRandomVariable> random,
 MrcHoldSelector::MrcHoldSelector(Ptr<UniformRandomVariable> random,
 		uint32_t spines, uint64_t skipNs, uint64_t probeIntervalNs,
 		AutoLossHold &hold, uint32_t leaf)
-	: MrcSelector(random, spines, skipNs, probeIntervalNs),
+	: MrcSpineSelector(random, spines, skipNs, probeIntervalNs),
 	  m_exploration(spines, hold, leaf)
 {
 }
@@ -2105,15 +2149,6 @@ void MrcHoldSelector::OnLoss(uint16_t path, uint64_t nowNs){
 bool MrcHoldSelector::RetractLoss(uint16_t path, uint64_t countedNs,
 		uint64_t nowNs){
 	return m_exploration.RetractLoss(path, countedNs, nowNs);
-}
-
-// A probe is sent up the spine it probes, which its answer names back.
-bool MrcHoldSelector::TakeProbe(uint64_t nowNs, uint16_t &path){
-	uint16_t spine;
-	if (!MrcSelector::TakeProbe(nowNs, spine))
-		return false;
-	path = SpineIdentification(spine, spine);
-	return true;
 }
 
 bool MrcHoldSelector::ChoseTrickle() const{
