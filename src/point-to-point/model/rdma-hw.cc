@@ -175,13 +175,14 @@ TypeId RdmaHw::GetTypeId (void)
 				"leaf over RepsOracleHops' hops, which needs "
 				"SprayGradeCostSource 1, and 9 is MRC over "
 				"spines leaving out the spines 6's loss hold holds, 10 is "
-				"REPS over spines leaving out none, and 11 is Themis's spraying "
-				"by packet sequence number with its path avoidance.",
+				"REPS over spines leaving out none, 11 is Themis's spraying "
+				"by packet sequence number with its path avoidance, and 12 is "
+				"11 leaving out the spines 6's loss hold holds.",
 				UintegerValue(static_cast<uint32_t>(PathSelectorKind::Ops)),
 				MakeUintegerAccessor(&RdmaHw::m_pathSelectorKind),
 				MakeUintegerChecker<uint32_t>(
 					static_cast<uint32_t>(PathSelectorKind::Ops),
-					static_cast<uint32_t>(PathSelectorKind::Themis)))
+					static_cast<uint32_t>(PathSelectorKind::ThemisHold)))
 		.AddAttribute("RepsBufferSize",
 				"REPS: the entries of the circular buffer of entropy values to "
 				"reuse. Default 8, REPS section 3.1.",
@@ -1950,7 +1951,7 @@ bool RdmaHw::IsRepsHold() const{
 			static_cast<uint32_t>(PathSelectorKind::RepsHold) ||
 		m_pathSelectorKind ==
 			static_cast<uint32_t>(PathSelectorKind::RepsFlowHold) ||
-		IsMrcHold();
+		IsMrcHold() || IsThemisHold();
 }
 
 bool RdmaHw::IsMrcHold() const{
@@ -2031,19 +2032,22 @@ FaultedSpines &RdmaHw::FaultedSpinesTo(uint32_t leaf){
 
 bool RdmaHw::IsLeafHold() const{
 	return (m_pathSelectorKind ==
-			static_cast<uint32_t>(PathSelectorKind::RepsHold) || IsMrcHold()) &&
+			static_cast<uint32_t>(PathSelectorKind::RepsHold) || IsMrcHold() ||
+			IsThemisHold()) &&
 		m_sprayHoldScope == static_cast<uint32_t>(HoldScope::Leaf);
 }
 
 bool RdmaHw::IsPairHold() const{
 	return (m_pathSelectorKind ==
-			static_cast<uint32_t>(PathSelectorKind::RepsHold) || IsMrcHold()) &&
+			static_cast<uint32_t>(PathSelectorKind::RepsHold) || IsMrcHold() ||
+			IsThemisHold()) &&
 		m_sprayHoldScope == static_cast<uint32_t>(HoldScope::Pair);
 }
 
 bool RdmaHw::IsAutoHold() const{
 	return (m_pathSelectorKind ==
-			static_cast<uint32_t>(PathSelectorKind::RepsHold) || IsMrcHold()) &&
+			static_cast<uint32_t>(PathSelectorKind::RepsHold) || IsMrcHold() ||
+			IsThemisHold()) &&
 		m_sprayHoldScope == static_cast<uint32_t>(HoldScope::Auto);
 }
 
@@ -3895,6 +3899,15 @@ std::unique_ptr<PathSelector> RdmaHw::MakePathSelector(Ptr<RdmaQueuePair> qp,
 				shared = std::make_shared<std::vector<uint64_t>>(m_spineCount, 0);
 			counters = shared;
 		}
+		if (IsAutoHold())
+			return std::make_unique<ThemisHoldSelector>(m_pathRandom,
+				m_spineCount, ThemisPaths(), m_sprayThemisAvoidanceWindow,
+				m_sprayThemisRetxReroute, counters, AutoHold(),
+				m_switchQueues->LeafOf(qp->dip.Get()));
+		if (IsThemisHold())
+			return std::make_unique<ThemisHoldSelector>(m_pathRandom,
+				m_spineCount, ThemisPaths(), m_sprayThemisAvoidanceWindow,
+				m_sprayThemisRetxReroute, counters, DestinationHold(qp->dip.Get()));
 		return std::make_unique<ThemisSelector>(m_pathRandom, m_spineCount,
 			ThemisPaths(), m_sprayThemisAvoidanceWindow, m_sprayThemisRetxReroute,
 			counters);

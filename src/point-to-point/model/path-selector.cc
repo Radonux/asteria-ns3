@@ -245,6 +245,11 @@ int ThemisSelector::OnPathAvoid(uint64_t psn, uint64_t){
 }
 
 uint16_t ThemisSelector::Choose(uint64_t){
+	const uint8_t spine = ChooseSpine();
+	return SpineIdentification(spine, spine);
+}
+
+uint8_t ThemisSelector::ChooseSpine(){
 	const uint8_t assigned = Assigned(m_psn);
 	const bool avoided = (*m_counter)[assigned] > 0;
 	if (avoided && !m_decremented){
@@ -252,24 +257,108 @@ uint16_t ThemisSelector::Choose(uint64_t){
 		m_decremented = true;
 		m_redirects++;
 	}
-	const uint8_t spine = avoided || (m_repair && m_reroute)
+	return avoided || Excluded(assigned) || (m_repair && m_reroute)
 		? DrawOther(assigned) : assigned;
-	return SpineIdentification(spine, spine);
+}
+
+bool ThemisSelector::Excluded(uint8_t) const{
+	return false;
 }
 
 uint8_t ThemisSelector::DrawOther(uint8_t assigned){
+	const auto closed = [this](uint8_t spine){
+		return (*m_counter)[spine] > 0 || Excluded(spine);
+	};
 	uint32_t open = 0;
 	for (uint32_t index = 0; index < m_paths; ++index){
 		const uint8_t spine = Assigned(index);
-		open += spine != assigned && (*m_counter)[spine] == 0;
+		open += spine != assigned && !closed(spine);
 	}
 	if (open == 0)
 		return assigned;
 	uint8_t spine;
 	do
 		spine = Assigned(m_random->GetInteger(0, m_paths - 1));
-	while (spine == assigned || (*m_counter)[spine] > 0);
+	while (spine == assigned || closed(spine));
 	return spine;
+}
+
+ThemisHoldSelector::ThemisHoldSelector(Ptr<UniformRandomVariable> random,
+		uint32_t spines, uint32_t paths, uint64_t window, bool reroute,
+		Counters counters, SpineScores &hold)
+	: ThemisSelector(random, spines, paths, window, reroute, std::move(counters)),
+	  m_exploration(spines, hold)
+{
+}
+
+ThemisHoldSelector::ThemisHoldSelector(Ptr<UniformRandomVariable> random,
+		uint32_t spines, uint32_t paths, uint64_t window, bool reroute,
+		Counters counters, AutoLossHold &hold, uint32_t leaf)
+	: ThemisSelector(random, spines, paths, window, reroute, std::move(counters)),
+	  m_exploration(spines, hold, leaf)
+{
+}
+
+ThemisHoldSelector::ThemisHoldSelector(Ptr<UniformRandomVariable> random,
+		uint32_t spines, uint32_t paths, uint64_t window, bool reroute,
+		uint32_t base, SpineScores &hold)
+	: ThemisSelector(random, spines, paths, window, reroute, base),
+	  m_exploration(spines, hold)
+{
+}
+
+uint16_t ThemisHoldSelector::Choose(uint64_t nowNs){
+	const uint8_t spine = m_exploration.Choose(nowNs,
+		[this]{ return ChooseSpine(); });
+	return SpineIdentification(spine, spine);
+}
+
+void ThemisHoldSelector::OnAck(uint16_t path, bool, uint64_t nowNs){
+	m_exploration.OnAck(path, nowNs);
+}
+
+void ThemisHoldSelector::OnLoss(uint16_t path, uint64_t nowNs){
+	m_exploration.OnLoss(path, nowNs);
+}
+
+bool ThemisHoldSelector::RetractLoss(uint16_t path, uint64_t countedNs,
+		uint64_t nowNs){
+	return m_exploration.RetractLoss(path, countedNs, nowNs);
+}
+
+bool ThemisHoldSelector::ChoseTrickle() const{
+	return m_exploration.ChoseTrickle();
+}
+
+bool ThemisHoldSelector::ChoseExploration() const{
+	return m_exploration.ChoseExploration();
+}
+
+bool ThemisHoldSelector::ChoseHeld() const{
+	return m_exploration.ChoseHeld();
+}
+
+void ThemisHoldSelector::OnTrickleAnswer(uint16_t path, bool lost,
+		uint64_t nowNs){
+	m_exploration.OnTrickleAnswer(path, lost, nowNs);
+}
+
+bool ThemisHoldSelector::TakeCopy(uint8_t &spine, bool &trickle){
+	return m_exploration.TakeCopy(spine, trickle);
+}
+
+void ThemisHoldSelector::SetReceiverHold(
+		std::shared_ptr<ReceiverHoldMarks> marks, uint32_t leaf){
+	m_exploration.SetReceiverHold(std::move(marks), leaf);
+}
+
+void ThemisHoldSelector::OnReceiverHold(uint32_t receiver,
+		const SpineBitmap &bitmap, bool partial, uint64_t){
+	m_exploration.OnReceiverHold(receiver, bitmap, partial);
+}
+
+bool ThemisHoldSelector::Excluded(uint8_t spine) const{
+	return m_exploration.Excluded(spine);
 }
 
 AckRedirectSelector::AckRedirectSelector(Ptr<UniformRandomVariable> random,

@@ -3909,7 +3909,7 @@ class PathSelectorAttributeTest : public TestCase
 {
   public:
     PathSelectorAttributeTest()
-        : TestCase("The PathSelector attribute takes every selector, Themis the last")
+        : TestCase("The PathSelector attribute takes every selector, ThemisHold the last")
     {
     }
 
@@ -3917,7 +3917,7 @@ class PathSelectorAttributeTest : public TestCase
     {
         Ptr<RdmaHw> hw = CreateObject<RdmaHw>();
         for (uint32_t kind = static_cast<uint32_t>(PathSelectorKind::Ops);
-             kind <= static_cast<uint32_t>(PathSelectorKind::Themis);
+             kind <= static_cast<uint32_t>(PathSelectorKind::ThemisHold);
              ++kind)
         {
             NS_TEST_EXPECT_MSG_EQ(hw->SetAttributeFailSafe("PathSelector", UintegerValue(kind)),
@@ -3927,9 +3927,9 @@ class PathSelectorAttributeTest : public TestCase
         NS_TEST_EXPECT_MSG_EQ(
             hw->SetAttributeFailSafe(
                 "PathSelector",
-                UintegerValue(static_cast<uint32_t>(PathSelectorKind::Themis) + 1)),
+                UintegerValue(static_cast<uint32_t>(PathSelectorKind::ThemisHold) + 1)),
             false,
-            "no selector past Themis");
+            "no selector past ThemisHold");
     }
 };
 
@@ -8406,6 +8406,156 @@ class MrcHoldTest : public TestCase
         NS_TEST_EXPECT_MSG_EQ(sentinelsByFlow[0] + sentinelsByFlow[1], 3u, "taken by either flow");
         NS_TEST_EXPECT_MSG_EQ(hold.Holds(3), false, "three clean sentinels release the spine");
         NS_TEST_EXPECT_MSG_GT(onSpine3[4], 1u, "and MRC chooses it again");
+    }
+};
+
+class ThemisHoldSelectorTest : public TestCase
+{
+  public:
+    ThemisHoldSelectorTest()
+        : TestCase("Under themis_hold Themis's spraying passes over a spine the loss hold or the "
+                   "receivers hold as it passes over an avoided path, taking no count, and with "
+                   "nothing held chooses as themis does")
+    {
+    }
+
+    void DoRun() override
+    {
+        Same();
+        ReceiverHold();
+        LossHold();
+        Made();
+        Simulator::Destroy();
+    }
+
+  private:
+    static constexpr uint32_t kSpines = LossHoldFixture::kSpines;
+    static constexpr uint64_t kInterval = LossHoldFixture::kInterval;
+    static constexpr uint64_t kSentinelNs = 100000;
+    static constexpr uint32_t kReceiverLeaf = 2;
+
+    static uint8_t Chosen(PathSelector& selector, uint64_t psn, bool repair = false)
+    {
+        selector.NextSend(psn, repair);
+        return RequestedSpine(selector.Choose(0));
+    }
+
+    // The same base, draws and redirects as themis, with a signal and repairs.
+    void Same()
+    {
+        SpineScores hold(kSpines, LossHoldFixture::Hw()->LossHoldParameters());
+        ThemisSelector plain(SelectorStream(), kSpines, kSpines, 3, true, 2);
+        ThemisHoldSelector held(SelectorStream(), kSpines, kSpines, 3, true, 2, hold);
+        plain.OnPathAvoid(4, 0);
+        held.OnPathAvoid(4, 0);
+        bool same = true;
+        for (uint64_t psn = 0; psn < 200; ++psn)
+        {
+            same = same && Chosen(plain, psn, psn % 7 == 0) == Chosen(held, psn, psn % 7 == 0);
+        }
+        NS_TEST_EXPECT_MSG_EQ(same, true, "with nothing held, themis's choices");
+        NS_TEST_EXPECT_MSG_EQ(held.Redirects(), plain.Redirects(), "and its redirects");
+    }
+
+    // A receiver holds spine 3, then Themis avoids spine 5 too, then the
+    // receivers hold every spine.
+    void ReceiverHold()
+    {
+        SpineScores hold(kSpines, LossHoldFixture::Hw()->LossHoldParameters());
+        ThemisHoldSelector selector(SelectorStream(), kSpines, kSpines, 1000, true, 0, hold);
+        selector.SetReceiverHold(std::make_shared<ReceiverHoldMarks>(kSpines, kSentinelNs),
+                                 kReceiverLeaf);
+        selector.OnReceiverHold(100, SpineBitmap::FromByte(0x08), false, 0);
+        std::set<uint32_t> moved;
+        bool kept = true;
+        for (uint64_t psn = 0; psn < 400; ++psn)
+        {
+            const uint8_t spine = Chosen(selector, psn);
+            if (psn % kSpines == 3)
+            {
+                moved.insert(spine);
+            }
+            else
+            {
+                kept = kept && spine == psn % kSpines;
+            }
+        }
+        NS_TEST_EXPECT_MSG_EQ(moved.count(3), 0u, "a held spine is passed over");
+        NS_TEST_EXPECT_MSG_EQ(moved.size(), kSpines - 1, "for another drawn at random");
+        NS_TEST_EXPECT_MSG_EQ(kept, true, "the other paths keep their own");
+        NS_TEST_EXPECT_MSG_EQ(selector.Counter(3), 0u, "no avoidance count");
+        NS_TEST_EXPECT_MSG_EQ(selector.Redirects(), 0u, "and no redirect of Themis's");
+        selector.OnPathAvoid(5, 0);
+        std::set<uint32_t> spines;
+        for (uint64_t psn = 400; psn < 800; ++psn)
+        {
+            spines.insert(Chosen(selector, psn));
+        }
+        NS_TEST_EXPECT_MSG_EQ(spines.count(3), 0u, "neither the held spine");
+        NS_TEST_EXPECT_MSG_EQ(spines.count(5), 0u, "nor the avoided one is sent on");
+        NS_TEST_EXPECT_MSG_EQ(selector.Redirects(), 50u, "the avoided path's packets take counts");
+        NS_TEST_EXPECT_MSG_EQ(selector.Counter(5), 950u, "one each");
+        selector.OnReceiverHold(100, SpineBitmap::FromByte(0xff), false, 0);
+        bool own = true;
+        for (uint64_t psn = 800; psn < 808; ++psn)
+        {
+            const uint8_t spine = Chosen(selector, psn);
+            own = own && (psn % kSpines == 5 ? spine != 5 : spine == psn % kSpines);
+        }
+        NS_TEST_EXPECT_MSG_EQ(own,
+                              true,
+                              "with every spine held a packet keeps its own unless Themis avoids it");
+    }
+
+    // The host's loss hold: every send on spine 3 is lost over the first
+    // interval, so the hold holds it and sends it one sentinel per interval;
+    // three clean sentinels release it and its path's packets return.
+    void LossHold()
+    {
+        SpineScores hold(kSpines, LossHoldFixture::Hw()->LossHoldParameters());
+        ThemisHoldSelector selector(SelectorStream(), kSpines, kSpines, 1000, true, 0, hold);
+        std::vector<uint32_t> onSpine3(5);
+        uint32_t step = 0;
+        for (uint32_t interval = 0; interval < 5; ++interval)
+        {
+            for (uint32_t i = 0; i < 100; ++i, ++step)
+            {
+                const uint64_t now = interval * kInterval + 100 * i;
+                const std::set<uint8_t> lossy =
+                    interval == 0 ? std::set<uint8_t>{3} : std::set<uint8_t>{};
+                selector.NextSend(step, false);
+                onSpine3[interval] += LossHoldFixture::Send(selector, now, step, lossy) == 3;
+            }
+        }
+        NS_TEST_EXPECT_MSG_GT(onSpine3[0], 0u, "spine 3 is sent on, and loses");
+        NS_TEST_EXPECT_MSG_EQ(onSpine3[1], 1u, "held: one sentinel in the first interval");
+        NS_TEST_EXPECT_MSG_EQ(onSpine3[2], 1u, "and in the second");
+        NS_TEST_EXPECT_MSG_EQ(onSpine3[3], 1u, "and in the third");
+        NS_TEST_EXPECT_MSG_EQ(hold.Holds(3), false, "three clean sentinels release it");
+        NS_TEST_EXPECT_MSG_GT(onSpine3[4], 1u, "and its path's packets return");
+        NS_TEST_EXPECT_MSG_EQ(selector.Redirects(), 0u, "no count of Themis's is taken");
+    }
+
+    // PathSelector ThemisHold makes the selector, and is a loss hold and Themis.
+    void Made()
+    {
+        Ptr<RdmaHw> hw = LossHoldFixture::Hw();
+        hw->m_pathSelectorKind = static_cast<uint32_t>(PathSelectorKind::ThemisHold);
+        hw->m_selective_retransmission = true;
+        hw->SetAttribute("Mtu", UintegerValue(1000));
+        hw->SetAttribute("PathRandomVariable", PointerValue(SelectorStream()));
+        NS_TEST_EXPECT_MSG_EQ(hw->IsRepsHold(), true, "a loss hold");
+        NS_TEST_EXPECT_MSG_EQ(hw->IsThemis(), true, "and Themis");
+        NS_TEST_EXPECT_MSG_EQ(hw->ValidRepsHold(), true, "a valid hold");
+        NS_TEST_EXPECT_MSG_EQ(hw->ValidThemis(), true, "a valid Themis");
+        Ptr<RdmaQueuePair> qp = CreateObject<RdmaQueuePair>(
+            3, Ipv4Address("11.0.1.1"), Ipv4Address("11.0.2.1"), 10000, 100);
+        hw->StartPathSelection(qp, 0, 1000);
+        NS_TEST_EXPECT_MSG_NE(dynamic_cast<ThemisHoldSelector*>(qp->m_pathSelector.get()),
+                              nullptr,
+                              "Themis's spraying with the hold");
+        hw->m_pathSelectorKind = static_cast<uint32_t>(PathSelectorKind::Themis);
+        NS_TEST_EXPECT_MSG_EQ(hw->IsRepsHold(), false, "themis keeps no hold");
     }
 };
 
@@ -18056,6 +18206,7 @@ PointToPointTestSuite::PointToPointTestSuite()
     AddTestCase(new ThemisDestinationTest, TestCase::Duration::QUICK);
     AddTestCase(new ThemisSenderTest, TestCase::Duration::QUICK);
     AddTestCase(new ThemisLeafAvoidanceTest, TestCase::Duration::QUICK);
+    AddTestCase(new ThemisHoldSelectorTest, TestCase::Duration::QUICK);
     AddTestCase(new PathSelectorAttributeTest, TestCase::Duration::QUICK);
     AddTestCase(new OutstandingWindowTest, TestCase::Duration::QUICK);
     AddTestCase(new TrimRepairedOnceTest, TestCase::Duration::QUICK);

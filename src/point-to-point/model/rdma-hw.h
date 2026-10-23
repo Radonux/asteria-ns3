@@ -225,8 +225,8 @@ public:
 	// m_senderSpineScores, made with parameters if it is null, its loss
 	// intervals traced to SpineLossInterval when they are graded.
 	SpineScores &HostScores(const SpineScores::Parameters &parameters);
-	// PathSelector RepsHold, RepsFlowHold or MrcHold, and whether its loss
-	// hold has what it needs:
+	// PathSelector RepsHold, RepsFlowHold, MrcHold or ThemisHold, and whether
+	// its loss hold has what it needs:
 	// spines named per packet, the loss thresholds, a loss interval, a loss
 	// hold and the sentinels that release it.
 	bool IsRepsHold() const;
@@ -462,13 +462,14 @@ public:
 	bool ValidRepsOracle() const;
 	// PathSelector RepsSpine: REPS over spines under LoadBalancing 2.
 	bool IsRepsSpine() const;
-	// PathSelector Themis (ThemisSelector at the source, ThemisArrival at
-	// the destination): its paths, 0 for the spines; the out-of-order degree
+	// PathSelector Themis or ThemisHold (ThemisSelector at the source,
+	// ThemisArrival at the destination), and ThemisHold alone: its paths, 0 for the spines; the out-of-order degree
 	// in packets past which a stashed repair request becomes a Path
 	// Avoidance Signal, 0 for none; the redirected packets a signal avoids
 	// its path for; whether a repair goes up another path; and whether the
 	// host's connections to one leaf share their paths' avoidance.
 	bool IsThemis() const;
+	bool IsThemisHold() const;
 	bool ValidThemis() const;
 	uint32_t ThemisPaths() const;
 	uint32_t m_sprayThemisPaths;

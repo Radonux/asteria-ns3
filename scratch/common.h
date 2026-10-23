@@ -231,15 +231,18 @@ std::string load_balancing = "ecmp";
 // hold keys; it reads REPS_BUFFER_SIZE and REPS_FREEZING_TIMEOUT_NS as reps
 // does, and SPRAY_PATH_SEQ and SPRAY_TAIL_RECOVERY as every spray_uniform
 // selector does. themis is Themis's spraying by packet sequence number with
-// its path avoidance (SPRAY_THEMIS_PATHS and the keys after it).
+// its path avoidance (SPRAY_THEMIS_PATHS and the keys after it). themis_hold
+// is themis leaving out the spines reps_hold's loss hold holds, at the same
+// SPRAY_HOLD_SCOPE; reps_hold() holds for it too.
 std::string path_selector = "ops";
 bool reps_hold() {
   return path_selector == "reps_hold" || path_selector == "reps_flow_hold" ||
-         path_selector == "mrc_hold";
+         path_selector == "mrc_hold" || path_selector == "themis_hold";
 }
-// Whether SPRAY_HOLD_SCOPE is read: reps_hold and mrc_hold.
+// Whether SPRAY_HOLD_SCOPE is read: reps_hold, mrc_hold and themis_hold.
 bool hold_scope_read() {
-  return path_selector == "reps_hold" || path_selector == "mrc_hold";
+  return path_selector == "reps_hold" || path_selector == "mrc_hold" ||
+         path_selector == "themis_hold";
 }
 // Under reps_hold and mrc_hold, what one loss hold is kept for: host, every
 // destination of the host, leaf, the destinations on one leaf, auto, per spine
@@ -749,12 +752,12 @@ const std::map<std::string, std::set<std::string>> path_selector_parameter_owner
     {"ACK_REDIRECT_TRIM_SCORING", {"ack_redirect"}},
     {"ACK_REDIRECT_SCOPE", {"ack_redirect"}},
     {"REPS_ORACLE_HOPS", {"reps_oracle"}},
-    {"SPRAY_THEMIS_PATHS", {"themis"}},
-    {"SPRAY_THEMIS_OOO_THRESHOLD", {"themis"}},
-    {"SPRAY_THEMIS_STASH_MIN_NS", {"themis"}},
-    {"SPRAY_THEMIS_AVOIDANCE_WINDOW", {"themis"}},
-    {"SPRAY_THEMIS_RETX_REROUTE", {"themis"}},
-    {"SPRAY_THEMIS_LEAF_AVOIDANCE", {"themis"}},
+    {"SPRAY_THEMIS_PATHS", {"themis", "themis_hold"}},
+    {"SPRAY_THEMIS_OOO_THRESHOLD", {"themis", "themis_hold"}},
+    {"SPRAY_THEMIS_STASH_MIN_NS", {"themis", "themis_hold"}},
+    {"SPRAY_THEMIS_AVOIDANCE_WINDOW", {"themis", "themis_hold"}},
+    {"SPRAY_THEMIS_RETX_REROUTE", {"themis", "themis_hold"}},
+    {"SPRAY_THEMIS_LEAF_AVOIDANCE", {"themis", "themis_hold"}},
 };
 // The keys of ack_redirect that only its per_connection scope reads.
 const std::set<std::string> ack_redirect_connection_keys = {
@@ -1429,6 +1432,8 @@ uint32_t path_selector_value() {
     return static_cast<uint32_t>(PathSelectorKind::RepsSpine);
   if (path_selector == "themis")
     return static_cast<uint32_t>(PathSelectorKind::Themis);
+  if (path_selector == "themis_hold")
+    return static_cast<uint32_t>(PathSelectorKind::ThemisHold);
   return std::numeric_limits<uint32_t>::max();
 }
 
@@ -3440,7 +3445,7 @@ bool ReadConf(string network_configuration) {
   if (path_selector_value() == std::numeric_limits<uint32_t>::max()) {
     std::cerr << "PATH_SELECTOR must be ops, reps, ue_oblivious, ue_aware, mrc, "
                  "ack_redirect, reps_hold, reps_flow_hold, reps_oracle, "
-                 "mrc_hold, reps_spine or themis\n";
+                 "mrc_hold, reps_spine, themis or themis_hold\n";
     return false;
   }
   if (reps_hold()) {
@@ -3468,7 +3473,8 @@ bool ReadConf(string network_configuration) {
     std::cerr << "REPS_ORACLE_HOPS must be round_trip or forward\n";
     return false;
   }
-  if ((path_selector == "reps_spine" || path_selector == "themis") &&
+  if ((path_selector == "reps_spine" || path_selector == "themis" ||
+       path_selector == "themis_hold") &&
       load_balancing != "spray_uniform") {
     std::cerr << "PATH_SELECTOR " << path_selector
               << " names spines and requires LOAD_BALANCING spray_uniform\n";

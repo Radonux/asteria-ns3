@@ -15,7 +15,12 @@ namespace ns3 {
 
 bool RdmaHw::IsThemis() const{
 	return m_pathSelectorKind ==
-		static_cast<uint32_t>(PathSelectorKind::Themis);
+		static_cast<uint32_t>(PathSelectorKind::Themis) || IsThemisHold();
+}
+
+bool RdmaHw::IsThemisHold() const{
+	return m_pathSelectorKind ==
+		static_cast<uint32_t>(PathSelectorKind::ThemisHold);
 }
 
 uint32_t RdmaHw::ThemisPaths() const{

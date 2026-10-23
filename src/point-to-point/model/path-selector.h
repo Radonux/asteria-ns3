@@ -218,6 +218,9 @@ enum class PathSelectorKind : uint32_t {
 	// Under SprayUniform: Themis's spraying by packet sequence number, with
 	// its source's per-path avoidance (ThemisSelector).
 	Themis,
+	// Under SprayUniform: Themis, leaving out the spines RepsHold's loss hold
+	// holds (ThemisHoldSelector).
+	ThemisHold,
 };
 
 // The queue pair's sends per trickle send onto one held spine that receives
@@ -352,7 +355,8 @@ private:
 // falls by one (section 4.4). Under reroute a repair, too, goes up another
 // path. When every other path is avoided, the packet keeps its own. The
 // counters, one per spine, are the selector's own, or under counters given
-// shared with other selectors (a host's connections to one leaf).
+// shared with other selectors (a host's connections to one leaf). A spine
+// Excluded names is passed over as an avoided one is, taking no count.
 class ThemisSelector : public PathSelector {
 public:
 	using Counters = std::shared_ptr<std::vector<uint64_t>>;
@@ -370,6 +374,12 @@ public:
 	uint64_t Counter(uint8_t spine) const;
 	// The packets sent up another path than their own while it was avoided.
 	uint64_t Redirects() const;
+
+protected:
+	// The spine of the send NextSend named.
+	uint8_t ChooseSpine();
+	// None by default.
+	virtual bool Excluded(uint8_t spine) const;
 
 private:
 	uint8_t DrawOther(uint8_t assigned);
@@ -1280,6 +1290,46 @@ public:
 
 protected:
 	bool Excluded(uint16_t path) const override;
+
+private:
+	LossHoldExploration m_exploration;
+};
+
+// Themis's source (ThemisSelector) with RepsHold's loss hold through
+// LossHoldExploration, as MrcHoldSelector has it: the spines the hold, or the
+// receivers under SprayReceiverHold, hold toward the queue pair's destination
+// are Excluded unless they hold every spine, the exploration sends are sent as
+// the hold's HoldRelease and SentinelMode have them, and every send and every
+// send declared lost is counted in the hold. A loss hold and Themis's
+// avoidance then share one spraying rule and one redirect.
+class ThemisHoldSelector : public ThemisSelector {
+public:
+	ThemisHoldSelector(Ptr<UniformRandomVariable> random, uint32_t spines,
+		uint32_t paths, uint64_t window, bool reroute, Counters counters,
+		SpineScores &hold);
+	ThemisHoldSelector(Ptr<UniformRandomVariable> random, uint32_t spines,
+		uint32_t paths, uint64_t window, bool reroute, Counters counters,
+		AutoLossHold &hold, uint32_t leaf);
+	// With the base given, for tests.
+	ThemisHoldSelector(Ptr<UniformRandomVariable> random, uint32_t spines,
+		uint32_t paths, uint64_t window, bool reroute, uint32_t base,
+		SpineScores &hold);
+	uint16_t Choose(uint64_t nowNs) override;
+	void OnAck(uint16_t path, bool marked, uint64_t nowNs) override;
+	void OnLoss(uint16_t path, uint64_t nowNs) override;
+	bool RetractLoss(uint16_t path, uint64_t countedNs, uint64_t nowNs) override;
+	bool ChoseTrickle() const override;
+	bool ChoseExploration() const override;
+	bool ChoseHeld() const override;
+	void OnTrickleAnswer(uint16_t path, bool lost, uint64_t nowNs) override;
+	bool TakeCopy(uint8_t &spine, bool &trickle) override;
+	void SetReceiverHold(std::shared_ptr<ReceiverHoldMarks> marks,
+		uint32_t leaf) override;
+	void OnReceiverHold(uint32_t receiver, const SpineBitmap &bitmap,
+		bool partial, uint64_t nowNs) override;
+
+protected:
+	bool Excluded(uint8_t spine) const override;
 
 private:
 	LossHoldExploration m_exploration;
