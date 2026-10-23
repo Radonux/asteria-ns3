@@ -8564,15 +8564,13 @@ class SpineBaselineSelectorTest : public TestCase
   public:
     SpineBaselineSelectorTest()
         : TestCase("mrc_spine and ue_aware_spine choose as MRC and UEC path-aware spraying do, "
-                   "naming the spine they choose; under UeLossAvoidNs a value with a declared "
-                   "loss is passed over for that long, and without it nothing changes")
+                   "naming the spine they choose")
     {
     }
 
     void DoRun() override
     {
         Mrc();
-        UeLossAvoidance();
         UeSpine();
         Made();
         Simulator::Destroy();
@@ -8619,59 +8617,12 @@ class SpineBaselineSelectorTest : public TestCase
         NS_TEST_EXPECT_MSG_EQ(back, true, "an answered probe returns it");
     }
 
-    void UeLossAvoidance()
-    {
-        constexpr uint32_t kValues = 16;
-        {
-            UeAwareSelector told(SelectorStream(), kValues, 0.5);
-            UeAwareSelector untold(SelectorStream(), kValues, 0.5);
-            told.OnLoss(5, 0);
-            bool same = true;
-            for (uint32_t i = 0; i < 4 * kValues; ++i)
-            {
-                same = same && told.Choose(0) == untold.Choose(0);
-            }
-            NS_TEST_EXPECT_MSG_EQ(same, true, "without loss avoidance a loss changes nothing");
-        }
-        {
-            UeAwareSelector aware(SelectorStream(), kValues, 0.5, 1000);
-            aware.OnLoss(5, 0);
-            bool avoided = true;
-            for (uint32_t i = 0; i < 4 * kValues; ++i)
-            {
-                avoided = avoided && aware.Choose(999) != 5;
-            }
-            NS_TEST_EXPECT_MSG_EQ(avoided, true, "a value with a loss is passed over");
-            bool back = false;
-            for (uint32_t i = 0; i < 2 * kValues; ++i)
-            {
-                back = back || aware.Choose(1000) == 5;
-            }
-            NS_TEST_EXPECT_MSG_EQ(back, true, "and returns when the time is up");
-        }
-        {
-            UeAwareSelector aware(SelectorStream(), kValues, 0.5, 1000);
-            for (uint16_t ev = 0; ev < kValues; ++ev)
-            {
-                aware.OnLoss(ev, 0);
-            }
-            std::set<uint16_t> sent;
-            for (uint32_t i = 0; i < 4 * kValues; ++i)
-            {
-                sent.insert(aware.Choose(10));
-            }
-            NS_TEST_EXPECT_MSG_EQ(sent.size(), kValues, "with every value avoided, all are sent");
-        }
-    }
-
     // Path-aware spraying over spines makes the selector's choices on the
     // same stream, each naming its spine.
     void UeSpine()
     {
-        UeAwareSpineSelector spine(SelectorStream(), kSpines, 0.5, 1000);
-        UeAwareSelector aware(SelectorStream(), kSpines, 0.5, 1000);
-        spine.OnLoss(2, 0);
-        aware.OnLoss(2, 0);
+        UeAwareSpineSelector spine(SelectorStream(), kSpines, 0.5);
+        UeAwareSelector aware(SelectorStream(), kSpines, 0.5);
         spine.OnAck(6, true, 0);
         aware.OnAck(6, true, 0);
         bool same = true;

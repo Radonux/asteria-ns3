@@ -94,7 +94,6 @@ public:
 	uint64_t m_repsFreezingTimeoutNs;
 	uint32_t m_ueEvSetSize;
 	double m_ueSaturationFraction;
-	uint64_t m_ueLossAvoidNs;
 	uint32_t m_mrcEvSetSize;
 	double m_mrcSkipBaseRtts;
 	double m_mrcProbeTimeouts;

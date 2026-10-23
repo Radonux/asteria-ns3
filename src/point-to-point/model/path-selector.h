@@ -1190,21 +1190,17 @@ private:
 // section's congestion bitmap: a value reported congested is marked, and the
 // rotation skips a marked value once, clearing its mark, unless more than a
 // fraction of the space is marked, when the signal no longer tells paths apart
-// and nothing is skipped. Under lossAvoidNs a value with a declared loss is
-// passed over for that long, unless every value is: section 3.6.16.5 lets the
-// source avoid an entropy value that produced a timeout or an inferred loss,
-// for a time it leaves to the implementation.
+// and nothing is skipped.
 class UeAwareSelector : public PathSelector {
 public:
 	UeAwareSelector(Ptr<UniformRandomVariable> random, uint32_t size,
-		double saturationFraction, uint64_t lossAvoidNs = 0);
+		double saturationFraction);
 	uint16_t Choose(uint64_t nowNs) override;
 	void OnAck(uint16_t path, bool marked, uint64_t nowNs) override;
 	// A trim before the last hop reports the path congested; a last-hop trim
 	// only through its echoed mark, the destination's own link being on every
 	// path (UEC 1.0.3 section 3.6.12.3).
 	void OnTrim(uint16_t path, bool lastHop, bool marked, uint64_t nowNs) override;
-	void OnLoss(uint16_t path, uint64_t nowNs) override;
 
 private:
 	void Mark(uint16_t ev);
@@ -1213,9 +1209,6 @@ private:
 	std::vector<bool> m_marked;
 	uint32_t m_markedCount;
 	double m_saturationFraction;
-	uint64_t m_lossAvoidNs;
-	// When each value's avoidance ends; empty without lossAvoidNs.
-	std::vector<uint64_t> m_avoidUntilNs;
 };
 
 // UEC path-aware spraying (UeAwareSelector) over spines under SprayUniform:
@@ -1223,7 +1216,7 @@ private:
 class UeAwareSpineSelector : public UeAwareSelector {
 public:
 	UeAwareSpineSelector(Ptr<UniformRandomVariable> random, uint32_t spines,
-		double saturationFraction, uint64_t lossAvoidNs);
+		double saturationFraction);
 	uint16_t Choose(uint64_t nowNs) override;
 };
 

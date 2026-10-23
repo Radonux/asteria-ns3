@@ -1935,21 +1935,15 @@ uint16_t UeObliviousSelector::Choose(uint64_t){
 }
 
 UeAwareSelector::UeAwareSelector(Ptr<UniformRandomVariable> random,
-		uint32_t size, double saturationFraction, uint64_t lossAvoidNs)
+		uint32_t size, double saturationFraction)
 	: m_rotation(random, size), m_marked(size, false), m_markedCount(0),
-	  m_saturationFraction(saturationFraction), m_lossAvoidNs(lossAvoidNs),
-	  m_avoidUntilNs(lossAvoidNs > 0 ? size : 0, 0)
+	  m_saturationFraction(saturationFraction)
 {
 }
 
-uint16_t UeAwareSelector::Choose(uint64_t nowNs){
-	// Two passes reach every value, whatever order the second is shuffled
-	// into; past them every value is avoided, and avoidance is set aside.
-	const uint32_t avoiding = m_lossAvoidNs > 0 ? 2 * m_rotation.Size() : 0;
-	for (uint32_t visited = 0;; ++visited){
+uint16_t UeAwareSelector::Choose(uint64_t){
+	for (;;){
 		const uint16_t ev = m_rotation.Next();
-		if (visited < avoiding && m_avoidUntilNs[ev] > nowNs)
-			continue;
 		if (!m_marked[ev])
 			return ev;
 		const bool saturated =
@@ -1972,16 +1966,9 @@ void UeAwareSelector::OnTrim(uint16_t path, bool lastHop, bool marked,
 		Mark(path);
 }
 
-void UeAwareSelector::OnLoss(uint16_t path, uint64_t nowNs){
-	if (m_lossAvoidNs == 0)
-		return;
-	NS_ASSERT_MSG(path < m_avoidUntilNs.size(), "every send takes a value of the space");
-	m_avoidUntilNs[path] = std::max(m_avoidUntilNs[path], nowNs + m_lossAvoidNs);
-}
-
 UeAwareSpineSelector::UeAwareSpineSelector(Ptr<UniformRandomVariable> random,
-		uint32_t spines, double saturationFraction, uint64_t lossAvoidNs)
-	: UeAwareSelector(random, spines, saturationFraction, lossAvoidNs)
+		uint32_t spines, double saturationFraction)
+	: UeAwareSelector(random, spines, saturationFraction)
 {
 }
 

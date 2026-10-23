@@ -720,9 +720,6 @@ uint32_t reps_buffer_size = 8;
 uint64_t reps_freezing_timeout_ns = 10000000;
 uint32_t ue_ev_set_size = 256;
 double ue_saturation_fraction = 0.5;
-// UEC path-aware spraying: how long a value with a declared loss is passed
-// over, in ns; 0, the default, none.
-uint64_t ue_loss_avoid_ns = 0;
 uint32_t mrc_ev_set_size = 128;
 double mrc_skip_base_rtts = 1.0;
 double mrc_probe_timeouts = 1.0;
@@ -748,7 +745,6 @@ const std::map<std::string, std::set<std::string>> path_selector_parameter_owner
      {"reps", "reps_hold", "reps_flow_hold", "reps_oracle", "reps_spine"}},
     {"UE_EV_SET_SIZE", {"ue_oblivious", "ue_aware"}},
     {"UE_SATURATION_FRACTION", {"ue_aware", "ue_aware_spine"}},
-    {"UE_LOSS_AVOID_NS", {"ue_aware", "ue_aware_spine"}},
     {"MRC_EV_SET_SIZE", {"mrc"}},
     {"MRC_SKIP_BASE_RTTS", {"mrc", "mrc_hold", "mrc_spine"}},
     {"MRC_PROBE_TIMEOUTS", {"mrc", "mrc_hold", "mrc_spine"}},
@@ -2803,8 +2799,6 @@ bool ReadConf(string network_configuration) {
       conf >> ue_ev_set_size;
     } else if (key.compare("UE_SATURATION_FRACTION") == 0) {
       conf >> ue_saturation_fraction;
-    } else if (key.compare("UE_LOSS_AVOID_NS") == 0) {
-      conf >> ue_loss_avoid_ns;
     } else if (key.compare("MRC_EV_SET_SIZE") == 0) {
       conf >> mrc_ev_set_size;
     } else if (key.compare("MRC_SKIP_BASE_RTTS") == 0) {
@@ -4548,7 +4542,6 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),
       rdmaHw->SetAttribute("UeEvSetSize", UintegerValue(ue_ev_set_size));
       rdmaHw->SetAttribute("UeSaturationFraction",
                            DoubleValue(ue_saturation_fraction));
-      rdmaHw->SetAttribute("UeLossAvoidNs", UintegerValue(ue_loss_avoid_ns));
       rdmaHw->SetAttribute("MrcEvSetSize", UintegerValue(mrc_ev_set_size));
       rdmaHw->SetAttribute("MrcSkipBaseRtts", DoubleValue(mrc_skip_base_rtts));
       rdmaHw->SetAttribute("MrcProbeTimeouts", DoubleValue(mrc_probe_timeouts));

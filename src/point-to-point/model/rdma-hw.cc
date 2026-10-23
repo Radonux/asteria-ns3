@@ -222,13 +222,7 @@ TypeId RdmaHw::GetTypeId (void)
 				DoubleValue(0.5),
 				MakeDoubleAccessor(&RdmaHw::m_ueSaturationFraction),
 				MakeDoubleChecker<double>(0, 1))
-		.AddAttribute("UeLossAvoidNs",
-				"UEC path-aware spraying: how long a value with a declared loss "
-				"is passed over, in ns. UEC 1.0.3 section 3.6.16.5 leaves the "
-				"time to the implementation; default 0, no avoidance.",
-				UintegerValue(0),
-				MakeUintegerAccessor(&RdmaHw::m_ueLossAvoidNs),
-				MakeUintegerChecker<uint64_t>())
+
 		.AddAttribute("MrcEvSetSize",
 				"MRC: the entropy values a queue pair rotates through. Default "
 				"128, within the one to two windows of OCP MRC 1.0 section "
@@ -3977,7 +3971,7 @@ std::unique_ptr<PathSelector> RdmaHw::MakePathSelector(Ptr<RdmaQueuePair> qp,
 				m_mrcProbeTimeouts * m_retransmission_timeout_ns));
 	if (m_pathSelectorKind == static_cast<uint32_t>(PathSelectorKind::UeAwareSpine))
 		return std::make_unique<UeAwareSpineSelector>(m_pathRandom,
-			m_spineCount, m_ueSaturationFraction, m_ueLossAvoidNs);
+			m_spineCount, m_ueSaturationFraction);
 	if (m_loadBalancing == static_cast<uint32_t>(LoadBalancingMode::SprayUniform))
 		return std::make_unique<UniformSpineSelector>(m_pathRandom, m_spineCount);
 	if (IsSprayPolicy()){
@@ -4026,7 +4020,7 @@ std::unique_ptr<PathSelector> RdmaHw::MakePathSelector(Ptr<RdmaQueuePair> qp,
 			m_ueEvSetSize);
 	case PathSelectorKind::UeAware:
 		return std::make_unique<UeAwareSelector>(m_pathRandom,
-			m_ueEvSetSize, m_ueSaturationFraction, m_ueLossAvoidNs);
+			m_ueEvSetSize, m_ueSaturationFraction);
 	case PathSelectorKind::Mrc:
 		return std::make_unique<MrcSelector>(m_pathRandom,
 			m_mrcEvSetSize, static_cast<uint64_t>(m_mrcSkipBaseRtts * baseRttNs),
