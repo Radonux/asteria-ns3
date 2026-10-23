@@ -4034,6 +4034,52 @@ class ThemisSenderTest : public TestCase
             NS_TEST_EXPECT_MSG_GT(themis->Counter(themis->Assigned(0)), 0, "and the path is avoided");
             Simulator::Destroy();
         }
+        {
+            // A signal for a send RACK has already repaired, in a job queue
+            // pair's order of events (sends 5200 ns apart, RACK window 3081
+            // ns): packet 1's answer declares packet 0 lost, its repair leaves
+            // at 17500 ns on another path, and packet 3's answer carries the
+            // signal for packet 0 before the repair's own answer.
+            IsolatedHost host(LoadBalancingMode::SprayUniform, kTestReceiver, 8);
+            host.hw->m_pathSelectorKind = static_cast<uint32_t>(PathSelectorKind::Themis);
+            Ptr<RdmaQueuePair> q = host.AddSender(kTestSender, kTestReceiver, 10 * kMtu);
+            auto* themis = dynamic_cast<ThemisSelector*>(q->m_pathSelector.get());
+            NS_TEST_ASSERT_MSG_NE(themis, nullptr, "Themis's selector");
+            q->m_rackReorderNs = 3081;
+            q->snd_nxt = 4 * kMtu;
+            q->m_highest_sent = 4 * kMtu;
+            for (uint64_t psn = 0; psn < 4; ++psn)
+            {
+                q->m_outstanding.Add(psn * kMtu, kMtu, themis->Assigned(psn), psn * 5200);
+            }
+            NS_TEST_EXPECT_MSG_EQ(q->AcknowledgePacket(kMtu, themis->Assigned(1)), kMtu,
+                                  "packet 1's answer declares packet 0 lost");
+            uint64_t start = 99;
+            NS_TEST_EXPECT_MSG_EQ(q->TakeRepairSegment(kMtu, start), kMtu, "the repair is taken");
+            NS_TEST_EXPECT_MSG_EQ(start, 0, "of packet 0");
+            q->m_outstanding.Add(0, kMtu, (themis->Assigned(0) + 1) % 8, 17500);
+            NS_TEST_EXPECT_MSG_EQ(q->AcknowledgePacket(2 * kMtu, themis->Assigned(2)), 0,
+                                  "packet 2's answer declares nothing");
+            const uint32_t recoveryBefore = q->m_recovery_events;
+            CustomHeader ack;
+            ack.l3Prot = 0xFC;
+            ack.sip = kTestReceiver.Get();
+            const uint8_t spine = themis->Assigned(3);
+            ack.ipid = SpineIdentification(spine, spine);
+            ack.ack.flags = 1 << qbbHeader::FLAG_PATH_AVOID;
+            ack.ack.sport = IsolatedHost::kReceiverPort;
+            ack.ack.dport = IsolatedHost::kSenderPort;
+            ack.ack.pg = IsolatedHost::kPriorityGroup;
+            ack.ack.seq = 0;
+            ack.ack.packet_seq = 3 * kMtu;
+            host.hw->ReceiveAck(Create<Packet>(), ack);
+            NS_TEST_EXPECT_MSG_EQ(q->m_repair_ranges.count(0), 0, "the signal does not repair packet 0 again");
+            NS_TEST_EXPECT_MSG_EQ(q->m_recovery_events - recoveryBefore, 0, "nor declares its repair lost");
+            NS_TEST_EXPECT_MSG_NE(q->m_outstanding.FindPacket(0), OutstandingPackets::kNone,
+                                  "the repair stays outstanding");
+            NS_TEST_EXPECT_MSG_EQ(themis->Counter(themis->Assigned(0)), 2000000, "and the path is avoided");
+            Simulator::Destroy();
+        }
     }
 };
 

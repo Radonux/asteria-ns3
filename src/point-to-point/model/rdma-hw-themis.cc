@@ -92,6 +92,12 @@ void RdmaHw::ThemisPathAvoid(Ptr<RdmaQueuePair> qp, uint64_t seq){
 	// The path the source avoids, through a connection's shared selector too.
 	if (avoided >= 0)
 		ReportTransportEvent(("themis_signal_spine" + std::to_string(avoided)).c_str(), 0);
+	// The signal names the send the destination's stash waits for. A resend
+	// of it left after the sender's own rule declared that send lost, so the
+	// destination has not judged it: avoid the path, repair nothing more.
+	const uint64_t resend = qp->m_outstanding.FindPacket(seq);
+	if (resend != OutstandingPackets::kNone && qp->m_outstanding.ResendsLost(resend))
+		return;
 	const uint64_t lost = qp->DeclareLostSeq(seq);
 	if (lost == 0)
 		return;
