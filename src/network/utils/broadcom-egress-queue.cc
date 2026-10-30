@@ -78,8 +78,12 @@ namespace ns3 {
 		m_medPriorityWeight = 25;
 		m_medDeficit = 0;
 		for (uint32_t i = 0; i < fCnt; i++)
-		{
 			m_bytesInQueue[i] = 0;
+		// A switch port enqueues to and schedules only its qCnt queues, and a
+		// host's port sends from its RDMA queue, so the queues past qCnt would
+		// never hold a packet.
+		for (uint32_t i = 0; i < qCnt; i++)
+		{
 			//m_queues.push_back(CreateObject<RedQueue>());
 			m_queues.push_back(CreateObject<DropTailQueuePacket>());
 		}

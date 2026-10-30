@@ -57,13 +57,66 @@ inline uint16_t PathOf(LoadBalancingMode mode, uint16_t identification){
 	return NamesSpine(mode) ? RequestedSpine(identification) : identification;
 }
 
+// How the receiver of a data packet picks the spine of each packet it sends
+// back to the sender: an acknowledgement, a NACK or a repair request. Under
+// both the answer returns the data packet's identification, whose spines the
+// sender reads; only the spine the switches route it over differs.
+// SprayDuplicateReport, under SprayCoverageFirst: a receiver flags its answer
+// to a data packet whose sequence it held already (qbbHeader::FLAG_DUPLICATE),
+// and a sender reads the flag on the answer to a timed-out send's resend.
+// Defer tells the selector a timeout's loss only at that answer, none where it
+// is flagged; Retract tells it at once and takes it back where the answer is
+// flagged (RdmaQueuePair::m_retractTimeoutEvidence).
+// SprayOverdueRepair, under a loss hold selector: a queue pair's latest send
+// on a spine not held, its answer SprayHeldLossRtts base RTTs overdue, is
+// repaired. Evidence declares it lost as a timed-out send is; Probe counts no
+// loss as it repairs, and under SprayDuplicateReport the repair's answer
+// settles the send (RdmaQueuePair::m_overdueProbe); Reprobe repairs as Probe
+// does and repairs the send again each time its last repair goes
+// SprayHeldLossRtts base RTTs without an answer, up to
+// SprayOverdueRepairLimit repairs.
+enum class OverdueRepair : uint32_t {
+	Off = 0,
+	Evidence,
+	Probe,
+	Reprobe,
+};
+
+enum class DuplicateReport : uint32_t {
+	Off = 0,
+	Defer,
+	Retract,
+};
+
+enum class AckRoute : uint32_t {
+	// Over the spine that carried the data packet it answers, which the
+	// identification names.
+	DataSpine = 0,
+	// Over a spine the receiver draws uniformly per answer, named in the
+	// answer's route_spine field.
+	Spray,
+	// Over a member, drawn uniformly per answer, of a set of spines the
+	// receiver keeps per connection, probes and renews (AnswerRouteSet),
+	// named in route_spine.
+	ReverseSet,
+	// Over one spine the receiver keeps per connection and draws again at a
+	// duplicate data arrival (AnswerRepath), named in route_spine.
+	Repath,
+};
+
+// The value of an answer's route_spine field that names no spine: the
+// answer is routed by the carrying spine its identification names. Spine
+// indices stay below 256, the identification naming each in a byte; a field
+// of one byte (SpineFieldBytes) writes it as 255.
+constexpr uint16_t kNoRouteSpine = 0xffff;
+
 // The value of an acknowledgement's redirect field that names no spine.
-constexpr uint8_t kNoRedirect = 255;
+constexpr uint16_t kNoRedirect = 0xffff;
 
 // The spine an acknowledgement's redirect field names among spines, or
 // kNoRedirect. A receiver writes only a spine's index or kNoRedirect, so any
 // other value names no spine.
-inline uint8_t DecodeRedirect(uint8_t field, uint32_t spines){
+inline uint16_t DecodeRedirect(uint16_t field, uint32_t spines){
 	return field < spines ? field : kNoRedirect;
 }
 

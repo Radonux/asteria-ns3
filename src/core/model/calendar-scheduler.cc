@@ -175,7 +175,7 @@ CalendarScheduler::PeekNext() const
     Scheduler::Event minEvent;
     minEvent.impl = nullptr;
     minEvent.key.m_ts = UINT64_MAX;
-    minEvent.key.m_uid = UINT32_MAX;
+    minEvent.key.m_uid = UINT64_MAX;
     minEvent.key.m_context = 0;
     do
     {

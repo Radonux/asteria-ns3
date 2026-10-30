@@ -32,6 +32,7 @@
 #include "ns3/socket-factory.h"
 #include "ns3/socket.h"
 #include "ns3/uinteger.h"
+#include "ns3/data-rate.h"
 #include <ns3/rdma-driver.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -81,7 +82,13 @@ TypeId RdmaClient::GetTypeId(void) {
                         MakeUintegerChecker<uint64_t>())
           .AddAttribute("Dest", "Dest", UintegerValue(0),
                         MakeUintegerAccessor(&RdmaClient::dest),
-                        MakeUintegerChecker<uint64_t>());
+                        MakeUintegerChecker<uint64_t>())
+          .AddAttribute("MaxRate",
+                        "The rate the queue pair is paced at, below the NIC's "
+                        "line rate; zero, the default, for the line rate",
+                        DataRateValue(DataRate(0)),
+                        MakeDataRateAccessor(&RdmaClient::m_maxRate),
+                        MakeDataRateChecker());
   return tid;
 }
 
@@ -127,7 +134,7 @@ void RdmaClient::StartApplication(void) {
   rdma->AddQueuePair(src, dest, tag, m_size, m_pg, m_sip, m_dip, m_sport,
                      m_dport, m_win, m_baseRtt,
                      MakeCallback(&RdmaClient::Finish, this),
-                     MakeCallback(&RdmaClient::Sent, this));
+                     MakeCallback(&RdmaClient::Sent, this), m_maxRate);
 }
 
 void RdmaClient::StopApplication() {

@@ -65,6 +65,13 @@ public:
 	// fraction over, has a link error rate or is black-holed, or a sending
 	// port of them sends slower than the slowest of another spine's path.
 	std::vector<bool> Faulted(uint32_t source, uint32_t destination) const;
+	// Per spine, whether a packet a host of leaf source sends to a host of
+	// leaf destination over it crosses a fault as the switches stand now, by
+	// Faulted's rule over the two hops it crosses, Faulted's forward hops:
+	// source's uplink to the spine and the spine's downlink to destination.
+	// An answer routed off its data's spine is such a packet from the
+	// receiver's leaf to the sender's.
+	std::vector<bool> ForwardFaulted(uint32_t source, uint32_t destination) const;
 
 private:
 	struct HopValues {
@@ -73,6 +80,12 @@ private:
 		double loss;
 		uint64_t rateBps;
 	};
+	// Per spine k, from the values of the hops a packet crosses over k: k is
+	// faulted where a hop loses packets, or where its slowest hop sends
+	// slower than the slowest hop of another spine.
+	template <size_t N>
+	static std::vector<bool> FaultedOver(
+		const std::vector<std::array<HopValues, N>> &hops);
 	// The four hops of the path over spine k, forward then reverse.
 	std::array<HopValues, 4> PathHops(uint32_t source, uint32_t destination,
 		uint32_t k) const;

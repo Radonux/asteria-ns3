@@ -49,8 +49,10 @@ public:
 	// Per-queue egress drop threshold, in bytes. UEC 1.0.3 section 4.1 models
 	// trimming against per-queue thresholds ("queue_trimmable.drop_threshold",
 	// "queue_trimmed.drop_threshold"), so the trimmable and trimmed classes must
-	// be sizeable independently. Zero leaves a queue unbounded.
+	// be sizeable independently. Zero leaves a queue unbounded. Without port
+	// it sets every port's; with it, port's alone.
 	void ConfigEgressThreshold(uint32_t qIndex, uint32_t bytes);
+	void ConfigEgressThreshold(uint32_t port, uint32_t qIndex, uint32_t bytes);
 
 	// config
 	uint32_t node_id;
@@ -66,7 +68,7 @@ public:
 	Ptr<UniformRandomVariable> markingRandom[pCnt];
 	uint32_t total_hdrm;
 	uint32_t total_rsrv;
-	uint32_t egress_threshold[qCnt]; // 0 = unbounded
+	uint32_t egress_threshold[pCnt][qCnt]; // 0 = unbounded
 
 	// runtime
 	uint32_t shared_used_bytes;
@@ -74,6 +76,12 @@ public:
 	uint32_t ingress_bytes[pCnt][qCnt];
 	uint32_t paused[pCnt][qCnt];
 	uint32_t egress_bytes[pCnt][qCnt];
+	// The most bytes each egress queue has held, and the packets its
+	// admission refused by the ingress (shared buffer) check and by the
+	// egress (static threshold) check, a packet failing both counted in each.
+	uint32_t max_egress_bytes[pCnt][qCnt];
+	uint64_t ingress_refused[pCnt][qCnt];
+	uint64_t egress_refused[pCnt][qCnt];
 };
 
 } /* namespace ns3 */

@@ -50,15 +50,15 @@ public:
 	static bool Redirects(double best, double score, double flag);
 	// An arrival over spine with its one-way delay and mark at nowNs; the
 	// spine the answer to it asks the sender to move to, or kNoRedirect.
-	uint8_t OnArrival(uint8_t spine, uint64_t delayNs, bool marked,
+	uint16_t OnArrival(uint8_t spine, uint64_t delayNs, bool marked,
 		uint64_t nowNs, const Parameters &parameters);
 	// The best spine, kNoRedirect before the first arrival.
-	uint8_t Best() const;
+	uint16_t Best() const;
 	double BestScore() const;
 	uint64_t CycleEndNs() const;
 
 private:
-	uint8_t m_best = kNoRedirect;
+	uint16_t m_best = kNoRedirect;
 	double m_bestScore = 0;
 	uint64_t m_cycleEndNs = 0;
 };
@@ -82,14 +82,14 @@ public:
 	};
 	void OnClose(const std::vector<SpineGrader::SpineInterval> &spines,
 		const Parameters &parameters);
-	uint8_t OnArrival(uint8_t spine, const Parameters &parameters) const;
-	uint8_t Best() const;
+	uint16_t OnArrival(uint8_t spine, const Parameters &parameters) const;
+	uint16_t Best() const;
 	// Spine's score at the latest close.
 	double SpineScore(uint32_t spine) const;
 
 private:
 	std::vector<double> m_scores;
-	uint8_t m_best = kNoRedirect;
+	uint16_t m_best = kNoRedirect;
 };
 
 } // namespace ns3

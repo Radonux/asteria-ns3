@@ -38,6 +38,15 @@ TypeId SwitchNode::GetTypeId (void)
 			UintegerValue(0),
 			MakeUintegerAccessor(&SwitchNode::m_ackHighPrio),
 			MakeUintegerChecker<uint32_t>())
+	.AddAttribute("RouteProbeReplyAsAnswer",
+			"Whether the reply to a receiver's probe of its answers' route "
+			"(a path probe flagged FLAG_ROUTE_PROBE_REPLY, AckRoute 2) is "
+			"queued as an answer is, in queue 0 under AckHighPrio, rather "
+			"than in its priority group's queue as a path probe is, where "
+			"admission can refuse it. Default false.",
+			BooleanValue(false),
+			MakeBooleanAccessor(&SwitchNode::m_routeProbeReplyAsAnswer),
+			MakeBooleanChecker())
 	.AddAttribute("PacketTrimMode",
 			"0=disabled, 1=trim and forward to the destination (UEC 1.0.3 section 4.1), "
 			"2=return trim metadata to the sender (not part of UEC 1.0.3).",
@@ -106,10 +115,6 @@ SwitchNode::SwitchNode(){
 	m_loadBalancing = static_cast<uint32_t>(LoadBalancingMode::Ecmp);
 	m_mmu = CreateObject<SwitchMmu>();
 	for (uint32_t i = 0; i < pCnt; i++)
-		for (uint32_t j = 0; j < pCnt; j++)
-			for (uint32_t k = 0; k < qCnt; k++)
-				m_bytes[i][j][k] = 0;
-	for (uint32_t i = 0; i < pCnt; i++)
 		m_portCounters[i] = SwitchPortCounters{};
 	for (uint32_t i = 0; i < pCnt; i++)
 		m_lastPktSize[i] = m_lastPktTs[i] = 0;
@@ -131,12 +136,13 @@ int SwitchNode::GetOutDev(Ptr<const Packet> p, CustomHeader &ch){
 	const bool namesPath = IdentifiesPath(ch);
 	// A destination behind another leaf is reached through spine uplinks alone.
 	// An answer goes up the spine that carried the data packet it answers, so
-	// that the answer to data that got through returns over a working spine.
+	// that the answer to data that got through returns over a working spine,
+	// or up the spine its receiver drew for it (ReturnSpine).
 	if (NamesSpine(mode) && namesPath &&
 			IsSpineUplink(nexthops[0])){
 		if (ch.l3Prot == 0x11)
 			return RouteToRequestedSpine(ch, nexthops);
-		return m_spinePort[LiveSpineFor(ch, CarryingSpine(ch.ipid), nexthops)];
+		return m_spinePort[LiveSpineFor(ch, ReturnSpine(ch), nexthops)];
 	}
 
 	// pick one next hop based on hash
@@ -179,6 +185,18 @@ bool SwitchNode::IdentifiesPath(const CustomHeader &ch){
 	return ch.l3Prot == 0x11 || ch.l3Prot == kPathProbeProtocol ||
 		ch.l3Prot == 0xFC || ch.l3Prot == 0xFD ||
 		ch.l3Prot == kUecTrimRepairProtocol;
+}
+
+// The spine an answer or a path probe goes up: the one its route_spine field
+// names, while answers carry the field (AckRoute::Spray) and the field names
+// one, and otherwise the carrying spine its identification names. Only an
+// answer's receiver writes a spine there; every other writer of a qbbHeader
+// leaves kNoRouteSpine.
+uint8_t SwitchNode::ReturnSpine(const CustomHeader &ch){
+	if (CustomHeader::ackRouteSpineBytes > 0 && CarriesQbbHeader(ch.l3Prot) &&
+			ch.ack.route_spine != kNoRouteSpine)
+		return ch.ack.route_spine;
+	return CarryingSpine(ch.ipid);
 }
 
 // Sends the packet up the uplink of the spine it requests and records in the
@@ -264,9 +282,11 @@ uint32_t SwitchNode::QueueIndexFor(const CustomHeader &ch) const{
 		return IsUetTrimmedDscp(ch.GetIpv4Dscp()) ? m_trimmedQueueIndex : ch.udp.pg;
 	if (ch.l3Prot == kUecTrimNotificationProtocol)
 		return m_trimmedQueueIndex;
+	const bool answer = ch.l3Prot == 0xFD || ch.l3Prot == 0xFC ||
+		(m_routeProbeReplyAsAnswer && ch.l3Prot == kPathProbeProtocol &&
+			((ch.ack.flags >> qbbHeader::FLAG_ROUTE_PROBE_REPLY) & 1));
 	if (ch.l3Prot == 0xFF || ch.l3Prot == 0xFE ||
-		ch.l3Prot == kUecTrimRepairProtocol ||
-		(m_ackHighPrio && (ch.l3Prot == 0xFD || ch.l3Prot == 0xFC)))
+		ch.l3Prot == kUecTrimRepairProtocol || (m_ackHighPrio && answer))
 		return 0; // QCN, PFC, and UET control packets
 	return ch.l3Prot == 0x06 ? 1 : ch.udp.pg; // if TCP, put to queue 1
 }
@@ -285,7 +305,9 @@ bool SwitchNode::TrimInPlace(Ptr<Packet> p, const CustomHeader &ch, bool lastHop
 	// identify the original packet, and the frame must stay a legal minimum-size
 	// Ethernet frame.
 	const uint32_t kMinEthernetPayload = 60 - 14 - 20;
-	uint32_t trimmedIpPayload = std::max(m_minTrimSize, CustomHeader::GetUdpHeaderSize());
+	// A closing header over more than kFixedTailCounts spines carries its
+	// counts too (CustomHeader::UdpHeaderBytes).
+	uint32_t trimmedIpPayload = std::max(m_minTrimSize, ch.UdpHeaderBytes());
 	trimmedIpPayload = std::max(trimmedIpPayload, kMinEthernetPayload);
 	// "The trimmed packet size MUST NOT be larger than the original packet size."
 	if (originalIpPayload <= trimmedIpPayload)
@@ -454,10 +476,14 @@ bool SwitchNode::SendToDev(Ptr<Packet>p, CustomHeader &ch){
 	p->PeekPacketTag(t);
 	uint32_t inDev = t.GetFlowId();
 	if (qIndex != 0){ //not highest priority
-		if (m_mmu->CheckIngressAdmission(inDev, qIndex, p->GetSize()) && m_mmu->CheckEgressAdmission(idx, qIndex, p->GetSize())){			// Admission control
+		const bool ingress = m_mmu->CheckIngressAdmission(inDev, qIndex, p->GetSize());
+		const bool egress = m_mmu->CheckEgressAdmission(idx, qIndex, p->GetSize());
+		if (ingress && egress){			// Admission control
 			m_mmu->UpdateIngressAdmission(inDev, qIndex, p->GetSize());
 			m_mmu->UpdateEgressAdmission(idx, qIndex, p->GetSize());
 		}else{
+			m_mmu->ingress_refused[idx][qIndex] += !ingress;
+			m_mmu->egress_refused[idx][qIndex] += !egress;
 			if (PacketTrimEnabledFor(ch) &&
 				TrimAndForward(p, ch, idx, PacketTrimTrigger::Admission)){
 				return false; // the original data packet was consumed by trimming
@@ -467,9 +493,9 @@ bool SwitchNode::SendToDev(Ptr<Packet>p, CustomHeader &ch){
 		}
 		CheckAndSendPfc(inDev, qIndex);
 	}
-	m_bytes[inDev][idx][qIndex] += p->GetSize();
+	BytesOf(inDev, idx)[qIndex] += p->GetSize();
 	if (!m_devices[idx]->SwitchSend(qIndex, p, ch)){
-		m_bytes[inDev][idx][qIndex] -= p->GetSize();
+		BytesOf(inDev, idx)[qIndex] -= p->GetSize();
 		if (qIndex != 0){
 			m_mmu->RemoveFromIngressAdmission(inDev, qIndex, p->GetSize());
 			m_mmu->RemoveFromEgressAdmission(idx, qIndex, p->GetSize());
@@ -576,7 +602,8 @@ bool SwitchNode::SwitchReceiveFromDevice(Ptr<NetDevice> device, Ptr<Packet> pack
 	// Control packets are lost with the data, as on a dead line card. Where the
 	// identification names a spine, an answer returns over the spine its data
 	// took (GetOutDev), so the answer to data that got through does not reach a
-	// black hole.
+	// black hole of both directions of a link, unless its receiver drew another
+	// spine for it (ReturnSpine).
 	if (!m_blackholed.empty()){
 		const uint32_t port = device->GetIfIndex();
 		if (port < m_blackholed.size() && m_blackholed[port]){
@@ -594,8 +621,18 @@ uint32_t SwitchNode::ReleaseBuffer(uint32_t ifIndex, uint32_t qIndex, Ptr<const 
 	const uint32_t inDev = t.GetFlowId();
 	m_mmu->RemoveFromIngressAdmission(inDev, qIndex, p->GetSize());
 	m_mmu->RemoveFromEgressAdmission(ifIndex, qIndex, p->GetSize());
-	m_bytes[inDev][ifIndex][qIndex] -= p->GetSize();
+	BytesOf(inDev, ifIndex)[qIndex] -= p->GetSize();
 	return inDev;
+}
+
+std::array<uint32_t, SwitchNode::qCnt> &SwitchNode::BytesOf(uint32_t inDev,
+		uint32_t outDev){
+	if (inDev >= m_bytes.size())
+		m_bytes.resize(inDev + 1);
+	std::vector<std::array<uint32_t, qCnt>> &out = m_bytes[inDev];
+	if (outDev >= out.size())
+		out.resize(outDev + 1, std::array<uint32_t, qCnt>{});
+	return out[outDev];
 }
 
 void SwitchNode::DiscardQueued(uint32_t ifIndex, uint32_t qIndex, Ptr<const Packet> p){

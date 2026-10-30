@@ -2,6 +2,9 @@
 #define SPINE_REPORT_H
 
 #include <stdint.h>
+#include <algorithm>
+
+#include "ns3/spine-bitmap.h"
 
 namespace ns3 {
 
@@ -11,7 +14,7 @@ namespace ns3 {
 // receiver issues a report per interval, numbered by sequence, and every
 // acknowledgement and repair request it sends carries the latest.
 struct SpineReport {
-	static constexpr uint32_t kMaxSpines = 32;
+	static constexpr uint32_t kMaxSpines = kMaxSpineCount;
 	static constexpr uint8_t kTopGrade = 3;
 
 	// The bytes the grades of spines take on the wire, four to a byte.
@@ -29,12 +32,15 @@ struct SpineReport {
 			(grades[spine / 4] & ~(kTopGrade << shift)) | (grade << shift));
 	}
 
+	SpineReport(){
+		std::fill_n(grades, kMaxSpines / 4, 0xff);
+	}
+
 	uint8_t sequence = 0;
 	bool edgeCongested = false;
 	// Spine k in bits 2(k mod 4) and 2(k mod 4) + 1 of byte k / 4; every spine
 	// starts at the top grade.
-	uint8_t grades[kMaxSpines / 4] = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-		0xff};
+	uint8_t grades[kMaxSpines / 4];
 };
 
 } // namespace ns3

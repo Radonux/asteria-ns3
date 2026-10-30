@@ -228,7 +228,7 @@ void
 HeapScheduler::Remove(const Event& ev)
 {
     NS_LOG_FUNCTION(this << &ev);
-    std::size_t uid = ev.key.m_uid;
+    uint64_t uid = ev.key.m_uid;
     for (std::size_t i = 1; i < m_heap.size(); i++)
     {
         if (uid == m_heap[i].key.m_uid)

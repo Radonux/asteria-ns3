@@ -19,12 +19,23 @@
 namespace ns3 {
 
 // What the host-wide loss hold of RepsHold is kept for: the host's every
-// destination, each destination leaf apart, or per spine either of the two
-// by the destination leaves it loses toward (AutoLossHold).
+// destination, each destination leaf apart, per spine either of the two by
+// the destination leaves it loses toward (AutoLossHold), or each destination
+// host apart.
 enum class HoldScope : uint32_t {
 	Host = 0,
 	Leaf,
 	Auto,
+	Pair,
+};
+
+// How long a sending host keeps a queue pair's path selector: for its one
+// message, or for the connection to its destination, a selector per
+// destination and priority group shared by the queue pairs to it and kept
+// past them (SharedPathSelector).
+enum class PathState : uint32_t {
+	Message = 0,
+	Connection,
 };
 
 // What puts a spine in the loss hold of RepsHold, RepsFlowHold and MrcHold,
@@ -140,6 +151,19 @@ enum class SentinelMode : uint32_t {
 	Duplicate,
 };
 
+// When a copy under SentinelMode::Duplicate that its own acknowledgement has
+// not answered is declared lost for the selector (RdmaQueuePair::ExpireCopies).
+// DataAck: once the data send of its sequence is acknowledged, at the first
+// acknowledgement after one base RTT since the copy was sent, so that a copy
+// queued on its spine for longer than its data's path is lost. Deadline: at
+// the first acknowledgement after a deadline since the copy was sent, the
+// tail loss guard of SprayTailLossRtts base RTTs, whether its data send is
+// acknowledged or not.
+enum class CopyExpiry : uint32_t {
+	DataAck = 0,
+	Deadline,
+};
+
 // The copy a selector's latest Choose asked for under SentinelMode::Duplicate.
 struct PendingCopy {
 	bool pending = false;
@@ -191,6 +215,17 @@ enum class PathSelectorKind : uint32_t {
 	MrcHold,
 	// Under SprayUniform: REPS over spines, leaving out none.
 	RepsSpine,
+	// Under SprayUniform: Themis's spraying by packet sequence number, with
+	// its source's per-path avoidance (ThemisSelector).
+	Themis,
+	// Under SprayUniform: Themis, leaving out the spines RepsHold's loss hold
+	// holds (ThemisHoldSelector).
+	ThemisHold,
+	// Under SprayUniform: MRC over spines (MrcSpineSelector).
+	MrcSpine,
+	// Under SprayUniform: UEC path-aware spraying over spines
+	// (UeAwareSpineSelector).
+	UeAwareSpine,
 };
 
 // The queue pair's sends per trickle send onto one held spine that receives
@@ -214,6 +249,10 @@ public:
 	virtual void OnTrim(uint16_t path, bool lastHop, bool marked, uint64_t nowNs);
 	// A send along path declared lost.
 	virtual void OnLoss(uint16_t path, uint64_t nowNs);
+	// The loss of a send along path told to OnLoss at countedNs, taken back:
+	// the send had arrived. Whether that took back the hold the loss began;
+	// a selector without a loss hold that can take a loss back keeps it.
+	virtual bool RetractLoss(uint16_t path, uint64_t countedNs, uint64_t nowNs);
 	// The retransmission timeout expired and declared lost the sends it had
 	// waited for, which no switch trimmed: a trimmed send's record is released
 	// by its repair request.
@@ -247,16 +286,57 @@ public:
 	// An acknowledgement's redirect field, the spine it asks this queue pair
 	// to send on or kNoRedirect, and the carrying spine of the send it
 	// answers, before the answer itself is told.
-	virtual void OnRedirect(uint8_t spine, uint8_t carrying, uint64_t nowNs);
+	virtual void OnRedirect(uint16_t spine, uint8_t carrying, uint64_t nowNs);
 	// An acknowledgement's receiver_hold bitmap from receiver, before the
-	// answer itself is told.
-	virtual void OnReceiverHold(uint32_t receiver, uint8_t bitmap,
-		uint64_t nowNs);
+	// answer itself is told; partial for a partial spine list, which adds
+	// the spines it names and releases none.
+	virtual void OnReceiverHold(uint32_t receiver, const SpineBitmap &bitmap,
+		bool partial, uint64_t nowNs);
 	// Under SprayReceiverHold, the marks of the receivers on the destination's
 	// leaf, which a selector with a loss hold holds spines by; others ignore
 	// them.
 	virtual void SetReceiverHold(std::shared_ptr<ReceiverHoldMarks> marks,
 		uint32_t leaf);
+	// Before Choose for a data packet: its packet sequence number in the
+	// connection (the queue pair's base plus its sequence in packets), and
+	// whether it is a repair.
+	virtual void NextSend(uint64_t psn, bool repair);
+	// An acknowledgement flagged as Themis's Path Avoidance Signal for the
+	// packet of sequence number psn; returns the spine avoided, or -1 for
+	// none.
+	virtual int OnPathAvoid(uint64_t psn, uint64_t nowNs);
+};
+
+// A queue pair's handle on the path selector of its connection under
+// PathState::Connection, which the host's other queue pairs to the same
+// destination share and which outlives them all: every call goes to it.
+class SharedPathSelector : public PathSelector {
+public:
+	explicit SharedPathSelector(std::shared_ptr<PathSelector> shared);
+	uint16_t Choose(uint64_t nowNs) override;
+	void OnAck(uint16_t path, bool marked, uint64_t nowNs) override;
+	void OnTrim(uint16_t path, bool lastHop, bool marked, uint64_t nowNs) override;
+	void OnLoss(uint16_t path, uint64_t nowNs) override;
+	bool RetractLoss(uint16_t path, uint64_t countedNs, uint64_t nowNs) override;
+	void OnTimeout(uint64_t nowNs) override;
+	bool TakeProbe(uint64_t nowNs, uint16_t &path) override;
+	void OnProbeAnswer(uint16_t path, bool marked, uint64_t nowNs) override;
+	bool ChoseTrickle() const override;
+	bool ChoseExploration() const override;
+	bool ChoseHeld() const override;
+	void OnTrickleAnswer(uint16_t path, bool lost, uint64_t nowNs) override;
+	bool TakeCopy(uint8_t &spine, bool &trickle) override;
+	void OnReport(const SpineReport &report, uint64_t nowNs) override;
+	void OnRedirect(uint16_t spine, uint8_t carrying, uint64_t nowNs) override;
+	void OnReceiverHold(uint32_t receiver, const SpineBitmap &bitmap,
+		bool partial, uint64_t nowNs) override;
+	void SetReceiverHold(std::shared_ptr<ReceiverHoldMarks> marks,
+		uint32_t leaf) override;
+	void NextSend(uint64_t psn, bool repair) override;
+	int OnPathAvoid(uint64_t psn, uint64_t nowNs) override;
+
+private:
+	std::shared_ptr<PathSelector> m_shared;
 };
 
 // A spine drawn uniformly per packet, named as both the requested and the
@@ -271,6 +351,59 @@ private:
 	uint32_t m_spines;
 };
 
+// The source side of Themis (Liu et al., EuroSys 2026), over spines. The
+// packet of sequence number psn goes up the spine of path psn mod N, the N
+// paths spaced spines / N apart from a base drawn once (equation 1). A Path
+// Avoidance Signal for psn sets its path's counter to the avoidance window;
+// while the path a packet is assigned has a nonzero counter, the packet goes
+// up another path drawn at random among those with none, and the counter
+// falls by one (section 4.4). Under reroute a repair, too, goes up another
+// path. When every other path is avoided, the packet keeps its own. The
+// counters, one per spine, are the selector's own, or under counters given
+// shared with other selectors (a host's connections to one leaf). A spine
+// Excluded names is passed over as an avoided one is, taking no count.
+class ThemisSelector : public PathSelector {
+public:
+	using Counters = std::shared_ptr<std::vector<uint64_t>>;
+	ThemisSelector(Ptr<UniformRandomVariable> random, uint32_t spines,
+		uint32_t paths, uint64_t window, bool reroute, Counters counters = nullptr);
+	// With the base given, for tests.
+	ThemisSelector(Ptr<UniformRandomVariable> random, uint32_t spines,
+		uint32_t paths, uint64_t window, bool reroute, uint32_t base,
+		Counters counters = nullptr);
+	uint16_t Choose(uint64_t nowNs) override;
+	void NextSend(uint64_t psn, bool repair) override;
+	int OnPathAvoid(uint64_t psn, uint64_t nowNs) override;
+	// The spine path psn mod N names.
+	uint8_t Assigned(uint64_t psn) const;
+	uint64_t Counter(uint8_t spine) const;
+	// The packets sent up another path than their own while it was avoided.
+	uint64_t Redirects() const;
+
+protected:
+	// The spine of the send NextSend named.
+	uint8_t ChooseSpine();
+	// None by default.
+	virtual bool Excluded(uint8_t spine) const;
+
+private:
+	uint8_t DrawOther(uint8_t assigned);
+	Ptr<UniformRandomVariable> m_random;
+	uint32_t m_spines;
+	uint32_t m_paths;
+	uint32_t m_stride;
+	uint32_t m_base;
+	uint64_t m_window;
+	bool m_reroute;
+	Counters m_counter;
+	// The packet NextSend named, and whether its Choose has taken a count
+	// already (a repair moved off a waiting tail loss chooses again).
+	uint64_t m_psn = 0;
+	bool m_repair = false;
+	bool m_decremented = false;
+	uint64_t m_redirects = 0;
+};
+
 // The sending side of ACK redirection, modelled on MPTR (Wang et al., IEEE
 // TII 2026): every packet, new data or repair, goes up the spine the latest
 // acknowledgement redirects to; failing a redirect, up the spine that carried
@@ -280,12 +413,12 @@ class AckRedirectSelector : public PathSelector {
 public:
 	AckRedirectSelector(Ptr<UniformRandomVariable> random, uint32_t spines);
 	uint16_t Choose(uint64_t nowNs) override;
-	void OnRedirect(uint8_t spine, uint8_t carrying, uint64_t nowNs) override;
+	void OnRedirect(uint16_t spine, uint8_t carrying, uint64_t nowNs) override;
 
 private:
 	UniformSpineSelector m_uniform;
 	// kNoRedirect before the first acknowledgement.
-	uint8_t m_spine;
+	uint16_t m_spine;
 };
 
 // A sender's scores of the spines towards one receiving host, which every
@@ -404,6 +537,11 @@ public:
 		// Under the sentinel held exploration, the interval between two
 		// sentinels on one held spine; zero, the report interval.
 		uint64_t sentinelIntervalNs = 0;
+		// Which sends take a sentinel once it is due: one in sentinelSpread
+		// on average for the host sentinelSalt names (SentinelSpreadTakes);
+		// at 1 the first.
+		uint32_t sentinelSpread = 1;
+		uint64_t sentinelSalt = 0;
 		// As a pool: the pool decay interval; zero decays once per report
 		// taken.
 		uint64_t poolDecayIntervalNs = 0;
@@ -544,11 +682,12 @@ private:
 	uint8_t DrawEpsilon(double fraction) const;
 	// The epsilon term of spine's share.
 	double EpsilonShare(uint32_t spine) const;
-	// The grade the lost fraction of sent sends earns.
+	// The grade the lost fraction of sent sends earns; losses with no sends
+	// are a fraction of 1, and neither the top grade.
 	uint8_t LossGrade(uint32_t sent, uint32_t lost) const;
 	// The loss grade of a period in which spine had sent sends and lost
 	// declared lost, through the loss hold; the top grade for a spine not
-	// sent on and not in loss hold.
+	// sent on, not lost on and not in loss hold.
 	uint8_t HeldLossGrade(uint32_t spine, uint32_t sent, uint32_t lost,
 		uint32_t answered);
 	// As a pool: close the loss intervals ended by now, grading the spines by
@@ -594,6 +733,8 @@ private:
 	std::vector<bool> m_held;
 	std::vector<uint64_t> m_sentinelNs;
 	uint64_t m_sentinelIntervalNs;
+	uint32_t m_sentinelSpread;
+	uint64_t m_sentinelSalt;
 	// As a pool with a pool decay interval: the end of the interval in
 	// progress, the scores decayed once at its start, and per spine the sum
 	// and count of the grades taken in it.
@@ -741,6 +882,16 @@ public:
 	// interval in progress once those ended by now are closed.
 	void CountSend(uint32_t leaf, uint32_t spine, uint64_t nowNs);
 	void CountLoss(uint32_t leaf, uint32_t spine, uint64_t nowNs);
+	// The loss toward leaf on spine that CountLoss counted at countedNs,
+	// taken back once the loss intervals ended by now are closed. In the
+	// interval in progress the count is taken out. In one closed since, the
+	// hold that interval's close began on spine toward leaf, at leaf or at
+	// host scope, under HoldRule::Count, is graded again without the count
+	// and released where the grade is no longer 0; whether it was. A clean
+	// count the loss restarted, a scope its leaf widened and the trace of a
+	// closed interval stay as they were.
+	bool RetractLoss(uint32_t leaf, uint32_t spine, uint64_t countedNs,
+		uint64_t nowNs);
 	// The acknowledgement of a send toward leaf on spine, counted likewise;
 	// under cleanOnAnswers these are a hold's clean sends.
 	void CountAnswer(uint32_t leaf, uint32_t spine, uint64_t nowNs);
@@ -782,6 +933,19 @@ private:
 		std::vector<uint64_t> sentinelNs;
 		std::vector<LossLikelihoodRatio> likelihood;
 		std::vector<TrickleRelease> trickle;
+		// Of a leaf-scope hold an interval's close began: the end of that
+		// interval and its counts toward the leaf; 0 for any other hold.
+		std::vector<uint64_t> heldEndNs;
+		std::vector<uint32_t> heldSent;
+		std::vector<uint32_t> heldLost;
+	};
+	// The interval close's evidence of the hold it began on spine
+	// (Leaf::heldEndNs), of a leaf's counts.
+	struct Evidence {
+		uint64_t endNs = 0;
+		uint32_t leaf = 0;
+		uint32_t sent = 0;
+		uint32_t lost = 0;
 	};
 	// Hold spine toward leaf by the auto scope's choice, on evidence of the
 	// rate given.
@@ -805,6 +969,8 @@ private:
 	uint32_t m_cleanSends;
 	bool m_cleanOnAnswers;
 	uint64_t m_sentinelIntervalNs;
+	uint32_t m_sentinelSpread;
+	uint64_t m_sentinelSalt;
 	uint32_t m_autoLeaves;
 	HoldRule m_holdRule;
 	LossLikelihoodRatio::Parameters m_likelihood;
@@ -818,6 +984,8 @@ private:
 	std::vector<uint32_t> m_hostClean;
 	std::vector<uint64_t> m_hostSentinelNs;
 	std::vector<TrickleRelease> m_hostTrickle;
+	// Of each host-scope hold an interval's close began, as Leaf::heldEndNs.
+	std::vector<Evidence> m_hostEvidence;
 	LeafLossIntervalCallback m_onLossInterval;
 };
 
@@ -851,13 +1019,18 @@ public:
 	// spine declared lost.
 	void OnAck(uint32_t spine, uint64_t nowNs);
 	void OnLoss(uint32_t spine, uint64_t nowNs);
+	// The loss told to OnLoss at countedNs taken back, of the host's
+	// AutoLossHold alone (AutoLossHold::RetractLoss); a SpineScores hold
+	// keeps it.
+	bool RetractLoss(uint32_t spine, uint64_t countedNs, uint64_t nowNs);
 	void OnTrickleAnswer(uint32_t spine, bool lost, uint64_t nowNs);
 	// Under SprayReceiverHold: the spines the receivers hold toward leaf, in
 	// marks, are held as the loss hold holds them, and sent marks'
 	// sentinels where the loss hold does not hold them.
 	void SetReceiverHold(std::shared_ptr<ReceiverHoldMarks> marks,
 		uint32_t leaf);
-	void OnReceiverHold(uint32_t receiver, uint8_t bitmap);
+	void OnReceiverHold(uint32_t receiver, const SpineBitmap &bitmap,
+		bool partial);
 
 private:
 	bool TakeHoldSentinel(uint64_t nowNs, uint8_t &spine);
@@ -905,6 +1078,7 @@ public:
 	// REPS's own answer, and the acknowledgement counted in the hold.
 	void OnAck(uint16_t path, bool marked, uint64_t nowNs) override;
 	void OnLoss(uint16_t path, uint64_t nowNs) override;
+	bool RetractLoss(uint16_t path, uint64_t countedNs, uint64_t nowNs) override;
 	bool ChoseTrickle() const override;
 	bool ChoseExploration() const override;
 	bool ChoseHeld() const override;
@@ -912,8 +1086,8 @@ public:
 	bool TakeCopy(uint8_t &spine, bool &trickle) override;
 	void SetReceiverHold(std::shared_ptr<ReceiverHoldMarks> marks,
 		uint32_t leaf) override;
-	void OnReceiverHold(uint32_t receiver, uint8_t bitmap,
-		uint64_t nowNs) override;
+	void OnReceiverHold(uint32_t receiver, const SpineBitmap &bitmap,
+		bool partial, uint64_t nowNs) override;
 
 protected:
 	bool Excluded(uint16_t path) const override;
@@ -943,6 +1117,18 @@ private:
 	uint64_t m_nextReadNs;
 	std::vector<bool> m_faulted;
 	bool m_excluding;
+};
+
+// The hops over which PathSelectorKind::RepsOracle reads a spine toward a
+// destination leaf as faulted. RoundTrip: the four of
+// SwitchQueueState::Faulted, the data's two hops and the two its
+// acknowledgement returns over through the same spine. Forward: the data's
+// two hops alone (SwitchQueueState::ForwardFaulted), the source leaf's uplink
+// to the spine and the spine's downlink to the destination leaf, for answers
+// that do not return over the data's spine (AckRoute::Spray).
+enum class OracleHops : uint32_t {
+	RoundTrip = 0,
+	Forward,
 };
 
 // REPS (RepsSelector) over spines under SprayUniform: the cached values and
@@ -1025,6 +1211,15 @@ private:
 	double m_saturationFraction;
 };
 
+// UEC path-aware spraying (UeAwareSelector) over spines under SprayUniform:
+// its values are the spine indices, each sent as SpineIdentification(k, k).
+class UeAwareSpineSelector : public UeAwareSelector {
+public:
+	UeAwareSpineSelector(Ptr<UniformRandomVariable> random, uint32_t spines,
+		double saturationFraction);
+	uint16_t Choose(uint64_t nowNs) override;
+};
+
 // MRC (OCP MRC 1.0 section 9.3.1, with the EV choice of the informative
 // example in section 11.2.2): each value of the queue pair's set is GOOD, SKIP
 // or ASSUMED_BAD. The rotation sends on a GOOD value and passes over the
@@ -1074,6 +1269,17 @@ private:
 };
 
 // MRC (MrcSelector) over spines under SprayUniform, its set the spine
+// indices, each sent as SpineIdentification(k, k), and its probes naming
+// spines; nothing else is left out.
+class MrcSpineSelector : public MrcSelector {
+public:
+	MrcSpineSelector(Ptr<UniformRandomVariable> random, uint32_t spines,
+		uint64_t skipNs, uint64_t probeIntervalNs);
+	uint16_t Choose(uint64_t nowNs) override;
+	bool TakeProbe(uint64_t nowNs, uint16_t &path) override;
+};
+
+// MRC (MrcSelector) over spines under SprayUniform, its set the spine
 // indices, with RepsHold's loss hold through LossHoldExploration, as
 // RepsHoldSelector has it: the spines the hold, or the receivers under
 // SprayReceiverHold, hold toward the queue pair's destination are left out
@@ -1083,7 +1289,7 @@ private:
 // SpineScores, the host's or the destination leaf's, or the host's
 // AutoLossHold toward the destination leaf. A declared loss moves MRC's
 // state too, and MRC's probes name spines.
-class MrcHoldSelector : public MrcSelector {
+class MrcHoldSelector : public MrcSpineSelector {
 public:
 	MrcHoldSelector(Ptr<UniformRandomVariable> random, uint32_t spines,
 		uint64_t skipNs, uint64_t probeIntervalNs, SpineScores &hold);
@@ -1094,7 +1300,8 @@ public:
 	// MRC's own answer, and the acknowledgement counted in the hold.
 	void OnAck(uint16_t path, bool marked, uint64_t nowNs) override;
 	void OnLoss(uint16_t path, uint64_t nowNs) override;
-	bool TakeProbe(uint64_t nowNs, uint16_t &path) override;
+	// The hold's count taken back; MRC's own state keeps the loss.
+	bool RetractLoss(uint16_t path, uint64_t countedNs, uint64_t nowNs) override;
 	bool ChoseTrickle() const override;
 	bool ChoseExploration() const override;
 	bool ChoseHeld() const override;
@@ -1102,11 +1309,51 @@ public:
 	bool TakeCopy(uint8_t &spine, bool &trickle) override;
 	void SetReceiverHold(std::shared_ptr<ReceiverHoldMarks> marks,
 		uint32_t leaf) override;
-	void OnReceiverHold(uint32_t receiver, uint8_t bitmap,
-		uint64_t nowNs) override;
+	void OnReceiverHold(uint32_t receiver, const SpineBitmap &bitmap,
+		bool partial, uint64_t nowNs) override;
 
 protected:
 	bool Excluded(uint16_t path) const override;
+
+private:
+	LossHoldExploration m_exploration;
+};
+
+// Themis's source (ThemisSelector) with RepsHold's loss hold through
+// LossHoldExploration, as MrcHoldSelector has it: the spines the hold, or the
+// receivers under SprayReceiverHold, hold toward the queue pair's destination
+// are Excluded unless they hold every spine, the exploration sends are sent as
+// the hold's HoldRelease and SentinelMode have them, and every send and every
+// send declared lost is counted in the hold. A loss hold and Themis's
+// avoidance then share one spraying rule and one redirect.
+class ThemisHoldSelector : public ThemisSelector {
+public:
+	ThemisHoldSelector(Ptr<UniformRandomVariable> random, uint32_t spines,
+		uint32_t paths, uint64_t window, bool reroute, Counters counters,
+		SpineScores &hold);
+	ThemisHoldSelector(Ptr<UniformRandomVariable> random, uint32_t spines,
+		uint32_t paths, uint64_t window, bool reroute, Counters counters,
+		AutoLossHold &hold, uint32_t leaf);
+	// With the base given, for tests.
+	ThemisHoldSelector(Ptr<UniformRandomVariable> random, uint32_t spines,
+		uint32_t paths, uint64_t window, bool reroute, uint32_t base,
+		SpineScores &hold);
+	uint16_t Choose(uint64_t nowNs) override;
+	void OnAck(uint16_t path, bool marked, uint64_t nowNs) override;
+	void OnLoss(uint16_t path, uint64_t nowNs) override;
+	bool RetractLoss(uint16_t path, uint64_t countedNs, uint64_t nowNs) override;
+	bool ChoseTrickle() const override;
+	bool ChoseExploration() const override;
+	bool ChoseHeld() const override;
+	void OnTrickleAnswer(uint16_t path, bool lost, uint64_t nowNs) override;
+	bool TakeCopy(uint8_t &spine, bool &trickle) override;
+	void SetReceiverHold(std::shared_ptr<ReceiverHoldMarks> marks,
+		uint32_t leaf) override;
+	void OnReceiverHold(uint32_t receiver, const SpineBitmap &bitmap,
+		bool partial, uint64_t nowNs) override;
+
+protected:
+	bool Excluded(uint8_t spine) const override;
 
 private:
 	LossHoldExploration m_exploration;

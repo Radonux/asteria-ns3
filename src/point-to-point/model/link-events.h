@@ -2,6 +2,7 @@
 #define LINK_EVENTS_H
 
 #include <ns3/data-rate.h>
+#include <ns3/error-model.h>
 #include <ns3/ptr.h>
 #include <functional>
 #include <map>
@@ -13,7 +14,6 @@
 namespace ns3 {
 
 class QbbNetDevice;
-class RateErrorModel;
 class SwitchNode;
 
 // What befalls the link between nodes a and b at a time in the run. Down takes
@@ -35,8 +35,15 @@ struct LinkEvent {
 	uint64_t timeNs = 0;
 	LinkEventKind kind = LinkEventKind::Down;
 	uint32_t a = 0, b = 0;
-	// Loss's error rate, in (0, 1].
+	// Loss's error rate, in (0, 1], of a packet under ERROR_UNIT_PACKET, the
+	// default, or of each of a packet's bytes under ERROR_UNIT_BYTE, so that
+	// a packet of s bytes is lost with 1 - (1 - errorRate)^s: a frame
+	// corrupted in any byte fails its check and is dropped.
 	double errorRate = 0;
+	RateErrorModel::ErrorUnit unit = RateErrorModel::ERROR_UNIT_PACKET;
+	// Under ERROR_UNIT_BYTE, the bytes of the full data frame errorRate was
+	// derived at, which the run's data frame must have.
+	uint32_t frameBytes = 0;
 	// Rate's data rate.
 	DataRate rate;
 	// Loss's or Rate's directions; the other kinds ignore it.
@@ -62,9 +69,9 @@ struct LinkEnds {
 
 // Applies link events and keeps, for each link, the state its latest failure
 // replaced, which a restore puts back: the data rates of the ends it set under
-// Rate, the error models and rates of the ends it set under Loss (a restore
-// removes a model the failure added), and b's port's black hole flag under
-// Blackhole. A Loss or Rate in both directions sets both ends; a Forward Loss
+// Rate, the error models, rates and units of the ends it set under Loss (a
+// restore removes a model the failure added), and b's port's black hole flag
+// under Blackhole. A Loss or Rate in both directions sets both ends; a Forward Loss
 // sets b's end alone and a Forward Rate a's end alone. The state is kept per
 // failure under its two nodes in the order named, so that failures of the two
 // directions of a link, such as a black hole at each end, are put back
@@ -87,7 +94,10 @@ private:
 		// Null when the device had no error model.
 		Ptr<RateErrorModel> errorModel;
 		double errorRate = 0;
+		RateErrorModel::ErrorUnit errorUnit = RateErrorModel::ERROR_UNIT_PACKET;
 	};
+	// device's error model set to event's rate and unit.
+	void SetLoss(Ptr<QbbNetDevice> device, const LinkEvent &event);
 	struct Saved {
 		LinkEventKind kind;
 		LinkEnds ends;

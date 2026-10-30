@@ -6,6 +6,7 @@
 #include "load-balancing.h"
 #include "path-selector.h"
 #include <ns3/simulator.h>
+#include <string>
 
 namespace ns3 {
 
@@ -17,18 +18,27 @@ bool RdmaHw::ValidPathSeq() const{
 
 void RdmaHw::CountPathSeq(Ptr<RdmaRxQueuePair> q, const CustomHeader &ch,
 		bool trimmed){
+	if (q->m_stray){
+		ReadStrayPathSeq(q, ch);
+		return;
+	}
 	if (m_sprayTailRecovery && (ch.udp.tail_flags & kTailCloses))
 		AskTailMissing(q, ch);
 	const uint8_t requested = RequestedSpine(ch.ipid);
 	const uint8_t carrying = CarryingSpine(ch.ipid);
 	// An arrival, or a trimmed header, whose request is not yet due needs
-	// none: the data arrived or its trim is repaired as any trim.
+	// none: the data arrived or its trim is repaired as any trim. One whose
+	// request's guard has not ended is not missing to the receiver's hold:
+	// the data arrived, or the trim is no loss.
 	if (m_sprayTailRecovery && !q->m_tailRuns.Empty())
 		q->m_tailRuns.OnArrival(requested, ch.udp.path_seq);
+	if (!q->m_tailMissingRuns.Empty())
+		q->m_tailMissingRuns.OnArrival(requested, ch.udp.path_seq);
 	if (trimmed){
 		// A trimmed header can overtake earlier data of its path in the
 		// switches' high-priority queue: it only accounts its sequence.
-		q->m_pathSeqReceiver.OnTrim(requested, carrying, ch.udp.path_seq);
+		if (q->m_pathSeqReceiver.OnTrim(requested, carrying, ch.udp.path_seq))
+			ReportTailMissing("receiver_tail_missing_late", requested);
 		if (IsReceiverHold())
 			ReceiverHoldOf().OnTrim(m_switchQueues->LeafOf(ch.sip), carrying,
 				Simulator::Now().GetNanoSeconds());
@@ -36,6 +46,8 @@ void RdmaHw::CountPathSeq(Ptr<RdmaRxQueuePair> q, const CustomHeader &ch,
 	}
 	const SpineSequenceReceiver::Arrival arrival =
 		q->m_pathSeqReceiver.OnArrival(requested, carrying, ch.udp.path_seq);
+	if (arrival.counted)
+		ReportTailMissing("receiver_tail_missing_late", requested);
 	if (carrying >= m_spineGaps.size())
 		m_spineGaps.resize(carrying + 1, 0);
 	m_spineGaps[carrying] += arrival.gaps;
@@ -43,6 +55,35 @@ void RdmaHw::CountPathSeq(Ptr<RdmaRxQueuePair> q, const CustomHeader &ch,
 		return;
 	ReceiverHoldOf().OnArrival(m_switchQueues->LeafOf(ch.sip), carrying,
 		arrival.gaps, arrival.late, Simulator::Now().GetNanoSeconds());
+}
+
+bool RdmaHw::ValidStrayPathSeq() const{
+	return m_sprayStrayPathSeq == static_cast<uint32_t>(StrayPathSeq::Fresh) ||
+		m_sprayPathSeq;
+}
+
+void RdmaHw::ReadStrayPathSeq(Ptr<RdmaRxQueuePair> q, const CustomHeader &ch){
+	// The stray queue pair's addresses and ports are the data's destination's
+	// first, as the removed one's were.
+	const auto closed = m_closedRxQps.find(
+		GetRxQpKey(q->dip, q->m_ecn_source.qIndex, q->dport));
+	if (closed == m_closedRxQps.end() || !closed->second)
+		return;
+	const Ptr<RdmaRxQueuePair> flow = closed->second;
+	const uint8_t requested = RequestedSpine(ch.ipid);
+	if (!flow->m_tailRuns.Empty())
+		flow->m_tailRuns.OnArrival(requested, ch.udp.path_seq);
+	if (!flow->m_tailMissingRuns.Empty())
+		flow->m_tailMissingRuns.OnArrival(requested, ch.udp.path_seq);
+	// A send is trimmed once and a data packet never carries a trimmed
+	// header's sequence, so a sequence the flow accounted, whether this is
+	// the data packet or its trimmed header, is one its runs counted missing
+	// (SpineSequenceReceiver::OnArrival, OnTrim).
+	if (flow->m_pathSeqReceiver.Accounted(requested, ch.udp.path_seq))
+		ReportTailMissing("receiver_tail_missing_late", requested);
+	if (flow->m_tailRuns.Empty() && flow->m_tailMissingRuns.Empty() &&
+			!flow->m_countedTailMissing)
+		closed->second = nullptr;
 }
 
 bool RdmaHw::ValidTailRecovery() const{
@@ -125,18 +166,71 @@ void RdmaHw::SendTailNack(Ptr<RdmaRxQueuePair> q, uint8_t spine,
 	request.SetDport(q->dport);
 	request.SetTailNack(spine, first, count);
 	SendRepairRequest(request, q->sip, q->dip,
-		SpineIdentification(spine, spine));
+		SpineIdentification(spine, spine), q);
+	if (m_sprayReceiverTailMissing)
+		WaitTailMissing(q, spine, first, count);
+}
+
+bool RdmaHw::ValidReceiverTailMissing() const{
+	return !m_sprayReceiverTailMissing ||
+		(m_sprayReceiverHold && m_sprayTailRecovery);
+}
+
+void RdmaHw::WaitTailMissing(Ptr<RdmaRxQueuePair> q, uint8_t spine,
+		uint16_t first, uint16_t count){
+	NS_ABORT_MSG_IF(m_sprayTailLossRtts > 0 && m_sprayBaseRttNs == 0,
+		"SprayReceiverTailMissing counts its guard in SprayBaseRttNs, which "
+		"is not set");
+	const uint64_t guardNs =
+		static_cast<uint64_t>(m_sprayTailLossRtts * m_sprayBaseRttNs);
+	// Every run waits the same guard, so a run added later is never due
+	// before the timer already set.
+	q->m_tailMissingRuns.Add(spine, first, count,
+		Simulator::Now().GetNanoSeconds() + guardNs);
+	if (!q->m_tailMissingTimer.IsPending())
+		q->m_tailMissingTimer = Simulator::Schedule(NanoSeconds(guardNs),
+			&RdmaHw::CountTailMissing, this, q);
+}
+
+void RdmaHw::CountTailMissing(Ptr<RdmaRxQueuePair> q){
+	const uint64_t now = Simulator::Now().GetNanoSeconds();
+	// The receive queue pair's addresses are the data's destination's first.
+	const uint32_t leaf = m_switchQueues->LeafOf(q->dip);
+	for (const PendingTailRuns::Request &run : q->m_tailMissingRuns.TakeDue(now)){
+		const uint16_t missing = q->m_pathSeqReceiver.TakeTailMissing(run.spine,
+			run.first, run.count);
+		if (missing == 0)
+			continue;
+		q->m_countedTailMissing = true;
+		ReceiverHoldOf().OnTailMissing(leaf, run.spine, missing, now);
+		for (uint16_t i = 0; i < missing; i++)
+			ReportTailMissing("receiver_tail_missing", run.spine);
+	}
+	const uint64_t next = q->m_tailMissingRuns.NextDue();
+	if (next != PendingTailRuns::kNone)
+		q->m_tailMissingTimer = Simulator::Schedule(NanoSeconds(next - now),
+			&RdmaHw::CountTailMissing, this, q);
+}
+
+void RdmaHw::ReportTailMissing(const char *event, uint8_t spine){
+	ReportTransportEvent(event, 0);
+	ReportTransportEvent(
+		(std::string(event) + "_spine" + std::to_string(spine)).c_str(), 0);
 }
 
 void RdmaHw::RecoverTail(Ptr<RdmaQueuePair> qp, const CustomHeader &ch){
 	if (!qp->m_outstanding.IsKept() || EnforceProgressDeadline(qp))
 		return;
+	const uint64_t guardNs =
+		static_cast<uint64_t>(m_sprayTailLossRtts * qp->m_baseRtt);
+	std::vector<RdmaQueuePair::DeclaredSend> deferred;
 	const uint64_t lost = qp->DeclareLostOnPathSeqs(ch.ack.tail_spine,
-		ch.ack.tail_seq, ch.ack.tail_count);
+		ch.ack.tail_seq, ch.ack.tail_count, guardNs > 0 ? &deferred : nullptr);
+	DeferTailLosses(qp, deferred, guardNs);
 	if (lost == 0)
 		return;
 	if (m_cc_mode == 11 && DeliverCongestionSignal(qp)){
-		qp->nscc.OnLoss(lost);
+		qp->Nscc().OnLoss(lost);
 		ApplyNsccWindow(qp);
 	}
 	m_nic[GetNicIdxOfQp(qp)].dev->TriggerTransmit();
@@ -148,7 +242,14 @@ bool RdmaHw::IsReceiverHold() const{
 }
 
 bool RdmaHw::ValidReceiverHold() const{
-	return CustomHeader::ackReceiverHoldBytes == (m_sprayReceiverHold ? 1u : 0u) &&
+	const uint32_t bytes = m_sprayReceiverHoldSlots > 0
+		? SpineListBytes(m_sprayReceiverHoldSlots) : SpineBitmapBytes(m_spineCount);
+	return CustomHeader::ackReceiverHoldBytes ==
+			(m_sprayReceiverHold ? bytes : 0u) &&
+		CustomHeader::ackReceiverHoldSlots ==
+			(m_sprayReceiverHold ? m_sprayReceiverHoldSlots : 0u) &&
+		(m_sprayReceiverHold || m_sprayReceiverHoldSlots == 0) &&
+		m_sprayReceiverHoldSlots <= kMaxSpineListSlots &&
 		(!m_sprayReceiverHold ||
 			(m_sprayPathSeq && IsRepsHold() && m_switchQueues &&
 				m_spineCount > 0 && m_spineCount <= kReceiverHoldSpines));
@@ -158,7 +259,9 @@ ReceiverHold &RdmaHw::ReceiverHoldOf(){
 	if (m_receiverHold)
 		return *m_receiverHold;
 	m_receiverHold = std::make_unique<ReceiverHold>(m_spineCount,
-		m_sprayHoldAutoLeaves, m_sprayReceiverHoldClean, m_sprayLossIntervalNs);
+		m_sprayReceiverHoldAutoLeaves > 0
+			? m_sprayReceiverHoldAutoLeaves : m_sprayHoldAutoLeaves,
+		m_sprayReceiverHoldClean, m_sprayLossIntervalNs);
 	m_receiverHold->SetIntervalCallback(
 		[this](uint32_t leaf, uint64_t endNs,
 				const std::vector<uint32_t> &arrivals,
@@ -172,10 +275,35 @@ ReceiverHold &RdmaHw::ReceiverHoldOf(){
 	return *m_receiverHold;
 }
 
-uint8_t RdmaHw::ReceiverHoldBitmap(uint32_t senderIp) const{
+SpineBitmap RdmaHw::ReceiverHoldBitmap(uint32_t senderIp) const{
 	if (!IsReceiverHold() || !m_receiverHold)
-		return 0;
+		return SpineBitmap();
 	return m_receiverHold->Bitmap(m_switchQueues->LeafOf(senderIp));
+}
+
+SpineBitmap RdmaHw::ReceiverHoldReport(uint32_t senderIp, bool &partial){
+	partial = false;
+	const SpineBitmap held = ReceiverHoldBitmap(senderIp);
+	if (m_sprayReceiverHoldSlots == 0 || held.Count() <= m_sprayReceiverHoldSlots)
+		return held;
+	// Each partial list names the next held spines from past the last one
+	// the previous list toward the leaf named, so every held spine reaches
+	// its senders while more are held than a list names.
+	partial = true;
+	uint32_t &next = m_receiverHoldNext[m_switchQueues->LeafOf(senderIp)];
+	SpineBitmap named;
+	uint32_t count = 0;
+	uint32_t last = next;
+	for (uint32_t i = 0; i < m_spineCount && count < m_sprayReceiverHoldSlots; i++){
+		const uint32_t k = (next + i) % m_spineCount;
+		if (held.Test(k)){
+			named.Set(k);
+			count++;
+			last = k;
+		}
+	}
+	next = (last + 1) % m_spineCount;
+	return named;
 }
 
 void RdmaHw::AttachReceiverHold(Ptr<RdmaQueuePair> qp){
@@ -185,11 +313,14 @@ void RdmaHw::AttachReceiverHold(Ptr<RdmaQueuePair> qp){
 	std::shared_ptr<ReceiverHoldMarks> marks;
 	if (m_pathSelectorKind ==
 			static_cast<uint32_t>(PathSelectorKind::RepsFlowHold))
-		marks = std::make_shared<ReceiverHoldMarks>(m_spineCount, sentinelNs);
+		marks = std::make_shared<ReceiverHoldMarks>(m_spineCount, sentinelNs,
+			m_sprayHeldSentinelSpread, SentinelSalt());
 	else {
 		if (!m_receiverHoldMarks)
-			m_receiverHoldMarks =
-				std::make_shared<ReceiverHoldMarks>(m_spineCount, sentinelNs);
+			m_receiverHoldMarks = std::make_shared<ReceiverHoldMarks>(
+				m_spineCount, sentinelNs, m_sprayHeldSentinelSpread,
+				SentinelSalt(), m_sprayReceiverHoldWiden,
+				m_switchQueues->LeafOf(qp->sip.Get()));
 		marks = m_receiverHoldMarks;
 	}
 	const uint32_t leaf = m_switchQueues->LeafOf(qp->dip.Get());

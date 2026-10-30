@@ -10,19 +10,43 @@ NS_LOG_COMPONENT_DEFINE("qbbHeader");
 
 namespace ns3 {
 
+	namespace {
+	// A spine field of bytes bytes, zero, one or two (SpineFieldBytes): in
+	// one byte 255 stands for none, 0xffff, which no spine index takes over
+	// at most 255 spines.
+	void WriteSpineField(Buffer::Iterator &i, uint16_t value, uint32_t bytes){
+		if (bytes == 1)
+			i.WriteU8(value == 0xffff ? 0xff : static_cast<uint8_t>(value));
+		else if (bytes == 2)
+			i.WriteU16(value);
+	}
+	uint16_t ReadSpineField(Buffer::Iterator &i, uint32_t bytes){
+		if (bytes == 2)
+			return i.ReadU16();
+		const uint8_t value = i.ReadU8();
+		return value == 0xff ? 0xffff : value;
+	}
+	} // namespace
+
 	NS_OBJECT_ENSURE_REGISTERED(qbbHeader);
 
 	qbbHeader::qbbHeader(uint16_t pg)
 		: sport(0), dport(0), flags(0), m_pg(pg), m_seq(0),
-		  m_trimPayloadSize(0), m_packetSeq(0), m_redirect(0xff),
-		  m_receiverHold(0), m_tailSpine(0), m_tailSeq(0), m_tailCount(0)
+		  m_trimPayloadSize(0), m_packetSeq(0), m_redirect(0xffff),
+		  m_receiverHold(), m_receiverHoldPartial(false), m_tailSpine(0),
+		  m_tailSeq(0), m_tailCount(0),
+		  m_routeSpine(0xffff), m_answerSeq(0), m_announceRoute(0xffff),
+		  m_announceSeq(0)
 	{
 	}
 
 	qbbHeader::qbbHeader()
 		: sport(0), dport(0), flags(0), m_pg(0), m_seq(0),
-		  m_trimPayloadSize(0), m_packetSeq(0), m_redirect(0xff),
-		  m_receiverHold(0), m_tailSpine(0), m_tailSeq(0), m_tailCount(0)
+		  m_trimPayloadSize(0), m_packetSeq(0), m_redirect(0xffff),
+		  m_receiverHold(), m_receiverHoldPartial(false), m_tailSpine(0),
+		  m_tailSeq(0), m_tailCount(0),
+		  m_routeSpine(0xffff), m_answerSeq(0), m_announceRoute(0xffff),
+		  m_announceSeq(0)
 	{}
 
 	qbbHeader::~qbbHeader()
@@ -76,6 +100,18 @@ namespace ns3 {
 	void qbbHeader::SetProbeAnswer(){
 		flags |= 1 << FLAG_PROBE_ANSWER;
 	}
+	void qbbHeader::SetRouteProbe(){
+		flags |= 1 << FLAG_ROUTE_PROBE;
+	}
+	void qbbHeader::SetRouteProbeReply(){
+		flags |= 1 << FLAG_ROUTE_PROBE_REPLY;
+	}
+	void qbbHeader::SetDuplicate(){
+		flags |= 1 << FLAG_DUPLICATE;
+	}
+	void qbbHeader::SetPathAvoid(){
+		flags |= 1 << FLAG_PATH_AVOID;
+	}
 	void qbbHeader::SetPacketSeq(uint32_t seq){
 		m_packetSeq = seq;
 	}
@@ -86,17 +122,30 @@ namespace ns3 {
 		else
 			flags &= ~(1 << FLAG_EDGE_CONGESTED);
 	}
-	void qbbHeader::SetRedirect(uint8_t spine){
+	void qbbHeader::SetRedirect(uint16_t spine){
 		m_redirect = spine;
 	}
-	void qbbHeader::SetReceiverHold(uint8_t bitmap){
+	void qbbHeader::SetReceiverHold(const SpineBitmap &bitmap){
 		m_receiverHold = bitmap;
+	}
+	void qbbHeader::SetReceiverHoldPartial(bool partial){
+		m_receiverHoldPartial = partial;
 	}
 	void qbbHeader::SetTailNack(uint8_t spine, uint16_t seq, uint16_t count){
 		flags |= 1 << FLAG_TAIL_NACK;
 		m_tailSpine = spine;
 		m_tailSeq = seq;
 		m_tailCount = count;
+	}
+	void qbbHeader::SetRouteSpine(uint16_t spine){
+		m_routeSpine = spine;
+	}
+	void qbbHeader::SetAnswerSeq(uint16_t seq, uint16_t announceRoute,
+			uint16_t announceSeq){
+		flags |= 1 << FLAG_ANSWER_NUMBERED;
+		m_answerSeq = seq;
+		m_announceRoute = announceRoute;
+		m_announceSeq = announceSeq;
 	}
 	void qbbHeader::SetIntHeader(const IntHeader &_ih){
 		ih = _ih;
@@ -141,11 +190,14 @@ namespace ns3 {
 	const SpineReport &qbbHeader::GetSpineReport() const{
 		return m_spineReport;
 	}
-	uint8_t qbbHeader::GetRedirect() const{
+	uint16_t qbbHeader::GetRedirect() const{
 		return m_redirect;
 	}
-	uint8_t qbbHeader::GetReceiverHold() const{
+	SpineBitmap qbbHeader::GetReceiverHold() const{
 		return m_receiverHold;
+	}
+	bool qbbHeader::GetReceiverHoldPartial() const{
+		return m_receiverHoldPartial;
 	}
 	bool qbbHeader::IsTailNack() const{
 		return (flags >> FLAG_TAIL_NACK) & 1;
@@ -158,6 +210,21 @@ namespace ns3 {
 	}
 	uint16_t qbbHeader::GetTailCount() const{
 		return m_tailCount;
+	}
+	uint16_t qbbHeader::GetRouteSpine() const{
+		return m_routeSpine;
+	}
+	bool qbbHeader::IsAnswerNumbered() const{
+		return (flags >> FLAG_ANSWER_NUMBERED) & 1;
+	}
+	uint16_t qbbHeader::GetAnswerSeq() const{
+		return m_answerSeq;
+	}
+	uint16_t qbbHeader::GetAnnounceRoute() const{
+		return m_announceRoute;
+	}
+	uint16_t qbbHeader::GetAnnounceSeq() const{
+		return m_announceSeq;
 	}
 
 	TypeId
@@ -187,7 +254,8 @@ namespace ns3 {
 		return sizeof(tmp.sport) + sizeof(tmp.dport) + sizeof(tmp.flags) + sizeof(tmp.m_pg) + sizeof(tmp.m_seq) + sizeof(tmp.m_trimPayloadSize) +
 			(CustomHeader::ackCarriesPacketSeq ? sizeof(tmp.m_packetSeq) : 0) +
 			CustomHeader::ackReportBytes + CustomHeader::ackRedirectBytes +
-			CustomHeader::ackReceiverHoldBytes + CustomHeader::ackTailNackBytes;
+			CustomHeader::ackReceiverHoldBytes + CustomHeader::ackTailNackBytes +
+			CustomHeader::ackRouteSpineBytes + CustomHeader::ackAnswerSeqBytes;
 	}
 	void qbbHeader::Serialize(Buffer::Iterator start)  const
 	{
@@ -204,14 +272,25 @@ namespace ns3 {
 			i.WriteU8(m_spineReport.sequence);
 			i.Write(m_spineReport.grades, CustomHeader::ackReportBytes - 1);
 		}
-		if (CustomHeader::ackRedirectBytes > 0)
-			i.WriteU8(m_redirect);
-		if (CustomHeader::ackReceiverHoldBytes > 0)
-			i.WriteU8(m_receiverHold);
+		WriteSpineField(i, m_redirect, CustomHeader::ackRedirectBytes);
+		if (CustomHeader::ackReceiverHoldSlots > 0){
+			uint8_t list[SpineListBytes(kMaxSpineListSlots)];
+			m_receiverHold.ToList(list, CustomHeader::ackReceiverHoldSlots,
+				m_receiverHoldPartial);
+			i.Write(list, CustomHeader::ackReceiverHoldBytes);
+		}else
+			for (uint32_t b = 0; b < CustomHeader::ackReceiverHoldBytes; b++)
+				i.WriteU8(m_receiverHold.Byte(b));
 		if (CustomHeader::ackTailNackBytes > 0){
 			i.WriteU8(m_tailSpine);
 			i.WriteU16(m_tailSeq);
 			i.WriteU16(m_tailCount);
+		}
+		WriteSpineField(i, m_routeSpine, CustomHeader::ackRouteSpineBytes);
+		if (CustomHeader::ackAnswerSeqBytes > 0){
+			i.WriteU16(m_answerSeq);
+			WriteSpineField(i, m_announceRoute, CustomHeader::ackAnswerSeqBytes - 4);
+			i.WriteU16(m_announceSeq);
 		}
 
 		// write IntHeader
@@ -235,13 +314,30 @@ namespace ns3 {
 			m_spineReport.edgeCongested = (flags >> FLAG_EDGE_CONGESTED) & 1;
 		}
 		if (CustomHeader::ackRedirectBytes > 0)
-			m_redirect = i.ReadU8();
-		if (CustomHeader::ackReceiverHoldBytes > 0)
-			m_receiverHold = i.ReadU8();
+			m_redirect = ReadSpineField(i, CustomHeader::ackRedirectBytes);
+		m_receiverHoldPartial = false;
+		if (CustomHeader::ackReceiverHoldSlots > 0){
+			uint8_t list[SpineListBytes(kMaxSpineListSlots)];
+			i.Read(list, CustomHeader::ackReceiverHoldBytes);
+			m_receiverHold = SpineBitmap::FromList(list,
+				CustomHeader::ackReceiverHoldSlots, m_receiverHoldPartial);
+		}else if (CustomHeader::ackReceiverHoldBytes > 0){
+			uint8_t bytes[kSpineBitmapBytes] = {};
+			for (uint32_t b = 0; b < CustomHeader::ackReceiverHoldBytes; b++)
+				bytes[b] = i.ReadU8();
+			m_receiverHold = SpineBitmap::FromBytes(bytes, CustomHeader::ackReceiverHoldBytes);
+		}
 		if (CustomHeader::ackTailNackBytes > 0){
 			m_tailSpine = i.ReadU8();
 			m_tailSeq = i.ReadU16();
 			m_tailCount = i.ReadU16();
+		}
+		if (CustomHeader::ackRouteSpineBytes > 0)
+			m_routeSpine = ReadSpineField(i, CustomHeader::ackRouteSpineBytes);
+		if (CustomHeader::ackAnswerSeqBytes > 0){
+			m_answerSeq = i.ReadU16();
+			m_announceRoute = ReadSpineField(i, CustomHeader::ackAnswerSeqBytes - 4);
+			m_announceSeq = i.ReadU16();
 		}
 
 		// read IntHeader

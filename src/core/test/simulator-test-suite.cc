@@ -24,7 +24,17 @@
 #include "ns3/simulator.h"
 #include "ns3/test.h"
 
+#include <type_traits>
+
 using namespace ns3;
+
+// A run can schedule more than 2^32 events. A 32-bit uid then wraps: events
+// at one time stamp stop running in the order scheduled, and an event given
+// uid EventId::UID::DESTROY cannot be cancelled.
+static_assert(std::is_same_v<decltype(std::declval<EventId>().GetUid()), uint64_t>,
+              "event uids must not wrap");
+static_assert(std::is_same_v<decltype(Scheduler::EventKey::m_uid), uint64_t>,
+              "event uids must not wrap");
 
 /**
  * \file

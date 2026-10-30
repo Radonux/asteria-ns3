@@ -114,6 +114,7 @@ set(header_files
     utils/broadcom-egress-queue.h
     utils/crc32.h
     utils/custom-header.h
+    utils/spine-bitmap.h
     utils/data-rate.h
     utils/drop-tail-queue.h
     utils/drop-tail-queue-packet.h

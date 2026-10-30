@@ -9,17 +9,35 @@
 #include <unordered_map>
 #include <vector>
 
+#include "ns3/spine-bitmap.h"
+
 namespace ns3 {
+
+// Whether a send at nowNs from the host salt names takes a sentinel that is
+// due, under a sentinel spread of spread: one send in spread on average, by
+// a hash of the send's time and the host, so that hosts sending in step take
+// theirs on different sends; every send at spread 1.
+inline bool SentinelSpreadTakes(uint64_t nowNs, uint64_t salt,
+		uint32_t spread){
+	if (spread <= 1)
+		return true;
+	uint64_t z = nowNs + (salt + 1) * 0x9E3779B97F4A7C15ULL;
+	z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
+	z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
+	return (z ^ (z >> 31)) % spread == 0;
+}
 
 // The spines an acknowledgement's receiver_hold bitmap can name: bit k is
 // spine k.
-constexpr uint32_t kReceiverHoldSpines = 8;
+constexpr uint32_t kReceiverHoldSpines = kMaxSpineCount;
 
 // The receiving host's pooled hold under SprayReceiverHold. Per sender leaf
 // and spine it counts the data packets that arrived and the packets the
-// path sequences show missing (SpineSequenceReceiver), and per spine it keeps
-// the sender leaves with a missing packet on it since that spine was last
-// released.
+// path sequences show missing (SpineSequenceReceiver), under
+// SprayReceiverTailMissing with those a closing packet's counts show sent and
+// that are still missing a guard after the receiver requested them, and per
+// spine it keeps the sender leaves with a missing packet on it since that
+// spine was last released.
 //
 // A packet missing on spine k from sender leaf a holds k: for every sender
 // leaf (host scope) if at least autoLeaves leaves have a missing packet on
@@ -46,7 +64,8 @@ public:
 	using IntervalCallback = std::function<void(uint32_t leaf, uint64_t endNs,
 		const std::vector<uint32_t> &arrivals, const std::vector<uint32_t> &lost,
 		const std::vector<Scope> &holds)>;
-	// Over spines, at most kReceiverHoldSpines; autoLeaves is at least 2 and
+	// Over spines, at most kReceiverHoldSpines; autoLeaves is at least 1 (at
+	// 1 a spine's first missing packet holds it for every sender leaf) and
 	// cleanArrivals above zero. intervalNs zero closes no interval.
 	ReceiverHold(uint32_t spines, uint32_t autoLeaves, uint32_t cleanArrivals,
 		uint64_t intervalNs);
@@ -60,10 +79,16 @@ public:
 	// neither as an arrival nor as a clean one, and only closes the
 	// intervals ended by nowNs.
 	void OnTrim(uint32_t leaf, uint32_t spine, uint64_t nowNs);
+	// missing data packets from sender leaf leaf requested up spine, counted
+	// at nowNs by SpineSequenceReceiver::TakeTailMissing. They hold as the
+	// gaps of an arrival do, and are no arrival: a spine on which nothing
+	// arrives shows no gap, and is held by these alone.
+	void OnTailMissing(uint32_t leaf, uint32_t spine, uint32_t missing,
+		uint64_t nowNs);
 	// Whether spine is held for sender leaf leaf, at either scope; and the
 	// bitmap of the spines held for it, bit k for spine k.
 	bool Holds(uint32_t leaf, uint32_t spine) const;
-	uint8_t Bitmap(uint32_t leaf) const;
+	SpineBitmap Bitmap(uint32_t leaf) const;
 	// Whether spine is held in host scope, the sender leaves with a missing
 	// packet on it, and the clean arrivals the hold that holds it for leaf
 	// has counted.
@@ -105,19 +130,30 @@ private:
 // set the spine's bit. A spine is held toward a leaf while any receiver on it
 // holds it; an acknowledgement from a receiver with the bit clear takes that
 // receiver out, so the hold ends only by the receivers that set it and never
-// by the sender's own clean sends. Each held (leaf, spine) is sent one
+// by the sender's own clean sends. A partial spine list (SprayReceiverHoldSlots)
+// adds the receiver to the spines it names and takes it out of none. Each held (leaf, spine) is sent one
 // sentinel per sentinel interval for the host, unless the sender's own loss
 // hold holds it and sends its own.
 class ReceiverHoldMarks {
 public:
-	ReceiverHoldMarks(uint32_t spines, uint64_t sentinelIntervalNs);
+	// Sentinels spread over sends by sentinelSpread for the host
+	// sentinelSalt names (SentinelSpreadTakes). With widenLeaves, at least
+	// 2, a spine that receivers on that many leaves hold is held toward
+	// every leaf; 0 holds it toward those leaves only. ownLeaf, the host's
+	// leaf, counts toward no widening: a send to it crosses no spine, so its
+	// receivers' holds say nothing of the host's uplinks.
+	ReceiverHoldMarks(uint32_t spines, uint64_t sentinelIntervalNs,
+		uint32_t sentinelSpread = 1, uint64_t sentinelSalt = 0,
+		uint32_t widenLeaves = 0, uint32_t ownLeaf = UINT32_MAX);
 	// The receiver_hold bitmap of an acknowledgement from receiver, a host on
-	// leaf.
-	void OnBitmap(uint32_t leaf, uint32_t receiver, uint8_t bitmap);
+	// leaf, partial or not.
+	void OnBitmap(uint32_t leaf, uint32_t receiver, const SpineBitmap &bitmap,
+		bool partial);
 	bool Holds(uint32_t leaf, uint32_t spine) const;
 	// Whether a sentinel toward leaf is due on a spine held for it and not
-	// held by localHolds, and which; the lowest such spine is taken and its
-	// sentinel interval restarts now.
+	// held by localHolds, and which, on a send that takes it under the
+	// sentinel spread; the lowest such spine is taken and its sentinel
+	// interval restarts now.
 	bool TakeSentinel(uint32_t leaf, uint64_t nowNs,
 		const std::function<bool(uint32_t)> &localHolds, uint8_t &spine);
 	uint32_t Spines() const;
@@ -130,6 +166,13 @@ private:
 	};
 	uint32_t m_spines;
 	uint64_t m_sentinelIntervalNs;
+	uint32_t m_sentinelSpread;
+	uint64_t m_sentinelSalt;
+	uint32_t m_widenLeaves;
+	uint32_t m_ownLeaf;
+	// Per spine, the leaves other than m_ownLeaf some receiver of which
+	// holds it.
+	std::vector<uint32_t> m_heldLeaves;
 	std::unordered_map<uint32_t, Leaf> m_leaves;
 };
 
@@ -140,7 +183,7 @@ public:
 	void Set(std::shared_ptr<ReceiverHoldMarks> marks, uint32_t leaf);
 	// Whether it is set.
 	bool Active() const;
-	void OnBitmap(uint32_t receiver, uint8_t bitmap);
+	void OnBitmap(uint32_t receiver, const SpineBitmap &bitmap, bool partial);
 	bool Holds(uint32_t spine) const;
 	// Whether every spine is held by the marks or by localHolds.
 	bool HoldsEvery(const std::function<bool(uint32_t)> &localHolds) const;

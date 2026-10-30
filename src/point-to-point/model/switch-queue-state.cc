@@ -55,10 +55,28 @@ std::vector<SpineGrader::SpineValues> SwitchQueueState::PathValues(
 
 std::vector<bool> SwitchQueueState::Faulted(uint32_t source,
 		uint32_t destination) const{
-	std::vector<bool> faulted(m_spines);
-	std::vector<uint64_t> slowest(m_spines, UINT64_MAX);
-	for (uint32_t k = 0; k < m_spines; k++){
-		for (const HopValues &hop : PathHops(source, destination, k)){
+	std::vector<std::array<HopValues, 4>> hops;
+	for (uint32_t k = 0; k < m_spines; k++)
+		hops.push_back(PathHops(source, destination, k));
+	return FaultedOver(hops);
+}
+
+std::vector<bool> SwitchQueueState::ForwardFaulted(uint32_t source,
+		uint32_t destination) const{
+	std::vector<std::array<HopValues, 2>> hops;
+	for (uint32_t k = 0; k < m_spines; k++)
+		hops.push_back({Read(m_uplinks[source * m_spines + k]),
+			Read(m_downlinks[destination * m_spines + k])});
+	return FaultedOver(hops);
+}
+
+template <size_t N>
+std::vector<bool> SwitchQueueState::FaultedOver(
+		const std::vector<std::array<HopValues, N>> &hops){
+	std::vector<bool> faulted(hops.size());
+	std::vector<uint64_t> slowest(hops.size(), UINT64_MAX);
+	for (uint32_t k = 0; k < hops.size(); k++){
+		for (const HopValues &hop : hops[k]){
 			faulted[k] = faulted[k] || hop.loss > 0;
 			slowest[k] = std::min(slowest[k], hop.rateBps);
 		}
@@ -66,7 +84,7 @@ std::vector<bool> SwitchQueueState::Faulted(uint32_t source,
 	// A rate is a fault only against the other spines': the fabric's own
 	// rate is no fault.
 	const uint64_t fastest = *std::max_element(slowest.begin(), slowest.end());
-	for (uint32_t k = 0; k < m_spines; k++)
+	for (uint32_t k = 0; k < hops.size(); k++)
 		faulted[k] = faulted[k] || slowest[k] < fastest;
 	return faulted;
 }

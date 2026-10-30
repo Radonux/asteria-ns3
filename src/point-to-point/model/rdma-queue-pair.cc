@@ -6,6 +6,7 @@
 #include <ns3/simulator.h>
 #include "ns3/ppp-header.h"
 #include "rdma-queue-pair.h"
+#include "load-balancing.h"
 #include <algorithm>
 #include <iterator>
 
@@ -16,7 +17,7 @@ namespace ns3 {
  *************************/
 OutstandingPackets::OutstandingPackets()
 	: m_packet_size(0), m_first(0), m_oldest(kNone), m_newest(kNone),
-	  m_bytes(0)
+	  m_highest_sent(kNone), m_bytes(0)
 {
 }
 
@@ -65,8 +66,13 @@ void OutstandingPackets::Add(uint64_t seq, uint32_t size, uint16_t path,
 	const uint64_t olderOnPath = newestOnPath == m_newest_on_path.end()
 		? kNone : newestOnPath->second;
 	const bool resendsLost = m_lost.erase(packet) > 0;
+	const bool sentBefore = m_highest_sent != kNone && packet <= m_highest_sent;
+	const uint8_t sends = sentBefore
+		? static_cast<uint8_t>(std::min<uint32_t>(record.sends + 1u, UINT8_MAX)) : 1;
+	if (!sentBefore)
+		m_highest_sent = packet;
 	record = {sentNs, size, path, pathSeq, true, resendsLost, trickle,
-		trickle || exploration, held, m_newest, kNone, olderOnPath, kNone};
+		trickle || exploration, held, m_newest, kNone, olderOnPath, kNone, sends};
 	if (m_newest != kNone)
 		At(m_newest).newer = packet;
 	else
@@ -82,13 +88,17 @@ void OutstandingPackets::Add(uint64_t seq, uint32_t size, uint16_t path,
 }
 
 uint64_t OutstandingPackets::Find(uint64_t seq, uint16_t path) const{
+	const uint64_t packet = FindPacket(seq);
+	return packet != kNone && At(packet).path == path ? packet : kNone;
+}
+
+uint64_t OutstandingPackets::FindPacket(uint64_t seq) const{
 	if (m_ring.empty())
 		return kNone;
 	const uint64_t packet = seq / m_packet_size;
 	if (packet < m_first || packet - m_first >= m_ring.size())
 		return kNone;
-	const Record &record = At(packet);
-	return record.outstanding && record.path == path ? packet : kNone;
+	return At(packet).outstanding ? packet : kNone;
 }
 
 uint64_t OutstandingPackets::Oldest() const{
@@ -121,6 +131,19 @@ uint16_t OutstandingPackets::PathSeq(uint64_t packet) const{
 
 bool OutstandingPackets::ResendsLost(uint64_t packet) const{
 	return At(packet).resends_lost;
+}
+
+uint8_t OutstandingPackets::Sends(uint64_t packet) const{
+	return At(packet).sends;
+}
+
+void OutstandingPackets::NoteCopy(uint64_t seq){
+	const uint64_t packet = seq / m_packet_size;
+	if (m_ring.empty() || packet < m_first || packet - m_first >= m_ring.size() ||
+			!At(packet).outstanding)
+		return;
+	Record &record = At(packet);
+	record.sends = static_cast<uint8_t>(std::min<uint32_t>(record.sends + 1u, UINT8_MAX));
 }
 
 bool OutstandingPackets::Trickle(uint64_t packet) const{
@@ -171,15 +194,23 @@ bool OutstandingPackets::RepairsAgain(uint64_t seq){
 	return !m_repaired.insert(seq / m_packet_size).second;
 }
 
-void OutstandingPackets::RemoveBelow(uint64_t seq){
+void OutstandingPackets::RemoveBelow(uint64_t seq,
+		std::vector<Unanswered> *unanswered){
 	// Rounded up so that the flow's last packet, the only one shorter than the
 	// packet size, is removed once the acknowledgement covers it.
 	const uint64_t end = (seq + m_packet_size - 1) / m_packet_size;
 	m_lost.erase(m_lost.begin(), m_lost.lower_bound(end));
 	m_repaired.erase(m_repaired.begin(), m_repaired.lower_bound(end));
 	for (; m_first < end; m_first++){
-		if (!m_ring.empty() && At(m_first).outstanding)
-			Remove(m_first);
+		if (m_ring.empty() || !At(m_first).outstanding)
+			continue;
+		if (unanswered){
+			const Record &record = At(m_first);
+			unanswered->push_back(Unanswered{Seq(m_first),
+				record.path, record.path_seq, record.trickle,
+				record.resends_lost});
+		}
+		Remove(m_first);
 	}
 }
 
@@ -223,7 +254,31 @@ RdmaQueuePair::RdmaQueuePair(uint16_t pg, Ipv4Address _sip, Ipv4Address _dip, ui
 	m_duplicate_repairs = 0;
 	m_tail_declared_lost = 0;
 	m_held_declared_lost = 0;
+	m_overdueTaken = false;
+	m_overdueSeq = 0;
+	m_overduePath = 0;
+	m_overdueSentNs = 0;
+	m_overdueSpent = false;
+	m_overdueRepeats = 0;
+	m_overdue_declared_lost = 0;
+	m_overdue_spurious = 0;
+	m_overdueProbe = false;
+	m_overdueRepeat = false;
+	m_rackReorderNs = 0;
+	m_rackDeferLoss = false;
+	m_psnBase = 0;
+	m_timeout_covered_losses = 0;
+	m_ack_loss_declared = 0;
 	m_tail_nacks_ignored = 0;
+	m_copyDeadlineRtts = 0;
+	m_coverageFirst = false;
+	m_answerCoverage = 0;
+	m_covered_answer_losses = 0;
+	m_deferTimeoutEvidence = false;
+	m_retractTimeoutEvidence = false;
+	m_retracted_timeout_losses = 0;
+	m_duplicate_answer_losses = 0;
+	m_timeout_data_losses = 0;
 	m_exploration_copies = 0;
 	m_exploration_copies_lost = 0;
 	m_timeouts = 0;
@@ -425,8 +480,39 @@ uint64_t RdmaQueuePair::AcknowledgePacket(uint64_t seq, uint16_t path){
 	uint64_t lost = 0;
 	for (uint64_t older = m_outstanding.OlderOnPath(packet);
 			older != OutstandingPackets::kNone;
-			older = m_outstanding.OlderOnPath(packet))
-		lost += DeclareLost(older);
+			older = m_outstanding.OlderOnPath(packet)){
+		// Delivered, as its coverage shows: the answer is what was lost.
+		if (CoveredAnswerLoss(m_outstanding.Seq(older), m_outstanding.Size(older)))
+			m_outstanding.Remove(older);
+		else
+			lost += DeclareLost(older);
+	}
+	// Across paths by send time: with many paths two outstanding sends
+	// rarely share one, so the rule above seldom applies.
+	if (m_rackReorderNs > 0){
+		const uint64_t sentNs = m_outstanding.SentNs(packet);
+		// An answer to a resend sooner than a base RTT after it left is the
+		// first send's, made earlier than the record says: it names no send
+		// time (RFC 8985 section 6.2 skips it).
+		const uint64_t answeredNs = Simulator::Now().GetNanoSeconds();
+		const bool ambiguous = m_outstanding.Sends(packet) > 1 &&
+			answeredNs < sentNs + m_baseRtt;
+		for (uint64_t oldest = m_outstanding.Oldest();
+				!ambiguous && oldest != packet &&
+					oldest != OutstandingPackets::kNone &&
+					m_outstanding.SentNs(oldest) + m_rackReorderNs <= sentNs;
+				oldest = m_outstanding.Oldest()){
+			if (CoveredAnswerLoss(m_outstanding.Seq(oldest),
+					m_outstanding.Size(oldest))){
+				m_outstanding.Remove(oldest);
+				continue;
+			}
+			if (m_rackDeferLoss)
+				m_rackDeferred.push_back(DeclaredSend{m_outstanding.Seq(oldest),
+					m_outstanding.Path(oldest), m_outstanding.Trickle(oldest)});
+			lost += DeclareLost(oldest, !m_rackDeferLoss);
+		}
+	}
 	const uint64_t nowNs = Simulator::Now().GetNanoSeconds();
 	// The answer of a resend may be that of the send declared lost before
 	// it, so only a first send's answer is told as a trickle send's.
@@ -447,6 +533,7 @@ void RdmaQueuePair::AddCopy(uint64_t seq, uint32_t size, uint16_t path,
 		uint64_t sentNs, bool trickle){
 	m_copies[seq] = ExplorationCopy{size, path, sentNs, trickle, false};
 	m_exploration_copies++;
+	m_outstanding.NoteCopy(seq);
 }
 
 bool RdmaQueuePair::AcknowledgeCopy(uint64_t seq, uint16_t path,
@@ -465,8 +552,13 @@ bool RdmaQueuePair::AcknowledgeCopy(uint64_t seq, uint16_t path,
 	for (uint64_t older = m_outstanding.NewestOnPath(path);
 			older != OutstandingPackets::kNone;){
 		const uint64_t next = m_outstanding.OlderOnPath(older);
-		if (m_outstanding.SentNs(older) < sentNs)
-			lost += DeclareLost(older);
+		if (m_outstanding.SentNs(older) < sentNs){
+			if (CoveredAnswerLoss(m_outstanding.Seq(older),
+					m_outstanding.Size(older)))
+				m_outstanding.Remove(older);
+			else
+				lost += DeclareLost(older);
+		}
 		older = next;
 	}
 	if (trickle)
@@ -487,11 +579,16 @@ void RdmaQueuePair::DeclareCopiesLostOnPath(uint16_t path, uint64_t sentNs,
 }
 
 void RdmaQueuePair::ExpireCopies(uint64_t nowNs){
+	const uint64_t deadlineNs =
+		static_cast<uint64_t>(m_copyDeadlineRtts * m_baseRtt);
 	for (auto copy = m_copies.begin(); copy != m_copies.end();){
 		const auto next = std::next(copy);
 		const bool acknowledged = copy->second.dataAcknowledged ||
 			copy->first + copy->second.size <= snd_una;
-		if (acknowledged && nowNs > copy->second.sentNs + m_baseRtt)
+		const bool expired = m_copyDeadlineRtts > 0
+			? nowNs > copy->second.sentNs + deadlineNs
+			: acknowledged && nowNs > copy->second.sentNs + m_baseRtt;
+		if (expired)
 			DeclareCopyLost(copy, nowNs);
 		copy = next;
 	}
@@ -501,6 +598,14 @@ void RdmaQueuePair::DeclareCopyLost(
 		std::map<uint64_t, ExplorationCopy>::iterator copy, uint64_t nowNs){
 	const uint16_t path = copy->second.path;
 	const bool trickle = copy->second.trickle;
+	// Its sequence delivered, by its data send's answer or cumulatively.
+	if (m_coverageFirst && (copy->second.dataAcknowledged ||
+			copy->first + copy->second.size <=
+				std::max<uint64_t>(snd_una, m_answerCoverage))){
+		CountCoveredAnswerLoss();
+		m_copies.erase(copy);
+		return;
+	}
 	m_copies.erase(copy);
 	m_exploration_copies_lost++;
 	m_pathSelector->OnLoss(path, nowNs);
@@ -522,12 +627,135 @@ uint64_t RdmaQueuePair::DeclareLostSentBy(uint64_t sentNs){
 			oldest != OutstandingPackets::kNone &&
 				m_outstanding.SentNs(oldest) <= sentNs;
 			oldest = m_outstanding.Oldest())
-		lost += DeclareLost(oldest);
+		lost += DeclareTimedOutSend(oldest);
 	return lost;
 }
 
+uint64_t RdmaQueuePair::DeclareTimedOutSend(uint64_t packet){
+	if (m_deferTimeoutEvidence){
+		// The first send's evidence waits for its resend's answer.
+		m_timedOut.emplace(m_outstanding.Seq(packet), TimedOutSend{
+			m_outstanding.Path(packet), m_outstanding.Trickle(packet)});
+		return DeclareLost(packet, false);
+	}
+	// Told at once, and kept until its resend's answer shows whether to take
+	// it back.
+	if (m_retractTimeoutEvidence)
+		m_timeoutLosses.emplace(m_outstanding.Seq(packet), TimeoutLoss{
+			m_outstanding.Path(packet),
+			static_cast<uint64_t>(Simulator::Now().GetNanoSeconds())});
+	return DeclareLost(packet);
+}
+
+uint64_t RdmaQueuePair::DeclareOverdueSendLost(uint64_t seq, uint16_t path,
+		uint64_t sentNs){
+	const uint64_t packet = m_outstanding.Find(seq, path);
+	if (packet == OutstandingPackets::kNone ||
+			m_outstanding.SentNs(packet) != sentNs)
+		return 0;
+	if (CoveredAnswerLoss(seq, m_outstanding.Size(packet))){
+		m_outstanding.Remove(packet);
+		return 0;
+	}
+	m_overdue_declared_lost++;
+	const auto repaired = m_overdueRepaired.find(seq);
+	if (m_overdueRepeat && repaired != m_overdueRepaired.end())
+		repaired->second.declared++;
+	else
+		m_overdueRepaired[seq] =
+			OverdueRepair{path, 1, {}, m_outstanding.Trickle(packet)};
+	// A probe is recovery alone.
+	if (m_overdueProbe)
+		return DeclareLost(packet, false);
+	return DeclareTimedOutSend(packet);
+}
+
+void RdmaQueuePair::CountTimedOutCovered(uint32_t losses){
+	m_timeout_covered_losses += losses;
+	if (!m_timedOutCovered.IsNull())
+		for (uint32_t k = 0; k < losses; k++)
+			m_timedOutCovered();
+}
+
+void RdmaQueuePair::NoteOverdueRepairSent(uint64_t seq, uint16_t path){
+	const auto repair = m_overdueRepaired.find(seq);
+	if (repair == m_overdueRepaired.end() ||
+			repair->second.repairPaths.size() >= repair->second.declared)
+		return;
+	repair->second.repairPaths.push_back(path);
+}
+
+bool RdmaQueuePair::OverdueRepairSpurious(uint64_t seq, uint16_t path,
+		bool duplicate, uint64_t nowNs){
+	const auto repair = m_overdueRepaired.find(seq);
+	if (repair == m_overdueRepaired.end())
+		return false;
+	const OverdueRepair r = repair->second;
+	const bool repairs = std::find(r.repairPaths.begin(), r.repairPaths.end(), path) !=
+		r.repairPaths.end();
+	const bool send = path == r.path && !repairs;
+	const bool resend = repairs && path != r.path;
+	if (!duplicate && !send && !resend)
+		return false;
+	m_overdueRepaired.erase(repair);
+	if (m_overdueProbe && (m_deferTimeoutEvidence || m_retractTimeoutEvidence)){
+		if (duplicate){
+			// Only the answer was lost.
+			m_duplicate_answer_losses++;
+			if (!m_timedOutResolved.IsNull())
+				m_timedOutResolved(true);
+		}else if (resend){
+			// The repair arrived first: the send was lost.
+			m_pathSelector->OnLoss(r.path, nowNs);
+			if (r.trickle)
+				m_pathSelector->OnTrickleAnswer(r.path, true, nowNs);
+			m_timeout_data_losses++;
+			if (!m_timedOutResolved.IsNull())
+				m_timedOutResolved(false);
+		}
+	}
+	if (resend && !duplicate)
+		return false;
+	m_overdue_spurious++;
+	return true;
+}
+
+void RdmaQueuePair::ResolveTimedOut(uint64_t seq, bool duplicate,
+		uint16_t route, uint64_t nowNs){
+	const auto losses = m_timeoutLosses.equal_range(seq);
+	for (auto loss = losses.first; loss != losses.second; ++loss){
+		if (!duplicate){
+			m_timeout_data_losses++;
+			if (!m_timedOutResolved.IsNull())
+				m_timedOutResolved(false);
+			continue;
+		}
+		const bool released = m_pathSelector->RetractLoss(loss->second.path,
+			loss->second.countedNs, nowNs);
+		m_retracted_timeout_losses++;
+		m_duplicate_answer_losses++;
+		if (!m_timeoutLossRetracted.IsNull())
+			m_timeoutLossRetracted(route, released);
+	}
+	m_timeoutLosses.erase(losses.first, losses.second);
+	const auto send = m_timedOut.find(seq);
+	if (send == m_timedOut.end())
+		return;
+	if (duplicate){
+		m_duplicate_answer_losses++;
+	}else{
+		m_pathSelector->OnLoss(send->second.path, nowNs);
+		if (send->second.trickle)
+			m_pathSelector->OnTrickleAnswer(send->second.path, true, nowNs);
+		m_timeout_data_losses++;
+	}
+	m_timedOut.erase(send);
+	if (!m_timedOutResolved.IsNull())
+		m_timedOutResolved(duplicate);
+}
+
 uint64_t RdmaQueuePair::DeclareLostOnPathSeqs(uint16_t path, uint16_t first,
-		uint16_t count){
+		uint16_t count, std::vector<DeclaredSend> *deferred){
 	std::vector<uint64_t> named;
 	for (uint64_t send = m_outstanding.NewestOnPath(path);
 			send != OutstandingPackets::kNone;
@@ -539,8 +767,17 @@ uint64_t RdmaQueuePair::DeclareLostOnPathSeqs(uint16_t path, uint16_t first,
 	}
 	uint64_t lost = 0;
 	// Oldest first, as the per-path rule declares them.
-	for (auto send = named.rbegin(); send != named.rend(); ++send)
-		lost += DeclareLost(*send);
+	for (auto send = named.rbegin(); send != named.rend(); ++send){
+		if (CoveredAnswerLoss(m_outstanding.Seq(*send),
+				m_outstanding.Size(*send))){
+			m_outstanding.Remove(*send);
+			continue;
+		}
+		if (deferred)
+			deferred->push_back(DeclaredSend{m_outstanding.Seq(*send),
+				m_outstanding.Path(*send), m_outstanding.Trickle(*send)});
+		lost += DeclareLost(*send, !deferred);
+	}
 	m_tail_declared_lost += named.size();
 	if (named.empty())
 		m_tail_nacks_ignored++;
@@ -553,18 +790,84 @@ uint64_t RdmaQueuePair::DeclareHeldSendLost(uint64_t seq, uint16_t path,
 	if (packet == OutstandingPackets::kNone ||
 			m_outstanding.SentNs(packet) != sentNs || !m_outstanding.Held(packet))
 		return 0;
+	if (CoveredAnswerLoss(seq, m_outstanding.Size(packet))){
+		m_outstanding.Remove(packet);
+		return 0;
+	}
 	m_held_declared_lost++;
 	return DeclareLost(packet);
 }
 
-uint32_t RdmaQueuePair::DeclareLost(uint64_t packet){
+uint64_t RdmaQueuePair::DeclareLostSeq(uint64_t seq){
+	const uint64_t packet = m_outstanding.FindPacket(seq);
+	if (packet == OutstandingPackets::kNone)
+		return 0;
+	if (CoveredAnswerLoss(m_outstanding.Seq(packet), m_outstanding.Size(packet))){
+		m_outstanding.Remove(packet);
+		return 0;
+	}
+	return DeclareLost(packet);
+}
+
+bool RdmaQueuePair::AnswerCovered(uint64_t seq, uint16_t path){
+	for (auto covered = m_covered.begin(); covered != m_covered.end();
+			++covered){
+		if (covered->send.seq != seq || covered->send.path != path)
+			continue;
+		if (covered->send.trickle && !covered->send.resendsLost)
+			m_pathSelector->OnTrickleAnswer(path, false,
+				Simulator::Now().GetNanoSeconds());
+		m_covered.erase(covered);
+		return true;
+	}
+	return false;
+}
+
+uint32_t RdmaQueuePair::DeclareAckLosses(uint64_t nowNs, uint64_t delayNs){
+	uint32_t declared = 0;
+	// Covered in order, and each due delayNs after it was covered.
+	while (!m_covered.empty() &&
+			m_covered.front().coveredNs + delayNs <= nowNs){
+		const OutstandingPackets::Unanswered send = m_covered.front().send;
+		m_covered.pop_front();
+		// Covered, so delivered: an answer loss and no loss on its path.
+		if (m_coverageFirst){
+			CountCoveredAnswerLoss();
+			continue;
+		}
+		m_pathSelector->OnLoss(send.path, nowNs);
+		if (send.trickle)
+			m_pathSelector->OnTrickleAnswer(send.path, true, nowNs);
+		declared++;
+	}
+	m_ack_loss_declared += declared;
+	return declared;
+}
+
+void RdmaQueuePair::CountCoveredAnswerLoss(){
+	m_covered_answer_losses++;
+	if (!m_coveredAnswerLoss.IsNull())
+		m_coveredAnswerLoss();
+}
+
+bool RdmaQueuePair::CoveredAnswerLoss(uint64_t seq, uint64_t size){
+	if (!m_coverageFirst ||
+			seq + size > std::max<uint64_t>(snd_una, m_answerCoverage))
+		return false;
+	CountCoveredAnswerLoss();
+	return true;
+}
+
+uint32_t RdmaQueuePair::DeclareLost(uint64_t packet, bool report){
 	const uint64_t seq = m_outstanding.Seq(packet);
 	const uint32_t size = m_outstanding.Size(packet);
-	m_pathSelector->OnLoss(m_outstanding.Path(packet),
-		Simulator::Now().GetNanoSeconds());
-	if (m_outstanding.Trickle(packet))
-		m_pathSelector->OnTrickleAnswer(m_outstanding.Path(packet), true,
+	if (report){
+		m_pathSelector->OnLoss(m_outstanding.Path(packet),
 			Simulator::Now().GetNanoSeconds());
+		if (m_outstanding.Trickle(packet))
+			m_pathSelector->OnTrickleAnswer(m_outstanding.Path(packet), true,
+				Simulator::Now().GetNanoSeconds());
+	}
 	AddRepairRange(seq, seq + size);
 	m_outstanding.RemoveLost(packet);
 	m_recovery_events++;
@@ -594,11 +897,35 @@ uint32_t RdmaQueuePair::GetHash(void){
 	return Hash32(buf.c, 12);
 }
 
-void RdmaQueuePair::Acknowledge(uint64_t ack){
+void RdmaQueuePair::Acknowledge(uint64_t ack, bool keepCovered){
 	if (ack > snd_una){
 		snd_una = ack;
-		if (m_outstanding.IsKept())
+		// A timed-out sequence acknowledged with no answer to its resend.
+		while (!m_timedOut.empty() && m_timedOut.begin()->first < snd_una){
+			CountTimedOutCovered(1);
+			ResolveTimedOut(m_timedOut.begin()->first, false, kNoRouteSpine,
+				Simulator::Now().GetNanoSeconds());
+		}
+		while (!m_timeoutLosses.empty() &&
+				m_timeoutLosses.begin()->first < snd_una){
+			CountTimedOutCovered(
+				m_timeoutLosses.count(m_timeoutLosses.begin()->first));
+			ResolveTimedOut(m_timeoutLosses.begin()->first, false,
+				kNoRouteSpine, Simulator::Now().GetNanoSeconds());
+		}
+		// A probed sequence covered before its repair's answer counts nothing.
+		if (m_overdueProbe)
+			m_overdueRepaired.erase(m_overdueRepaired.begin(),
+				m_overdueRepaired.lower_bound(snd_una));
+		if (m_outstanding.IsKept() && keepCovered){
+			std::vector<OutstandingPackets::Unanswered> unanswered;
+			m_outstanding.RemoveBelow(snd_una, &unanswered);
+			const uint64_t nowNs = Simulator::Now().GetNanoSeconds();
+			for (const OutstandingPackets::Unanswered &send : unanswered)
+				m_covered.push_back(CoveredSend{send, nowNs});
+		}else if (m_outstanding.IsKept()){
 			m_outstanding.RemoveBelow(snd_una);
+		}
 		// A cumulative ACK can outrun a go-back-N rewind: resent duplicates
 		// make the receiver repeat its frontier ACK, which lands above the
 		// rewound snd_nxt. Unclamped, GetOnTheFly() underflows and the window
@@ -620,7 +947,20 @@ uint64_t RdmaQueuePair::GetOnTheFly(){
 
 bool RdmaQueuePair::IsWinBound(){
 	uint64_t w = GetWin();
-	return w != 0 && GetOnTheFly() >= w;
+	return w != 0 && WindowOnTheFly() >= w;
+}
+
+NsccWindow &RdmaQueuePair::Nscc(){
+	return m_nsccConnection ? m_nsccConnection->window : nscc;
+}
+
+uint64_t RdmaQueuePair::WindowOnTheFly(){
+	if (!m_nsccConnection)
+		return GetOnTheFly();
+	uint64_t bytes = 0;
+	for (const Ptr<RdmaQueuePair> &qp : m_nsccConnection->queuePairs)
+		bytes += qp->GetOnTheFly();
+	return bytes;
 }
 
 uint64_t RdmaQueuePair::GetWin(){
@@ -681,6 +1021,8 @@ RdmaRxQueuePair::RdmaRxQueuePair(){
 	m_highest_seen_end = 0;
 	m_data_arrivals = 0;
 	m_folded_arrivals = 0;
+	m_countedTailMissing = false;
+	m_stray = false;
 }
 
 uint32_t RdmaRxQueuePair::GetHash(void){

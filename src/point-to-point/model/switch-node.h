@@ -1,7 +1,9 @@
 #ifndef SWITCH_NODE_H
 #define SWITCH_NODE_H
 
+#include <array>
 #include <unordered_map>
+#include <vector>
 #include <ns3/node.h>
 #include "qbb-net-device.h"
 #include "switch-mmu.h"
@@ -58,7 +60,11 @@ class SwitchNode : public Node{
 	std::unordered_map<uint32_t, std::vector<int> > m_rtTable; // map from ip address (u32) to possible ECMP port (index of dev)
 
 	// monitor of PFC
-	uint32_t m_bytes[pCnt][pCnt][qCnt]; // m_bytes[inDev][outDev][qidx] is the bytes from inDev enqueued for outDev at qidx
+	// m_bytes[inDev][outDev][qidx] is the bytes from inDev enqueued for outDev
+	// at qidx, over the ports that have enqueued (BytesOf), so that a switch
+	// keeps its own ports' and not pCnt * pCnt.
+	std::vector<std::vector<std::array<uint32_t, qCnt>>> m_bytes;
+	std::array<uint32_t, qCnt> &BytesOf(uint32_t inDev, uint32_t outDev);
 	
 	SwitchPortCounters m_portCounters[pCnt];
 
@@ -72,6 +78,7 @@ protected:
 	uint64_t m_maxRtt;
 
 	uint32_t m_ackHighPrio; // set high priority for ACK/NACK
+	bool m_routeProbeReplyAsAnswer; // RouteProbeReplyAsAnswer
 	uint32_t m_packetTrimMode;
 	uint32_t m_trimmedQueueIndex; // TC_med egress queue for DSCP_TRIMMED
 	uint32_t m_minTrimSize;       // MIN_TRIM_SIZE, in IP payload bytes
@@ -100,6 +107,7 @@ private:
 	static uint32_t EcmpHash(const uint8_t* key, size_t len, uint32_t seed);
 	static void FillFlowKey(const CustomHeader &ch, uint32_t key[3]);
 	static bool IdentifiesPath(const CustomHeader &ch);
+	static uint8_t ReturnSpine(const CustomHeader &ch);
 	void CheckAndSendPfc(uint32_t inDev, uint32_t qIndex);
 	void CheckAndSendResume(uint32_t inDev, uint32_t qIndex);
 	// Return a queued packet's bytes to the buffer it was admitted against.

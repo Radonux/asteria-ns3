@@ -42,7 +42,7 @@ EventId::EventId()
     NS_LOG_FUNCTION(this);
 }
 
-EventId::EventId(const Ptr<EventImpl>& impl, uint64_t ts, uint32_t context, uint32_t uid)
+EventId::EventId(const Ptr<EventImpl>& impl, uint64_t ts, uint32_t context, uint64_t uid)
     : m_eventImpl(impl),
       m_ts(ts),
       m_context(context),
@@ -106,7 +106,7 @@ EventId::GetContext() const
     return m_context;
 }
 
-uint32_t
+uint64_t
 EventId::GetUid() const
 {
     NS_LOG_FUNCTION(this);

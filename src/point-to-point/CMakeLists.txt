@@ -21,6 +21,8 @@ build_lib(
     ${mpi_sources}
     helper/point-to-point-helper.cc
     helper/qbb-helper.cc
+    model/answer-path-seq.cc
+    model/answer-route.cc
     model/cn-header.cc
     model/link-events.cc
     model/nscc-window.cc
@@ -38,7 +40,10 @@ build_lib(
     model/receiver-hold.cc
     model/rdma-driver.cc
     model/rdma-hw.cc
+    model/rdma-hw-answer-path.cc
+    model/rdma-hw-answer-route.cc
     model/rdma-hw-spine-sequence.cc
+    model/rdma-hw-themis.cc
     model/rdma-queue-pair.cc
     model/spine-grader.cc
     model/spine-redirect.cc
@@ -51,6 +56,8 @@ build_lib(
     helper/point-to-point-helper.h
     helper/qbb-helper.h
     helper/sim-setting.h
+    model/answer-path-seq.h
+    model/answer-route.h
     model/cn-header.h
     model/link-events.h
     model/load-balancing.h

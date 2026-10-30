@@ -34,6 +34,9 @@ namespace ns3 {
 		memset(ingress_bytes, 0, sizeof(ingress_bytes));
 		memset(paused, 0, sizeof(paused));
 		memset(egress_bytes, 0, sizeof(egress_bytes));
+		memset(max_egress_bytes, 0, sizeof(max_egress_bytes));
+		memset(ingress_refused, 0, sizeof(ingress_refused));
+		memset(egress_refused, 0, sizeof(egress_refused));
 		memset(egress_threshold, 0, sizeof(egress_threshold));
 	}
 	bool SwitchMmu::CheckIngressAdmission(uint32_t port, uint32_t qIndex, uint32_t psize){
@@ -48,9 +51,9 @@ namespace ns3 {
 	// that queue's drop threshold. Trimmable and trimmed classes carry separate
 	// thresholds so a shallow data queue can coexist with a bounded trimmed queue.
 	bool SwitchMmu::CheckEgressAdmission(uint32_t port, uint32_t qIndex, uint32_t psize){
-		if (qIndex >= qCnt || egress_threshold[qIndex] == 0)
+		if (qIndex >= qCnt || egress_threshold[port][qIndex] == 0)
 			return true;
-		return egress_bytes[port][qIndex] + psize <= egress_threshold[qIndex];
+		return egress_bytes[port][qIndex] + psize <= egress_threshold[port][qIndex];
 	}
 	void SwitchMmu::UpdateIngressAdmission(uint32_t port, uint32_t qIndex, uint32_t psize){
 		uint32_t new_bytes = ingress_bytes[port][qIndex] + psize;
@@ -68,6 +71,8 @@ namespace ns3 {
 	}
 	void SwitchMmu::UpdateEgressAdmission(uint32_t port, uint32_t qIndex, uint32_t psize){
 		egress_bytes[port][qIndex] += psize;
+		if (egress_bytes[port][qIndex] > max_egress_bytes[port][qIndex])
+			max_egress_bytes[port][qIndex] = egress_bytes[port][qIndex];
 	}
 	void SwitchMmu::RemoveFromIngressAdmission(uint32_t port, uint32_t qIndex, uint32_t psize){
 		uint32_t from_hdrm = std::min(hdrm_bytes[port][qIndex], psize);
@@ -145,7 +150,12 @@ namespace ns3 {
 		buffer_size = size;
 	}
 	void SwitchMmu::ConfigEgressThreshold(uint32_t qIndex, uint32_t bytes){
-		if (qIndex < qCnt)
-			egress_threshold[qIndex] = bytes;
+		for (uint32_t port = 0; port < pCnt; port++)
+			ConfigEgressThreshold(port, qIndex, bytes);
+	}
+	void SwitchMmu::ConfigEgressThreshold(uint32_t port, uint32_t qIndex,
+			uint32_t bytes){
+		if (port < pCnt && qIndex < qCnt)
+			egress_threshold[port][qIndex] = bytes;
 	}
 }

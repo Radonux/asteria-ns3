@@ -24,6 +24,7 @@
 #include "ns3/integer.h"
 #include "ns3/internet-module.h"
 #include "ns3/ipv4-static-routing-helper.h"
+#include "ns3/flow-id-tag.h"
 #include "ns3/packet.h"
 #include "ns3/point-to-point-helper.h"
 #include "ns3/qbb-helper.h"
@@ -58,6 +59,35 @@ using namespace std;
 NS_LOG_COMPONENT_DEFINE("GENERIC_SIMULATION");
 
 uint32_t cc_mode = 1;
+// Under CC_MODE 11 (NSCC), NSCC_WINDOW_STATE message or connection: how long a
+// host keeps an NSCC window. message, the default, opens one per queue pair,
+// that is per message. connection keeps one per destination and priority
+// group, opened once at MaxWnd by the first queue pair to it, shared by every
+// queue pair to it, at once or later, as the bound of the bytes they have in
+// flight together, and kept past them: the next message to the destination
+// starts from the window the last one left, and an idle connection keeps its
+// window as it stands. Each queue pair keeps its own send records, repairs and
+// timers. The other CC modes keep their state per queue pair and refuse it.
+std::string nscc_window_state = "message";
+bool nscc_window_state_given = false;
+// Under CC_MODE 11 (NSCC), NSCC_RTT_SAMPLE any or karn: which answers give
+// NSCC a round trip. any, the default, takes every answer but that of a
+// sequence's first resend after it was declared lost, matched to the newest
+// send of its sequence along its path. karn takes Karn's rule: no answer to a
+// sequence sent more than once while unacknowledged, whatever became of the
+// earlier send (declared lost, trimmed and released, or copied), and floors
+// every sample at the queue pair's base RTT, below which no answer returns.
+std::string nscc_rtt_sample = "any";
+bool nscc_rtt_sample_given = false;
+// PAIR_BANDWIDTH path or spines: the bandwidth of a pair of hosts (pairBw),
+// which with its base RTT gives the pair's BDP, the link speed and MaxWnd of
+// NSCC's window and REPS's buffer. path, the default, is the bottleneck of the
+// best shortest path (CalculateRoute). spines, under a LOAD_BALANCING mode
+// that names spines, is that of a pair whose packets are sprayed over every
+// spine, for hosts on two leaves: the sum over the spines of the lesser of
+// the source leaf's uplink to it and its downlink to the destination leaf, at
+// most either host's link (SprayPairBandwidth).
+std::string pair_bandwidth = "path";
 bool enable_qcn = true, use_dynamic_pfc_threshold = true;
 uint32_t packet_payload_size = 1000, l2_chunk_size = 0, l2_ack_interval = 0;
 double pause_time = 5, simulator_stop_time = 3.01;
@@ -74,10 +104,33 @@ std::string transport_event_summary_output_file = "transport_summary.csv";
 // carrying spine, written when a link fails and at the end of the run. Empty
 // writes neither.
 std::string port_counter_output_file, spine_arrival_output_file;
+// SWITCH_QUEUE_OUTPUT_FILE: per switch port and queue that has held a byte,
+// the most bytes the queue has held, its static egress threshold (0 for
+// none), the port's ECN minimum and maximum, and the packets admission
+// refused by the shared buffer's check and by the static threshold's, a
+// packet refused by both counted in each; written at the link events and at
+// the end, as the port counters are. Empty writes none.
+std::string switch_queue_output_file;
+FILE *switch_queue_file = nullptr;
+// PORT_COUNTER_INTERVAL_NS <ns>: the switch port counters of
+// PORT_COUNTER_OUTPUT_FILE written also at every multiple of it; 0, the
+// default, writes them (and SPINE_ARRIVAL_OUTPUT_FILE's) at the link events
+// and at the end alone.
+uint64_t port_counter_interval_ns = 0;
 std::string spine_report_output_file;
 // Each host's pooled loss intervals under SPRAY_LOSS_THRESHOLDS: one row per
 // host, closed interval and spine. Empty writes none.
 std::string spine_loss_output_file;
+// SPINE_LOSS_SPARSE on: SPINE_LOSS_OUTPUT_FILE writes a row of a closed
+// interval only where its series sent or lost in it or its grade changed,
+// and one row (spine 0's) of an interval that would write none
+// (spine_loss_rows). Off, the default, writes every row.
+bool spine_loss_sparse = false;
+// RECEIVER_HOLD_SPARSE on: RECEIVER_HOLD_OUTPUT_FILE writes its rows as
+// SPINE_LOSS_SPARSE writes SPINE_LOSS_OUTPUT_FILE's, a row where the series
+// had an arrival or a missing packet in the interval or its hold changed
+// (receiver_hold_rows). Off, the default, writes every row.
+bool receiver_hold_sparse = false;
 // One row per retransmission timeout fired, under every mode: the time, the
 // host's rank and the destination's, the requested spine of the oldest
 // outstanding send the timer waited for (empty where no send record is kept
@@ -93,9 +146,35 @@ std::string rto_event_output_file;
 // SPINE_LOSS_OUTPUT_FILE have other columns under each SPRAY_HOLD_SCOPE.
 // Empty writes none.
 std::string receiver_hold_output_file;
+// HOLD_TRACE_HOSTS <n> <node>...: the hosts whose rows SPINE_LOSS_OUTPUT_FILE
+// and RECEIVER_HOLD_OUTPUT_FILE write, by node id; absent, every host's.
+std::set<uint32_t> hold_trace_hosts;
+bool hold_trace_hosts_given = false;
+// Whether host node i's hold rows are written.
+bool hold_traced(uint32_t i) {
+  return !hold_trace_hosts_given || hold_trace_hosts.count(i) > 0;
+}
+// TRANSPORT_EVENT_HOSTS <n> <node>...: the hosts, by node id, whose packets'
+// rows TRANSPORT_EVENT_OUTPUT_FILE writes, those from or to one of them;
+// absent, every packet's. TRANSPORT_EVENT_SUMMARY_OUTPUT_FILE counts every
+// packet either way.
+std::set<uint32_t> transport_event_hosts;
+bool transport_event_hosts_given = false;
+// Whether the row of a packet from node source to node destination is written.
+bool transport_event_traced(uint32_t source, uint32_t destination) {
+  return !transport_event_hosts_given ||
+         transport_event_hosts.count(source) > 0 ||
+         transport_event_hosts.count(destination) > 0;
+}
+// Under SPRAY_ANSWER_PATH_SEQ on, ANSWER_HOLD_OUTPUT_FILE: one row per change
+// of a hold, time_ns,side,rank,leaf,spine,held: side sender for a route spine
+// of the answers of receiver leaf leaf held at sender rank, receiver for a
+// spine of rank's answers to sender leaf leaf, held 1 or 0.
+std::string answer_hold_output_file;
 FILE *port_counter_file = nullptr, *spine_arrival_file = nullptr;
 FILE *spine_report_file = nullptr, *spine_loss_file = nullptr;
 FILE *rto_event_file = nullptr, *receiver_hold_file = nullptr;
+FILE *answer_hold_file = nullptr;
 
 double alpha_resume_interval = 55, rp_timer, ewma_gain = 1 / 16;
 double rate_decrease_interval = 4;
@@ -122,6 +201,9 @@ enum class DeviceRngBlock : int64_t {
   LinkError = 1,
   EcnMarking = 2,
   PfcIdentification = 3,
+  // A host's draw of its answers' spines under ACK_ROUTE spray, on the
+  // stream of its first NIC.
+  AckRoute = 4,
 };
 
 int64_t device_rng_stream(DeviceRngBlock block, Ptr<NetDevice> dev) {
@@ -148,56 +230,68 @@ std::string load_balancing = "ecmp";
 // spines leaving out none: no loss hold, no sentinels, and none of the loss
 // hold keys; it reads REPS_BUFFER_SIZE and REPS_FREEZING_TIMEOUT_NS as reps
 // does, and SPRAY_PATH_SEQ and SPRAY_TAIL_RECOVERY as every spray_uniform
-// selector does.
+// selector does. themis is Themis's spraying by packet sequence number with
+// its path avoidance (SPRAY_THEMIS_PATHS and the keys after it). themis_hold
+// is themis leaving out the spines reps_hold's loss hold holds, at the same
+// SPRAY_HOLD_SCOPE; reps_hold() holds for it too. mrc_spine is MRC over
+// spines and ue_aware_spine UEC path-aware spraying over spines, each with
+// no loss hold and its selector's keys but the entropy space's size.
 std::string path_selector = "ops";
 bool reps_hold() {
   return path_selector == "reps_hold" || path_selector == "reps_flow_hold" ||
-         path_selector == "mrc_hold";
+         path_selector == "mrc_hold" || path_selector == "themis_hold";
 }
-// Whether SPRAY_HOLD_SCOPE is read: reps_hold and mrc_hold.
+// Whether SPRAY_HOLD_SCOPE is read: reps_hold, mrc_hold and themis_hold.
 bool hold_scope_read() {
-  return path_selector == "reps_hold" || path_selector == "mrc_hold";
+  return path_selector == "reps_hold" || path_selector == "mrc_hold" ||
+         path_selector == "themis_hold";
 }
 // Under reps_hold and mrc_hold, what one loss hold is kept for: host, every
-// destination of the host, leaf, the destinations on one leaf, or auto, per
-// spine either of the two. Under auto the host counts each spine's sends and losses per
-// destination leaf and keeps the destination leaves with a loss on it since
-// it was last released. A spine graded 0 toward a leaf is held for every
-// destination when at least SPRAY_HOLD_AUTO_LEAVES leaves have a loss on it,
-// else for that leaf alone; a leaf-scope hold widens to every destination
-// once a loss on the spine brings its leaves to SPRAY_HOLD_AUTO_LEAVES. A
-// hold ends by the clean sends at the scope it has, counted over every leaf
-// for a host-scope hold, whose release clears the spine's leaves. Each held
-// (spine, scope) is sent one sentinel per sentinel interval for the host.
+// destination of the host, leaf, the destinations on one leaf, auto, per spine
+// either of the two, or pair, one destination host. Under auto the host counts
+// each spine's sends and losses per destination leaf and keeps the destination
+// leaves with a loss on it since it was last released. A spine graded 0 toward
+// a leaf is held for every destination when at least SPRAY_HOLD_AUTO_LEAVES
+// leaves have a loss on it, else for that leaf alone; a leaf-scope hold widens
+// to every destination once a loss on the spine brings its leaves to
+// SPRAY_HOLD_AUTO_LEAVES. A hold ends by the clean sends at the scope it has,
+// counted over every leaf for a host-scope hold, whose release clears the
+// spine's leaves. Each held (spine, scope) is sent one sentinel per sentinel
+// interval for the host.
 // SPINE_LOSS_OUTPUT_FILE writes one row per destination leaf and spine, as
-// leaf writes it, with the grade of the scope the spine is held at.
+// leaf writes it, with the grade of the scope the spine is held at. Under pair
+// the hold is leaf's, kept per destination host instead of per leaf: the
+// host's queue pairs to one destination, each made for one message, share it,
+// so that it outlasts them as one queue pair kept across the messages would
+// keep it. SPINE_LOSS_OUTPUT_FILE writes one row per destination and spine,
+// with the destination's node id where leaf writes the leaf.
 std::string spray_hold_scope = "auto";
 bool spray_hold_scope_given = false;
 // Under SPRAY_HOLD_SCOPE auto, the destination leaves with a loss on a spine
 // from which its hold is kept for every destination; at least 2.
 uint32_t spray_hold_auto_leaves = 2;
 bool spray_hold_auto_leaves_given = false;
-// Under reps_hold, reps_flow_hold and mrc_hold, what puts a spine in loss
-// hold, per hold key: the (destination leaf, spine) under SPRAY_HOLD_SCOPE
-// leaf and auto, the spine under host, and the queue pair's spine under
-// reps_flow_hold. count: a loss interval whose lost fraction grades the
-// spine 0 through SPRAY_LOSS_THRESHOLDS. llr: a sequential likelihood-ratio
-// test per key, of the loss probability SPRAY_LOSS_P0 of a working path
-// against SPRAY_LOSS_P1 of a faulted one: its statistic L starts at 0, each
-// send on the key adds ln((1 - p1) / (1 - p0)) and each send declared lost
-// ln(p1 / p0), and the key is held at the loss that brings L to
-// ln((1 - beta) / alpha), SPRAY_HOLD_ALPHA being the probability of holding
-// a working path and SPRAY_HOLD_BETA that of missing a faulted one. L is
-// clamped below at 0, so that a clean stretch builds no unbounded credit
-// against the losses that follow it, and restarts at 0 at the key's release.
-// With SPRAY_LOSS_P0 0 a loss adds +infinity, so the first loss holds as
-// count holds it, and a send adds 0. Under llr SPRAY_LOSS_THRESHOLDS grade
-// the intervals SPINE_LOSS_OUTPUT_FILE writes but hold nothing, and the
-// release is unchanged. Under auto the leaves with a loss on a spine still
-// choose the scope of the hold the test starts. SPRAY_HOLD_BETA is read only
-// under llr, and SPRAY_LOSS_P0, SPRAY_LOSS_P1 and SPRAY_HOLD_ALPHA only under
-// llr or SPRAY_HOLD_RELEASE trickle; 0 <= SPRAY_LOSS_P0 < SPRAY_LOSS_P1 < 1,
-// and SPRAY_HOLD_ALPHA and SPRAY_HOLD_BETA are in (0, 0.5).
+// Under reps_hold, reps_flow_hold and mrc_hold, what puts a spine in loss hold,
+// per hold key: the (destination leaf, spine) under SPRAY_HOLD_SCOPE leaf and
+// auto, the (destination, spine) under pair, the spine under host, and the
+// queue pair's spine under reps_flow_hold. count: a loss interval whose lost
+// fraction grades the spine 0 through SPRAY_LOSS_THRESHOLDS. llr: a sequential
+// likelihood-ratio test per key, of the loss probability SPRAY_LOSS_P0 of a
+// working path against SPRAY_LOSS_P1 of a faulted one: its statistic L starts
+// at 0, each send on the key adds ln((1 - p1) / (1 - p0)) and each send
+// declared lost ln(p1 / p0), and the key is held at the loss that brings L to
+// ln((1 - beta) / alpha), SPRAY_HOLD_ALPHA being the probability of holding a
+// working path and SPRAY_HOLD_BETA that of missing a faulted one. L is clamped
+// below at 0, so that a clean stretch builds no unbounded credit against the
+// losses that follow it, and restarts at 0 at the key's release. With
+// SPRAY_LOSS_P0 0 a loss adds +infinity, so the first loss holds as count holds
+// it, and a send adds 0. Under llr SPRAY_LOSS_THRESHOLDS grade the intervals
+// SPINE_LOSS_OUTPUT_FILE writes but hold nothing, and the release is unchanged.
+// Under auto the leaves with a loss on a spine still choose the scope of the
+// hold the test starts. SPRAY_HOLD_BETA is read only under llr, and
+// SPRAY_LOSS_P0, SPRAY_LOSS_P1 and SPRAY_HOLD_ALPHA only under llr or
+// SPRAY_HOLD_RELEASE trickle; 0 <= SPRAY_LOSS_P0 < SPRAY_LOSS_P1 < 1, and
+// SPRAY_HOLD_ALPHA and SPRAY_HOLD_BETA are in (0, 0.5).
 std::string spray_hold_rule = "count";
 bool spray_hold_rule_given = false;
 double spray_loss_p0 = 0;
@@ -245,6 +339,17 @@ std::set<std::string> hold_test_keys_given;
 // packet sent up it.
 std::string spray_sentinel_mode = "data";
 bool spray_sentinel_mode_given = false;
+// Under SPRAY_SENTINEL_MODE duplicate, SPRAY_COPY_EXPIRY: when a copy its own
+// acknowledgement has not answered is declared lost for the hold. data_ack,
+// the default, as above: once its data send is acknowledged, more than one
+// base RTT after the copy was sent. deadline: more than SPRAY_TAIL_LOSS_RTTS
+// base RTTs after it was sent, the guard a tail repair request's declared
+// sends wait, whether its data send is acknowledged or not, so that a copy
+// queued on its spine longer than its data's path takes is not lost when its
+// data's acknowledgement comes first. Either is checked at the queue pair's
+// acknowledgements; deadline needs SPRAY_TAIL_LOSS_RTTS above 0.
+std::string spray_copy_expiry = "data_ack";
+bool spray_copy_expiry_given = false;
 // Under reps_hold, reps_flow_hold and mrc_hold, the queue pair's base RTTs
 // after which a data send up a spine held as it was chosen, by the loss hold
 // or under SPRAY_RECEIVER_HOLD by the receivers' (the sentinel or trickle send
@@ -254,6 +359,136 @@ bool spray_sentinel_mode_given = false;
 // resend's. 0 waits for the timeout. At least 0.
 double spray_held_loss_rtts = 2;
 bool spray_held_loss_rtts_given = false;
+// Under those selectors with SPRAY_HELD_LOSS_RTTS above 0,
+// SPRAY_OVERDUE_REPAIR evidence: a queue pair's latest data send up a spine
+// not held as it was chosen is declared lost and repaired as a held send is,
+// once its answer is SPRAY_HELD_LOSS_RTTS of the queue pair's base RTTs
+// overdue, whether or not any spine is held; one repair is sent until the
+// queue pair's next answer or retransmission timeout. Its loss is evidence
+// as a retransmission timeout's is, under SPRAY_DUPLICATE_REPORT too. probe:
+// the repair is sent alike but counts no loss; under SPRAY_DUPLICATE_REPORT
+// the repair's answer settles the send: unflagged, a data loss on the send's
+// path, counted as timeout_loss_data; flagged, an answer loss, counted as
+// answer_loss_duplicate; none when it is lost or the cumulative
+// acknowledgement covers the sequence first. Each repair is counted as the
+// host transport event overdue_repair. A receiver flags its answers to
+// duplicates as under SPRAY_DUPLICATE_REPORT, and a repair whose sequence's
+// send arrived first, its answer flagged or the send's own, is counted as
+// overdue_repair_spurious. With either value under SPRAY_DUPLICATE_REPORT, a
+// timed-out send the cumulative acknowledgement leaves a data loss by
+// covering its sequence first is also counted as timeout_loss_data_covered.
+// reprobe: probe's repair, and a repair that goes SPRAY_HELD_LOSS_RTTS of the
+// queue pair's base RTTs without an answer is followed by another of the
+// same send, up to SPRAY_OVERDUE_REPAIR_LIMIT repairs (at least 1, default 2)
+// until the queue pair's next answer or retransmission timeout; the limit is
+// read under reprobe alone. reprobe, and no other value, is also read under
+// reps_spine, reps_oracle and the uniform draw (LOAD_BALANCING spray_uniform
+// without a selector), whose sends no hold holds, after
+// SPRAY_HELD_LOSS_RTTS's wait, which only it reads there. Off, the default.
+std::string spray_overdue_repair = "off";
+bool spray_overdue_repair_given = false;
+uint32_t spray_overdue_repair_limit = 2;
+bool spray_overdue_repair_limit_given = false;
+// Under LOAD_BALANCING spray_uniform, SPRAY_RACK_REORDER_NS n: the answer to
+// a send made at t declares lost every outstanding send of the queue pair
+// made at or before t - n ns, along any path, as the answer to a later send
+// along the same path already does (RACK, RFC 8985 section 6.2, without its
+// reorder timer); its loss is told to the path selector. 0, the default, is
+// off.
+uint64_t spray_rack_reorder_ns = 0;
+bool spray_rack_reorder_ns_given = false;
+// Under SPRAY_RACK_REORDER_NS above 0 and SPRAY_TAIL_LOSS_RTTS above 0,
+// SPRAY_RACK_DEFER_LOSS on: the sends that rule declares lost are repaired at
+// once, but the path selector is told of their loss as of a tail repair
+// request's declarations, SPRAY_TAIL_LOSS_RTTS base RTTs later, and the
+// declared send's answer arriving before then drops the loss (counted as
+// tail_loss_delivered or tail_loss_ambiguous). Default off.
+std::string spray_rack_defer_loss = "off";
+bool spray_rack_defer_loss_given = false;
+// PATH_SELECTOR themis, under LOAD_BALANCING spray_uniform: Themis (Liu et
+// al., EuroSys 2026) over spines. A queue pair's packet of sequence number p,
+// numbered on from the connection's earlier queue pairs, goes up the spine of
+// path p mod SPRAY_THEMIS_PATHS, the paths spaced evenly over the spines (0,
+// the default, for every spine). The receiving host keeps Themis's
+// destination state per queue pair: the repair request it would send for the
+// head of a gap is confirmed when a later packet of the head's path has
+// arrived and otherwise stashed, and a packet more than
+// SPRAY_THEMIS_OOO_THRESHOLD past a stashed head (default 448, Themis's; 0
+// for none) makes that arrival's acknowledgement a Path Avoidance Signal
+// for the head, once the stash is SPRAY_THEMIS_STASH_MIN_NS old (default 0,
+// Themis's rule). The sender declares the head's send lost and repairs it, and
+// sends the next SPRAY_THEMIS_AVOIDANCE_WINDOW packets assigned the head's
+// path (default 2000000, Themis's; 0 for none) up other paths drawn at random
+// among those not avoided. Under SPRAY_THEMIS_RETX_REROUTE on, the default, a
+// repair goes up another path than its own. Under SPRAY_THEMIS_LEAF_AVOIDANCE
+// on (default off, Themis's per queue pair avoidance), a signal avoids its
+// path for the host's every connection to the destination's leaf, each
+// keeping its own paths.
+uint32_t spray_themis_paths = 0;
+uint32_t spray_themis_ooo_threshold = 448;
+uint64_t spray_themis_stash_min_ns = 0;
+uint64_t spray_themis_avoidance_window = 2000000;
+std::string spray_themis_retx_reroute = "on";
+std::string spray_themis_leaf_avoidance = "off";
+// Under LOAD_BALANCING spray_uniform, with any PATH_SELECTOR,
+// SPRAY_ACK_LOSS_RTTS <x>: a data send that the cumulative acknowledgement
+// covers before its own acknowledgement arrives, and whose own acknowledgement
+// has still not arrived x of the queue pair's base RTTs after that, is declared
+// lost on its path for the path selector alone, as a lost acknowledgement: the
+// loss holds and SPINE_LOSS_OUTPUT_FILE count it as a loss on that spine, but
+// nothing is repaired, the retransmission timeout is left as it is and the
+// congestion controller is told nothing, the data having arrived. Each is
+// counted as the host transport event ack_loss_declared. 0, the default,
+// declares nothing. At least 0.
+double spray_ack_loss_rtts = 0;
+bool spray_ack_loss_rtts_given = false;
+// Under LOAD_BALANCING spray_uniform, with any PATH_SELECTOR, ACK_ROUTE: the
+// spine the switches route each answer a receiver sends to a sender over, an
+// acknowledgement, a NACK or a repair request. data_spine, the default, is the
+// spine that carried the data packet it answers, which the answer's echoed
+// identification names. spray draws a spine uniformly per answer to a sender
+// off the receiver's leaf from a stream of the receiver's own, and names it
+// in a route_spine byte every answer then carries; answers to a sender on the
+// receiver's leaf cross no spine and draw nothing. reverse_set keeps per
+// connection, a sending host and priority group, a set of ACK_ROUTE_SET_SIZE
+// spines drawn once from that stream, routes each answer over a member drawn
+// uniformly, probes every member once per ACK_ROUTE_SET_PROBE_RTTS of
+// SPRAY_BASE_RTT_NS (above 0, default 1) while the connection's data
+// arrives, with an acknowledgement the sender returns over
+// the spine probed, and replaces a member by a spine outside the set once its
+// probe has gone unanswered for two base RTTs (host transport events
+// answer_set_probe and answer_set_replace). repath keeps per connection one
+// spine drawn from that stream, and draws another at each data packet that
+// adds nothing the receiver held already, a resend, unless its send was also
+// sent as a copy, which its tail flags then say (answer_repath); it needs
+// SPRAY_TAIL_RECOVERY on. Under each but data_spine the answer names its spine
+// in route_spine. The echoed identification is the same under all, and the
+// sender reads its spines from it alone.
+std::string ack_route = "data_spine";
+bool ack_route_given = false;
+uint32_t ack_route_set_size = 2;
+bool ack_route_set_size_given = false;
+double ack_route_set_probe_rtts = 1;
+bool ack_route_set_probe_rtts_given = false;
+// Under ACK_ROUTE reverse_set, ACK_ROUTE_SET_REPLY: how the switches queue
+// the sender's return of a probe, a path probe. data, the default, in its
+// priority group's queue, as a path probe is, where admission can refuse it;
+// answer, as the answers are, in queue 0 under ACK_HIGH_PRIO.
+std::string ack_route_set_reply = "data";
+bool ack_route_set_reply_given = false;
+// Under ACK_ROUTE spray, ACK_ROUTE_ORACLE on: the draw leaves out the spines
+// over which an answer toward the sender's leaf crosses a fault, a loss or a
+// black hole on the receiver's leaf's uplink to the spine or on the spine's
+// downlink to the sender's leaf, or a port slower than another spine's, as
+// the switches' state shows it from the fault's onset, read once per
+// SPRAY_BASE_RTT_NS as reps_oracle reads its own; a spine once left out stays
+// out. Off, the default.
+std::string ack_route_oracle = "off";
+bool ack_route_oracle_given = false;
+bool ack_route_spray() { return ack_route == "spray"; }
+// Whether answers name their route spine: under every ACK_ROUTE but the data's.
+bool ack_route_named() { return ack_route != "data_spine"; }
+bool ack_route_oracle_on() { return ack_route_oracle == "on"; }
 std::string spray_hold_release = "sentinels";
 bool spray_hold_release_given = false;
 double spray_hold_trickle = 0.01;
@@ -277,6 +512,22 @@ bool spray_hold_trickle_given = false;
 // data header as it is.
 std::string spray_path_seq = "off";
 bool spray_path_seq_given = false;
+// Under LOAD_BALANCING spray_uniform, with any PATH_SELECTOR or none,
+// SPRAY_PATH_STATE message or connection: how long a host keeps the path
+// selector of a queue pair, each queue pair carrying one message. message, the
+// default, keeps it for that queue pair alone, so every message starts afresh.
+// connection keeps one per destination and priority group, made by the first
+// queue pair to it, shared by every queue pair to it, at once or later, and
+// kept past them, as one queue pair kept across the messages would keep it:
+// REPS's cached values and freezing mode, MRC's value states, rotation and
+// probes, a loss hold selector's trickle schedule and receivers' marks,
+// reps_flow_hold's own hold and ack_redirect's redirect carry from one message
+// to the next. A queue pair's send records, copies, covered sends and path
+// sequences stay its own, and the host's holds are as SPRAY_HOLD_SCOPE keeps
+// them. A tail repair request's loss told after its queue pair completed
+// reaches the connection's selector.
+std::string spray_path_state = "message";
+bool spray_path_state_given = false;
 // Under LOAD_BALANCING spray_uniform, with any PATH_SELECTOR,
 // SPRAY_TAIL_RECOVERY on, which requires SPRAY_PATH_SEQ on and at most 8
 // spines: a queue pair's message is its flow's data, and it ends with the send
@@ -314,12 +565,35 @@ bool spray_tail_recovery_given = false;
 // SprayBaseRttNs); 0 requests at once.
 uint64_t spray_tail_recovery_delay_ns = 0;
 bool spray_tail_recovery_delay_ns_given = false;
+// Under SPRAY_TAIL_RECOVERY on, SPRAY_TAIL_LOSS_RTTS <x>: a send a tail repair
+// request declares lost is repaired at once, but the path selector is told of
+// its loss x of the queue pair's base RTTs later, so that the loss holds and
+// SPINE_LOSS_OUTPUT_FILE count it then. A trimmed header can reach the receiver
+// after its request for the trimmed packet; the trim notification of that send
+// arriving before then drops the loss, a trim being no loss to the selector,
+// and repairs nothing again; each loss so dropped is counted as the host
+// transport event tail_loss_cancelled. An acknowledgement of the declared send
+// along its path, the send having arrived after the request, drops the loss as
+// well, counted as tail_loss_delivered, or as tail_loss_ambiguous when a repair
+// of the send had left along the same path. The selector chooses again, up to
+// once per spine, for a repair it would send along the path of the waiting
+// declared send, and a repair so moved to another path is counted as
+// tail_repair_rerouted. The losses wait on the host, so a queue pair that
+// completes leaves its own waiting, and a trim notification that follows the
+// completion still drops one; one told after the completion reaches the host's
+// loss hold for the receiver's leaf, and under reps_flow_hold, whose hold was
+// the queue pair's, is dropped. 0 tells the selector at once. Default 1. At
+// least 0.
+double spray_tail_loss_rtts = 1;
+bool spray_tail_loss_rtts_given = false;
 bool tail_recovery() { return spray_tail_recovery == "on"; }
 // Under reps_hold, reps_flow_hold or mrc_hold with SPRAY_PATH_SEQ on,
 // SPRAY_RECEIVER_HOLD on: each receiving host counts, per sender leaf and spine, the data packets
 // that arrived and the packets the path sequences show missing. A missing
 // packet on spine k from sender leaf a holds k for a alone, or for every
-// sender leaf once SPRAY_HOLD_AUTO_LEAVES sender leaves have a missing packet
+// sender leaf once SPRAY_HOLD_AUTO_LEAVES sender leaves (or
+// SPRAY_RECEIVER_HOLD_AUTO_LEAVES, at least 1, when given; at 1 at its first
+// missing packet) have a missing packet
 // on it; SPRAY_RECEIVER_HOLD_CLEAN consecutive arrivals on k without a missing
 // packet, from a or from any leaf as the hold's scope is, release it, and a
 // missing packet restarts the count. Every acknowledgement carries a 1-byte
@@ -335,6 +609,112 @@ std::string spray_receiver_hold = "off";
 bool spray_receiver_hold_given = false;
 uint32_t spray_receiver_hold_clean = 1024;
 bool spray_receiver_hold_clean_given = false;
+// With SPRAY_RECEIVER_HOLD on, SPRAY_RECEIVER_HOLD_SLOTS n: the
+// acknowledgement's receiver_hold field is a list of n spine bytes after a
+// count byte instead of the bitmap over every spine, so it does not grow with
+// the spines. Holding more than n spines toward a sender leaf, the receiver
+// names n of them, in turn from past the last one it named, and marks the
+// list partial; a sender adds the spines a partial list names and releases
+// none until a complete list. 0, the default, keeps the bitmap; at most 127.
+uint32_t spray_receiver_hold_slots = 0;
+// With SPRAY_RECEIVER_HOLD on, SPRAY_RECEIVER_HOLD_WIDEN n: a sender holds
+// spine k toward every leaf while receivers on n or more destination leaves
+// hold k for its leaf, as its own loss hold widens after losses toward
+// SPRAY_HOLD_AUTO_LEAVES leaves, so that the receivers' reports of its own
+// uplink add up; its sentinels on k still go toward those leaves alone. 0,
+// the default, holds k toward those leaves only; otherwise at least 2.
+// Refused under reps_flow_hold, whose marks are each queue pair's own.
+uint32_t spray_receiver_hold_widen = 0;
+uint32_t spray_receiver_hold_auto_leaves = 0;
+bool spray_receiver_hold_auto_leaves_given = false;
+// With SPRAY_RECEIVER_HOLD and SPRAY_TAIL_RECOVERY on,
+// SPRAY_RECEIVER_TAIL_MISSING on: the receiving host's hold also counts as
+// missing, for the sender's leaf on their requested spine, the path sequences
+// a tail repair request names that are still missing SPRAY_TAIL_LOSS_RTTS of
+// the fabric's largest base RTT after the request. The gaps alone never show
+// a black-holed spine, on which no data arrives. The wait matches the
+// sender's: a send that arrives late in it is the one whose acknowledgement
+// cancels the sender's report of it. A data packet or a trimmed header of the
+// run arriving before then takes it out, a trim being no loss; a sequence a
+// data arrival passed meanwhile was counted as a gap and is not counted
+// again; and a sequence counted that arrives later is a late arrival, which
+// neither counts toward the release nor restarts it. Each send counted is
+// the host transport event receiver_tail_missing, and each of them whose data
+// packet or trimmed header arrives after all is receiver_tail_missing_late.
+// Each is also written as receiver_tail_missing_spine<k> or
+// receiver_tail_missing_late_spine<k> for the requested spine k of its send,
+// the breakdown of the two by spine. Off, the default, leaves the hold to the
+// gaps.
+std::string spray_receiver_tail_missing = "off";
+bool spray_receiver_tail_missing_given = false;
+// Under SPRAY_PATH_SEQ on, SPRAY_STRAY_PATH_SEQ: how a receiving host reads
+// the path sequences of a packet that arrives after the frontend removed its
+// flow's receive queue pair at the flow's completion, a copy, a repaired send
+// or a repair still in flight, which makes a receive queue pair of its own.
+// fresh, the default, reads them there as a new flow's, so that the tail
+// counts of a closing packet among them name every send of the flow that
+// queue pair has not seen as missing, and SPRAY_RECEIVER_TAIL_MISSING counts
+// them. closed reads them against the removed queue pair: the packet takes
+// its sequence out of that queue pair's tail runs still waiting, is
+// receiver_tail_missing_late where that queue pair counted its sequence
+// missing, and counts no gap, asks no tail repair and counts nothing in the
+// receiver's hold.
+std::string spray_stray_path_seq = "fresh";
+bool spray_stray_path_seq_given = false;
+// Under LOAD_BALANCING spray_uniform, SPRAY_COVERAGE_FIRST on: before the
+// per-path rule, the held-loss rule, a tail repair request or a copy's expiry
+// declares a send lost, the queue pair applies its coverage, the cumulative
+// acknowledgement (the one of the answer it reads, where it reads one) and for
+// a copy its data send's answer. A send so covered was delivered, and its
+// missing answer is an answer loss: counted as the host transport event
+// answer_loss_covered, neither repaired nor told to the selector, so that it
+// counts toward no spine's losses, no hold and no copy's. The covered sends
+// SPRAY_ACK_LOSS_RTTS declares are counted so too. Off, the default.
+std::string spray_coverage_first = "off";
+bool spray_coverage_first_given = false;
+// With SPRAY_COVERAGE_FIRST on, SPRAY_DUPLICATE_REPORT on: a receiver flags its
+// answer to a data packet whose sequence it held already, and a sender tells
+// the selector the loss of a send a retransmission timeout declares only at
+// the answer to its resend: none where that answer is flagged, the first send
+// having arrived, counted as the host transport event answer_loss_duplicate;
+// and on the first send's path where it is not, or the cumulative
+// acknowledgement covers the sequence first, counted as timeout_loss_data.
+// retract: the receiver flags as under on, and the sender tells each loss a
+// retransmission timeout declares at once, as with off, a sequence timed out
+// again told once more; the flagged answer to the sequence takes each back
+// from the host's auto loss hold, regrading without it the hold it began,
+// counted as answer_loss_duplicate, by the route spine the answer came back
+// over, and timeout_retract_release where the hold was released; a loss
+// left standing is timeout_loss_data. retract needs PATH_SELECTOR reps_hold,
+// mrc_hold or themis_hold under SPRAY_HOLD_SCOPE auto and SPRAY_HOLD_RULE
+// count. Off, the default.
+std::string spray_duplicate_report = "off";
+bool spray_duplicate_report_given = false;
+// Under ACK_ROUTE spray with SPRAY_PATH_SEQ on and a loss hold PATH_SELECTOR,
+// SPRAY_ANSWER_PATH_SEQ on: a receiving host numbers each queue pair's answers
+// per route spine, and each answer announces another route's count. The
+// sender counts per receiver leaf and route spine the answers it receives and
+// those it finds lost, from a gap in a route's numbers or from an
+// announcement not met within two base RTTs, and holds a route whose lost
+// fraction over a SPRAY_LOSS_INTERVAL_NS interval reaches the top of
+// SPRAY_LOSS_THRESHOLDS; SPRAY_ANSWER_HOLD_CLEAN answers in a row received
+// over a held route without a loss release it. Its data packets to the leaf
+// carry the routes it holds in an answer_hold byte, and a receiving host
+// leaves out of its draw of the routes of its answers to a sender leaf the
+// spines any sender of that leaf last reported held, but for one probe answer
+// per held spine and sender leaf every SPRAY_ANSWER_PROBE_INTERVAL_NS. Each
+// answer found lost is the host transport event answer_route_lost, with its
+// breakdown by route spine, each probe answer answer_probe, and each change of
+// a sender's route hold answer_route_hold or answer_route_release;
+// ANSWER_HOLD_OUTPUT_FILE traces the changes of both ends' holds. Off, the
+// default.
+std::string spray_answer_path_seq = "off";
+bool spray_answer_path_seq_given = false;
+uint64_t spray_answer_probe_interval_ns = 1000000;
+bool spray_answer_probe_interval_ns_given = false;
+uint32_t spray_answer_hold_clean = 3;
+bool spray_answer_hold_clean_given = false;
+bool answer_path_seq() { return spray_answer_path_seq == "on"; }
 bool receiver_hold() { return spray_receiver_hold == "on"; }
 uint32_t reps_buffer_size = 8;
 uint64_t reps_freezing_timeout_ns = 10000000;
@@ -348,6 +728,14 @@ double ack_redirect_flag = 0.1;
 double ack_redirect_validity_base_rtts = 2.0;
 std::string ack_redirect_trim_scoring = "mark";
 std::string ack_redirect_scope = "per_connection";
+// Under reps_oracle, REPS_ORACLE_HOPS: the hops over which a spine toward the
+// destination's leaf is read as faulted. round_trip, the default: the data's
+// two hops and the two its acknowledgement returns over through the same
+// spine, the destination leaf's uplink to the spine and the spine's downlink
+// to the source's leaf. forward: the data's two hops alone, the source leaf's
+// uplink to the spine and the spine's downlink to the destination's leaf, for
+// answers that do not return over the data's spine, as under ACK_ROUTE spray.
+std::string reps_oracle_hops = "round_trip";
 // The selectors each parameter belongs to. A parameter given under another
 // selector would be read by nothing, so it is refused.
 const std::map<std::string, std::set<std::string>> path_selector_parameter_owners = {
@@ -356,15 +744,22 @@ const std::map<std::string, std::set<std::string>> path_selector_parameter_owner
     {"REPS_FREEZING_TIMEOUT_NS",
      {"reps", "reps_hold", "reps_flow_hold", "reps_oracle", "reps_spine"}},
     {"UE_EV_SET_SIZE", {"ue_oblivious", "ue_aware"}},
-    {"UE_SATURATION_FRACTION", {"ue_aware"}},
+    {"UE_SATURATION_FRACTION", {"ue_aware", "ue_aware_spine"}},
     {"MRC_EV_SET_SIZE", {"mrc"}},
-    {"MRC_SKIP_BASE_RTTS", {"mrc", "mrc_hold"}},
-    {"MRC_PROBE_TIMEOUTS", {"mrc", "mrc_hold"}},
+    {"MRC_SKIP_BASE_RTTS", {"mrc", "mrc_hold", "mrc_spine"}},
+    {"MRC_PROBE_TIMEOUTS", {"mrc", "mrc_hold", "mrc_spine"}},
     {"ACK_REDIRECT_OMEGA", {"ack_redirect"}},
     {"ACK_REDIRECT_FLAG", {"ack_redirect"}},
     {"ACK_REDIRECT_VALIDITY_BASE_RTTS", {"ack_redirect"}},
     {"ACK_REDIRECT_TRIM_SCORING", {"ack_redirect"}},
     {"ACK_REDIRECT_SCOPE", {"ack_redirect"}},
+    {"REPS_ORACLE_HOPS", {"reps_oracle"}},
+    {"SPRAY_THEMIS_PATHS", {"themis", "themis_hold"}},
+    {"SPRAY_THEMIS_OOO_THRESHOLD", {"themis", "themis_hold"}},
+    {"SPRAY_THEMIS_STASH_MIN_NS", {"themis", "themis_hold"}},
+    {"SPRAY_THEMIS_AVOIDANCE_WINDOW", {"themis", "themis_hold"}},
+    {"SPRAY_THEMIS_RETX_REROUTE", {"themis", "themis_hold"}},
+    {"SPRAY_THEMIS_LEAF_AVOIDANCE", {"themis", "themis_hold"}},
 };
 // The keys of ack_redirect that only its per_connection scope reads.
 const std::set<std::string> ack_redirect_connection_keys = {
@@ -417,9 +812,14 @@ uint64_t spray_pool_decay_interval_ns = 0;
 // 1 holds a spine the host's pooled scores hold in every destination's draw.
 uint32_t spray_pool_hold_propagates = 0;
 // What a spine graded 0 is sent: epsilon, sentinel or none. Zero
-// spray_held_sentinel_interval_ns is the report interval.
+// spray_held_sentinel_interval_ns is the report interval. Under sentinel,
+// SPRAY_HELD_SENTINEL_SPREAD n: a sentinel once due rides a send with
+// probability 1 / n, by a hash of the send's time and the host, the loss
+// hold's and the receivers' hold's alike, so that hosts sending in step take
+// theirs on different sends; 1, the default, the first send.
 std::string spray_held_exploration = "epsilon";
 uint64_t spray_held_sentinel_interval_ns = 0;
+uint32_t spray_held_sentinel_spread = 1;
 // The keys that only spray_policy reads, and among them those that only its
 // one-way delay reads; a key nothing reads is refused.
 const std::set<std::string> spray_policy_keys = {
@@ -438,7 +838,7 @@ const std::set<std::string> spray_policy_keys = {
     "SPRAY_POOL_HOLD_PROPAGATES",
     "SPINE_REPORT_OUTPUT_FILE",
     "SPINE_LOSS_OUTPUT_FILE", "SPRAY_HELD_EXPLORATION",
-    "SPRAY_HELD_SENTINEL_INTERVAL_NS",
+    "SPRAY_HELD_SENTINEL_INTERVAL_NS", "SPRAY_HELD_SENTINEL_SPREAD",
     "SPRAY_ABSENCE_FRACTION_OF_MEDIAN", "SPRAY_ABSENCE_MINIMUM_MEDIAN",
     "SPRAY_GRADE_REFERENCE", "SPRAY_GRADE_SCOPE", "SPRAY_GRADE_COST_SOURCE",
     "SPRAY_ESTIMATOR_INTERVAL_SAMPLES"};
@@ -461,7 +861,8 @@ const std::set<std::string> spine_grader_keys = {
 const std::set<std::string> loss_hold_keys = {
     "SPRAY_LOSS_THRESHOLDS", "SPRAY_LOSS_INTERVAL_NS",
     "SPRAY_LOSS_HOLD_CLEAN_SENTINELS", "SPRAY_HELD_EXPLORATION",
-    "SPRAY_HELD_SENTINEL_INTERVAL_NS", "SPINE_LOSS_OUTPUT_FILE"};
+    "SPRAY_HELD_SENTINEL_INTERVAL_NS", "SPRAY_HELD_SENTINEL_SPREAD",
+    "SPINE_LOSS_OUTPUT_FILE"};
 const std::vector<std::string> loss_hold_required_keys = {
     "SPRAY_LOSS_THRESHOLDS", "SPRAY_LOSS_INTERVAL_NS",
     "SPRAY_LOSS_HOLD_CLEAN_SENTINELS", "SPRAY_HELD_EXPLORATION"};
@@ -487,6 +888,11 @@ uint32_t enable_pfc = 1;
 // queue_trimmable and queue_trimmed drop thresholds of section 4.1.
 uint32_t data_queue_bytes = 0;
 uint32_t trimmed_queue_bytes = 0;
+// DATA_QUEUE_BYTES_MAP and TRIMMED_QUEUE_BYTES_MAP, as KMAX_MAP: the two
+// thresholds of a switch port by its link speed, in place of DATA_QUEUE_BYTES
+// and TRIMMED_QUEUE_BYTES; each needs the other and a row for every switch
+// port's speed.
+map<uint64_t, uint32_t> rate2data_queue_bytes, rate2trimmed_queue_bytes;
 uint32_t has_win = 1;
 uint32_t global_t = 1;
 uint32_t mi_thresh = 5;
@@ -510,6 +916,7 @@ uint32_t link_down_A = 0, link_down_B = 0;
 //   LINK_FAILURE <time_ns> down <a> <b>
 //   LINK_FAILURE <time_ns> blackhole <a> <b>
 //   LINK_FAILURE <time_ns> loss <a> <b> <error_rate> [forward|both]
+//                [byte <frame_bytes>]
 //   LINK_FAILURE <time_ns> rate <a> <b> <data_rate> [forward|both]
 //   LINK_RESTORE <time_ns> <a> <b>
 // down takes the link down for the rest of the run. blackhole needs b to be a
@@ -527,7 +934,14 @@ uint32_t link_down_A = 0, link_down_B = 0;
 // link fail and restore independently when each failure and its restore name
 // the nodes in the same order. A later failure named in the same order
 // replaces the one before it, which a restore then no longer puts back; a link
-// taken down is not restored.
+// taken down is not restored. Under loss, byte makes error_rate each byte's:
+// a packet of s bytes as the device receives it, data, acknowledgement,
+// repair request or trimmed header alike, is dropped with probability
+// 1 - (1 - error_rate)^s, as a frame corrupted in any byte fails its check.
+// frame_bytes is the full data frame error_rate was derived at, which must be
+// the run's: the PPP, IPv4 and data headers and PACKET_PAYLOAD_SIZE
+// (RdmaHw::DataFrameBytes). Without byte every packet is dropped with
+// error_rate whatever its size.
 vector<LinkEvent> link_events;
 
 uint32_t enable_trace = 1;
@@ -763,21 +1177,40 @@ void record_host_transport_event(const char *event, uint64_t bytes) {
   accumulate_transport_event(event, plane, bytes);
 }
 
+// The totals of a device's per-packet event, by the addresses of the literals
+// naming the event and its plane: written on every hop of every packet, they
+// are found by two pointers rather than by building and comparing strings.
+map<pair<const char *, const char *>, pair<uint64_t, uint64_t> *>
+    transport_event_totals_by_literal;
+
 void write_transport_event(const char *event, Ptr<QbbNetDevice> dev,
                            Ptr<const Packet> packet, uint32_t protocol,
                            int32_t queue) {
+  // The totals need the IP header alone; the transport header is read for a
+  // row of the raw stream.
+  CustomHeader ip(CustomHeader::L2_Header | CustomHeader::L3_Header);
+  packet->PeekHeader(ip);
+  // A trimmed packet rides the UDP protocol number but carries no payload, so
+  // it is reported on the control plane alongside ACKs and NACKs.
+  const bool payload_bearing =
+      protocol == 0x11 && !IsUetTrimmedDscp(ip.GetIpv4Dscp());
+  const char *plane = payload_bearing ? "data" : "control";
+  auto &totals = transport_event_totals_by_literal[{event, plane}];
+  if (totals == nullptr)
+    totals = &transport_event_totals[{event, plane}];
+  totals->first += 1;
+  totals->second += packet->GetSize();
+  maybe_flush_transport_event_outputs();
+  if (transport_event_raw_cctx == nullptr)
+    return;
+  const uint32_t source = ip_to_node_id(Ipv4Address(ip.sip));
+  const uint32_t destination = ip_to_node_id(Ipv4Address(ip.dip));
+  if (!transport_event_traced(source, destination))
+    return;
   CustomHeader ch(CustomHeader::L2_Header | CustomHeader::L3_Header |
                   CustomHeader::L4_Header);
   ch.getInt = 1;
   packet->PeekHeader(ch);
-  // A trimmed packet rides the UDP protocol number but carries no payload, so
-  // it is reported on the control plane alongside ACKs and NACKs.
-  const bool payload_bearing =
-      protocol == 0x11 && !IsUetTrimmedDscp(ch.GetIpv4Dscp());
-  accumulate_transport_event(event, payload_bearing ? "data" : "control",
-                             packet->GetSize());
-  if (transport_event_raw_cctx == nullptr)
-    return;
   uint16_t source_port = 0;
   uint32_t sequence = 0;
   if (protocol == 0x11) {
@@ -793,8 +1226,7 @@ void write_transport_event(const char *event, Ptr<QbbNetDevice> dev,
       Simulator::Now().GetNanoSeconds(), event,
       payload_bearing ? "data" : "control", protocol,
       dev->GetNode()->GetId(), dev->GetNode()->GetNodeType(),
-      dev->GetIfIndex(), ip_to_node_id(Ipv4Address(ch.sip)),
-      ip_to_node_id(Ipv4Address(ch.dip)), source_port, sequence,
+      dev->GetIfIndex(), source, destination, source_port, sequence,
       packet->GetSize(), queue);
   append_transport_event_raw(row, length);
 }
@@ -812,6 +1244,39 @@ void get_queue_event(const char *event, Ptr<QbbNetDevice> dev,
   packet->PeekHeader(ch);
   write_transport_event(event, dev, packet, ch.l3Prot,
                         static_cast<int32_t>(queue));
+}
+
+// The receiving end of every leaf-spine link, by node id and device index:
+// the spine's index, by the rank of its node id as AssignSpinePorts indexes
+// it, and whether the link goes up, from the leaf to the spine.
+std::map<std::pair<uint32_t, uint32_t>, std::pair<uint32_t, bool>>
+    spine_link_receivers;
+
+// An answer a receiver sends to a sender, an acknowledgement, a NACK or a
+// repair request, lost where node's device port receives it: if that device
+// ends a leaf-spine link, counted as answer_drop_up or answer_drop_down by
+// the link's direction, and again with _spine<k> appended for its spine k,
+// the breakdown by spine. The losses are those switch_blackhole_drop and
+// link_error_drop count already.
+void count_answer_drop(uint32_t node, uint32_t port, uint8_t protocol,
+                       uint64_t bytes) {
+  if (protocol != 0xFC && protocol != 0xFD &&
+      protocol != kUecTrimRepairProtocol)
+    return;
+  const auto link = spine_link_receivers.find({node, port});
+  if (link == spine_link_receivers.end())
+    return;
+  const string event =
+      string("answer_drop_") + (link->second.second ? "up" : "down");
+  accumulate_transport_event(event, "control", bytes);
+  accumulate_transport_event(event + "_spine" + std::to_string(link->second.first),
+                             "control", bytes);
+}
+
+void get_answer_link_error_drop(Ptr<QbbNetDevice> dev, Ptr<const Packet> packet,
+                                uint32_t protocol) {
+  count_answer_drop(dev->GetNode()->GetId(), dev->GetIfIndex(), protocol,
+                    packet->GetSize());
 }
 
 void get_switch_drop(Ptr<SwitchNode> sw,
@@ -844,7 +1309,17 @@ void get_switch_drop(Ptr<SwitchNode> sw,
   }
   accumulate_transport_event(event, (udp || trimmed) ? "data" : "control",
                              packet->GetSize());
+  // A black hole drops what arrives on its port, which the device tagged.
+  FlowIdTag port;
+  if (static_cast<SwitchDropReason>(reason) == SwitchDropReason::Blackhole &&
+      packet->PeekPacketTag(port))
+    count_answer_drop(sw->GetId(), port.GetFlowId(), ch.l3Prot,
+                      packet->GetSize());
   if (transport_event_raw_cctx == nullptr)
+    return;
+  const uint32_t source = ip_to_node_id(Ipv4Address(ch.sip));
+  const uint32_t destination = ip_to_node_id(Ipv4Address(ch.dip));
+  if (!transport_event_traced(source, destination))
     return;
   const uint16_t source_port =
       udp ? ch.udp.sport : (trimmed ? ch.ack.sport : 0);
@@ -854,8 +1329,7 @@ void get_switch_drop(Ptr<SwitchNode> sw,
       row, sizeof(row), "%lu,%s,%s,%u,%u,%u,-1,%u,%u,%u,%u,%u,-1\n",
       Simulator::Now().GetNanoSeconds(), event,
       (udp || trimmed) ? "data" : "control", ch.l3Prot, sw->GetId(),
-      sw->GetNodeType(), ip_to_node_id(Ipv4Address(ch.sip)),
-      ip_to_node_id(Ipv4Address(ch.dip)), source_port, sequence,
+      sw->GetNodeType(), source, destination, source_port, sequence,
       packet->GetSize());
   append_transport_event_raw(row, length);
 }
@@ -873,8 +1347,8 @@ void get_switch_trim(Ptr<SwitchNode> sw,
   // payload that the trim replaced.
   const uint32_t trimmed_payload =
       forwardToDestination
-          ? (ch.udp.payload_size > CustomHeader::GetUdpHeaderSize()
-                 ? ch.udp.payload_size - CustomHeader::GetUdpHeaderSize()
+          ? (ch.udp.payload_size > ch.UdpHeaderBytes()
+                 ? ch.udp.payload_size - ch.UdpHeaderBytes()
                  : 0)
           : ch.ack.trim_payload_size;
   const char *mode = forwardToDestination ? "ftd" : "bts";
@@ -897,13 +1371,17 @@ void get_switch_trim(Ptr<SwitchNode> sw,
                              trimmed_payload);
   if (transport_event_raw_cctx == nullptr)
     return;
+  const uint32_t source =
+      ip_to_node_id(Ipv4Address(forwardToDestination ? ch.sip : ch.dip));
+  const uint32_t destination =
+      ip_to_node_id(Ipv4Address(forwardToDestination ? ch.dip : ch.sip));
+  if (!transport_event_traced(source, destination))
+    return;
   char row[224];
   const int length = snprintf(
       row, sizeof(row), "%lu,trim_%s_%s,data,%u,%u,%u,-1,%u,%u,%u,%u,%u,-1\n",
       Simulator::Now().GetNanoSeconds(), mode, reason, ch.l3Prot, sw->GetId(),
-      sw->GetNodeType(),
-      ip_to_node_id(Ipv4Address(forwardToDestination ? ch.sip : ch.dip)),
-      ip_to_node_id(Ipv4Address(forwardToDestination ? ch.dip : ch.sip)),
+      sw->GetNodeType(), source, destination,
       forwardToDestination ? ch.udp.sport : ch.ack.dport,
       forwardToDestination ? ch.udp.seq : ch.ack.seq, trimmed_payload);
   append_transport_event_raw(row, length);
@@ -954,6 +1432,14 @@ uint32_t path_selector_value() {
     return static_cast<uint32_t>(PathSelectorKind::MrcHold);
   if (path_selector == "reps_spine")
     return static_cast<uint32_t>(PathSelectorKind::RepsSpine);
+  if (path_selector == "themis")
+    return static_cast<uint32_t>(PathSelectorKind::Themis);
+  if (path_selector == "themis_hold")
+    return static_cast<uint32_t>(PathSelectorKind::ThemisHold);
+  if (path_selector == "mrc_spine")
+    return static_cast<uint32_t>(PathSelectorKind::MrcSpine);
+  if (path_selector == "ue_aware_spine")
+    return static_cast<uint32_t>(PathSelectorKind::UeAwareSpine);
   return std::numeric_limits<uint32_t>::max();
 }
 
@@ -1008,6 +1494,8 @@ uint32_t spray_hold_scope_value() {
     return static_cast<uint32_t>(HoldScope::Leaf);
   if (spray_hold_scope == "auto")
     return static_cast<uint32_t>(HoldScope::Auto);
+  if (spray_hold_scope == "pair")
+    return static_cast<uint32_t>(HoldScope::Pair);
   return std::numeric_limits<uint32_t>::max();
 }
 
@@ -1017,6 +1505,10 @@ bool leaf_hold() {
   return hold_scope_read() &&
          (spray_hold_scope == "leaf" || spray_hold_scope == "auto");
 }
+
+// Under reps_hold and mrc_hold, whether a loss hold is kept per destination
+// host, under pair.
+bool pair_hold() { return hold_scope_read() && spray_hold_scope == "pair"; }
 
 uint32_t spray_candidate_draw_value() {
   if (spray_candidate_draw == "proportional")
@@ -1143,6 +1635,8 @@ void connect_transport_traces(Ptr<QbbNetDevice> dev) {
   dev->TraceConnectWithoutContext(
       "LinkErrorDrop", MakeBoundCallback(&get_transport_event,
                                          "link_error_drop", dev));
+  dev->TraceConnectWithoutContext(
+      "LinkErrorDrop", MakeBoundCallback(&get_answer_link_error_drop, dev));
 }
 
 struct QlenDistribution {
@@ -1321,6 +1815,41 @@ void LeavesAndSpines(NodeContainer &n, vector<Ptr<Node>> &leaves,
             [](Ptr<Node> a, Ptr<Node> b) { return a->GetId() < b->GetId(); });
 }
 
+// PAIR_BANDWIDTH spines: every pair of hosts on two leaves of a leaf-spine
+// fabric gets the bandwidth of its packets sprayed over every spine, the sum
+// over the spines of the lesser of the source leaf's link up to it and its
+// link down to the destination leaf, links taken down left out, at most
+// either host's link. A pair on one leaf keeps CalculateRoute's.
+void SprayPairBandwidth(NodeContainer &n) {
+  vector<Ptr<Node>> leaves, spines;
+  LeavesAndSpines(n, leaves, spines);
+  // Each host's leaf and its link's bandwidth.
+  map<Ptr<Node>, std::pair<Ptr<Node>, uint64_t>> attached;
+  for (Ptr<Node> leaf : leaves)
+    for (const auto &link : nbr2if[leaf])
+      if (link.first->GetNodeType() == 0)
+        attached[link.first] = {leaf, link.second.bw};
+  for (const auto &source : attached) {
+    for (const auto &destination : attached) {
+      const Ptr<Node> from = source.second.first;
+      const Ptr<Node> to = destination.second.first;
+      if (from == to)
+        continue;
+      uint64_t sprayed = 0;
+      for (Ptr<Node> spine : spines) {
+        const auto up = nbr2if[from].find(spine);
+        const auto down = nbr2if[spine].find(to);
+        if (up == nbr2if[from].end() || down == nbr2if[spine].end() ||
+            !up->second.up || !down->second.up)
+          continue;
+        sprayed += std::min(up->second.bw, down->second.bw);
+      }
+      pairBw[source.first->GetId()][destination.first->GetId()] = std::min(
+          {source.second.second, destination.second.second, sprayed});
+    }
+  }
+}
+
 uint32_t AssignSpinePorts(NodeContainer &n) {
   vector<Ptr<Node>> leaves, spines;
   LeavesAndSpines(n, leaves, spines);
@@ -1335,6 +1864,22 @@ uint32_t AssignSpinePorts(NodeContainer &n) {
     DynamicCast<SwitchNode>(leaf)->SetSpinePorts(ports);
   }
   return spines.size();
+}
+
+// spine_link_receivers, for a fabric of leaves and spines.
+void FindSpineLinkReceivers(NodeContainer &n) {
+  vector<Ptr<Node>> leaves, spines;
+  LeavesAndSpines(n, leaves, spines);
+  for (Ptr<Node> leaf : leaves) {
+    for (uint32_t k = 0; k < spines.size(); k++) {
+      const auto link = nbr2if[leaf].find(spines[k]);
+      if (link == nbr2if[leaf].end())
+        continue;
+      spine_link_receivers[{spines[k]->GetId(),
+                            nbr2if[spines[k]][leaf].idx}] = {k, true};
+      spine_link_receivers[{leaf->GetId(), link->second.idx}] = {k, false};
+    }
+  }
 }
 
 // Simulation only: every hop of every leaf-spine path, for a receiver that
@@ -1383,6 +1928,8 @@ void TakeDownLink(NodeContainer n, Ptr<Node> a, Ptr<Node> b) {
   nbr2if[a][b].up = nbr2if[b][a].up = false;
   nextHop.clear();
   CalculateRoutes(n);
+  if (pair_bandwidth == "spines")
+    SprayPairBandwidth(n);
   // clear routing tables
   for (uint32_t i = 0; i < n.GetN(); i++) {
     if (n.Get(i)->GetNodeType() == 1)
@@ -1410,9 +1957,9 @@ uint32_t neighbour_of(Ptr<NetDevice> dev) {
   return peer->GetNode()->GetId();
 }
 
-// The counters as they stand now, one row per switch port and one per host
-// and spine, under the current time.
-void write_fabric_counters() {
+// The counters as they stand now, one row per switch port and, unless
+// ports_only, one per host and spine, under the current time.
+void write_fabric_counters(bool ports_only = false) {
   const unsigned long now = Simulator::Now().GetNanoSeconds();
   for (uint32_t i = 0; i < n.GetN(); i++) {
     Ptr<Node> node = n.Get(i);
@@ -1427,7 +1974,23 @@ void write_fabric_counters() {
                 static_cast<unsigned long>(sent.dataPackets),
                 static_cast<unsigned long>(sent.ecnMarks));
       }
-    } else if (node->GetNodeType() == 0 && spine_arrival_file != nullptr) {
+      if (switch_queue_file != nullptr && !ports_only)
+        for (uint32_t port = 1; port < sw->GetNDevices(); port++)
+          for (uint32_t q = 0; q < SwitchMmu::qCnt; q++) {
+            const SwitchMmu &mmu = *sw->m_mmu;
+            if (mmu.max_egress_bytes[port][q] == 0 &&
+                mmu.ingress_refused[port][q] == 0 &&
+                mmu.egress_refused[port][q] == 0)
+              continue;
+            fprintf(switch_queue_file, "%lu,%u,%u,%u,%u,%u,%u,%u,%lu,%lu\n",
+                    now, i, port, q, mmu.max_egress_bytes[port][q],
+                    mmu.egress_threshold[port][q], mmu.kmin[port],
+                    mmu.kmax[port],
+                    static_cast<unsigned long>(mmu.ingress_refused[port][q]),
+                    static_cast<unsigned long>(mmu.egress_refused[port][q]));
+          }
+    } else if (node->GetNodeType() == 0 && spine_arrival_file != nullptr &&
+               !ports_only) {
       Ptr<RdmaHw> hw = node->GetObject<RdmaDriver>()->m_rdma;
       for (uint32_t spine = 0; spine < hw->m_spineCount; spine++) {
         const SpineArrivals arrived = spine < hw->m_spineArrivals.size()
@@ -1441,9 +2004,18 @@ void write_fabric_counters() {
     }
   }
   for (FILE *file : {port_counter_file, spine_arrival_file, spine_report_file,
-                     spine_loss_file, rto_event_file, receiver_hold_file})
+                     spine_loss_file, rto_event_file, receiver_hold_file,
+                     answer_hold_file, switch_queue_file})
     if (file != nullptr)
       fflush(file);
+}
+
+// Under PORT_COUNTER_INTERVAL_NS, the counters at each multiple of it, for as
+// long as the simulation runs.
+void write_periodic_fabric_counters() {
+  write_fabric_counters(true);
+  Simulator::Schedule(NanoSeconds(port_counter_interval_ns),
+                      &write_periodic_fabric_counters);
 }
 
 // A report graded from the switches' state for one source leaf: one row per
@@ -1492,6 +2064,62 @@ void write_spine_report(uint32_t rank, uint64_t now_ns,
   }
 }
 
+// Under SPINE_LOSS_SPARSE, each series' last grade written, by host and
+// destination (the leaf, the destination's node id, or none for the pooled
+// scores), per spine; 0xffff for none yet.
+std::map<std::pair<uint32_t, int64_t>, std::vector<uint16_t>> spine_loss_grades;
+// Under RECEIVER_HOLD_SPARSE, each series' last hold written, by receiving
+// host and sender leaf, per spine; 0xffff for none yet.
+std::map<std::pair<uint32_t, uint32_t>, std::vector<uint16_t>> receiver_hold_scopes;
+
+// Whether spine's row of a closed interval of a series is written, its last
+// values written kept in last: a row with a count in it (counts, other), or
+// a value other than the series' last, and spine 0's where the interval
+// would write none, which marks it closed. A reader takes a row left out as
+// no count at the series' last value.
+std::vector<bool> sparse_rows(std::vector<uint16_t> &last,
+                              const std::vector<uint32_t> &counts,
+                              const std::vector<uint32_t> &other,
+                              const std::vector<uint8_t> &values) {
+  std::vector<bool> rows(counts.size(), true);
+  last.resize(counts.size(), 0xffff);
+  bool any = false;
+  for (uint32_t spine = 0; spine < counts.size(); spine++) {
+    rows[spine] = counts[spine] > 0 || other[spine] > 0 || last[spine] != values[spine];
+    last[spine] = values[spine];
+    any = any || rows[spine];
+  }
+  if (!any && !rows.empty())
+    rows[0] = true;
+  return rows;
+}
+
+// Whether spine's row of a closed interval of the host's series toward
+// destination is written: every row densely; under SPINE_LOSS_SPARSE a row
+// with a send or a loss in it, or a grade other than the series' last
+// (sparse_rows).
+std::vector<bool> spine_loss_rows(uint32_t rank, int64_t destination,
+                                  const std::vector<uint32_t> &sent,
+                                  const std::vector<uint32_t> &lost,
+                                  const std::vector<uint8_t> &grades) {
+  if (!spine_loss_sparse)
+    return std::vector<bool>(sent.size(), true);
+  return sparse_rows(spine_loss_grades[{rank, destination}], sent, lost, grades);
+}
+
+// Whether spine's row of a closed interval of the receiving host's series
+// for the sender leaf is written: every row densely; under
+// RECEIVER_HOLD_SPARSE a row with an arrival or a missing packet in it, or a
+// hold other than the series' last (sparse_rows).
+std::vector<bool> receiver_hold_rows(uint32_t rank, uint32_t leaf,
+                                     const std::vector<uint32_t> &arrivals,
+                                     const std::vector<uint32_t> &lost,
+                                     const std::vector<uint8_t> &holds) {
+  if (!receiver_hold_sparse)
+    return std::vector<bool>(arrivals.size(), true);
+  return sparse_rows(receiver_hold_scopes[{rank, leaf}], arrivals, lost, holds);
+}
+
 // A loss interval the host's pooled scores closed: one row per spine, under
 // the time the interval ended at, with the sends and losses counted in it and
 // the grade its lost fraction earns.
@@ -1499,10 +2127,12 @@ void write_spine_loss_interval(uint32_t rank, uint64_t end_ns,
                                const std::vector<uint32_t> &sent,
                                const std::vector<uint32_t> &lost,
                                const std::vector<uint8_t> &grades) {
+  const std::vector<bool> rows = spine_loss_rows(rank, -1, sent, lost, grades);
   for (uint32_t spine = 0; spine < sent.size(); spine++)
-    fprintf(spine_loss_file, "%lu,%u,%u,%u,%u,%u\n",
-            static_cast<unsigned long>(end_ns), rank, spine, sent[spine],
-            lost[spine], grades[spine]);
+    if (rows[spine])
+      fprintf(spine_loss_file, "%lu,%u,%u,%u,%u,%u\n",
+              static_cast<unsigned long>(end_ns), rank, spine, sent[spine],
+              lost[spine], grades[spine]);
 }
 
 // A loss interval a destination leaf's loss hold closed under reps_hold, or
@@ -1513,10 +2143,24 @@ void write_leaf_spine_loss_interval(uint32_t rank, uint32_t leaf,
                                     const std::vector<uint32_t> &sent,
                                     const std::vector<uint32_t> &lost,
                                     const std::vector<uint8_t> &grades) {
+  const std::vector<bool> rows = spine_loss_rows(rank, leaf, sent, lost, grades);
   for (uint32_t spine = 0; spine < sent.size(); spine++)
-    fprintf(spine_loss_file, "%lu,%u,%u,%u,%u,%u,%u\n",
-            static_cast<unsigned long>(end_ns), rank, leaf, spine, sent[spine],
-            lost[spine], grades[spine]);
+    if (rows[spine])
+      fprintf(spine_loss_file, "%lu,%u,%u,%u,%u,%u,%u\n",
+              static_cast<unsigned long>(end_ns), rank, leaf, spine,
+              sent[spine], lost[spine], grades[spine]);
+}
+
+// A loss interval a destination host's loss hold closed under pair, as
+// write_leaf_spine_loss_interval writes it with the destination's node id
+// for the leaf.
+void write_pair_spine_loss_interval(uint32_t rank, uint32_t destination,
+                                    uint64_t end_ns,
+                                    const std::vector<uint32_t> &sent,
+                                    const std::vector<uint32_t> &lost,
+                                    const std::vector<uint8_t> &grades) {
+  write_leaf_spine_loss_interval(rank, ip_to_node_id(Ipv4Address(destination)),
+                                 end_ns, sent, lost, grades);
 }
 
 // A retransmission timeout a host's queue pair took.
@@ -1540,10 +2184,21 @@ void write_receiver_hold_interval(uint32_t rank, uint32_t leaf,
                                   const std::vector<uint32_t> &lost,
                                   const std::vector<uint8_t> &holds) {
   static const char *const scopes[] = {"none", "leaf", "host"};
+  const std::vector<bool> rows = receiver_hold_rows(rank, leaf, arrivals, lost, holds);
   for (uint32_t spine = 0; spine < arrivals.size(); spine++)
-    fprintf(receiver_hold_file, "%lu,%u,%u,%u,%u,%u,%s\n",
-            static_cast<unsigned long>(end_ns), rank, leaf, spine,
-            arrivals[spine], lost[spine], scopes[holds[spine]]);
+    if (rows[spine])
+      fprintf(receiver_hold_file, "%lu,%u,%u,%u,%u,%u,%s\n",
+              static_cast<unsigned long>(end_ns), rank, leaf, spine,
+              arrivals[spine], lost[spine], scopes[holds[spine]]);
+}
+
+void write_answer_hold(uint32_t rank, bool receiverSide, uint32_t leaf,
+                       uint32_t spine, bool held, uint64_t now_ns) {
+  if (answer_hold_file == nullptr)
+    return;
+  fprintf(answer_hold_file, "%lu,%s,%u,%u,%u,%d\n",
+          static_cast<unsigned long>(now_ns),
+          receiverSide ? "receiver" : "sender", rank, leaf, spine, held ? 1 : 0);
 }
 
 // The link events' applier, which keeps what a restore puts back.
@@ -1741,11 +2396,14 @@ bool valid_spray_policy() {
                  "SPRAY_GRADE_COST_SOURCE switch_queue\n";
     return false;
   }
-  if (spray_policy_keys_given.count("SPRAY_HELD_SENTINEL_INTERVAL_NS") > 0 &&
-      spray_held_exploration != "sentinel") {
-    std::cerr << "SPRAY_HELD_SENTINEL_INTERVAL_NS is read only with "
-                 "SPRAY_HELD_EXPLORATION sentinel\n";
-    return false;
+  for (const char *key : {"SPRAY_HELD_SENTINEL_INTERVAL_NS",
+                          "SPRAY_HELD_SENTINEL_SPREAD"}) {
+    if (spray_policy_keys_given.count(key) > 0 &&
+        spray_held_exploration != "sentinel") {
+      std::cerr << key << " is read only with SPRAY_HELD_EXPLORATION "
+                          "sentinel\n";
+      return false;
+    }
   }
   // Only the host's pool counts over loss intervals, and only the sender's
   // own counting, outside switch_queue, feeds it.
@@ -1806,7 +2464,8 @@ bool valid_loss_hold() {
   const bool trickle = spray_hold_release == "trickle";
   if (trickle) {
     for (const char *key : {"SPRAY_LOSS_HOLD_CLEAN_SENTINELS",
-                            "SPRAY_HELD_SENTINEL_INTERVAL_NS"}) {
+                            "SPRAY_HELD_SENTINEL_INTERVAL_NS",
+                            "SPRAY_HELD_SENTINEL_SPREAD"}) {
       if (spray_policy_keys_given.count(key) > 0) {
         std::cerr << key << " is read only under SPRAY_HOLD_RELEASE "
                             "sentinels\n";
@@ -1883,6 +2542,20 @@ bool valid_hold_rule() {
     std::cerr << "SPRAY_SENTINEL_MODE must be data or duplicate\n";
     return false;
   }
+  if (spray_copy_expiry != "data_ack" && spray_copy_expiry != "deadline") {
+    std::cerr << "SPRAY_COPY_EXPIRY must be data_ack or deadline\n";
+    return false;
+  }
+  if (spray_copy_expiry_given && spray_sentinel_mode != "duplicate") {
+    std::cerr << "SPRAY_COPY_EXPIRY is read only under SPRAY_SENTINEL_MODE "
+                 "duplicate\n";
+    return false;
+  }
+  if (spray_copy_expiry == "deadline" && !(spray_tail_loss_rtts > 0)) {
+    std::cerr << "SPRAY_COPY_EXPIRY deadline needs SPRAY_TAIL_LOSS_RTTS above "
+                 "0\n";
+    return false;
+  }
   if (spray_held_loss_rtts_given && !reps_hold()) {
     std::cerr << "SPRAY_HELD_LOSS_RTTS is read only under PATH_SELECTOR "
                  "reps_hold, reps_flow_hold or mrc_hold\n";
@@ -1890,6 +2563,53 @@ bool valid_hold_rule() {
   }
   if (!(spray_held_loss_rtts >= 0)) {
     std::cerr << "SPRAY_HELD_LOSS_RTTS must be at least 0\n";
+    return false;
+  }
+  if (spray_overdue_repair != "evidence" && spray_overdue_repair != "probe" &&
+      spray_overdue_repair != "reprobe" && spray_overdue_repair != "off") {
+    std::cerr << "SPRAY_OVERDUE_REPAIR must be evidence, probe, reprobe or off\n";
+    return false;
+  }
+  if (spray_overdue_repair_limit_given && spray_overdue_repair != "reprobe") {
+    std::cerr << "SPRAY_OVERDUE_REPAIR_LIMIT is read only under "
+                 "SPRAY_OVERDUE_REPAIR reprobe\n";
+    return false;
+  }
+  if (spray_overdue_repair_limit < 1) {
+    std::cerr << "SPRAY_OVERDUE_REPAIR_LIMIT must be at least 1\n";
+    return false;
+  }
+  if (spray_rack_reorder_ns_given && load_balancing != "spray_uniform") {
+    std::cerr << "SPRAY_RACK_REORDER_NS is read only under LOAD_BALANCING "
+                 "spray_uniform\n";
+    return false;
+  }
+  if (spray_rack_defer_loss != "on" && spray_rack_defer_loss != "off") {
+    std::cerr << "SPRAY_RACK_DEFER_LOSS must be on or off\n";
+    return false;
+  }
+  if (spray_rack_defer_loss_given &&
+      (spray_rack_reorder_ns == 0 || spray_tail_loss_rtts <= 0)) {
+    std::cerr << "SPRAY_RACK_DEFER_LOSS is read only under "
+                 "SPRAY_RACK_REORDER_NS and SPRAY_TAIL_LOSS_RTTS above 0\n";
+    return false;
+  }
+  // Without a loss hold, reps_spine, reps_oracle and the uniform draw read
+  // reprobe alone.
+  const bool overdue_without_hold =
+      load_balancing == "spray_uniform" &&
+      (path_selector == "reps_spine" || path_selector == "reps_oracle" ||
+       path_selector == "themis" || path_selector == "mrc_spine" ||
+       path_selector == "ue_aware_spine" || path_selector == "ops") &&
+      (spray_overdue_repair == "reprobe" || spray_overdue_repair == "off");
+  if (spray_overdue_repair_given &&
+      ((!reps_hold() && !overdue_without_hold) ||
+       !(spray_held_loss_rtts > 0))) {
+    std::cerr << "SPRAY_OVERDUE_REPAIR is read only under PATH_SELECTOR "
+                 "reps_hold, reps_flow_hold or mrc_hold, or as reprobe or "
+                 "off under reps_spine, reps_oracle, themis, mrc_spine, "
+                 "ue_aware_spine or the uniform draw, with SPRAY_HELD_LOSS_RTTS "
+                 "above 0\n";
     return false;
   }
   if (spray_hold_release_value() == std::numeric_limits<uint32_t>::max()) {
@@ -2073,6 +2793,8 @@ bool ReadConf(string network_configuration) {
       conf >> reps_buffer_size;
     } else if (key.compare("REPS_FREEZING_TIMEOUT_NS") == 0) {
       conf >> reps_freezing_timeout_ns;
+    } else if (key.compare("REPS_ORACLE_HOPS") == 0) {
+      conf >> reps_oracle_hops;
     } else if (key.compare("UE_EV_SET_SIZE") == 0) {
       conf >> ue_ev_set_size;
     } else if (key.compare("UE_SATURATION_FRACTION") == 0) {
@@ -2167,12 +2889,57 @@ bool ReadConf(string network_configuration) {
     } else if (key.compare("SPRAY_HOLD_RULE") == 0) {
       conf >> spray_hold_rule;
       spray_hold_rule_given = true;
+    } else if (key.compare("SPRAY_COPY_EXPIRY") == 0) {
+      conf >> spray_copy_expiry;
+      spray_copy_expiry_given = true;
     } else if (key.compare("SPRAY_SENTINEL_MODE") == 0) {
       conf >> spray_sentinel_mode;
       spray_sentinel_mode_given = true;
     } else if (key.compare("SPRAY_HELD_LOSS_RTTS") == 0) {
       conf >> spray_held_loss_rtts;
       spray_held_loss_rtts_given = true;
+    } else if (key.compare("SPRAY_OVERDUE_REPAIR") == 0) {
+      conf >> spray_overdue_repair;
+      spray_overdue_repair_given = true;
+    } else if (key.compare("SPRAY_OVERDUE_REPAIR_LIMIT") == 0) {
+      conf >> spray_overdue_repair_limit;
+      spray_overdue_repair_limit_given = true;
+    } else if (key.compare("SPRAY_RACK_REORDER_NS") == 0) {
+      conf >> spray_rack_reorder_ns;
+      spray_rack_reorder_ns_given = true;
+    } else if (key.compare("SPRAY_RACK_DEFER_LOSS") == 0) {
+      conf >> spray_rack_defer_loss;
+      spray_rack_defer_loss_given = true;
+    } else if (key.compare("SPRAY_THEMIS_PATHS") == 0) {
+      conf >> spray_themis_paths;
+    } else if (key.compare("SPRAY_THEMIS_OOO_THRESHOLD") == 0) {
+      conf >> spray_themis_ooo_threshold;
+    } else if (key.compare("SPRAY_THEMIS_STASH_MIN_NS") == 0) {
+      conf >> spray_themis_stash_min_ns;
+    } else if (key.compare("SPRAY_THEMIS_AVOIDANCE_WINDOW") == 0) {
+      conf >> spray_themis_avoidance_window;
+    } else if (key.compare("SPRAY_THEMIS_RETX_REROUTE") == 0) {
+      conf >> spray_themis_retx_reroute;
+    } else if (key.compare("SPRAY_THEMIS_LEAF_AVOIDANCE") == 0) {
+      conf >> spray_themis_leaf_avoidance;
+    } else if (key.compare("SPRAY_ACK_LOSS_RTTS") == 0) {
+      conf >> spray_ack_loss_rtts;
+      spray_ack_loss_rtts_given = true;
+    } else if (key.compare("ACK_ROUTE") == 0) {
+      conf >> ack_route;
+      ack_route_given = true;
+    } else if (key.compare("ACK_ROUTE_SET_SIZE") == 0) {
+      conf >> ack_route_set_size;
+      ack_route_set_size_given = true;
+    } else if (key.compare("ACK_ROUTE_SET_PROBE_RTTS") == 0) {
+      conf >> ack_route_set_probe_rtts;
+      ack_route_set_probe_rtts_given = true;
+    } else if (key.compare("ACK_ROUTE_SET_REPLY") == 0) {
+      conf >> ack_route_set_reply;
+      ack_route_set_reply_given = true;
+    } else if (key.compare("ACK_ROUTE_ORACLE") == 0) {
+      conf >> ack_route_oracle;
+      ack_route_oracle_given = true;
     } else if (key.compare("SPRAY_HOLD_RELEASE") == 0) {
       conf >> spray_hold_release;
       spray_hold_release_given = true;
@@ -2191,6 +2958,9 @@ bool ReadConf(string network_configuration) {
     } else if (key.compare("SPRAY_HOLD_BETA") == 0) {
       conf >> spray_hold_beta;
       hold_test_keys_given.insert(key);
+    } else if (key.compare("SPRAY_PATH_STATE") == 0) {
+      conf >> spray_path_state;
+      spray_path_state_given = true;
     } else if (key.compare("SPRAY_PATH_SEQ") == 0) {
       conf >> spray_path_seq;
       spray_path_seq_given = true;
@@ -2200,16 +2970,55 @@ bool ReadConf(string network_configuration) {
     } else if (key.compare("SPRAY_TAIL_RECOVERY_DELAY_NS") == 0) {
       conf >> spray_tail_recovery_delay_ns;
       spray_tail_recovery_delay_ns_given = true;
+    } else if (key.compare("SPRAY_TAIL_LOSS_RTTS") == 0) {
+      conf >> spray_tail_loss_rtts;
+      spray_tail_loss_rtts_given = true;
     } else if (key.compare("SPRAY_RECEIVER_HOLD") == 0) {
       conf >> spray_receiver_hold;
       spray_receiver_hold_given = true;
     } else if (key.compare("SPRAY_RECEIVER_HOLD_CLEAN") == 0) {
       conf >> spray_receiver_hold_clean;
       spray_receiver_hold_clean_given = true;
+    } else if (key.compare("SPRAY_RECEIVER_HOLD_SLOTS") == 0) {
+      conf >> spray_receiver_hold_slots;
+    } else if (key.compare("SPRAY_RECEIVER_HOLD_WIDEN") == 0) {
+      conf >> spray_receiver_hold_widen;
+    } else if (key.compare("SPRAY_RECEIVER_HOLD_AUTO_LEAVES") == 0) {
+      conf >> spray_receiver_hold_auto_leaves;
+      spray_receiver_hold_auto_leaves_given = true;
+    } else if (key.compare("SPRAY_RECEIVER_TAIL_MISSING") == 0) {
+      conf >> spray_receiver_tail_missing;
+      spray_receiver_tail_missing_given = true;
+    } else if (key.compare("SPRAY_STRAY_PATH_SEQ") == 0) {
+      conf >> spray_stray_path_seq;
+      spray_stray_path_seq_given = true;
+    } else if (key.compare("SPRAY_COVERAGE_FIRST") == 0) {
+      conf >> spray_coverage_first;
+      spray_coverage_first_given = true;
+    } else if (key.compare("SPRAY_DUPLICATE_REPORT") == 0) {
+      conf >> spray_duplicate_report;
+      spray_duplicate_report_given = true;
+    } else if (key.compare("SPRAY_ANSWER_PATH_SEQ") == 0) {
+      conf >> spray_answer_path_seq;
+      spray_answer_path_seq_given = true;
+    } else if (key.compare("SPRAY_ANSWER_PROBE_INTERVAL_NS") == 0) {
+      conf >> spray_answer_probe_interval_ns;
+      spray_answer_probe_interval_ns_given = true;
+    } else if (key.compare("SPRAY_ANSWER_HOLD_CLEAN") == 0) {
+      conf >> spray_answer_hold_clean;
+      spray_answer_hold_clean_given = true;
+    } else if (key.compare("ANSWER_HOLD_OUTPUT_FILE") == 0) {
+      conf >> answer_hold_output_file;
     } else if (key.compare("SPRAY_HELD_EXPLORATION") == 0) {
       conf >> spray_held_exploration;
     } else if (key.compare("SPRAY_HELD_SENTINEL_INTERVAL_NS") == 0) {
       conf >> spray_held_sentinel_interval_ns;
+    } else if (key.compare("SPRAY_HELD_SENTINEL_SPREAD") == 0) {
+      conf >> spray_held_sentinel_spread;
+      if (spray_held_sentinel_spread < 1) {
+        std::cerr << "SPRAY_HELD_SENTINEL_SPREAD must be at least 1\n";
+        return false;
+      }
 	} else if (key.compare("PACKET_TRIM_MODE") == 0) {
 	  conf >> packet_trim_mode;
 	} else if (key.compare("PACKET_TRIM_QUEUE") == 0) {
@@ -2228,6 +3037,14 @@ bool ReadConf(string network_configuration) {
 	  conf >> trimmed_queue_bytes;
     } else if (key.compare("CC_MODE") == 0) {
       conf >> cc_mode;
+    } else if (key.compare("NSCC_RTT_SAMPLE") == 0) {
+      conf >> nscc_rtt_sample;
+      nscc_rtt_sample_given = true;
+    } else if (key.compare("PAIR_BANDWIDTH") == 0) {
+      conf >> pair_bandwidth;
+    } else if (key.compare("NSCC_WINDOW_STATE") == 0) {
+      conf >> nscc_window_state;
+      nscc_window_state_given = true;
     } else if (key.compare("RATE_DECREASE_INTERVAL") == 0) {
       double v;
       conf >> v;
@@ -2274,12 +3091,50 @@ bool ReadConf(string network_configuration) {
       conf >> transport_event_summary_output_file;
     } else if (key.compare("PORT_COUNTER_OUTPUT_FILE") == 0) {
       conf >> port_counter_output_file;
+    } else if (key.compare("PORT_COUNTER_INTERVAL_NS") == 0) {
+      conf >> port_counter_interval_ns;
+    } else if (key.compare("SWITCH_QUEUE_OUTPUT_FILE") == 0) {
+      conf >> switch_queue_output_file;
     } else if (key.compare("SPINE_ARRIVAL_OUTPUT_FILE") == 0) {
       conf >> spine_arrival_output_file;
     } else if (key.compare("SPINE_REPORT_OUTPUT_FILE") == 0) {
       conf >> spine_report_output_file;
     } else if (key.compare("SPINE_LOSS_OUTPUT_FILE") == 0) {
       conf >> spine_loss_output_file;
+    } else if (key.compare("SPINE_LOSS_SPARSE") == 0) {
+      std::string value;
+      conf >> value;
+      if (value != "on" && value != "off") {
+        std::cerr << "SPINE_LOSS_SPARSE must be on or off\n";
+        return false;
+      }
+      spine_loss_sparse = value == "on";
+    } else if (key.compare("RECEIVER_HOLD_SPARSE") == 0) {
+      std::string value;
+      conf >> value;
+      if (value != "on" && value != "off") {
+        std::cerr << "RECEIVER_HOLD_SPARSE must be on or off\n";
+        return false;
+      }
+      receiver_hold_sparse = value == "on";
+    } else if (key.compare("HOLD_TRACE_HOSTS") == 0) {
+      uint32_t count = 0;
+      conf >> count;
+      for (uint32_t k = 0; k < count; k++) {
+        uint32_t node = 0;
+        conf >> node;
+        hold_trace_hosts.insert(node);
+      }
+      hold_trace_hosts_given = true;
+    } else if (key.compare("TRANSPORT_EVENT_HOSTS") == 0) {
+      uint32_t count = 0;
+      conf >> count;
+      for (uint32_t k = 0; k < count; k++) {
+        uint32_t node = 0;
+        conf >> node;
+        transport_event_hosts.insert(node);
+      }
+      transport_event_hosts_given = true;
     } else if (key.compare("RTO_EVENT_OUTPUT_FILE") == 0) {
       conf >> rto_event_output_file;
     } else if (key.compare("RECEIVER_HOLD_OUTPUT_FILE") == 0) {
@@ -2318,22 +3173,47 @@ bool ReadConf(string network_configuration) {
       }
       if (failure.kind == LinkEventKind::Loss ||
           failure.kind == LinkEventKind::Rate) {
-        // An optional last token on the line: both, the default, or forward,
-        // the direction from the first node named to the second alone.
-        std::string rest, direction, extra;
+        // Optional last tokens on the line: both, the default, or forward,
+        // the direction from the first node named to the second alone; then,
+        // under loss, byte and the bytes of the full data frame the rate was
+        // derived at, the rate being each byte's.
+        std::string rest, word;
         std::getline(conf, rest);
         std::istringstream tokens(rest);
-        tokens >> direction >> extra;
-        if (direction == "forward") {
-          failure.direction = LinkDirection::Forward;
-        } else if (!direction.empty() && direction != "both") {
+        std::vector<std::string> words;
+        while (tokens >> word)
+          words.push_back(word);
+        size_t next = 0;
+        if (next < words.size() &&
+            (words[next] == "forward" || words[next] == "both")) {
+          if (words[next] == "forward")
+            failure.direction = LinkDirection::Forward;
+          next++;
+        }
+        if (failure.kind == LinkEventKind::Loss && next < words.size() &&
+            words[next] == "byte") {
+          std::istringstream frame(next + 1 < words.size() ? words[next + 1]
+                                                           : "");
+          if (!(frame >> failure.frameBytes) || failure.frameBytes == 0 ||
+              !frame.eof()) {
+            std::cerr << "LINK_FAILURE loss byte needs the data frame's "
+                         "bytes\n";
+            return false;
+          }
+          failure.unit = RateErrorModel::ERROR_UNIT_BYTE;
+          next += 2;
+        }
+        if (next == 0 && !words.empty()) {
           std::cerr << "LINK_FAILURE " << kind
                     << " direction must be forward or both\n";
           return false;
         }
-        if (!extra.empty()) {
-          std::cerr << "LINK_FAILURE " << kind
-                    << " takes nothing after its direction\n";
+        if (next < words.size()) {
+          std::cerr << "LINK_FAILURE " << kind << " takes nothing after its "
+                    << (failure.unit == RateErrorModel::ERROR_UNIT_BYTE
+                            ? "unit"
+                            : "direction")
+                    << "\n";
           return false;
         }
       }
@@ -2354,6 +3234,19 @@ bool ReadConf(string network_configuration) {
       link_events.push_back(restore);
     } else if (key.compare("ENABLE_TRACE") == 0) {
       conf >> enable_trace;
+    } else if (key.compare("DATA_QUEUE_BYTES_MAP") == 0 ||
+               key.compare("TRIMMED_QUEUE_BYTES_MAP") == 0) {
+      map<uint64_t, uint32_t> &rows = key.compare("DATA_QUEUE_BYTES_MAP") == 0
+                                          ? rate2data_queue_bytes
+                                          : rate2trimmed_queue_bytes;
+      int n_k;
+      conf >> n_k;
+      for (int i = 0; i < n_k; i++) {
+        uint64_t rate;
+        uint32_t bytes;
+        conf >> rate >> bytes;
+        rows[rate] = bytes;
+      }
     } else if (key.compare("KMAX_MAP") == 0) {
       int n_k;
       conf >> n_k;
@@ -2500,6 +3393,11 @@ bool ReadConf(string network_configuration) {
                  "3.6.4.5 excludes PFC from best-effort networks\n";
     return false;
   }
+  if (rate2data_queue_bytes.empty() != rate2trimmed_queue_bytes.empty()) {
+    std::cerr << "DATA_QUEUE_BYTES_MAP and TRIMMED_QUEUE_BYTES_MAP are read "
+                 "together\n";
+    return false;
+  }
   if (packet_trim_mode_value() !=
           static_cast<uint32_t>(PacketTrimMode::Disabled) &&
       data_queue_bytes == 0) {
@@ -2555,7 +3453,8 @@ bool ReadConf(string network_configuration) {
   if (path_selector_value() == std::numeric_limits<uint32_t>::max()) {
     std::cerr << "PATH_SELECTOR must be ops, reps, ue_oblivious, ue_aware, mrc, "
                  "ack_redirect, reps_hold, reps_flow_hold, reps_oracle, "
-                 "mrc_hold or reps_spine\n";
+                 "mrc_hold, reps_spine, themis, themis_hold, mrc_spine or "
+                 "ue_aware_spine\n";
     return false;
   }
   if (reps_hold()) {
@@ -2579,9 +3478,24 @@ bool ReadConf(string network_configuration) {
       return false;
     }
   }
-  if (path_selector == "reps_spine" && load_balancing != "spray_uniform") {
+  if (reps_oracle_hops != "round_trip" && reps_oracle_hops != "forward") {
+    std::cerr << "REPS_ORACLE_HOPS must be round_trip or forward\n";
+    return false;
+  }
+  if ((path_selector == "reps_spine" || path_selector == "themis" ||
+       path_selector == "themis_hold" || path_selector == "mrc_spine" ||
+       path_selector == "ue_aware_spine") &&
+      load_balancing != "spray_uniform") {
     std::cerr << "PATH_SELECTOR " << path_selector
               << " names spines and requires LOAD_BALANCING spray_uniform\n";
+    return false;
+  }
+  if (spray_themis_retx_reroute != "on" && spray_themis_retx_reroute != "off") {
+    std::cerr << "SPRAY_THEMIS_RETX_REROUTE must be on or off\n";
+    return false;
+  }
+  if (spray_themis_leaf_avoidance != "on" && spray_themis_leaf_avoidance != "off") {
+    std::cerr << "SPRAY_THEMIS_LEAF_AVOIDANCE must be on or off\n";
     return false;
   }
   if (spray_hold_scope_given && !hold_scope_read()) {
@@ -2590,7 +3504,7 @@ bool ReadConf(string network_configuration) {
     return false;
   }
   if (spray_hold_scope_value() == std::numeric_limits<uint32_t>::max()) {
-    std::cerr << "SPRAY_HOLD_SCOPE must be host, leaf or auto\n";
+    std::cerr << "SPRAY_HOLD_SCOPE must be host, leaf, auto or pair\n";
     return false;
   }
   if (spray_hold_auto_leaves_given &&
@@ -2616,6 +3530,72 @@ bool ReadConf(string network_configuration) {
                  "spray_uniform\n";
     return false;
   }
+  if (spray_path_state != "message" && spray_path_state != "connection") {
+    std::cerr << "SPRAY_PATH_STATE must be message or connection\n";
+    return false;
+  }
+  if (spray_path_state_given && load_balancing != "spray_uniform") {
+    std::cerr << "SPRAY_PATH_STATE is read only under LOAD_BALANCING "
+                 "spray_uniform\n";
+    return false;
+  }
+  if (spray_ack_loss_rtts_given && load_balancing != "spray_uniform") {
+    std::cerr << "SPRAY_ACK_LOSS_RTTS is read only under LOAD_BALANCING "
+                 "spray_uniform\n";
+    return false;
+  }
+  if (!(spray_ack_loss_rtts >= 0)) {
+    std::cerr << "SPRAY_ACK_LOSS_RTTS must be at least 0\n";
+    return false;
+  }
+  if (ack_route != "data_spine" && ack_route != "spray" &&
+      ack_route != "reverse_set" && ack_route != "repath") {
+    std::cerr << "ACK_ROUTE must be data_spine, spray, reverse_set or repath\n";
+    return false;
+  }
+  if (ack_route_set_size_given && ack_route != "reverse_set") {
+    std::cerr << "ACK_ROUTE_SET_SIZE is read only under ACK_ROUTE reverse_set\n";
+    return false;
+  }
+  if (ack_route_set_probe_rtts_given && ack_route != "reverse_set") {
+    std::cerr << "ACK_ROUTE_SET_PROBE_RTTS is read only under ACK_ROUTE "
+                 "reverse_set\n";
+    return false;
+  }
+  if (ack_route_set_reply_given && ack_route != "reverse_set") {
+    std::cerr << "ACK_ROUTE_SET_REPLY is read only under ACK_ROUTE "
+                 "reverse_set\n";
+    return false;
+  }
+  if (ack_route_set_reply != "data" && ack_route_set_reply != "answer") {
+    std::cerr << "ACK_ROUTE_SET_REPLY must be data or answer\n";
+    return false;
+  }
+  if (!(ack_route_set_probe_rtts > 0)) {
+    std::cerr << "ACK_ROUTE_SET_PROBE_RTTS must be above zero\n";
+    return false;
+  }
+  if (ack_route_set_size == 0) {
+    std::cerr << "ACK_ROUTE_SET_SIZE must be above zero\n";
+    return false;
+  }
+  if (ack_route == "repath" && spray_tail_recovery != "on") {
+    std::cerr << "ACK_ROUTE repath tells a copied send by its tail flags and "
+                 "needs SPRAY_TAIL_RECOVERY on\n";
+    return false;
+  }
+  if (ack_route_given && load_balancing != "spray_uniform") {
+    std::cerr << "ACK_ROUTE is read only under LOAD_BALANCING spray_uniform\n";
+    return false;
+  }
+  if (ack_route_oracle != "on" && ack_route_oracle != "off") {
+    std::cerr << "ACK_ROUTE_ORACLE must be on or off\n";
+    return false;
+  }
+  if (ack_route_oracle_given && !ack_route_spray()) {
+    std::cerr << "ACK_ROUTE_ORACLE is read only under ACK_ROUTE spray\n";
+    return false;
+  }
   if (spray_tail_recovery != "on" && spray_tail_recovery != "off") {
     std::cerr << "SPRAY_TAIL_RECOVERY must be on or off\n";
     return false;
@@ -2637,6 +3617,15 @@ bool ReadConf(string network_configuration) {
   if (spray_tail_recovery_delay_ns_given &&
       spray_tail_recovery_delay_ns == RdmaHw::kTailDelayBaseRtt) {
     std::cerr << "SPRAY_TAIL_RECOVERY_DELAY_NS is out of range\n";
+    return false;
+  }
+  if (spray_tail_loss_rtts_given && !tail_recovery()) {
+    std::cerr << "SPRAY_TAIL_LOSS_RTTS is read only with "
+                 "SPRAY_TAIL_RECOVERY on\n";
+    return false;
+  }
+  if (!(spray_tail_loss_rtts >= 0)) {
+    std::cerr << "SPRAY_TAIL_LOSS_RTTS must be at least 0\n";
     return false;
   }
   if (spray_receiver_hold != "on" && spray_receiver_hold != "off") {
@@ -2662,6 +3651,103 @@ bool ReadConf(string network_configuration) {
     std::cerr << "SPRAY_RECEIVER_HOLD_CLEAN must be above zero\n";
     return false;
   }
+  if (spray_receiver_hold_slots > 0 && !receiver_hold()) {
+    std::cerr << "SPRAY_RECEIVER_HOLD_SLOTS is read only with "
+                 "SPRAY_RECEIVER_HOLD on\n";
+    return false;
+  }
+  if (spray_receiver_hold_slots > kMaxSpineListSlots) {
+    std::cerr << "SPRAY_RECEIVER_HOLD_SLOTS must be at most "
+              << kMaxSpineListSlots << "\n";
+    return false;
+  }
+  if (spray_receiver_hold_widen > 0 &&
+      (!receiver_hold() || path_selector == "reps_flow_hold")) {
+    std::cerr << "SPRAY_RECEIVER_HOLD_WIDEN is read only with "
+                 "SPRAY_RECEIVER_HOLD on, under reps_hold or mrc_hold\n";
+    return false;
+  }
+  if (spray_receiver_hold_widen == 1) {
+    std::cerr << "SPRAY_RECEIVER_HOLD_WIDEN must be 0 or at least 2\n";
+    return false;
+  }
+  if (spray_receiver_hold_auto_leaves_given &&
+      (!receiver_hold() || spray_receiver_hold_auto_leaves < 1)) {
+    std::cerr << "SPRAY_RECEIVER_HOLD_AUTO_LEAVES is read only with "
+                 "SPRAY_RECEIVER_HOLD on and must be at least 1\n";
+    return false;
+  }
+  if (spray_receiver_tail_missing != "on" &&
+      spray_receiver_tail_missing != "off") {
+    std::cerr << "SPRAY_RECEIVER_TAIL_MISSING must be on or off\n";
+    return false;
+  }
+  if (spray_receiver_tail_missing_given &&
+      (!receiver_hold() || !tail_recovery())) {
+    std::cerr << "SPRAY_RECEIVER_TAIL_MISSING is read only with "
+                 "SPRAY_RECEIVER_HOLD and SPRAY_TAIL_RECOVERY on\n";
+    return false;
+  }
+  if (spray_stray_path_seq != "fresh" && spray_stray_path_seq != "closed") {
+    std::cerr << "SPRAY_STRAY_PATH_SEQ must be fresh or closed\n";
+    return false;
+  }
+  if (spray_stray_path_seq_given && spray_path_seq != "on") {
+    std::cerr << "SPRAY_STRAY_PATH_SEQ is read only with SPRAY_PATH_SEQ on\n";
+    return false;
+  }
+  if (spray_coverage_first != "on" && spray_coverage_first != "off") {
+    std::cerr << "SPRAY_COVERAGE_FIRST must be on or off\n";
+    return false;
+  }
+  if (spray_coverage_first_given && load_balancing != "spray_uniform") {
+    std::cerr << "SPRAY_COVERAGE_FIRST is read only under LOAD_BALANCING "
+                 "spray_uniform\n";
+    return false;
+  }
+  if (spray_duplicate_report != "on" && spray_duplicate_report != "off" &&
+      spray_duplicate_report != "retract") {
+    std::cerr << "SPRAY_DUPLICATE_REPORT must be on, off or retract\n";
+    return false;
+  }
+  if (spray_duplicate_report == "retract" &&
+      (!hold_scope_read() || spray_hold_scope != "auto" ||
+       spray_hold_rule != "count")) {
+    std::cerr << "SPRAY_DUPLICATE_REPORT retract takes losses back from "
+                 "PATH_SELECTOR reps_hold's, mrc_hold's or themis_hold's loss "
+                 "hold under SPRAY_HOLD_SCOPE auto and SPRAY_HOLD_RULE count\n";
+    return false;
+  }
+  if (spray_duplicate_report_given && spray_coverage_first != "on") {
+    std::cerr << "SPRAY_DUPLICATE_REPORT is read only with SPRAY_COVERAGE_FIRST "
+                 "on\n";
+    return false;
+  }
+  if (spray_answer_path_seq != "on" && spray_answer_path_seq != "off") {
+    std::cerr << "SPRAY_ANSWER_PATH_SEQ must be on or off\n";
+    return false;
+  }
+  if (spray_answer_path_seq_given &&
+      (load_balancing != "spray_uniform" || !reps_hold() ||
+       spray_path_seq != "on" || ack_route != "spray")) {
+    std::cerr << "SPRAY_ANSWER_PATH_SEQ is read only under ACK_ROUTE spray "
+                 "with SPRAY_PATH_SEQ on and PATH_SELECTOR reps_hold, "
+                 "reps_flow_hold or mrc_hold\n";
+    return false;
+  }
+  if ((spray_answer_probe_interval_ns_given || spray_answer_hold_clean_given ||
+       !answer_hold_output_file.empty()) &&
+      !answer_path_seq()) {
+    std::cerr << "SPRAY_ANSWER_PROBE_INTERVAL_NS, SPRAY_ANSWER_HOLD_CLEAN and "
+                 "ANSWER_HOLD_OUTPUT_FILE are read only with "
+                 "SPRAY_ANSWER_PATH_SEQ on\n";
+    return false;
+  }
+  if (spray_answer_probe_interval_ns == 0 || spray_answer_hold_clean == 0) {
+    std::cerr << "SPRAY_ANSWER_PROBE_INTERVAL_NS and SPRAY_ANSWER_HOLD_CLEAN "
+                 "must be above zero\n";
+    return false;
+  }
   if (!receiver_hold_output_file.empty() && !receiver_hold()) {
     std::cerr << "RECEIVER_HOLD_OUTPUT_FILE is read only with "
                  "SPRAY_RECEIVER_HOLD on\n";
@@ -2677,6 +3763,8 @@ bool ReadConf(string network_configuration) {
       return false;
   } else if (path_selector != "ops" && !reps_hold() &&
              path_selector != "reps_oracle" && path_selector != "reps_spine" &&
+             path_selector != "themis" && path_selector != "mrc_spine" &&
+             path_selector != "ue_aware_spine" &&
              load_balancing_value() !=
                  static_cast<uint32_t>(LoadBalancingMode::EntropyHash)) {
     std::cerr << "PATH_SELECTOR " << path_selector
@@ -2718,6 +3806,31 @@ bool ReadConf(string network_configuration) {
   // its window from it.
   if (cc_mode == 11 && has_win == 0) {
     std::cerr << "CC_MODE 11 (NSCC) requires HAS_WIN 1\n";
+    return false;
+  }
+  if (nscc_window_state != "message" && nscc_window_state != "connection") {
+    std::cerr << "NSCC_WINDOW_STATE must be message or connection\n";
+    return false;
+  }
+  if (nscc_window_state_given && cc_mode != 11) {
+    std::cerr << "NSCC_WINDOW_STATE is read only under CC_MODE 11 (NSCC)\n";
+    return false;
+  }
+  if (nscc_rtt_sample != "any" && nscc_rtt_sample != "karn") {
+    std::cerr << "NSCC_RTT_SAMPLE must be any or karn\n";
+    return false;
+  }
+  if (nscc_rtt_sample_given && cc_mode != 11) {
+    std::cerr << "NSCC_RTT_SAMPLE is read only under CC_MODE 11 (NSCC)\n";
+    return false;
+  }
+  if (pair_bandwidth != "path" && pair_bandwidth != "spines") {
+    std::cerr << "PAIR_BANDWIDTH must be path or spines\n";
+    return false;
+  }
+  if (pair_bandwidth == "spines" && !names_spine()) {
+    std::cerr << "PAIR_BANDWIDTH spines needs a LOAD_BALANCING mode that "
+                 "names spines\n";
     return false;
   }
   if (load_balancing_value() != static_cast<uint32_t>(LoadBalancingMode::Ecmp) &&
@@ -2782,7 +3895,12 @@ void SetConfig() {
   CustomHeader::ackRedirectBytes = path_selector == "ack_redirect" ? 1 : 0;
   CustomHeader::udpCarriesPathSeq = spray_path_seq == "on";
   CustomHeader::ackReceiverHoldBytes = receiver_hold() ? 1 : 0;
+  CustomHeader::ackReceiverHoldSlots =
+      receiver_hold() ? spray_receiver_hold_slots : 0;
   CustomHeader::ackTailNackBytes = tail_recovery() ? 5 : 0;
+  CustomHeader::ackRouteSpineBytes = ack_route_named() ? 1 : 0;
+  CustomHeader::ackAnswerSeqBytes = answer_path_seq() ? 5 : 0;
+  CustomHeader::udpAnswerHoldBytes = answer_path_seq() ? 1 : 0;
 
   // Set Pint
   if (cc_mode == 10) {
@@ -2915,6 +4033,43 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),
     std::cerr << "Error: cannot open PFC or transport event output files\n";
     return false;
   }
+  // Written under every mode, zero where SPRAY_ACK_LOSS_RTTS is off.
+  transport_event_totals[{"ack_loss_declared", "control"}];
+  // Written under every mode, zero where SPRAY_TAIL_LOSS_RTTS defers nothing.
+  transport_event_totals[{"tail_loss_cancelled", "control"}];
+  transport_event_totals[{"tail_loss_delivered", "control"}];
+  transport_event_totals[{"tail_repair_rerouted", "control"}];
+  transport_event_totals[{"tail_loss_ambiguous", "control"}];
+  // Written under every mode, zero where SPRAY_RECEIVER_TAIL_MISSING is off;
+  // their breakdowns by spine only where a spine has one.
+  transport_event_totals[{"receiver_tail_missing", "control"}];
+  transport_event_totals[{"receiver_tail_missing_late", "control"}];
+  // Written under every mode; their breakdowns by spine only where a spine
+  // has one.
+  transport_event_totals[{"answer_drop_up", "control"}];
+  transport_event_totals[{"answer_drop_down", "control"}];
+  // Written where their key is on.
+  if (spray_coverage_first == "on")
+    transport_event_totals[{"answer_loss_covered", "control"}];
+  if (spray_duplicate_report != "off")
+    for (const char *event : {"answer_loss_duplicate", "timeout_loss_data"})
+      transport_event_totals[{event, "control"}];
+  if (spray_duplicate_report == "retract")
+    transport_event_totals[{"timeout_retract_release", "control"}];
+  if (spray_overdue_repair != "off")
+    for (const char *event : {"overdue_repair", "overdue_repair_spurious"})
+      transport_event_totals[{event, "control"}];
+  if (spray_overdue_repair != "off" && spray_duplicate_report != "off")
+    transport_event_totals[{"timeout_loss_data_covered", "control"}];
+  if (answer_path_seq())
+    for (const char *event : {"answer_route_lost", "answer_route_hold",
+                              "answer_route_release", "answer_probe"})
+      transport_event_totals[{event, "control"}];
+  if (ack_route == "reverse_set")
+    for (const char *event : {"answer_set_probe", "answer_set_replace"})
+      transport_event_totals[{event, "control"}];
+  if (ack_route == "repath")
+    transport_event_totals[{"answer_repath", "control"}];
   // The totals must land even when a watchdog exits the run mid-simulation.
   std::atexit(write_transport_event_summary);
   ZSTD_CCtx_setParameter(transport_event_raw_cctx, ZSTD_c_compressionLevel, 8);
@@ -2939,6 +4094,8 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),
     if (n.Get(i)->GetNodeType() == 1) {
       Ptr<SwitchNode> sw = DynamicCast<SwitchNode>(n.Get(i));
       sw->SetAttribute("AckHighPrio", UintegerValue(ack_high_prio));
+      sw->SetAttribute("RouteProbeReplyAsAnswer",
+                       BooleanValue(ack_route_set_reply == "answer"));
         sw->SetAttribute("PacketTrimMode",
                  UintegerValue(packet_trim_mode_value()));
       sw->SetAttribute("TrimmedQueueIndex", UintegerValue(packet_trim_queue));
@@ -3087,10 +4244,30 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),
         sw->m_mmu->ConfigEgressThreshold(q, data_queue_bytes);
       }
       sw->m_mmu->ConfigEgressThreshold(packet_trim_queue, trimmed_queue_bytes);
+      // Under the maps each port's thresholds are its link speed's.
+      for (uint32_t j = 1; j < sw->GetNDevices() && !rate2data_queue_bytes.empty();
+           j++) {
+        const uint64_t rate = DynamicCast<QbbNetDevice>(sw->GetDevice(j))
+                                  ->GetDataRate()
+                                  .GetBitRate();
+        if (rate2data_queue_bytes.count(rate) == 0 ||
+            rate2trimmed_queue_bytes.count(rate) == 0) {
+          std::cerr << "DATA_QUEUE_BYTES_MAP and TRIMMED_QUEUE_BYTES_MAP have "
+                       "no row for a switch port of "
+                    << rate << " bps\n";
+          return false;
+        }
+        for (uint32_t q = 1; q < 8; q++) {
+          sw->m_mmu->ConfigEgressThreshold(j, q, rate2data_queue_bytes[rate]);
+        }
+        sw->m_mmu->ConfigEgressThreshold(j, packet_trim_queue,
+                                         rate2trimmed_queue_bytes[rate]);
+      }
       sw->m_mmu->node_id = sw->GetId();
     }
   }
 
+  FindSpineLinkReceivers(n);
   uint32_t spine_count = 0;
   if (names_spine()) {
     spine_count = AssignSpinePorts(n);
@@ -3098,6 +4275,12 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),
       std::cerr << "LOAD_BALANCING " << load_balancing
                 << " needs a leaf-spine fabric in which every leaf links to "
                    "every spine\n";
+      return false;
+    }
+    if (spine_count > kMaxSpineCount) {
+      std::cerr << "LOAD_BALANCING " << load_balancing
+                << " names a spine in a byte of the identification, at most "
+                << kMaxSpineCount << " spines\n";
       return false;
     }
   }
@@ -3125,15 +4308,39 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),
     return false;
   }
   CustomHeader::udpTailCounts = tail_recovery() ? spine_count : 0;
+  if (ack_route == "reverse_set" && ack_route_set_size > spine_count) {
+    std::cerr << "ACK_ROUTE_SET_SIZE is at most the fabric's " << spine_count
+              << " spines\n";
+    return false;
+  }
   if (receiver_hold() && spine_count > kReceiverHoldSpines) {
     std::cerr << "SPRAY_RECEIVER_HOLD holds at most " << kReceiverHoldSpines
               << " spines\n";
     return false;
   }
-  // The switches' state, which leaf_hold and receiver_hold read only for the
-  // hosts' leaves.
+  // SetConfig sized the spine fields and bitmaps in a byte; they take the
+  // bytes the fabric's spines need, one up to 8 spines.
+  if (spine_count > 0) {
+    if (CustomHeader::ackRedirectBytes > 0)
+      CustomHeader::ackRedirectBytes = SpineFieldBytes(spine_count);
+    if (CustomHeader::ackReceiverHoldBytes > 0)
+      CustomHeader::ackReceiverHoldBytes =
+          spray_receiver_hold_slots > 0
+              ? SpineListBytes(spray_receiver_hold_slots)
+              : SpineBitmapBytes(spine_count);
+    if (CustomHeader::ackRouteSpineBytes > 0)
+      CustomHeader::ackRouteSpineBytes = SpineFieldBytes(spine_count);
+    if (CustomHeader::ackAnswerSeqBytes > 0)
+      CustomHeader::ackAnswerSeqBytes = 4 + SpineFieldBytes(spine_count);
+    if (CustomHeader::udpAnswerHoldBytes > 0)
+      CustomHeader::udpAnswerHoldBytes = SpineBitmapBytes(spine_count);
+  }
+  // The switches' state, which leaf_hold, receiver_hold and
+  // SPRAY_ANSWER_PATH_SEQ read only for the hosts' leaves.
   const Ptr<SwitchQueueState> switch_queues =
-      switch_queue_cost() || leaf_hold() || reps_oracle() || receiver_hold()
+      switch_queue_cost() || leaf_hold() || reps_oracle() || receiver_hold() ||
+              ack_route_oracle_on() || answer_path_seq() ||
+              spray_themis_leaf_avoidance == "on"
           ? BuildSwitchQueueState(n)
           : nullptr;
   // One variable for every host, so the draw consumes a single fixed stream.
@@ -3177,6 +4384,16 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),
       rdmaHw->SetAttribute("SelectiveRetransmission",
                BooleanValue(selective_retransmission != 0));
       rdmaHw->SetAttribute("CcMode", UintegerValue(cc_mode));
+      rdmaHw->SetAttribute(
+          "NsccWindowState",
+          UintegerValue(static_cast<uint32_t>(
+              nscc_window_state == "connection" ? NsccWindowState::Connection
+                                                : NsccWindowState::Message)));
+      rdmaHw->SetAttribute(
+          "NsccRttSample",
+          UintegerValue(static_cast<uint32_t>(nscc_rtt_sample == "karn"
+                                                  ? NsccRttSample::Karn
+                                                  : NsccRttSample::Any)));
       rdmaHw->SetAttribute("RateDecreaseInterval",
                            DoubleValue(rate_decrease_interval));
       rdmaHw->SetAttribute("MinRate", DataRateValue(DataRate(min_rate)));
@@ -3202,6 +4419,11 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),
       rdmaHw->SetAttribute("RepsBufferSize", UintegerValue(reps_buffer_size));
       rdmaHw->SetAttribute("RepsFreezingTimeoutNs",
                            UintegerValue(reps_freezing_timeout_ns));
+      rdmaHw->SetAttribute(
+          "RepsOracleHops",
+          UintegerValue(static_cast<uint32_t>(reps_oracle_hops == "forward"
+                                                  ? OracleHops::Forward
+                                                  : OracleHops::RoundTrip)));
       rdmaHw->SetAttribute("SprayHoldScope",
                            UintegerValue(spray_hold_scope_value()));
       rdmaHw->SetAttribute("SprayHoldAutoLeaves",
@@ -3217,8 +4439,66 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),
       rdmaHw->SetAttribute("SprayHoldTrickle", DoubleValue(spray_hold_trickle));
       rdmaHw->SetAttribute("SpraySentinelMode",
                            UintegerValue(spray_sentinel_mode_value()));
+      rdmaHw->SetAttribute(
+          "SprayCopyExpiry",
+          UintegerValue(static_cast<uint32_t>(spray_copy_expiry == "deadline"
+                                                  ? CopyExpiry::Deadline
+                                                  : CopyExpiry::DataAck)));
       rdmaHw->SetAttribute("SprayHeldLossRtts",
                            DoubleValue(spray_held_loss_rtts));
+      rdmaHw->SetAttribute(
+          "SprayOverdueRepair",
+          UintegerValue(static_cast<uint32_t>(
+              spray_overdue_repair == "probe"      ? OverdueRepair::Probe
+              : spray_overdue_repair == "reprobe"  ? OverdueRepair::Reprobe
+              : spray_overdue_repair == "evidence" ? OverdueRepair::Evidence
+                                                   : OverdueRepair::Off)));
+      rdmaHw->SetAttribute("SprayOverdueRepairLimit",
+                           UintegerValue(spray_overdue_repair_limit));
+      rdmaHw->SetAttribute("SprayRackReorderNs",
+                           UintegerValue(spray_rack_reorder_ns));
+      rdmaHw->SetAttribute("SprayRackDeferLoss",
+                           BooleanValue(spray_rack_defer_loss == "on"));
+      rdmaHw->SetAttribute("SprayThemisPaths", UintegerValue(spray_themis_paths));
+      rdmaHw->SetAttribute("SprayThemisOooThreshold",
+                           UintegerValue(spray_themis_ooo_threshold));
+      rdmaHw->SetAttribute("SprayThemisStashMinNs",
+                           UintegerValue(spray_themis_stash_min_ns));
+      rdmaHw->SetAttribute("SprayThemisAvoidanceWindow",
+                           UintegerValue(spray_themis_avoidance_window));
+      rdmaHw->SetAttribute("SprayThemisRetxReroute",
+                           BooleanValue(spray_themis_retx_reroute == "on"));
+      rdmaHw->SetAttribute("SprayThemisLeafAvoidance",
+                           BooleanValue(spray_themis_leaf_avoidance == "on"));
+      rdmaHw->SetAttribute("SprayAckLossRtts",
+                           DoubleValue(spray_ack_loss_rtts));
+      rdmaHw->SetAttribute(
+          "AckRoute",
+          UintegerValue(static_cast<uint32_t>(
+              ack_route_spray()            ? AckRoute::Spray
+              : ack_route == "reverse_set" ? AckRoute::ReverseSet
+              : ack_route == "repath"      ? AckRoute::Repath
+                                           : AckRoute::DataSpine)));
+      rdmaHw->SetAttribute("AckRouteSetSize",
+                           UintegerValue(ack_route_set_size));
+      rdmaHw->SetAttribute("AckRouteSetProbeRtts",
+                           DoubleValue(ack_route_set_probe_rtts));
+      rdmaHw->SetAttribute("AckRouteOracle",
+                           BooleanValue(ack_route_oracle_on()));
+      // Made only where answers name their spine, so that data_spine
+      // allocates no stream.
+      if (ack_route_named())
+        rdmaHw->SetAttribute(
+            "AckRouteRandomVariable",
+            PointerValue(CreateObjectWithAttributes<UniformRandomVariable>(
+                "Stream", IntegerValue(device_rng_stream(
+                              DeviceRngBlock::AckRoute,
+                              n.Get(i)->GetDevice(1))))));
+      rdmaHw->SetAttribute(
+          "SprayPathState",
+          UintegerValue(static_cast<uint32_t>(spray_path_state == "connection"
+                                                  ? PathState::Connection
+                                                  : PathState::Message)));
       rdmaHw->SetAttribute("SprayPathSeq",
                            BooleanValue(spray_path_seq == "on"));
       rdmaHw->SetAttribute("SprayTailRecovery", BooleanValue(tail_recovery()));
@@ -3226,9 +4506,39 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),
                            UintegerValue(spray_tail_recovery_delay_ns_given
                                              ? spray_tail_recovery_delay_ns
                                              : RdmaHw::kTailDelayBaseRtt));
+      rdmaHw->SetAttribute("SprayTailLossRtts",
+                           DoubleValue(spray_tail_loss_rtts));
       rdmaHw->SetAttribute("SprayReceiverHold", BooleanValue(receiver_hold()));
       rdmaHw->SetAttribute("SprayReceiverHoldClean",
                            UintegerValue(spray_receiver_hold_clean));
+      rdmaHw->SetAttribute("SprayReceiverHoldSlots",
+                           UintegerValue(spray_receiver_hold_slots));
+      rdmaHw->SetAttribute("SprayReceiverHoldWiden",
+                           UintegerValue(spray_receiver_hold_widen));
+      rdmaHw->SetAttribute("SprayReceiverHoldAutoLeaves",
+                           UintegerValue(spray_receiver_hold_auto_leaves));
+      rdmaHw->SetAttribute(
+          "SprayReceiverTailMissing",
+          BooleanValue(spray_receiver_tail_missing == "on"));
+      rdmaHw->SetAttribute("SprayCoverageFirst",
+                           BooleanValue(spray_coverage_first == "on"));
+      rdmaHw->SetAttribute(
+          "SprayDuplicateReport",
+          UintegerValue(static_cast<uint32_t>(
+              spray_duplicate_report == "retract" ? DuplicateReport::Retract
+              : spray_duplicate_report == "on"    ? DuplicateReport::Defer
+                                                  : DuplicateReport::Off)));
+      rdmaHw->SetAttribute("SprayAnswerPathSeq",
+                           BooleanValue(answer_path_seq()));
+      rdmaHw->SetAttribute("SprayAnswerProbeIntervalNs",
+                           UintegerValue(spray_answer_probe_interval_ns));
+      rdmaHw->SetAttribute("SprayAnswerHoldClean",
+                           UintegerValue(spray_answer_hold_clean));
+      rdmaHw->SetAttribute(
+          "SprayStrayPathSeq",
+          UintegerValue(static_cast<uint32_t>(spray_stray_path_seq == "closed"
+                                                  ? StrayPathSeq::Closed
+                                                  : StrayPathSeq::Fresh)));
       rdmaHw->SetAttribute("UeEvSetSize", UintegerValue(ue_ev_set_size));
       rdmaHw->SetAttribute("UeSaturationFraction",
                            DoubleValue(ue_saturation_fraction));
@@ -3243,7 +4553,7 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),
                            UintegerValue(ack_redirect_trim_scoring_value()));
       rdmaHw->SetAttribute("AckRedirectScope",
                            UintegerValue(grade_scope_value(ack_redirect_scope)));
-      if (path_selector == "ack_redirect")
+      if (path_selector == "ack_redirect" || ack_route_named())
         rdmaHw->m_ownLeafHosts = own_leaf_hosts(n.Get(i));
       rdmaHw->SetAttribute("SprayReportIntervalBaseRtts",
                            DoubleValue(spray_report_interval_base_rtts));
@@ -3329,6 +4639,8 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),
               spray_held_exploration_value())));
       rdmaHw->SetAttribute("SprayHeldSentinelIntervalNs",
                            UintegerValue(spray_held_sentinel_interval_ns));
+      rdmaHw->SetAttribute("SprayHeldSentinelSpread",
+                           UintegerValue(spray_held_sentinel_spread));
       // A PointerValue cannot carry null, which is the ECMP default.
       if (path_random)
         rdmaHw->SetAttribute("PathRandomVariable", PointerValue(path_random));
@@ -3371,6 +4683,8 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),
 
   // setup routing
   CalculateRoutes(n);
+  if (pair_bandwidth == "spines")
+    SprayPairBandwidth(n);
   SetRoutingEntries();
 
   //
@@ -3397,9 +4711,15 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),
     }
   }
   printf("maxRtt=%lu maxBdp=%lu\n", maxRtt, maxBdp);
+  // Read only to set the routing tables and each pair's BDP and RTT, these
+  // grow with every node and host; TakeDownLink computes them again.
+  nextHop.clear();
+  pairDelay.clear();
+  pairTxDelay.clear();
   // Known only now that every route is, and read from the first packet on.
   if (load_balancing == "spray_policy" || path_selector == "ack_redirect" ||
-      reps_oracle() || tail_recovery()) {
+      reps_oracle() || tail_recovery() || ack_route_oracle_on() ||
+      ack_route == "reverse_set") {
     for (uint32_t i = 0; i < node_num; i++)
       if (n.Get(i)->GetNodeType() == 0)
         n.Get(i)->GetObject<RdmaDriver>()->m_rdma->SetAttribute(
@@ -3453,7 +4773,9 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),
     sim_setting.Serialize(trace_output);
   }
 
-  Ipv4GlobalRoutingHelper::PopulateRoutingTables();
+  // Every packet is forwarded by the tables SetRoutingEntries sets, none by
+  // the IP stack, so the nodes get no global routing tables, which hold a
+  // route to every link's network on every node.
 
   NS_LOG_INFO("Create Applications.");
 
@@ -3476,6 +4798,16 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),
     Simulator::Schedule(Seconds(2) + MicroSeconds(link_down_time),
                         &TakeDownLink, n, n.Get(link_down_A),
                         n.Get(link_down_B));
+  }
+  if (!switch_queue_output_file.empty()) {
+    switch_queue_file = fopen(switch_queue_output_file.c_str(), "w");
+    if (switch_queue_file == nullptr) {
+      std::cerr << "Error: cannot open " << switch_queue_output_file << "\n";
+      return false;
+    }
+    fprintf(switch_queue_file,
+            "time_ns,switch,port,queue,max_bytes,egress_threshold_bytes,"
+            "kmin_bytes,kmax_bytes,shared_refused,threshold_refused\n");
   }
   if (!port_counter_output_file.empty()) {
     port_counter_file = fopen(port_counter_output_file.c_str(), "w");
@@ -3527,11 +4859,17 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),
       return false;
     }
     fprintf(spine_loss_file, "time_ns,rank,%sspine,sent,lost,grade\n",
-            leaf_hold() ? "destination_leaf," : "");
+            pair_hold()   ? "destination,"
+            : leaf_hold() ? "destination_leaf,"
+                          : "");
     for (uint32_t i = 0; i < node_num; i++)
-      if (n.Get(i)->GetNodeType() == 0) {
+      if (n.Get(i)->GetNodeType() == 0 && hold_traced(i)) {
         Ptr<RdmaHw> hw = n.Get(i)->GetObject<RdmaDriver>()->m_rdma;
-        if (leaf_hold())
+        if (pair_hold())
+          hw->TraceConnectWithoutContext(
+              "LeafSpineLossInterval",
+              MakeBoundCallback(&write_pair_spine_loss_interval, i));
+        else if (leaf_hold())
           hw->TraceConnectWithoutContext(
               "LeafSpineLossInterval",
               MakeBoundCallback(&write_leaf_spine_loss_interval, i));
@@ -3554,6 +4892,18 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),
         n.Get(i)->GetObject<RdmaDriver>()->m_rdma->TraceConnectWithoutContext(
             "RetransmissionTimeout", MakeBoundCallback(&write_rto_event, i));
   }
+  if (!answer_hold_output_file.empty()) {
+    answer_hold_file = fopen(answer_hold_output_file.c_str(), "w");
+    if (answer_hold_file == nullptr) {
+      std::cerr << "Error: cannot open " << answer_hold_output_file << "\n";
+      return false;
+    }
+    fprintf(answer_hold_file, "time_ns,side,rank,leaf,spine,held\n");
+    for (uint32_t i = 0; i < node_num; i++)
+      if (n.Get(i)->GetNodeType() == 0)
+        n.Get(i)->GetObject<RdmaDriver>()->m_rdma->TraceConnectWithoutContext(
+            "AnswerHold", MakeBoundCallback(&write_answer_hold, i));
+  }
   if (!receiver_hold_output_file.empty()) {
     receiver_hold_file = fopen(receiver_hold_output_file.c_str(), "w");
     if (receiver_hold_file == nullptr) {
@@ -3563,7 +4913,7 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),
     fprintf(receiver_hold_file,
             "time_ns,rank,sender_leaf,spine,arrivals,lost,hold\n");
     for (uint32_t i = 0; i < node_num; i++)
-      if (n.Get(i)->GetNodeType() == 0)
+      if (n.Get(i)->GetNodeType() == 0 && hold_traced(i))
         n.Get(i)->GetObject<RdmaDriver>()->m_rdma->TraceConnectWithoutContext(
             "ReceiverHoldInterval",
             MakeBoundCallback(&write_receiver_hold_interval, i));
@@ -3583,12 +4933,23 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),
       std::cerr << "LINK_FAILURE blackhole needs a switch as its second node\n";
       return false;
     }
+    // The headers are sized for the run by now.
+    if (event.unit == RateErrorModel::ERROR_UNIT_BYTE &&
+        event.frameBytes != RdmaHw::DataFrameBytes(packet_payload_size)) {
+      std::cerr << "LINK_FAILURE loss byte derives its rate at a data frame of "
+                << event.frameBytes << " bytes, and this run's is "
+                << RdmaHw::DataFrameBytes(packet_payload_size) << "\n";
+      return false;
+    }
     event_times.insert(event.timeNs);
   }
   // Scheduled first, so that each set of counters is what stood before the
   // failures and restores at its time.
   for (uint64_t time_ns : event_times)
-    Simulator::Schedule(NanoSeconds(time_ns), &write_fabric_counters);
+    Simulator::Schedule(NanoSeconds(time_ns), &write_fabric_counters, false);
+  if (port_counter_interval_ns > 0)
+    Simulator::Schedule(NanoSeconds(port_counter_interval_ns),
+                        &write_periodic_fabric_counters);
   // In order, which events at one time keep, a restore before a failure.
   for (const LinkEvent &event : link_events)
     Simulator::Schedule(NanoSeconds(event.timeNs), &ApplyLinkEvent, n, event);

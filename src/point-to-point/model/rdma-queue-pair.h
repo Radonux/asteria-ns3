@@ -13,6 +13,8 @@
 #include "spine-grader.h"
 #include "spine-redirect.h"
 #include "spine-sequence.h"
+#include "answer-path-seq.h"
+#include <deque>
 #include <map>
 #include <memory>
 #include <set>
@@ -50,6 +52,9 @@ public:
 		bool held = false);
 	// The packet number of the outstanding send of seq along path, or kNone.
 	uint64_t Find(uint64_t seq, uint16_t path) const;
+	// The packet number of the outstanding send of seq along any path, or
+	// kNone.
+	uint64_t FindPacket(uint64_t seq) const;
 	uint64_t Oldest() const;
 	uint64_t OlderOnPath(uint64_t packet) const;
 	uint64_t Seq(uint64_t packet) const;
@@ -61,6 +66,11 @@ public:
 	// lost. A send declared lost may still arrive, and the answer to it would
 	// name the resend's record.
 	bool ResendsLost(uint64_t packet) const;
+	// The packet's sends since its first, this one and its copies included
+	// (NoteCopy), at most 255: above 1, an answer to it may be any of them's.
+	uint8_t Sends(uint64_t packet) const;
+	// A copy of the outstanding send of seq went out too.
+	void NoteCopy(uint64_t seq);
 	bool Trickle(uint64_t packet) const;
 	bool Exploration(uint64_t packet) const;
 	bool Held(uint64_t packet) const;
@@ -72,8 +82,18 @@ public:
 	// Note a repair send of seq. True when seq's packet was repaired before,
 	// so that this send repeats a repair.
 	bool RepairsAgain(uint64_t seq);
-	// Remove the record of every packet that starts below seq.
-	void RemoveBelow(uint64_t seq);
+	// A send whose record RemoveBelow removed: neither acknowledged by its
+	// own acknowledgement nor declared lost.
+	struct Unanswered {
+		uint64_t seq;
+		uint16_t path;
+		uint16_t pathSeq;
+		bool trickle;
+		bool resendsLost;
+	};
+	// Remove the record of every packet that starts below seq, and append to
+	// unanswered, unless it is null, the sends so removed in send order.
+	void RemoveBelow(uint64_t seq, std::vector<Unanswered> *unanswered = nullptr);
 	uint64_t Bytes() const;
 
 private:
@@ -91,6 +111,7 @@ private:
 		// end: across every path, then along this record's path.
 		uint64_t older, newer;
 		uint64_t older_on_path, newer_on_path;
+		uint8_t sends;
 	};
 	Record &At(uint64_t packet);
 	const Record &At(uint64_t packet) const;
@@ -100,6 +121,10 @@ private:
 	std::vector<Record> m_ring; // a power of two in size
 	uint64_t m_first; // every packet below it has been removed
 	uint64_t m_oldest, m_newest;
+	// The highest packet number ever sent, kNone before the first send: a
+	// slot from m_first up to it keeps its packet's record once removed, so
+	// its count of sends carries over to the packet's next send.
+	uint64_t m_highest_sent;
 	std::unordered_map<uint16_t, uint64_t> m_newest_on_path;
 	uint64_t m_bytes;
 	// The packets whose last send was declared lost and that have not been
@@ -108,6 +133,8 @@ private:
 	// The packets repaired at least once.
 	std::set<uint64_t> m_repaired;
 };
+
+struct NsccConnection;
 
 class RdmaQueuePair : public Object {
 public:
@@ -191,10 +218,15 @@ public:
 	// path: the acknowledgement of a newer send along that path, data or
 	// copy, finds it outstanding; and its own acknowledgement declares lost
 	// the older data sends and copies along its path as a data
-	// acknowledgement does. Once the data send of its sequence is
-	// acknowledged, by its own answer or cumulatively, a copy outstanding
-	// for more than one base RTT since it was sent is declared lost, and one
-	// younger waits for its own answer. A declared loss is told to the
+	// acknowledgement does. With m_copyDeadlineRtts zero (CopyExpiry::DataAck),
+	// once the data send of its sequence is acknowledged, by its own answer or
+	// cumulatively, a copy outstanding for more than one base RTT since it was
+	// sent is declared lost, and one younger waits for its own answer. With
+	// it above zero (CopyExpiry::Deadline), a copy outstanding for more than
+	// that many base RTTs since it was sent is declared lost, whether its data
+	// send is acknowledged or not, and one younger waits for its own answer
+	// whatever its data's acknowledgement says. Either is checked at the
+	// queue pair's acknowledgements. A declared loss is told to the
 	// selector's OnLoss, and of a trickle copy to OnTrickleAnswer, and
 	// nothing else.
 	struct ExplorationCopy {
@@ -205,6 +237,7 @@ public:
 		bool dataAcknowledged;
 	};
 	std::map<uint64_t, ExplorationCopy> m_copies;
+	double m_copyDeadlineRtts;
 	uint32_t m_exploration_copies;
 	uint32_t m_exploration_copies_lost;
 	// A copy of the send of seq along path, at sentNs. A copy of seq still
@@ -279,6 +312,14 @@ public:
 		uint32_t m_incStage;
 	}hpccPint;
 	NsccWindow nscc;
+	// Under NsccWindowState connection, the window of the queue pair's
+	// connection, which NSCC moves in place of nscc.
+	std::shared_ptr<NsccConnection> m_nsccConnection;
+	// The window NSCC moves for the queue pair: nscc, or its connection's.
+	NsccWindow &Nscc();
+	// The bytes in flight its window bounds: its own, or under a connection's
+	// window those of every queue pair open on it.
+	uint64_t WindowOnTheFly();
 
 	/***********
 	 * methods
@@ -307,14 +348,25 @@ public:
 	// Declare lost every outstanding send made at or before sentNs and queue
 	// its range for repair. Returns the bytes declared lost.
 	uint64_t DeclareLostSentBy(uint64_t sentNs);
+	// One outstanding send (m_outstanding's packet) of DeclareLostSentBy:
+	// declared lost and its range queued for repair, its loss told, deferred
+	// or kept as SprayDuplicateReport says. Returns the bytes declared lost.
+	uint64_t DeclareTimedOutSend(uint64_t packet);
 	// Under SprayTailRecovery, a tail repair request: declare lost every
 	// outstanding send along path whose path sequence is one of the count
 	// from first, and queue its range for repair. A send already
 	// acknowledged or declared lost is no longer outstanding and is left
 	// alone, as is a later send of the same packet, which carries a path
-	// sequence of its own. Returns the bytes declared lost.
+	// sequence of its own. With deferred the selector is not told: each
+	// send declared lost is appended to it instead, for RdmaHw to tell the
+	// selector later (RdmaHw::m_tailLosses). Returns the bytes declared lost.
+	struct DeclaredSend {
+		uint64_t seq;
+		uint16_t path;
+		bool trickle;
+	};
 	uint64_t DeclareLostOnPathSeqs(uint16_t path, uint16_t first,
-		uint16_t count);
+		uint16_t count, std::vector<DeclaredSend> *deferred = nullptr);
 	// Sends declared lost by tail repair requests, and the requests that
 	// found no outstanding send.
 	uint32_t m_tail_declared_lost;
@@ -324,8 +376,187 @@ public:
 	// queue its range for repair. Returns the bytes declared lost: zero when
 	// it was acknowledged or declared lost since, or seq was sent again.
 	uint64_t DeclareHeldSendLost(uint64_t seq, uint16_t path, uint64_t sentNs);
+	// Under PathSelector Themis: declare lost the outstanding send of seq,
+	// along whichever path it took, and queue its range for repair, as
+	// Themis's Path Avoidance Signal does for the packet it names. Returns
+	// the bytes declared lost: zero when nothing of seq is outstanding.
+	uint64_t DeclareLostSeq(uint64_t seq);
+	// Under PathSelector Themis: the packet sequence number of this queue
+	// pair's first packet in its connection, so that the connection's
+	// messages number their packets as one queue pair would.
+	uint64_t m_psnBase;
 	// Sends on a held spine declared lost by DeclareHeldSendLost.
 	uint32_t m_held_declared_lost;
+	// SprayOverdueRepair (RdmaHw): the queue pair's latest send on a spine
+	// not held as it was chosen, seq along path at sentNs, while
+	// m_overdueTaken (not when the latest send was held, or once it is
+	// repaired), whose answer, overdue by SprayHeldLossRtts base RTTs, has it
+	// declared lost and repaired as a held send is (RdmaHw::OverdueSendDue);
+	// m_overdueTimer is set for it. One repair is sent per answer or
+	// timeout: m_overdueSpent, set by the repair, keeps any send from being
+	// taken until the queue pair's next answer or retransmission timeout
+	// clears it. Each sequence repaired waits in m_overdueRepaired, with the
+	// paths of its send and of its repair, for the answer that shows which
+	// arrived first (OverdueRepairSpurious).
+	bool m_overdueTaken;
+	uint64_t m_overdueSeq;
+	uint16_t m_overduePath;
+	uint64_t m_overdueSentNs;
+	bool m_overdueSpent;
+	// Under SprayOverdueRepair reprobe, the repairs sent since the queue
+	// pair's last answer or timeout.
+	uint32_t m_overdueRepeats;
+	EventId m_overdueTimer;
+	// A sequence's send path, the repairs DeclareOverdueSendLost declared of
+	// it and the paths of those sent, and whether its send was a trickle's.
+	struct OverdueRepair {
+		uint16_t path;
+		uint32_t declared;
+		std::vector<uint16_t> repairPaths;
+		bool trickle;
+	};
+	std::map<uint64_t, OverdueRepair> m_overdueRepaired;
+	uint32_t m_overdue_declared_lost;
+	uint32_t m_overdue_spurious;
+	// SprayOverdueRepair probe: the repair counts no loss as it goes out, and
+	// under SprayDuplicateReport the answer that ends a repaired sequence's
+	// wait settles the send (OverdueRepairSpurious): the repair's, unflagged,
+	// a data loss on the send's path, told to the selector and counted in
+	// m_timeout_data_losses; a flagged one an answer loss, counted in
+	// m_duplicate_answer_losses; the send's own nothing. A sequence the
+	// cumulative acknowledgement covers first counts nothing.
+	bool m_overdueProbe;
+	// SprayOverdueRepair reprobe: a repair declared lost again keeps its
+	// sequence's record (DeclareOverdueSendLost).
+	bool m_overdueRepeat;
+	// SprayRackReorderNs: the answer to a send made at t declares lost every
+	// outstanding send made at or before t less this window, along any path
+	// (RACK, RFC 8985 section 6.2, without its reorder timer); 0 is off.
+	uint64_t m_rackReorderNs;
+	// SprayRackDeferLoss: the sends the rule declares lost are repaired at
+	// once, but their loss is not told to the path selector here; they wait
+	// in m_rackDeferred for RdmaHw, which tells them as a tail repair
+	// request's declarations (DeferTailLosses), so that the late answer of a
+	// send that had only waited in a queue drops its loss.
+	bool m_rackDeferLoss;
+	std::vector<DeclaredSend> m_rackDeferred;
+	// Declare lost the send of seq along path made at sentNs, if it is still
+	// outstanding, and queue its range for repair; its loss is evidence as a
+	// retransmission timeout's is (DeclareLostSentBy), or under m_overdueProbe
+	// none; under m_overdueRepeat a sequence repaired already keeps its
+	// send's path as its repair is declared lost. Returns the bytes declared
+	// lost: zero when it was acknowledged or declared lost since, or seq was
+	// sent again, or under SprayCoverageFirst it is covered.
+	uint64_t DeclareOverdueSendLost(uint64_t seq, uint16_t path,
+		uint64_t sentNs);
+	// A repair of seq left along path: the first after each repair
+	// DeclareOverdueSendLost declared of the sequence is that repair's path.
+	void NoteOverdueRepairSent(uint64_t seq, uint16_t path);
+	// Whether the answer to seq along path, flagged as a duplicate or not,
+	// shows a repair of DeclareOverdueSendLost spurious, the send it repaired
+	// having arrived first: flagged, or unflagged along the send's path where
+	// the repair took another, the send's own answer (m_overdue_spurious).
+	// Unflagged along the repair's path, where the send took another, it is
+	// the repair's, which arrived first; either answer ends the wait, and
+	// along one path for both an unflagged answer leaves it to a flagged one.
+	// An answer along any of a sequence's repairs' paths is a repair's.
+	// Under m_overdueProbe the answer that ends the wait settles the send.
+	bool OverdueRepairSpurious(uint64_t seq, uint16_t path, bool duplicate,
+		uint64_t nowNs);
+	// Under SprayAckLossRtts, the sends the cumulative acknowledgement
+	// covered before their own acknowledgement arrived, in the order it
+	// covered them, each with the time it was covered. Their data was
+	// delivered, so only the acknowledgement may have been lost on its path.
+	// The own acknowledgement of one of them, found by its sequence and path,
+	// drops it; one still here when it is due (AckLossDue) is declared lost
+	// on its path for the selector alone. Empty unless a cumulative advance
+	// removes unanswered sends.
+	struct CoveredSend {
+		OutstandingPackets::Unanswered send;
+		uint64_t coveredNs;
+	};
+	std::deque<CoveredSend> m_covered;
+	EventId m_ackLossTimer;
+	// Covered sends declared lost on their paths.
+	uint32_t m_ack_loss_declared;
+	// Whether the acknowledgement of seq along path answers a covered send;
+	// if so it is dropped, and the answer to a trickle send that resends
+	// nothing declared lost is told to OnTrickleAnswer.
+	bool AnswerCovered(uint64_t seq, uint16_t path);
+	// Declare lost, on its path and for the selector alone, every covered
+	// send covered delayNs or more before nowNs, as DeclareLost tells the
+	// selector of a send, without a repair. Returns how many.
+	uint32_t DeclareAckLosses(uint64_t nowNs, uint64_t delayNs);
+	// SprayCoverageFirst (RdmaHw): before the per-path rule, the held-loss
+	// rule, a tail repair request or a copy's expiry declares a send lost, the
+	// coverage the queue pair has is applied: the cumulative acknowledgement,
+	// snd_una or, while an answer is processed, the one it carries
+	// (m_answerCoverage), and for a copy the answer of its data send too
+	// (ExplorationCopy::dataAcknowledged). A send it covers was delivered, so
+	// only its own answer is missing: it is an answer loss, counted in
+	// m_covered_answer_losses and told to m_coveredAnswerLoss, and is neither
+	// repaired nor told to the selector, so that it enters no spine's loss
+	// counts, no hold and no copy's. Under SprayAckLossRtts the covered sends
+	// due are counted so too, rather than declared on their paths.
+	bool m_coverageFirst;
+	uint64_t m_answerCoverage;
+	uint32_t m_covered_answer_losses;
+	Callback<void> m_coveredAnswerLoss;
+	// Under SprayCoverageFirst, whether the range from seq of size bytes is
+	// covered; if so it is counted as an answer loss.
+	bool CoveredAnswerLoss(uint64_t seq, uint64_t size);
+	void CountCoveredAnswerLoss();
+	// SprayDuplicateReport (RdmaHw), under SprayCoverageFirst: the sends a
+	// retransmission timeout declares lost are repaired at once, but their
+	// loss is told to the selector only once the answer to the sequence's
+	// resend shows what became of the first send (ResolveTimedOut). An answer
+	// the receiver flags as a duplicate, of a sequence it held already, shows
+	// the first send delivered: an answer loss, counted in
+	// m_duplicate_answer_losses and told to the selector nowhere. An
+	// unflagged one, or the cumulative acknowledgement covering the sequence
+	// with no answer to its resend, tells the loss on the first send's path
+	// as the timeout would have, counted in m_timeout_data_losses. Each is
+	// told to m_timedOutResolved, with whether it was a duplicate.
+	struct TimedOutSend {
+		uint16_t path;
+		bool trickle;
+	};
+	bool m_deferTimeoutEvidence;
+	std::map<uint64_t, TimedOutSend> m_timedOut;
+	uint32_t m_duplicate_answer_losses;
+	uint32_t m_timeout_data_losses;
+	Callback<void, bool> m_timedOutResolved;
+	// Of m_timeout_data_losses, those the cumulative acknowledgement left
+	// data losses by covering their sequence first, each told to
+	// m_timedOutCovered.
+	uint32_t m_timeout_covered_losses;
+	Callback<void> m_timedOutCovered;
+	void CountTimedOutCovered(uint32_t losses);
+	// Under SprayDuplicateReport's retract instead, a retransmission timeout
+	// tells the loss of each send it declares at once, as without the key,
+	// and keeps each in m_timeoutLosses, a sequence timed out again kept
+	// once more. An answer to the sequence flagged as a duplicate takes each
+	// back (PathSelector::RetractLoss), the first send having arrived:
+	// counted in m_duplicate_answer_losses and m_retracted_timeout_losses,
+	// and told to m_timeoutLossRetracted with the route spine the answer came
+	// back over and whether the hold the loss began was released. An
+	// unflagged answer, or the cumulative acknowledgement covering the
+	// sequence first, leaves each a data loss, counted in
+	// m_timeout_data_losses and told to m_timedOutResolved.
+	struct TimeoutLoss {
+		uint16_t path;
+		uint64_t countedNs;
+	};
+	bool m_retractTimeoutEvidence;
+	std::multimap<uint64_t, TimeoutLoss> m_timeoutLosses;
+	uint32_t m_retracted_timeout_losses;
+	Callback<void, uint16_t, bool> m_timeoutLossRetracted;
+	// The answer to a send of seq over route spine route, kNoRouteSpine for
+	// none, flagged as a duplicate or not.
+	void ResolveTimedOut(uint64_t seq, bool duplicate, uint16_t route,
+		uint64_t nowNs);
+	// Under SprayAnswerPathSeq, the numbered answers read so far.
+	AnswerSequenceTracker m_answerTracker;
 
 	uint64_t GetBytesLeft();
 	uint64_t GetInitialSize();
@@ -334,7 +565,9 @@ public:
 	uint64_t GetTag();
 	void SetTag(uint64_t tag);void SetSrc(uint32_t src);void SetDest(uint32_t dest);void SetInitialSize(uint64_t size);
 	uint32_t GetHash(void);
-	void Acknowledge(uint64_t ack);
+	// The cumulative acknowledgement of every byte below ack; with
+	// keepCovered the sends it removes unanswered are kept in m_covered.
+	void Acknowledge(uint64_t ack, bool keepCovered = false);
 	uint64_t GetOnTheFly();
 	bool IsWinBound();
 	uint64_t GetWin(); // window size calculated from m_rate
@@ -343,15 +576,26 @@ public:
 	uint64_t HpGetCurWin(); // window size calculated from hp.m_curRate, used by HPCC
 
 private:
-	// Returns the bytes declared lost.
-	uint32_t DeclareLost(uint64_t packet);
+	// Returns the bytes declared lost. Without report the selector is not
+	// told.
+	uint32_t DeclareLost(uint64_t packet, bool report = true);
 	// Declare lost, for the selector alone, the copies along path sent
-	// before sentNs, and those whose data send is acknowledged and that are
-	// outstanding past one base RTT by nowNs.
+	// before sentNs, and those ExpireCopies declares by nowNs.
 	void DeclareCopiesLostOnPath(uint16_t path, uint64_t sentNs, uint64_t nowNs);
 	void ExpireCopies(uint64_t nowNs);
 	void DeclareCopyLost(std::map<uint64_t, ExplorationCopy>::iterator copy,
 		uint64_t nowNs);
+};
+
+// Under NsccWindowState connection, the NSCC window of a sending host's queue
+// pairs to one destination and priority group, each carrying one message. It is
+// opened once, by the first of them, bounds the bytes all of them have in
+// flight together, and outlives them, so that the next message to the
+// destination starts from it; it persists across idle periods as it is.
+struct NsccConnection {
+	NsccWindow window;
+	// The queue pairs open on it, each until it completes or fails.
+	std::vector<Ptr<RdmaQueuePair>> queuePairs;
 };
 
 class RdmaRxQueuePair : public Object { // Rx side queue pair
@@ -392,10 +636,36 @@ public:
 	uint64_t m_folded_arrivals;
 	// Under SprayPathSeq, the path sequence expected next per path.
 	SpineSequenceReceiver m_pathSeqReceiver;
+	// Under PathSelector Themis, Themis's destination state for this queue
+	// pair (Liu et al., EuroSys 2026, algorithm 1 and section 4.4), packets
+	// numbered from the queue pair's first: the highest packet seen per path
+	// index (packet mod N), the stashed undetermined repair request, its
+	// head, and the head last requested.
+	struct ThemisDestination {
+		std::vector<int64_t> pathMax;
+		bool valid = false;
+		uint64_t sePsn = 0;
+		// When the stash was made, in ns.
+		uint64_t stashNs = 0;
+		uint64_t requestedHead = UINT64_MAX;
+	};
+	ThemisDestination m_themis;
 	// Under SprayTailRecovery with a delay, the missing runs not yet
 	// requested, and the one timer that requests those due.
 	PendingTailRuns m_tailRuns;
 	EventId m_tailTimer;
+	// Under SprayAnswerPathSeq, the numbers of this queue pair's answers per
+	// route spine.
+	AnswerSequencer m_answerSequencer;
+	// Under SprayReceiverTailMissing, the runs requested whose guard has
+	// not yet ended, and the one timer that counts those due.
+	PendingTailRuns m_tailMissingRuns;
+	EventId m_tailMissingTimer;
+	// Whether the runs counted any path sequence missing.
+	bool m_countedTailMissing;
+	// Under SprayStrayPathSeq Closed, whether a packet of a flow whose receive
+	// queue pair the frontend removed made this one (StrayPathSeq).
+	bool m_stray;
 	// Whether the experiment layer may forgive this flow on this step, asked
 	// once when the queue pair is created. Every acknowledgement this queue
 	// pair emits carries it, and an acknowledgement carrying it without the
